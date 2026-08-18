@@ -1,28 +1,3 @@
-/*
-  Copyright (c) 2018, 2019 Jouni Siren
-  Copyright (c) 2015, 2016 Genome Research Ltd.
-
-  Author: Jouni Siren <jouni.siren@iki.fi>
-
-  Permission is hereby granted, free of charge, to any person obtaining a copy
-  of this software and associated documentation files (the "Software"), to deal
-  in the Software without restriction, including without limitation the rights
-  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-  copies of the Software, and to permit persons to whom the Software is
-  furnished to do so, subject to the following conditions:
-
-  The above copyright notice and this permission notice shall be included in all
-  copies or substantial portions of the Software.
-
-  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-  SOFTWARE.
-*/
-
 #include <gcsa/support.h>
 #include <gcsa/internal.h>
 
@@ -163,7 +138,7 @@ Alphabet::Alphabet(const Alphabet& a)
   this->copy(a);
 }
 
-Alphabet::Alphabet(Alphabet&& a)
+Alphabet::Alphabet(Alphabet&& a) noexcept
 {
   *this = std::move(a);
 }
@@ -192,7 +167,7 @@ Alphabet::copy(const Alphabet& a)
 }
 
 void
-Alphabet::swap(Alphabet& a)
+Alphabet::swap(Alphabet& a) noexcept
 {
   if(this != &a)
   {
@@ -212,7 +187,7 @@ Alphabet::operator=(const Alphabet& a)
 }
 
 Alphabet&
-Alphabet::operator=(Alphabet&& a)
+Alphabet::operator=(Alphabet&& a) noexcept
 {
   if(this != &a)
   {
@@ -261,7 +236,7 @@ NodeMapping::NodeMapping(const NodeMapping& source)
   this->copy(source);
 }
 
-NodeMapping::NodeMapping(NodeMapping&& source)
+NodeMapping::NodeMapping(NodeMapping&& source) noexcept
 {
   *this = std::move(source);
 }
@@ -284,7 +259,7 @@ NodeMapping::copy(const NodeMapping& source)
 }
 
 void
-NodeMapping::swap(NodeMapping& source)
+NodeMapping::swap(NodeMapping& source) noexcept
 {
   if(this != &source)
   {
@@ -302,7 +277,7 @@ NodeMapping::operator=(const NodeMapping& source)
 }
 
 NodeMapping&
-NodeMapping::operator=(NodeMapping&& source)
+NodeMapping::operator=(NodeMapping&& source) noexcept
 {
   if(this != &source)
   {
@@ -359,7 +334,7 @@ SadaCount::SadaCount(const SadaCount& source)
   this->copy(source);
 }
 
-SadaCount::SadaCount(SadaCount&& source)
+SadaCount::SadaCount(SadaCount&& source) noexcept
 {
   *this = std::move(source);
 }
@@ -369,7 +344,7 @@ SadaCount::~SadaCount()
 }
 
 void
-SadaCount::swap(SadaCount& another)
+SadaCount::swap(SadaCount& another) noexcept
 {
   if(this != &another)
   {
@@ -386,7 +361,7 @@ SadaCount::operator=(const SadaCount& source)
 }
 
 SadaCount&
-SadaCount::operator=(SadaCount&& source)
+SadaCount::operator=(SadaCount&& source) noexcept
 {
   if(this != &source)
   {
@@ -442,7 +417,7 @@ SadaSparse::SadaSparse(const SadaSparse& source)
   this->copy(source);
 }
 
-SadaSparse::SadaSparse(SadaSparse&& source)
+SadaSparse::SadaSparse(SadaSparse&& source) noexcept
 {
   *this = std::move(source);
 }
@@ -452,7 +427,7 @@ SadaSparse::~SadaSparse()
 }
 
 void
-SadaSparse::swap(SadaSparse& another)
+SadaSparse::swap(SadaSparse& another) noexcept
 {
   if(this != &another)
   {
@@ -474,7 +449,7 @@ SadaSparse::operator=(const SadaSparse& source)
 }
 
 SadaSparse&
-SadaSparse::operator=(SadaSparse&& source)
+SadaSparse::operator=(SadaSparse&& source) noexcept
 {
   if(this != &source)
   {

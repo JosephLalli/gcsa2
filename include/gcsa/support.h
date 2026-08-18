@@ -1,28 +1,3 @@
-/*
-  Copyright (c) 2018, 2019 Jouni Siren
-  Copyright (c) 2015, 2016 Genome Research Ltd.
-
-  Author: Jouni Siren <jouni.siren@iki.fi>
-
-  Permission is hereby granted, free of charge, to any person obtaining a copy
-  of this software and associated documentation files (the "Software"), to deal
-  in the Software without restriction, including without limitation the rights
-  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-  copies of the Software, and to permit persons to whom the Software is
-  furnished to do so, subject to the following conditions:
-
-  The above copyright notice and this permission notice shall be included in all
-  copies or substantial portions of the Software.
-
-  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-  SOFTWARE.
-*/
-
 #ifndef GCSA_SUPPORT_H
 #define GCSA_SUPPORT_H
 
@@ -108,7 +83,7 @@ public:
 
   Alphabet();
   Alphabet(const Alphabet& a);
-  Alphabet(Alphabet&& a);
+  Alphabet(Alphabet&& a) noexcept;
   ~Alphabet();
 
   /*
@@ -139,9 +114,9 @@ public:
     const sdsl::int_vector<8>& _char2comp = DEFAULT_CHAR2COMP,
     const sdsl::int_vector<8>& _comp2char = DEFAULT_COMP2CHAR);
 
-  void swap(Alphabet& a);
+  void swap(Alphabet& a) noexcept;
   Alphabet& operator=(const Alphabet& a);
-  Alphabet& operator=(Alphabet&& a);
+  Alphabet& operator=(Alphabet&& a) noexcept;
 
   size_type serialize(std::ostream& out, sdsl::structure_tree_node* v = nullptr, std::string name = "") const;
   void load(std::istream& in);
@@ -190,14 +165,14 @@ public:
 
   NodeMapping();
   NodeMapping(const NodeMapping& source);
-  NodeMapping(NodeMapping&& source);
+  NodeMapping(NodeMapping&& source) noexcept;
   ~NodeMapping();
 
   explicit NodeMapping(size_type first_node_id);
 
-  void swap(NodeMapping& another);
+  void swap(NodeMapping& another) noexcept;
   NodeMapping& operator=(const NodeMapping& source);
-  NodeMapping& operator=(NodeMapping&& source);
+  NodeMapping& operator=(NodeMapping&& source) noexcept;
 
   size_type serialize(std::ostream& out, sdsl::structure_tree_node* v = nullptr, std::string name = "") const;
   void load(std::istream& in);
@@ -236,14 +211,14 @@ public:
 
   SadaCount();
   SadaCount(const SadaCount& source);
-  SadaCount(SadaCount&& source);
+  SadaCount(SadaCount&& source) noexcept;
   ~SadaCount();
 
   template<class Container> explicit SadaCount(const Container& source);
 
-  void swap(SadaCount& another);
+  void swap(SadaCount& another) noexcept;
   SadaCount& operator=(const SadaCount& source);
-  SadaCount& operator=(SadaCount&& source);
+  SadaCount& operator=(SadaCount&& source) noexcept;
 
   size_type serialize(std::ostream& out, sdsl::structure_tree_node* v = nullptr, std::string name = "") const;
   void load(std::istream& in);
@@ -303,14 +278,14 @@ public:
 
   SadaSparse();
   SadaSparse(const SadaSparse& source);
-  SadaSparse(SadaSparse&& source);
+  SadaSparse(SadaSparse&& source) noexcept;
   ~SadaSparse();
 
   template<class Container> explicit SadaSparse(const Container& source);
 
-  void swap(SadaSparse& another);
+  void swap(SadaSparse& another) noexcept;
   SadaSparse& operator=(const SadaSparse& source);
-  SadaSparse& operator=(SadaSparse&& source);
+  SadaSparse& operator=(SadaSparse&& source) noexcept;
 
   size_type serialize(std::ostream& out, sdsl::structure_tree_node* v = nullptr, std::string name = "") const;
   void load(std::istream& in);
