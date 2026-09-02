@@ -183,6 +183,8 @@ int main()
 
   std::remove(first.path_names[0].c_str()); std::remove(first.rank_names[0].c_str());
   std::remove(second.path_names[0].c_str()); std::remove(second.rank_names[0].c_str());
+  std::remove(path_a.c_str()); std::remove(rank_a.c_str());
+  std::remove(path_b.c_str()); std::remove(rank_b.c_str());
   std::remove(path_c.c_str()); std::remove(rank_c.c_str());
   std::remove(path_d.c_str()); std::remove(rank_d.c_str());
   return 0;

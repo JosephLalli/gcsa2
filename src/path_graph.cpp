@@ -524,8 +524,12 @@ struct PathSortRunReader
   bool at_end;
 
   PathSortRunReader(const std::string& name, size_type buffer_records) :
-    file(name.c_str(), std::ios_base::binary), buffer(), offset(0), buffer_records(buffer_records), at_end(false)
+    file(), buffer(), offset(0), buffer_records(buffer_records), at_end(false)
   {
+    // The explicit byte-counted vector is the only input buffer. Otherwise
+    // libstdc++ adds an unaccounted buffer for every merge input stream.
+    this->file.rdbuf()->pubsetbuf(nullptr, 0);
+    this->file.open(name.c_str(), std::ios_base::binary);
     if(!this->file) { externalSortFailure("cannot open run " + name); }
     this->buffer.resize(this->buffer_records);
     this->refill();
@@ -573,7 +577,9 @@ struct PathSortHeapComparator
 void
 writePathSortRun(const std::string& name, const std::vector<PathSortRecord>& records)
 {
-  std::ofstream output(name.c_str(), std::ios_base::binary);
+  std::ofstream output;
+  output.rdbuf()->pubsetbuf(nullptr, 0);
+  output.open(name.c_str(), std::ios_base::binary);
   if(!output) { externalSortFailure("cannot create run " + name); }
   if(!records.empty()) { DiskIO::write(output, records.data(), records.size()); }
   output.close();
@@ -584,7 +590,9 @@ mergePathSortRuns(const std::vector<std::string>& inputs, size_type buffer_recor
   ExternalPathSortStats* stats)
 {
   std::string output_name = TempFile::getName("gcsa_path_sort_run");
-  std::ofstream output(output_name.c_str(), std::ios_base::binary);
+  std::ofstream output;
+  output.rdbuf()->pubsetbuf(nullptr, 0);
+  output.open(output_name.c_str(), std::ios_base::binary);
   if(!output) { externalSortFailure("cannot create merged run"); }
   std::vector<PathSortRunReader> readers;
   readers.reserve(inputs.size());
@@ -622,7 +630,10 @@ writeSortedPathPair(const std::string& run_name, const std::string& path_name,
   size_type buffer_records, ExternalPathSortStats* stats)
 {
   PathSortRunReader reader(run_name, buffer_records);
-  std::ofstream paths(path_name.c_str(), std::ios_base::binary), ranks(rank_name.c_str(), std::ios_base::binary);
+  std::ofstream paths, ranks;
+  paths.rdbuf()->pubsetbuf(nullptr, 0); ranks.rdbuf()->pubsetbuf(nullptr, 0);
+  paths.open(path_name.c_str(), std::ios_base::binary);
+  ranks.open(rank_name.c_str(), std::ios_base::binary);
   if(!paths || !ranks) { externalSortFailure("cannot create sorted path pair"); }
   std::vector<PathNode> path_buffer; path_buffer.reserve(std::max((size_type)1, buffer_records));
   std::vector<PathNode::rank_type> rank_buffer;
@@ -656,6 +667,22 @@ writeSortedPathPair(const std::string& run_name, const std::string& path_name,
   if(path_count != expected_paths || rank_count != expected_ranks) { externalSortFailure("sorted path pair has incorrect counts"); }
 }
 
+void
+addPathSortRun(std::vector<std::vector<std::string>>& levels, const std::string& run,
+  size_type level, size_type fan_in, size_type buffer_records,
+  ExternalPathSortStats* stats)
+{
+  if(levels.size() <= level) { levels.resize(level + 1); }
+  levels[level].push_back(run);
+  if(levels[level].size() < fan_in) { return; }
+
+  std::vector<std::string> inputs; inputs.swap(levels[level]);
+  std::string merged = mergePathSortRuns(inputs, buffer_records, stats);
+  for(size_type i = 0; i < inputs.size(); i++) { TempFile::remove(inputs[i]); }
+  if(stats != nullptr) { stats->merge_passes = std::max(stats->merge_passes, level + 1); }
+  addPathSortRun(levels, merged, level + 1, fan_in, buffer_records, stats);
+}
+
 } // namespace
 
 void
@@ -678,6 +705,7 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   size_type run_records = std::max((size_type)1, available / (3 * record_bytes));
 
   std::ifstream paths, ranks;
+  paths.rdbuf()->pubsetbuf(nullptr, 0); ranks.rdbuf()->pubsetbuf(nullptr, 0);
   graph.open(paths, ranks, file);
   if(graph.path_counts[file] > std::numeric_limits<size_type>::max() / sizeof(PathNode) ||
      graph.rank_counts[file] > std::numeric_limits<size_type>::max() / sizeof(PathNode::rank_type) ||
@@ -686,7 +714,9 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   {
     externalSortFailure("source path/rank file length does not match metadata");
   }
-  std::vector<std::string> runs;
+  // At most fan_in - 1 runs remain at each level. Run metadata therefore uses
+  // O(fan_in * log(number_of_runs)) memory rather than one string per run.
+  std::vector<std::vector<std::string>> levels;
   std::vector<PathSortRecord> records; records.reserve(run_records);
   updatePathSortStats(stats, run_records, PATH_SORT_FIXED_BYTES + run_records * record_bytes);
   size_type rank_offset = 0, path_count = 0;
@@ -698,7 +728,8 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
     {
       std::sort(records.begin(), records.end(), pathSortLess);
       std::string name = TempFile::getName("gcsa_path_sort_run");
-      writePathSortRun(name, records); runs.push_back(name); records.clear();
+      writePathSortRun(name, records); records.clear();
+      addPathSortRun(levels, name, 0, fan_in, merge_records, stats);
       if(stats != nullptr) { stats->runs++; }
     }
   }
@@ -710,14 +741,23 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   {
     std::sort(records.begin(), records.end(), pathSortLess);
     std::string name = TempFile::getName("gcsa_path_sort_run");
-    writePathSortRun(name, records); runs.push_back(name);
+    writePathSortRun(name, records);
+    addPathSortRun(levels, name, 0, fan_in, merge_records, stats);
     if(stats != nullptr) { stats->runs++; }
   }
   paths.close(); ranks.close();
+  // Run construction and run merging are sequential phases. Drop the run
+  // buffer capacity before allocating per-reader merge buffers so the byte
+  // budget remains a ceiling instead of becoming a per-phase allowance.
+  std::vector<PathSortRecord>().swap(records);
 
+  std::vector<std::string> runs;
+  for(size_type level = 0; level < levels.size(); level++)
+  {
+    runs.insert(runs.end(), levels[level].begin(), levels[level].end());
+  }
   while(runs.size() > fan_in)
   {
-    if(stats != nullptr) { stats->merge_passes++; }
     std::vector<std::string> compacted;
     for(size_type first = 0; first < runs.size(); first += fan_in)
     {
@@ -728,6 +768,7 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
       compacted.push_back(merged);
     }
     runs.swap(compacted);
+    if(stats != nullptr) { stats->merge_passes++; }
   }
   if(runs.empty())
   {
@@ -748,7 +789,10 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   }
   std::string old_path = graph.path_names[file], old_rank = graph.rank_names[file];
   graph.path_names[file] = final_path; graph.rank_names[file] = final_rank;
-  TempFile::remove(old_path); TempFile::remove(old_rank);
+  if(graph.delete_files)
+  {
+    TempFile::remove(old_path); TempFile::remove(old_rank);
+  }
 }
 
 size_type
