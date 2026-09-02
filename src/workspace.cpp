@@ -1,6 +1,7 @@
 #include <gcsa/workspace.h>
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -27,6 +28,17 @@ bool exists(const std::string& p) { return access(p.c_str(),F_OK)==0; }
 std::string base(const std::string& p) { size_t x=p.find_last_of('/'); return x==std::string::npos?p:p.substr(x+1); }
 std::string parent(const std::string& p) { size_t x=p.find_last_of('/'); return x==std::string::npos?".":(x==0?"/":p.substr(0,x)); }
 std::string json(const std::string& s) { std::string r; for(size_t i=0;i<s.size();++i) { unsigned char c=s[i]; if(c=='"'||c=='\\') { r+='\\'; r+=c; } else if(c=='\n') r+="\\n"; else if(c=='\r') r+="\\r"; else if(c=='\t') r+="\\t"; else if(c<32) throw std::runtime_error("control character in manifest setting"); else r+=c; } return r; }
+
+// Deterministic crash injection for recovery tests. _exit() intentionally
+// skips C++ destructors: the on-disk state must look like an abrupt process or
+// machine failure, rather than an exception that lets ArtifactWriter clean its
+// partial file. The variable is undocumented user interface and is only set by
+// the workspace test executable.
+void crash_if_requested(const char* point)
+{
+  const char* requested=std::getenv("GCSA_WORKSPACE_CRASH_POINT");
+  if(requested!=0 && std::string(requested)==point){::_exit(86);}
+}
 }
 uint64_t BuildWorkspace::checksum(const void* d,size_t n,uint64_t h) { const uint8_t* p=(const uint8_t*)d; for(size_t i=0;i<n;i++) { h^=p[i]; h*=1099511628211ULL; } return h; }
 std::string BuildWorkspace::safe(const std::string& v) { if(v.empty()) throw std::runtime_error("empty artifact identity component"); std::string out; for(size_t i=0;i<v.size();++i) { char c=v[i]; if((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='-'||c=='_') out+=c; else out+='_'; } return out; }
@@ -41,10 +53,10 @@ BuildWorkspace::ArtifactWriter::ArtifactWriter(ArtifactWriter&& o):ws_(o.ws_),id
 BuildWorkspace::ArtifactWriter& BuildWorkspace::ArtifactWriter::operator=(ArtifactWriter&& o) { if(this!=&o){if(!done_){if(fd_>=0)close(fd_);if(!partial_.empty())unlink(partial_.c_str());}ws_=o.ws_;id_=o.id_;logical_=o.logical_;shard_=o.shard_;final_=o.final_;partial_=o.partial_;sort_=o.sort_;range_=o.range_;fd_=o.fd_;bytes_=o.bytes_;sum_=o.sum_;done_=o.done_;o.fd_=-1;o.done_=true;}return *this;}
 BuildWorkspace::ArtifactWriter::~ArtifactWriter(){if(!done_){if(fd_>=0)close(fd_);if(!partial_.empty())unlink(partial_.c_str());}}
 void BuildWorkspace::ArtifactWriter::write(const void* d,size_t n){if(done_)throw std::runtime_error("write on finished ArtifactWriter");write_all(fd_,d,n,partial_);sum_=BuildWorkspace::checksum(d,n,sum_);bytes_+=n;}
-BuildWorkspace::ArtifactRef BuildWorkspace::ArtifactWriter::finish(uint64_t records){if(done_)throw std::runtime_error("ArtifactWriter already finished"); off_t count_off=off_t(24+id_.kind.size()); unsigned char b[8]; for(size_t i=0;i<8;i++)b[i]=unsigned(records>>(8*i));pwrite_all(fd_,b,8,count_off,partial_);for(size_t i=0;i<8;i++)b[i]=unsigned(bytes_>>(8*i));pwrite_all(fd_,b,8,count_off+8,partial_);for(size_t i=0;i<8;i++)b[i]=unsigned(sum_>>(8*i));pwrite_all(fd_,b,8,count_off+16,partial_);put(fd_,FOOT,4,partial_);put(fd_,ArtifactFooter::VERSION,4,partial_);put_string(fd_,id_.kind,partial_);put(fd_,logical_.value,4,partial_);put(fd_,shard_.value,8,partial_);put(fd_,records,8,partial_);put(fd_,bytes_,8,partial_);put(fd_,sum_,8,partial_);put_string(fd_,sort_,partial_);put_string(fd_,range_,partial_);sync_file(fd_,partial_);fd_=-1;if(rename(partial_.c_str(),final_.c_str())!=0)throw err("cannot atomically publish artifact",final_);sync_dir(ws_->directory_);done_=true;return ArtifactRef(id_,logical_,shard_,records,bytes_,sum_);}
+BuildWorkspace::ArtifactRef BuildWorkspace::ArtifactWriter::finish(uint64_t records){if(done_)throw std::runtime_error("ArtifactWriter already finished"); off_t count_off=off_t(24+id_.kind.size()); unsigned char b[8]; for(size_t i=0;i<8;i++)b[i]=unsigned(records>>(8*i));pwrite_all(fd_,b,8,count_off,partial_);for(size_t i=0;i<8;i++)b[i]=unsigned(bytes_>>(8*i));pwrite_all(fd_,b,8,count_off+8,partial_);for(size_t i=0;i<8;i++)b[i]=unsigned(sum_>>(8*i));pwrite_all(fd_,b,8,count_off+16,partial_);put(fd_,FOOT,4,partial_);put(fd_,ArtifactFooter::VERSION,4,partial_);put_string(fd_,id_.kind,partial_);put(fd_,logical_.value,4,partial_);put(fd_,shard_.value,8,partial_);put(fd_,records,8,partial_);put(fd_,bytes_,8,partial_);put(fd_,sum_,8,partial_);put_string(fd_,sort_,partial_);put_string(fd_,range_,partial_);sync_file(fd_,partial_);fd_=-1;crash_if_requested("artifact-before-rename");if(rename(partial_.c_str(),final_.c_str())!=0)throw err("cannot atomically publish artifact",final_);sync_dir(ws_->directory_);crash_if_requested("artifact-after-rename");done_=true;return ArtifactRef(id_,logical_,shard_,records,bytes_,sum_);}
 BuildWorkspace::ArtifactWriter BuildWorkspace::open_artifact(const ArtifactIdentity& i,logical_file_id_t l,physical_shard_id_t s,const std::string& so,const std::string& kr){return ArtifactWriter(this,i,l,s,so,kr);}
 void BuildWorkspace::commit_artifact(logical_file_id_t l,physical_shard_id_t s,uint64_t r,const std::vector<uint8_t>& p){ArtifactIdentity i;ArtifactWriter w=open_artifact(i,l,s);w.write(p.data(),p.size());ArtifactRef ref=w.finish(r);std::vector<ArtifactRef> a(1,ref);commit_task(i.task,i.phase,a);}
-void BuildWorkspace::commit_task(const std::string& task,const std::string& phase,const std::vector<ArtifactRef>& a,const std::vector<std::string>& deps){if(a.empty())throw std::runtime_error("cannot commit empty task completion record");std::string final=completion_path(task,phase),tmp=final+partial_suffix();int fd=open(tmp.c_str(),O_CREAT|O_EXCL|O_WRONLY,0644);if(fd<0)throw err("cannot create completion record",tmp);try{std::ostringstream x;x<<"version=1\nfingerprint="<<fingerprint_<<"\n";for(size_t n=0;n<a.size();++n){std::string p=artifact_path(a[n].identity,a[n].logical,a[n].shard);if(!exists(p))throw err("completion references missing artifact",p);x<<"artifact\t"<<base(p)<<"\t"<<a[n].records<<"\t"<<a[n].bytes<<"\t"<<a[n].checksum<<"\n";}for(size_t n=0;n<deps.size();++n)x<<"dependency\t"<<deps[n]<<"\n";std::string text=x.str();write_all(fd,text.data(),text.size(),tmp);sync_file(fd,tmp);if(rename(tmp.c_str(),final.c_str())!=0)throw err("cannot publish completion record",final);sync_dir(directory_);}catch(...){close(fd);unlink(tmp.c_str());throw;}}
+void BuildWorkspace::commit_task(const std::string& task,const std::string& phase,const std::vector<ArtifactRef>& a,const std::vector<std::string>& deps){if(a.empty())throw std::runtime_error("cannot commit empty task completion record");std::string final=completion_path(task,phase),tmp=final+partial_suffix();int fd=open(tmp.c_str(),O_CREAT|O_EXCL|O_WRONLY,0644);if(fd<0)throw err("cannot create completion record",tmp);try{std::ostringstream x;x<<"version=1\nfingerprint="<<fingerprint_<<"\n";for(size_t n=0;n<a.size();++n){std::string p=artifact_path(a[n].identity,a[n].logical,a[n].shard);if(!exists(p))throw err("completion references missing artifact",p);x<<"artifact\t"<<base(p)<<"\t"<<a[n].records<<"\t"<<a[n].bytes<<"\t"<<a[n].checksum<<"\n";}for(size_t n=0;n<deps.size();++n)x<<"dependency\t"<<deps[n]<<"\n";std::string text=x.str();write_all(fd,text.data(),text.size(),tmp);sync_file(fd,tmp);crash_if_requested("task-before-rename");if(rename(tmp.c_str(),final.c_str())!=0)throw err("cannot publish completion record",final);sync_dir(directory_);crash_if_requested("task-after-rename");}catch(...){close(fd);unlink(tmp.c_str());throw;}}
 void BuildWorkspace::ensure_completed(const ArtifactIdentity& i,const std::string& b,uint64_t sum)const{std::string p=completion_path(i.task,i.phase);int fd=open(p.c_str(),O_RDONLY);if(fd<0)throw err("missing task completion record",p);std::string text;char buf[4096];for(;;){ssize_t n=read(fd,buf,sizeof(buf));if(n<0&&errno==EINTR)continue;if(n<0){close(fd);throw err("cannot read task completion record",p);}if(n==0)break;text.append(buf,n);}close(fd);std::string prefix="artifact\t"+b+"\t";size_t found=text.find(prefix);if(text.find("fingerprint="+fingerprint_+"\n")==std::string::npos||found==std::string::npos||text.find("\t"+std::to_string(sum)+"\n",found+prefix.size())==std::string::npos)throw err("artifact not committed by matching completion record",p);}
 void BuildWorkspace::validate_artifact(const ArtifactIdentity& i,logical_file_id_t l,physical_shard_id_t s)const{std::string p=artifact_path(i,l,s);int fd=open(p.c_str(),O_RDONLY);if(fd<0)throw err("missing artifact",p);try{if(readn(fd,4,p)!=HEAD||readn(fd,4,p)!=ArtifactHeader::VERSION||get_string(fd,p)!=i.kind||readn(fd,4,p)!=l.value||readn(fd,8,p)!=s.value)throw err("artifact header mismatch",p);uint64_t rec=readn(fd,8,p),bytes=readn(fd,8,p),sum=readn(fd,8,p);std::string sort=get_string(fd,p),range=get_string(fd,p);std::vector<char>b(BUFFER);uint64_t left=bytes,actual=1469598103934665603ULL;while(left){size_t want=left<b.size()?size_t(left):b.size();size_t at=0;while(at<want){ssize_t n=read(fd,&b[at],want-at);if(n<0&&errno==EINTR)continue;if(n<=0)throw err("truncated artifact payload",p);at+=n;}actual=checksum(&b[0],want,actual);left-=want;}if(actual!=sum||readn(fd,4,p)!=FOOT||readn(fd,4,p)!=ArtifactFooter::VERSION||get_string(fd,p)!=i.kind||readn(fd,4,p)!=l.value||readn(fd,8,p)!=s.value||readn(fd,8,p)!=rec||readn(fd,8,p)!=bytes||readn(fd,8,p)!=sum||get_string(fd,p)!=sort||get_string(fd,p)!=range)throw err("artifact checksum or footer mismatch",p);char extra;ssize_t n=read(fd,&extra,1);if(n!=0)throw err("artifact has trailing data",p);close(fd);ensure_completed(i,base(p),sum);}catch(...){close(fd);throw;}}
 void BuildWorkspace::validate_artifact(logical_file_id_t l,physical_shard_id_t s)const{validate_artifact(ArtifactIdentity(),l,s);}
@@ -145,5 +157,50 @@ BuildWorkspace::restore_artifact(const ArtifactIdentity& identity,
   }
 }
 
-void BuildWorkspace::recover(){DIR*d=opendir(directory_.c_str());if(!d)throw err("cannot open workspace",directory_);std::set<std::string> keep;for(dirent*e;(e=readdir(d));){std::string n=e->d_name;if(n.size()>9&&n.substr(n.size()-9)==".complete"){int fd=open((directory_+"/"+n).c_str(),O_RDONLY);if(fd<0)continue;std::string t;char b[4096];ssize_t z;while((z=read(fd,b,sizeof(b)))>0)t.append(b,z);close(fd);std::istringstream in(t);std::string line;while(std::getline(in,line)){if(line.compare(0,9,"artifact\t")==0){size_t x=line.find('\t',9);if(x!=std::string::npos)keep.insert(line.substr(9,x-9));}}}}rewinddir(d);for(dirent*e;(e=readdir(d));){std::string n=e->d_name,p=directory_+"/"+n;if(n.find(".partial")!=std::string::npos)unlink(p.c_str());else if(n.size()>4&&n.substr(n.size()-4)==".bin"&&keep.find(n)==keep.end())unlink(p.c_str());}closedir(d);sync_dir(directory_);}
+void
+BuildWorkspace::recover()
+{
+  DIR* directory=opendir(directory_.c_str());
+  if(directory==0){throw err("cannot open workspace",directory_);}
+
+  // A completion record is the commit point. Renamed artifacts without one
+  // are intentionally excluded, because a crash may have happened after an
+  // artifact rename but before all outputs of its task were durable.
+  std::set<std::string> keep;
+  for(dirent* entry;(entry=readdir(directory));)
+  {
+    std::string name=entry->d_name;
+    if(name.size()<=9||name.substr(name.size()-9)!=".complete"){continue;}
+    int descriptor=open((directory_+"/"+name).c_str(),O_RDONLY);
+    if(descriptor<0){continue;}
+    std::string text;char buffer[4096];ssize_t bytes;
+    while((bytes=read(descriptor,buffer,sizeof(buffer)))>0){text.append(buffer,bytes);}
+    close(descriptor);
+    std::istringstream input(text);std::string line;
+    while(std::getline(input,line))
+    {
+      if(line.compare(0,9,"artifact\t")!=0){continue;}
+      size_t separator=line.find('\t',9);
+      if(separator!=std::string::npos){keep.insert(line.substr(9,separator-9));}
+    }
+  }
+
+  rewinddir(directory);
+  for(dirent* entry;(entry=readdir(directory));)
+  {
+    std::string name=entry->d_name,path=directory_+"/"+name;
+    bool partial=(name.find(".partial")!=std::string::npos);
+    bool uncommitted=(name.size()>4&&name.substr(name.size()-4)==".bin"&&
+      keep.find(name)==keep.end());
+    if(partial||uncommitted)
+    {
+      if(unlink(path.c_str())!=0&&errno!=ENOENT)
+      {
+        closedir(directory);throw err("cannot remove incomplete workspace artifact",path);
+      }
+      crash_if_requested("cleanup-after-remove");
+    }
+  }
+  closedir(directory);sync_dir(directory_);
+}
 } // namespace gcsa
