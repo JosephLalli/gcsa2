@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <sys/types.h>
 #include <vector>
 namespace gcsa {
 struct logical_file_id_t
@@ -49,7 +50,7 @@ public:
   private:
     friend class BuildWorkspace; ArtifactWriter(BuildWorkspace*,const ArtifactIdentity&,logical_file_id_t,physical_shard_id_t,const std::string&,const std::string&);
     ArtifactWriter(const ArtifactWriter&); ArtifactWriter& operator=(const ArtifactWriter&);
-    BuildWorkspace* ws_; ArtifactIdentity id_; logical_file_id_t logical_; physical_shard_id_t shard_; std::string final_,partial_,sort_,range_; int fd_; uint64_t bytes_,sum_; bool done_;
+    BuildWorkspace* ws_; ArtifactIdentity id_; logical_file_id_t logical_; physical_shard_id_t shard_; std::string final_,partial_,sort_,range_; int fd_; uint64_t bytes_,sum_; off_t cache_released_; bool done_;
   };
   BuildWorkspace(const std::string&,const Settings&,const Settings& operational=Settings(),OpenMode mode=RESUME);
   const std::string& fingerprint() const { return fingerprint_; } std::string manifest() const;
