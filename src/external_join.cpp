@@ -40,6 +40,7 @@ constexpr size_type JOIN_RECORD_BYTES =
 // caches byte-sized and account for them in the same join reservation.
 constexpr size_type JOIN_IO_BUFFER_BYTES = 64 * KILOBYTE;
 constexpr size_type JOIN_IO_BUFFER_RECORDS = JOIN_IO_BUFFER_BYTES / JOIN_RECORD_BYTES;
+constexpr size_type JOIN_PARALLEL_SORT_MIN_RECORDS = 64 * 1024;
 // Run generation may simultaneously have a join writer, path/rank source
 // caches, and path/rank output caches. Merge reader caches are accounted per
 // input when selecting fan-in below.
@@ -620,7 +621,18 @@ private:
   void flush()
   {
     if(this->buffer.empty()) { return; }
-    std::sort(this->buffer.begin(), this->buffer.end(), joinRecordLess);
+    // Sorting is in-place inside the run's existing byte reservation. Large
+    // runs use the construction thread pool; tiny runs stay sequential to
+    // avoid making forced-spill tests and small indexes pay team startup cost.
+    if(this->buffer.size() >= JOIN_PARALLEL_SORT_MIN_RECORDS && omp_get_max_threads() > 1)
+    {
+      parallelQuickSort(this->buffer.begin(), this->buffer.end(), joinRecordLess);
+      if(this->statistics != nullptr) { this->statistics->join_parallel_sorts++; }
+    }
+    else
+    {
+      sequentialSort(this->buffer.begin(), this->buffer.end(), joinRecordLess);
+    }
     std::string name = TempFile::getName("gcsa_join_run");
     JoinFileWriter writer(name, this->logical_id, this->key_kind);
     for(size_type i = 0; i < this->buffer.size(); i++) { writer.writeRecord(this->buffer[i]); }
@@ -1099,6 +1111,7 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
       stats->label_sort_runs += sort_stats.runs;
       stats->label_merge_passes = std::max(stats->label_merge_passes,
         sort_stats.merge_passes);
+      stats->label_parallel_sorts += sort_stats.parallel_sorts;
       stats->max_records_resident = std::max(stats->max_records_resident,
         sort_stats.max_records_resident);
       stats->max_bytes_resident = std::max(stats->max_bytes_resident,

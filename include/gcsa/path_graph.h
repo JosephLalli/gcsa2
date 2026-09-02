@@ -355,9 +355,12 @@ struct PathGraph
 
 struct ExternalPathSortStats
 {
-  size_type runs, merge_passes, max_records_resident, max_bytes_resident;
+  size_type runs, merge_operations, merge_passes, parallel_sorts;
+  size_type max_records_resident, max_bytes_resident;
 
-  ExternalPathSortStats() : runs(0), merge_passes(0), max_records_resident(0), max_bytes_resident(0) { }
+  ExternalPathSortStats() :
+    runs(0), merge_operations(0), merge_passes(0), parallel_sorts(0),
+    max_records_resident(0), max_bytes_resident(0) { }
 };
 
 // Sort one physical PathGraph file without materializing it in memory.
@@ -369,13 +372,13 @@ struct ExternalPathJoinStats
 {
   size_type left_records, right_records, sorted_bypass, generated_records;
   size_type initial_runs, merge_operations, blocked_key_groups;
-  size_type label_sort_runs, label_merge_passes;
+  size_type join_parallel_sorts, label_sort_runs, label_merge_passes, label_parallel_sorts;
   size_type max_records_resident, max_bytes_resident;
 
   ExternalPathJoinStats() :
     left_records(0), right_records(0), sorted_bypass(0), generated_records(0),
     initial_runs(0), merge_operations(0), blocked_key_groups(0),
-    label_sort_runs(0), label_merge_passes(0),
+    join_parallel_sorts(0), label_sort_runs(0), label_merge_passes(0), label_parallel_sorts(0),
     max_records_resident(0), max_bytes_resident(0) { }
 };
 

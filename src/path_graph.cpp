@@ -26,6 +26,7 @@
 #include <gcsa/path_graph.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <deque>
 #include <fcntl.h>
@@ -436,8 +437,15 @@ struct PathSortRecord
   PathNode::rank_type labels[PathLabel::LABEL_LENGTH + 1];
 };
 
-// Covers stream state, vector control blocks, allocator slack, and the heap.
-constexpr size_type PATH_SORT_FIXED_BYTES = 8192;
+// The source PathGraph uses record-at-a-time decoding because each PathNode
+// points to a variable number of ranks. Explicit stream buffers avoid one
+// syscall per decoded record while remaining part of the declared budget.
+constexpr size_type PATH_SORT_STREAM_BUFFER_BYTES = 64 * KILOBYTE;
+constexpr size_type PATH_SORT_PARALLEL_MIN_RECORDS = 64 * 1024;
+// Covers the two source stream buffers, stream state, vector control blocks,
+// allocator slack, and the heap.
+constexpr size_type PATH_SORT_FIXED_BYTES =
+  8192 + 2 * PATH_SORT_STREAM_BUFFER_BYTES;
 // Linux charges clean filesystem cache to a cgroup's memory ceiling. The
 // sorter therefore retains only a small sequential tail and periodically
 // syncs completed output prefixes before making them reclaimable. These
@@ -556,6 +564,23 @@ pathSortLess(const PathSortRecord& a, const PathSortRecord& b)
     if(a.labels[i] != b.labels[i]) { return (a.labels[i] < b.labels[i]); }
   }
   return false; // Equal records are byte-equivalent after rank pointers are rewritten.
+}
+
+inline void
+sortPathRecords(std::vector<PathSortRecord>& records, ExternalPathSortStats* stats)
+{
+  // The balanced parallel quicksort works in place, so all record storage is
+  // still covered by the current run reservation. Equivalent records become
+  // byte-identical when writeSortedPathPair() replaces their rank pointers.
+  if(records.size() >= PATH_SORT_PARALLEL_MIN_RECORDS && omp_get_max_threads() > 1)
+  {
+    parallelQuickSort(records.begin(), records.end(), pathSortLess);
+    if(stats != nullptr) { stats->parallel_sorts++; }
+  }
+  else
+  {
+    sequentialSort(records.begin(), records.end(), pathSortLess);
+  }
 }
 
 inline void
@@ -712,6 +737,7 @@ std::string
 mergePathSortRuns(const std::vector<std::string>& inputs, size_type buffer_records,
   ExternalPathSortStats* stats)
 {
+  if(stats != nullptr) { stats->merge_operations++; }
   std::string output_name = TempFile::getName("gcsa_path_sort_run");
   std::ofstream output;
   output.rdbuf()->pubsetbuf(nullptr, 0);
@@ -883,11 +909,16 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   size_type merge_available = available - fan_in * reader_overhead;
   size_type merge_records = merge_available / ((fan_in + 1) * record_bytes);
   if(merge_records == 0) { externalSortFailure("byte budget cannot buffer a merge"); }
-  // Reserve two thirds for sorting records and one third for allocator / I/O slack.
-  size_type run_records = std::max((size_type)1, available / (3 * record_bytes));
+  // Use two thirds for sorting records and leave one third for allocator / I/O
+  // slack. Compute the slack first to avoid overflowing on a large byte limit.
+  size_type run_bytes = available - available / 3;
+  size_type run_records = std::max((size_type)1, run_bytes / record_bytes);
 
+  std::array<char, PATH_SORT_STREAM_BUFFER_BYTES> path_stream_buffer;
+  std::array<char, PATH_SORT_STREAM_BUFFER_BYTES> rank_stream_buffer;
   std::ifstream paths, ranks;
-  paths.rdbuf()->pubsetbuf(nullptr, 0); ranks.rdbuf()->pubsetbuf(nullptr, 0);
+  paths.rdbuf()->pubsetbuf(path_stream_buffer.data(), path_stream_buffer.size());
+  ranks.rdbuf()->pubsetbuf(rank_stream_buffer.data(), rank_stream_buffer.size());
   graph.open(paths, ranks, file);
   int source_path_cache_descriptor = openPathSortCacheDescriptor(graph.path_names[file], O_RDONLY);
   int source_rank_cache_descriptor = openPathSortCacheDescriptor(graph.rank_names[file], O_RDONLY);
@@ -922,7 +953,7 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
     }
     if(records.size() == run_records)
     {
-      std::sort(records.begin(), records.end(), pathSortLess);
+      sortPathRecords(records, stats);
       std::string name = TempFile::getName("gcsa_path_sort_run");
       writePathSortRun(name, records); records.clear();
       addPathSortRun(levels, name, 0, fan_in, merge_records, stats);
@@ -940,7 +971,7 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   ::close(source_path_cache_descriptor); ::close(source_rank_cache_descriptor);
   if(!records.empty())
   {
-    std::sort(records.begin(), records.end(), pathSortLess);
+    sortPathRecords(records, stats);
     std::string name = TempFile::getName("gcsa_path_sort_run");
     writePathSortRun(name, records);
     addPathSortRun(levels, name, 0, fan_in, merge_records, stats);
@@ -976,8 +1007,20 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
     std::string name = TempFile::getName("gcsa_path_sort_run");
     writePathSortRun(name, records); runs.push_back(name);
   }
-  std::string merged = mergePathSortRuns(runs, merge_records, stats);
-  for(size_type i = 0; i < runs.size(); i++) { TempFile::remove(runs[i]); }
+  // A run is already in final label order. Sending a single run through the
+  // k-way merger only copies the complete payload once before the normal
+  // path/rank materialization pass, which is especially costly for the common
+  // production case where a generous run budget creates exactly one run.
+  std::string merged;
+  if(runs.size() == 1)
+  {
+    merged = runs.front();
+  }
+  else
+  {
+    merged = mergePathSortRuns(runs, merge_records, stats);
+    for(size_type i = 0; i < runs.size(); i++) { TempFile::remove(runs[i]); }
+  }
 
   std::string final_path = TempFile::getName(PathGraph::PREFIX), final_rank = TempFile::getName(PathGraph::PREFIX);
   std::string partial_path = final_path + ".partial", partial_rank = final_rank + ".partial";
@@ -1625,9 +1668,14 @@ PathGraph::extend(size_type size_limit, size_type memory_limit)
     }
 
     // Sort the next generation.
-    // Sorting is deliberately single-threaded and uses only a conservative
-    // fraction of the extension memory allowance for run and merge buffers.
-    size_type sort_budget = std::max((size_type)sizeof(PathSortRecord), memory_limit / 8);
+    // The legacy extension route still delegates label ordering to the external
+    // sorter. Give it a conservative fraction of the extension allowance, but
+    // never less than the sorter's explicit stream/buffer minimum.
+    if(memory_limit < externalPathGraphSortMinimumBudget())
+    {
+      externalSortFailure("extension memory limit is below the label-sort minimum");
+    }
+    size_type sort_budget = std::max(externalPathGraphSortMinimumBudget(), memory_limit / 8);
     builder.sort(file, sort_budget, 8);
   }
   builder.close();
