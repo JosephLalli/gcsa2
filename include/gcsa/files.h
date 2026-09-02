@@ -28,6 +28,8 @@
 
 #include <gcsa/support.h>
 
+#include <functional>
+
 namespace gcsa
 {
 
@@ -70,6 +72,8 @@ void writeKMers(const std::string& base_name, std::vector<KMer>& kmers, size_typ
 
 struct InputGraph
 {
+  typedef std::function<void(size_type, const std::vector<KMer>&)> KMerBlockConsumer;
+
   std::vector<std::string> filenames;
   std::string              lcp_name; // Used to pass the LCP array from GCSA construction.
   std::string              mapping_name; // Stable identity for resumable construction.
@@ -103,6 +107,16 @@ struct InputGraph
   */
   void read(std::vector<KMer>& kmers) const;
   void read(std::vector<KMer>& kmers, size_type file, bool append = false) const;
+
+  /*
+    Sequentially decode one logical input into KMer blocks. The record vector
+    never reserves more than byte_budget / sizeof(KMer) entries (apart from
+    the required one-record minimum), and source/sink marking is applied before
+    every callback. This is the disk-first alternative to read() for callers
+    that cannot materialize an entire logical file.
+  */
+  void scanKMerBlocks(size_type file, size_type byte_budget,
+    const KMerBlockConsumer& consumer) const;
 
   // Get the keys for distinct labels with merged predecessors / successors in sorted order.
   void readKeys(std::vector<key_type>& keys) const;

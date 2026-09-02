@@ -73,6 +73,15 @@ public:
   */
   DeBruijnGraph(const std::vector<key_type>& keys, size_type kmer_length, const Alphabet& alphabet);
 
+  /*
+    Disk-first equivalent of the vector constructor. key_name contains exactly
+    key_count label-sorted, unique key_type records. The constructor scans it
+    twice through a bounded buffer: once for counts/edge sizing and once to
+    fill the final succinct vectors.
+  */
+  DeBruijnGraph(const std::string& key_name, size_type key_count,
+    size_type kmer_length, const Alphabet& alphabet, size_type buffer_bytes);
+
 //------------------------------------------------------------------------------
 
   inline size_type size() const { return this->node_count; }

@@ -47,13 +47,13 @@ endif
 CXX_FLAGS=$(MY_CXX_FLAGS) $(VERIFY_FLAGS) $(PARALLEL_FLAGS) $(MY_CXX_OPT_FLAGS) -Iinclude -I$(INC_DIR)
 
 HEADERS=$(wildcard include/gcsa/*.h)
-LIBOBJS=$(addprefix $(BUILD_OBJ)/,algorithms.o checkpoint.o dbg.o external_join.o files.o gcsa.o internal.o lcp.o path_graph.o support.o utils.o resources.o workspace.o)
+LIBOBJS=$(addprefix $(BUILD_OBJ)/,algorithms.o checkpoint.o dbg.o disk_array.o external_join.o external_preprocessing.o external_sort.o files.o gcsa.o internal.o lcp.o path_graph.o support.o utils.o resources.o workspace.o)
 LIBRARY=$(BUILD_LIB)/libgcsa2.a
 
 PROGRAMS=$(addprefix $(BUILD_BIN)/,build_gcsa convert_graph gcsa_format try_extend)
 OBSOLETE=build_gcsa convert_graph gcsa_format try_extend
 
-.PHONY: all clean directories test workspace-test external-path-sort-test external-join-test internal-buffer-test parameter-test construction-resume-test
+.PHONY: all clean directories test workspace-test external-path-sort-test external-join-test external-sort-test external-preprocessing-test disk-array-test internal-buffer-test parameter-test construction-resume-test
 all: directories $(LIBRARY) $(PROGRAMS)
 
 directories: $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)
@@ -90,6 +90,27 @@ external-path-sort-test: directories $(BUILD_OBJ)/test_external_path_sort.o $(LI
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_external_path_sort $(BUILD_OBJ)/test_external_path_sort.o $(LIBRARY) $(LIBS)
 	$(BUILD_BIN)/test_external_path_sort
 
+$(BUILD_OBJ)/test_external_sort.o:tests/test_external_sort.cpp include/gcsa/external_sort.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+external-sort-test: directories $(BUILD_OBJ)/test_external_sort.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_external_sort $(BUILD_OBJ)/test_external_sort.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_external_sort
+
+$(BUILD_OBJ)/test_external_preprocessing.o:tests/test_external_preprocessing.cpp include/gcsa/external_preprocessing.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+external-preprocessing-test: directories $(BUILD_OBJ)/test_external_preprocessing.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_external_preprocessing $(BUILD_OBJ)/test_external_preprocessing.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_external_preprocessing
+
+$(BUILD_OBJ)/test_disk_array.o:tests/test_disk_array.cpp include/gcsa/disk_array.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+disk-array-test: directories $(BUILD_OBJ)/test_disk_array.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_disk_array $(BUILD_OBJ)/test_disk_array.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_disk_array
+
 $(BUILD_OBJ)/test_external_join.o:tests/test_external_join.cpp include/gcsa/path_graph.h
 	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
 
@@ -118,7 +139,7 @@ construction-resume-test: directories $(BUILD_OBJ)/test_construction_resume.o $(
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_construction_resume $(BUILD_OBJ)/test_construction_resume.o $(LIBRARY) $(LIBS)
 	$(BUILD_BIN)/test_construction_resume
 
-test: workspace-test external-path-sort-test external-join-test internal-buffer-test parameter-test construction-resume-test
+test: workspace-test external-path-sort-test external-join-test external-sort-test external-preprocessing-test disk-array-test internal-buffer-test parameter-test construction-resume-test
 
 clean:
 	rm -rf $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)

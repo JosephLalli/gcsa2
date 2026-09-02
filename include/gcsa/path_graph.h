@@ -255,6 +255,12 @@ struct LCP
   LCP();
   LCP(const std::vector<key_type>& keys, size_type _kmer_length);
 
+  // Disk-first equivalent of the vector constructor. key_name is a raw,
+  // label-sorted unique key stream; only the final LCP construction buffer is
+  // materialized.
+  LCP(const std::string& key_name, size_type key_count,
+    size_type _kmer_length, size_type buffer_bytes);
+
   /*
     Computes the minimal/maximal lcp of the path labels corresponding to path nodes a and b.
     a must be before b in lexicographic order, and the ranges must not overlap.

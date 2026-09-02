@@ -25,6 +25,7 @@
 
 #include <gcsa/algorithms.h>
 #include <gcsa/checkpoint.h>
+#include <gcsa/external_preprocessing.h>
 #include <gcsa/internal.h>
 #include <gcsa/path_graph.h>
 #include <gcsa/workspace.h>
@@ -84,6 +85,9 @@ constructionSemanticSettings(const InputGraph& graph,
   settings["gcsa_format"] = std::to_string(Version::GCSA_VERSION);
   settings["lcp_format"] = std::to_string(Version::LCP_VERSION);
   settings["binary_input"] = (graph.binary ? "true" : "false");
+  // A workspace generated before disk-first preprocessing cannot safely mix
+  // old initial/path checkpoints with the v1 reduced key/start artifacts.
+  settings["external_preprocessing"] = "v1";
   settings["kmer_length"] = std::to_string(graph.k());
   settings["doubling_steps"] = std::to_string(parameters.getSteps());
   settings["sample_period"] = std::to_string(parameters.getSamplePeriod());
@@ -576,28 +580,48 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
       parameters.getResume() ? BuildWorkspace::RESUME : BuildWorkspace::NEW_WORKSPACE));
   }
 
-  // Extract the keys and build the necessary support structures.
-  // FIXME Later: Write the structures to disk until needed?
-  std::vector<key_type> keys;
-  graph.readKeys(keys);
-  DeBruijnGraph mapper(keys, graph.k(), graph.alpha);
-  LCP lcp(keys, graph.k());
+  // Extract key and start-node facts. The legacy branch retains its historical
+  // vectors exactly. With a workspace, ExternalInputPreprocessor instead
+  // streams immutable record files through bounded sort/merge passes and
+  // checkpoints the reduced key/start streams for resume.
+  DeBruijnGraph mapper;
+  LCP lcp;
   sdsl::int_vector<0> last_char;
-  Key::lastChars(keys, last_char);
-  sdsl::int_vector<0> distinct_labels(keys.size(), 0, bit_length(Key::label(keys.back())));
-  for(size_type i = 0; i < keys.size(); i++) { distinct_labels[i] = Key::label(keys[i]); }
-  sdsl::util::clear(keys);
+  sdsl::sd_vector<> from_nodes;
+  size_type unique_from_nodes = 0;
+  std::unique_ptr<ExternalInputPreprocessor> external_preprocessor;
+  sdsl::int_vector<0> distinct_labels;
+  if(parameters.externalMemory())
+  {
+    external_preprocessor.reset(new ExternalInputPreprocessor(graph, parameters,
+      workspace.get()));
+    external_preprocessor->buildKeySupport(mapper, lcp, last_char);
+    external_preprocessor->buildStartNodes(from_nodes);
+    unique_from_nodes = external_preprocessor->startNodeCount();
+  }
+  else
+  {
+    std::vector<key_type> keys;
+    graph.readKeys(keys);
+    mapper = DeBruijnGraph(keys, graph.k(), graph.alpha);
+    lcp = LCP(keys, graph.k());
+    Key::lastChars(keys, last_char);
+    distinct_labels = sdsl::int_vector<0>(keys.size(), 0,
+      bit_length(Key::label(keys.back())));
+    for(size_type i = 0; i < keys.size(); i++) { distinct_labels[i] = Key::label(keys[i]); }
+    sdsl::util::clear(keys);
 
-  // Determine the existing start nodes. Because the information is only used for index
-  // construction, we use NodeMapping to map the node ids used for construction to the
-  // node ids reported by locate().
-  std::vector<node_type> from_node_buffer;
-  graph.readFrom(from_node_buffer, true);
-  sdsl::sd_vector<> from_nodes(from_node_buffer.begin(), from_node_buffer.end());
+    // Determine the existing start nodes. Because the information is only used for index
+    // construction, we use NodeMapping to map the node ids used for construction to the
+    // node ids reported by locate().
+    std::vector<node_type> from_node_buffer;
+    graph.readFrom(from_node_buffer, true);
+    from_nodes = sdsl::sd_vector<>(from_node_buffer.begin(), from_node_buffer.end());
+    unique_from_nodes = from_node_buffer.size();
+    sdsl::util::clear(from_node_buffer);
+  }
   sdsl::sd_vector<>::rank_1_type from_rank;
   sdsl::util::init_support(from_rank, &(from_nodes));
-  size_type unique_from_nodes = from_node_buffer.size();
-  sdsl::util::clear(from_node_buffer);
 
   // Create or restore the initial PathGraph. Resumption still rebuilds the
   // compact key/LCP support above, but never repeats a committed doubling phase.
@@ -628,7 +652,16 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
   }
   if(!restored_graph)
   {
-    PathGraph initial_graph(graph, distinct_labels);
+    PathGraph initial_graph(0, graph.k(), 0);
+    if(parameters.externalMemory())
+    {
+      external_preprocessor->buildInitialPathGraph(initial_graph);
+    }
+    else
+    {
+      PathGraph legacy_initial(graph, distinct_labels);
+      initial_graph.swap(legacy_initial);
+    }
     path_graph.swap(initial_graph);
     if(workspace)
     {
@@ -636,7 +669,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
       stopAfterCommittedPhase(parameters, "initial");
     }
   }
-  sdsl::util::clear(distinct_labels);
+  if(!parameters.externalMemory()) { sdsl::util::clear(distinct_labels); }
   if(Verbosity::level >= Verbosity::EXTENDED)
   {
     double stop = readTimer();
