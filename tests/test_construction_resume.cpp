@@ -2,6 +2,7 @@
 #include <gcsa/files.h>
 #include <gcsa/gcsa.h>
 #include <gcsa/lcp.h>
+#include <gcsa/path_graph.h>
 
 #include <filesystem>
 #include <fstream>
@@ -45,8 +46,8 @@ externalParameters(const std::string& workspace, size_type memory_limit)
   parameters.setWorkDirectory(workspace);
   parameters.setMemoryLimitBytes(memory_limit);
   parameters.setIOBufferSize(KILOBYTE);
-  parameters.setSortRunSize(32 * KILOBYTE);
-  parameters.setJoinPartitionSize(64 * KILOBYTE);
+  parameters.setSortRunSize(externalPathGraphSortMinimumBudget());
+  parameters.setJoinPartitionSize(externalPathJoinMinimumBudget());
   parameters.setMergeFanIn(2);
   parameters.setMaxOpenFiles(8);
   return parameters;
@@ -85,7 +86,7 @@ main()
   // Stop after a durable, fine-grained prefix-doubling checkpoint.
   TempFile::setDirectory(workspace_root);
   {
-    ConstructionParameters parameters = externalParameters(workspace_root, 128 * KILOBYTE);
+    ConstructionParameters parameters = externalParameters(workspace_root, 768 * KILOBYTE);
     parameters.setStopAfter("step-01-prune");
     bool stopped = false;
     try
@@ -105,7 +106,7 @@ main()
   // Resume with a different operational RAM ceiling. Semantic parameters and
   // input checksums stay fixed, while the committed prune is restored.
   {
-    ConstructionParameters parameters = externalParameters(workspace_root, 96 * KILOBYTE);
+    ConstructionParameters parameters = externalParameters(workspace_root, 640 * KILOBYTE);
     parameters.setResume();
     InputGraph graph({ input_name }, false, parameters);
     GCSA index(graph, parameters);
@@ -124,7 +125,7 @@ main()
   bool semantic_change_refused = false;
   try
   {
-    ConstructionParameters parameters = externalParameters(workspace_root, 96 * KILOBYTE);
+    ConstructionParameters parameters = externalParameters(workspace_root, 640 * KILOBYTE);
     parameters.setSteps(1);
     parameters.setResume();
     InputGraph graph({ input_name }, false, parameters);
