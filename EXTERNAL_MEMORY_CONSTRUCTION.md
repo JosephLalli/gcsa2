@@ -179,6 +179,16 @@ Sorted paths bypass the join and enter label-run generation unchanged. A later
 optimization may encode one left reference followed by many right references,
 delaying repeated-label materialization.
 
+The first production slice uses an external sort-merge implementation of the
+same plan. For every logical input it writes explicit, versioned left-by-`to`
+and right-by-`from` run records. Run creation uses leveled compaction, so file
+name metadata is `O(F log_F R)` for merge fan-in `F` and `R` initial runs. A
+matching key is processed without materializing either key group: the right
+range is replayed for each left record. This is deliberately slower than the
+planned sampled range partitions, but it already handles an individual key
+larger than RAM and preserves joins across physical shards. Generated records
+flow directly to the bounded external label sorter.
+
 ### Pruning
 
 `SpillableGroup` keeps only a bounded prefix plus a summary: first/last label,
@@ -212,12 +222,23 @@ when its production call path and forced-spill/recovery tests pass.
 | Shared byte-token `MemoryBudget` and statvfs-aware `DiskBudget` | in review |
 | Versioned workspace artifacts, atomic publication, manifest compatibility, recovery tests | in review |
 | Human-readable operational construction parameters | in review |
-| Bounded external path-label runs and multi-pass merge | in review |
-| Run-set `PathGraph` metadata and logical/physical identity in pruning | not implemented |
-| Disk-partitioned prefix-doubling join | not implemented |
+| Bounded external path-label runs and leveled multi-pass merge | implemented; forced-spill tested |
+| Logical/physical `PathGraph` identity in pruning and joining | implemented; durable run-set manifest pending |
+| External prefix-doubling join | bounded sort-merge implemented; sampled range partitioning pending |
 | External keys/start nodes/initial paths | not implemented |
 | Spillable pruning groups | not implemented |
 | Final event/component passes and transactional `prev_occ` | not implemented |
 | Streaming LCP levels and legacy packer | not implemented |
 | Standalone and vg CLI integration | not implemented |
 | Chromosome-scale benchmark | not run |
+
+Current limitations are intentionally explicit. The external route is selected
+only when `ConstructionParameters::work_directory` is nonempty. Key extraction,
+start-node extraction, initial path construction, pruning groups, final GCSA
+components, and LCP levels still use the legacy resident algorithms. Join runs
+are checksummed immutable files but are not yet registered as resumable
+workspace tasks. The current heavy-key fallback uses one-record left blocks and
+repeated right-range reads; it is bounded but can perform much more I/O than a
+larger blocked implementation. These limitations mean the full construction
+does not yet satisfy the end-to-end RAM invariant, even though prefix-doubling
+extension itself no longer requires a chromosome or join key to fit in memory.

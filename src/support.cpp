@@ -179,7 +179,7 @@ ConstructionParameters::setMergeFanIn(size_type fan_in)
 void
 ConstructionParameters::setMaxOpenFiles(size_type files)
 {
-  this->max_open_files = std::max((size_type)4, files);
+  this->max_open_files = std::max((size_type)6, files);
 }
 
 void

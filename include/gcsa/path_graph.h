@@ -342,6 +342,24 @@ size_type externalPathGraphSortMinimumBudget();
 void externalPathGraphSort(PathGraph& graph, size_type file,
   size_type byte_budget, size_type fan_in, ExternalPathSortStats* stats = nullptr);
 
+struct ExternalPathJoinStats
+{
+  size_type left_records, right_records, sorted_bypass, generated_records;
+  size_type initial_runs, merge_operations, blocked_key_groups;
+  size_type max_records_resident, max_bytes_resident;
+
+  ExternalPathJoinStats() :
+    left_records(0), right_records(0), sorted_bypass(0), generated_records(0),
+    initial_runs(0), merge_operations(0), blocked_key_groups(0),
+    max_records_resident(0), max_bytes_resident(0) { }
+};
+
+// Prefix doubling with a bounded external sort-merge join. Input shards with
+// the same logical ID are joined together, regardless of physical layout.
+size_type externalPathJoinMinimumBudget();
+void externalPathGraphExtend(PathGraph& graph, size_type size_limit,
+  const ConstructionParameters& parameters, ExternalPathJoinStats* stats = nullptr);
+
 //------------------------------------------------------------------------------
 
 /*
