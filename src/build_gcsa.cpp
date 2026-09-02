@@ -23,7 +23,12 @@
   SOFTWARE.
 */
 
+#include <cerrno>
+#include <filesystem>
+#include <fcntl.h>
+#include <getopt.h>
 #include <string>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <gcsa/algorithms.h>
@@ -33,6 +38,34 @@ using namespace gcsa;
 //------------------------------------------------------------------------------
 
 const size_type INDENT = 20;
+
+template<class IndexType>
+bool
+atomicStore(const IndexType& index, const std::string& final_name)
+{
+  std::string partial = final_name + "." +
+    std::to_string(static_cast<unsigned long long>(getpid())) + ".partial";
+  if(!sdsl::store_to_file(index, partial)) { return false; }
+  int descriptor = ::open(partial.c_str(), O_RDONLY);
+  if(descriptor < 0 || ::fdatasync(descriptor) != 0)
+  {
+    if(descriptor >= 0) { ::close(descriptor); }
+    ::unlink(partial.c_str()); return false;
+  }
+  if(::close(descriptor) != 0 || ::rename(partial.c_str(), final_name.c_str()) != 0)
+  {
+    ::unlink(partial.c_str()); return false;
+  }
+  std::filesystem::path parent = std::filesystem::path(final_name).parent_path();
+  if(parent.empty()) { parent = "."; }
+  descriptor = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY);
+  if(descriptor < 0 || ::fsync(descriptor) != 0)
+  {
+    if(descriptor >= 0) { ::close(descriptor); }
+    return false;
+  }
+  return (::close(descriptor) == 0);
+}
 
 int
 main(int argc, char** argv)
@@ -58,6 +91,23 @@ main(int argc, char** argv)
     std::cerr << "  -l N  Limit disk space usage to N gigabytes (default " << ConstructionParameters::SIZE_LIMIT << ")" << std::endl;
     std::cerr << "  -T N  Set the number of threads to N (default and max " << omp_get_max_threads() << " on this system)" << std::endl;
     std::cerr << "  -V N  Set verbosity level to N (default 3)" << std::endl;
+    std::cerr << "External-memory options (sizes accept K/M/G/T and KiB/GiB forms):" << std::endl;
+    std::cerr << "      --work-dir PATH            durable construction workspace" << std::endl;
+    std::cerr << "      --resume                   resume compatible committed phases" << std::endl;
+    std::cerr << "      --keep-work                retain workspace after success" << std::endl;
+    std::cerr << "      --memory-limit SIZE        strict external working-set ceiling" << std::endl;
+    std::cerr << "      --disk-limit SIZE          workspace/output disk ceiling" << std::endl;
+    std::cerr << "      --io-buffer-size SIZE      byte size of sequential I/O buffers" << std::endl;
+    std::cerr << "      --sort-run-size SIZE       maximum label-sort working set" << std::endl;
+    std::cerr << "      --join-partition-size SIZE maximum join working set" << std::endl;
+    std::cerr << "      --merge-fan-in N           maximum merge inputs" << std::endl;
+    std::cerr << "      --max-open-files N         construction descriptor ceiling" << std::endl;
+    std::cerr << "      --checkpoint-records N     record checkpoint interval" << std::endl;
+    std::cerr << "      --checkpoint-bytes SIZE    byte checkpoint interval" << std::endl;
+    std::cerr << "      --verify-workspace         verify payload checksums on reuse" << std::endl;
+    std::cerr << "      --clean-obsolete           remove eligible predecessor artifacts" << std::endl;
+    std::cerr << "      --stop-after PHASE         stop after a committed phase" << std::endl;
+    std::cerr << "      --allow-path-explosion     permit growth up to the disk ceiling" << std::endl;
     std::cerr << std::endl;
     std::exit(EXIT_SUCCESS);
   }
@@ -67,7 +117,38 @@ main(int argc, char** argv)
   bool binary = true, load_index = false, verify = false;
   std::string index_file, lcp_file, mapping_file;
   ConstructionParameters parameters;
-  while((c = getopt(argc, argv, "bto:d:m:s:B:LvD:l:T:V:")) != -1)
+  enum LongOption
+  {
+    OPT_WORK_DIR = 1000, OPT_RESUME, OPT_KEEP_WORK, OPT_MEMORY_LIMIT,
+    OPT_DISK_LIMIT, OPT_IO_BUFFER, OPT_SORT_RUN, OPT_JOIN_PARTITION,
+    OPT_MERGE_FAN_IN, OPT_MAX_OPEN_FILES, OPT_CHECKPOINT_RECORDS,
+    OPT_CHECKPOINT_BYTES, OPT_VERIFY_WORKSPACE, OPT_CLEAN_OBSOLETE,
+    OPT_STOP_AFTER, OPT_ALLOW_PATH_EXPLOSION
+  };
+  static struct option long_options[] =
+  {
+    { "work-dir", required_argument, nullptr, OPT_WORK_DIR },
+    { "resume", no_argument, nullptr, OPT_RESUME },
+    { "keep-work", no_argument, nullptr, OPT_KEEP_WORK },
+    { "memory-limit", required_argument, nullptr, OPT_MEMORY_LIMIT },
+    { "disk-limit", required_argument, nullptr, OPT_DISK_LIMIT },
+    { "io-buffer-size", required_argument, nullptr, OPT_IO_BUFFER },
+    { "sort-run-size", required_argument, nullptr, OPT_SORT_RUN },
+    { "join-partition-size", required_argument, nullptr, OPT_JOIN_PARTITION },
+    { "merge-fan-in", required_argument, nullptr, OPT_MERGE_FAN_IN },
+    { "max-open-files", required_argument, nullptr, OPT_MAX_OPEN_FILES },
+    { "checkpoint-records", required_argument, nullptr, OPT_CHECKPOINT_RECORDS },
+    { "checkpoint-bytes", required_argument, nullptr, OPT_CHECKPOINT_BYTES },
+    { "verify-workspace", no_argument, nullptr, OPT_VERIFY_WORKSPACE },
+    { "clean-obsolete", no_argument, nullptr, OPT_CLEAN_OBSOLETE },
+    { "stop-after", required_argument, nullptr, OPT_STOP_AFTER },
+    { "allow-path-explosion", no_argument, nullptr, OPT_ALLOW_PATH_EXPLOSION },
+    { "output", required_argument, nullptr, 'o' },
+    { "threads", required_argument, nullptr, 'T' },
+    { nullptr, 0, nullptr, 0 }
+  };
+  while((c = getopt_long(argc, argv, "bto:d:m:s:B:LvD:l:T:V:",
+    long_options, nullptr)) != -1)
   {
     switch(c)
     {
@@ -99,6 +180,38 @@ main(int argc, char** argv)
       omp_set_num_threads(Range::bound(std::stoul(optarg), 1, omp_get_max_threads())); break;
     case 'V':
       Verbosity::set(std::stoul(optarg)); break;
+    case OPT_WORK_DIR:
+      parameters.setWorkDirectory(optarg); break;
+    case OPT_RESUME:
+      parameters.setResume(); break;
+    case OPT_KEEP_WORK:
+      parameters.setKeepWork(); break;
+    case OPT_MEMORY_LIMIT:
+      parameters.setMemoryLimitBytes(parseBytes(optarg)); break;
+    case OPT_DISK_LIMIT:
+      parameters.setLimitBytes(parseBytes(optarg)); break;
+    case OPT_IO_BUFFER:
+      parameters.setIOBufferSize(parseBytes(optarg)); break;
+    case OPT_SORT_RUN:
+      parameters.setSortRunSize(parseBytes(optarg)); break;
+    case OPT_JOIN_PARTITION:
+      parameters.setJoinPartitionSize(parseBytes(optarg)); break;
+    case OPT_MERGE_FAN_IN:
+      parameters.setMergeFanIn(std::stoull(optarg)); break;
+    case OPT_MAX_OPEN_FILES:
+      parameters.setMaxOpenFiles(std::stoull(optarg)); break;
+    case OPT_CHECKPOINT_RECORDS:
+      parameters.setCheckpointRecords(std::stoull(optarg)); break;
+    case OPT_CHECKPOINT_BYTES:
+      parameters.setCheckpointBytes(parseBytes(optarg)); break;
+    case OPT_VERIFY_WORKSPACE:
+      parameters.setVerifyWorkspace(); break;
+    case OPT_CLEAN_OBSOLETE:
+      parameters.setCleanObsolete(); break;
+    case OPT_STOP_AFTER:
+      parameters.setStopAfter(optarg); break;
+    case OPT_ALLOW_PATH_EXPLOSION:
+      parameters.setAllowPathExplosion(); break;
     case '?':
       std::exit(EXIT_FAILURE);
     default:
@@ -114,6 +227,23 @@ main(int argc, char** argv)
   {
     index_file = std::string(argv[optind]) + GCSA::EXTENSION;
     lcp_file = std::string(argv[optind]) + LCPArray::EXTENSION;
+  }
+  if(parameters.getResume() && parameters.getWorkDirectory().empty())
+  {
+    std::cerr << "build_gcsa: --resume requires --work-dir" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if(parameters.externalMemory())
+  {
+    std::error_code error;
+    std::filesystem::create_directories(parameters.getWorkDirectory(), error);
+    if(error)
+    {
+      std::cerr << "build_gcsa: Cannot create workspace "
+                << parameters.getWorkDirectory() << ": " << error.message() << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    TempFile::setDirectory(parameters.getWorkDirectory());
   }
 
   Version::print(std::cout, "GCSA2 builder");
@@ -136,6 +266,12 @@ main(int argc, char** argv)
     printHeader("Branching factor", INDENT); std::cout << parameters.lcp_branching << std::endl;
     printHeader("Temp directory", INDENT); std::cout << TempFile::temp_dir << std::endl;
     printHeader("Size limit", INDENT); std::cout << inGigabytes(parameters.size_limit) << " GB" << std::endl;
+    printHeader("Memory limit", INDENT); std::cout << formatBytes(parameters.memory_limit) << std::endl;
+    if(parameters.externalMemory())
+    {
+      printHeader("Work directory", INDENT); std::cout << parameters.getWorkDirectory() << std::endl;
+      printHeader("Resume", INDENT); std::cout << (parameters.getResume() ? "yes" : "no") << std::endl;
+    }
     printHeader("Threads", INDENT); std::cout << omp_get_max_threads() << std::endl;
     printHeader("Verbosity", INDENT); std::cout << Verbosity::levelName() << std::endl;
   }
@@ -161,20 +297,28 @@ main(int argc, char** argv)
   else
   {
     double start = readTimer();
-    index = GCSA(graph, parameters);
-    lcp = LCPArray(graph, parameters);
+    try
+    {
+      index = GCSA(graph, parameters);
+      lcp = LCPArray(graph, parameters);
+    }
+    catch(const ConstructionStopped& stopped)
+    {
+      std::cout << stopped.what() << std::endl;
+      return 0;
+    }
     double seconds = readTimer() - start;
     std::cout << "Index built in " << seconds << " seconds" << std::endl;
     std::cout << "Memory usage: " << inGigabytes(memoryUsage()) << " GB" << std::endl;
     std::cout << "I/O volume: " << inGigabytes(readVolume()) << " GB read, "
               << inGigabytes(writeVolume()) << " GB write" << std::endl;
     std::cout << std::endl;
-    if(!sdsl::store_to_file(index, index_file))
+    if(!atomicStore(index, index_file))
     {
       std::cerr << "build_gcsa: Cannot write the index to " << index_file << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    if(!sdsl::store_to_file(lcp, lcp_file))
+    if(!atomicStore(lcp, lcp_file))
     {
       std::cerr << "build_gcsa: Cannot write the LCP array to " << lcp_file << std::endl;
       std::exit(EXIT_FAILURE);

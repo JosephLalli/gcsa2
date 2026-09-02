@@ -47,6 +47,7 @@ struct InputGraph
 {
   std::vector<std::string> filenames;
   std::string              lcp_name; // Used to pass the LCP array from GCSA construction.
+  std::string              mapping_name; // Stable identity for resumable construction.
   std::vector<size_type>   sizes;
 
   Alphabet                 alpha;

@@ -6,6 +6,16 @@
 namespace gcsa
 {
 
+class ConstructionStopped : public std::runtime_error
+{
+public:
+  explicit ConstructionStopped(const std::string& phase) :
+    std::runtime_error("construction stopped after committed phase " + phase),
+    completed_phase(phase) { }
+
+  std::string completed_phase;
+};
+
 /*
   support.h: Support structures included in the public interface.
 */

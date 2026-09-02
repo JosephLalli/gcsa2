@@ -1,9 +1,15 @@
 #include <gcsa/algorithms.h>
+#include <gcsa/checkpoint.h>
 #include <gcsa/internal.h>
 #include <gcsa/path_graph.h>
+#include <gcsa/workspace.h>
 
+#include <fstream>
+#include <iomanip>
+#include <memory>
 #include <random>
 #include <sstream>
+#include <sys/stat.h>
 #include <unordered_set>
 
 namespace gcsa
@@ -14,6 +20,105 @@ namespace gcsa
 // Other class variables
 
 const std::string GCSA::EXTENSION = ".gcsa";
+
+namespace
+{
+
+std::string
+doublingTask(size_type step)
+{
+  std::ostringstream result;
+  result << "step-" << std::setw(2) << std::setfill('0') << step;
+  return result.str();
+}
+
+std::uint64_t
+constructionFileChecksum(const std::string& filename, size_type buffer_bytes)
+{
+  std::ifstream input;
+  input.rdbuf()->pubsetbuf(nullptr, 0);
+  input.open(filename.c_str(), std::ios_base::binary);
+  if(!input) { throw std::runtime_error("GCSA::GCSA(): cannot checksum " + filename); }
+  std::vector<std::uint8_t> buffer(std::max(static_cast<size_type>(1), buffer_bytes));
+  std::uint64_t checksum = 1469598103934665603ULL;
+  while(input)
+  {
+    input.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
+    std::streamsize bytes = input.gcount();
+    if(bytes > 0) { checksum = BuildWorkspace::checksum(buffer.data(), bytes, checksum); }
+  }
+  if(!input.eof()) { throw std::runtime_error("GCSA::GCSA(): failed to checksum " + filename); }
+  return checksum;
+}
+
+BuildWorkspace::Settings
+constructionSemanticSettings(const InputGraph& graph,
+  const ConstructionParameters& parameters, size_type checksum_buffer)
+{
+  BuildWorkspace::Settings settings;
+  settings["gcsa_format"] = std::to_string(Version::GCSA_VERSION);
+  settings["lcp_format"] = std::to_string(Version::LCP_VERSION);
+  settings["binary_input"] = (graph.binary ? "true" : "false");
+  settings["kmer_length"] = std::to_string(graph.k());
+  settings["doubling_steps"] = std::to_string(parameters.getSteps());
+  settings["sample_period"] = std::to_string(parameters.getSamplePeriod());
+  settings["lcp_branching"] = std::to_string(parameters.getLCPBranching());
+  settings["input_count"] = std::to_string(graph.files());
+  for(size_type file = 0; file < graph.files(); file++)
+  {
+    struct stat info;
+    if(::stat(graph.filenames[file].c_str(), &info) != 0)
+    {
+      throw std::runtime_error("GCSA::GCSA(): cannot stat " + graph.filenames[file]);
+    }
+    std::string prefix = "input_" + std::to_string(file) + "_";
+    settings[prefix + "path"] = graph.filenames[file];
+    settings[prefix + "bytes"] = std::to_string(static_cast<std::uint64_t>(info.st_size));
+    settings[prefix + "checksum"] = std::to_string(
+      constructionFileChecksum(graph.filenames[file], checksum_buffer));
+    settings[prefix + "logical_id"] = std::to_string(file);
+  }
+  settings["mapping_path"] = graph.mapping_name;
+  if(!graph.mapping_name.empty())
+  {
+    struct stat info;
+    if(::stat(graph.mapping_name.c_str(), &info) != 0)
+    {
+      throw std::runtime_error("GCSA::GCSA(): cannot stat " + graph.mapping_name);
+    }
+    settings["mapping_bytes"] = std::to_string(static_cast<std::uint64_t>(info.st_size));
+    settings["mapping_checksum"] = std::to_string(
+      constructionFileChecksum(graph.mapping_name, checksum_buffer));
+  }
+  return settings;
+}
+
+BuildWorkspace::Settings
+constructionOperationalSettings(const ConstructionParameters& parameters)
+{
+  BuildWorkspace::Settings settings;
+  settings["memory_limit"] = std::to_string(parameters.getMemoryLimitBytes());
+  settings["disk_limit"] = std::to_string(parameters.getLimitBytes());
+  settings["io_buffer_size"] = std::to_string(parameters.getIOBufferSize());
+  settings["sort_run_size"] = std::to_string(parameters.getSortRunSize());
+  settings["join_partition_size"] = std::to_string(parameters.getJoinPartitionSize());
+  settings["merge_fan_in"] = std::to_string(parameters.getMergeFanIn());
+  settings["max_open_files"] = std::to_string(parameters.getMaxOpenFiles());
+  settings["threads"] = std::to_string(omp_get_max_threads());
+  return settings;
+}
+
+void
+stopAfterCommittedPhase(const ConstructionParameters& parameters,
+  const std::string& completed_phase)
+{
+  if(parameters.getStopAfter() == completed_phase)
+  {
+    throw ConstructionStopped(completed_phase);
+  }
+}
+
+} // namespace
 
 //------------------------------------------------------------------------------
 
@@ -433,6 +538,18 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
     std::exit(EXIT_SIZE_LIMIT_EXCEEDED);
   }
 
+  size_type checkpoint_buffer = std::max(static_cast<size_type>(1),
+    std::min(parameters.getIOBufferSize(), parameters.getMemoryLimitBytes() / 16));
+  std::unique_ptr<BuildWorkspace> workspace;
+  if(parameters.externalMemory())
+  {
+    BuildWorkspace::Settings semantic = constructionSemanticSettings(
+      graph, parameters, checkpoint_buffer);
+    BuildWorkspace::Settings operational = constructionOperationalSettings(parameters);
+    workspace.reset(new BuildWorkspace(parameters.getWorkDirectory(), semantic, operational,
+      parameters.getResume() ? BuildWorkspace::RESUME : BuildWorkspace::NEW_WORKSPACE));
+  }
+
   // Extract the keys and build the necessary support structures.
   // FIXME Later: Write the structures to disk until needed?
   std::vector<key_type> keys;
@@ -456,8 +573,43 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
   size_type unique_from_nodes = from_node_buffer.size();
   sdsl::util::clear(from_node_buffer);
 
-  // Create the initial PathGraph.
-  PathGraph path_graph(graph, distinct_labels);
+  // Create or restore the initial PathGraph. Resumption still rebuilds the
+  // compact key/LCP support above, but never repeats a committed doubling phase.
+  PathGraph path_graph(0, graph.k(), 0);
+  size_type first_step = 1;
+  bool restored_prune = false, restored_graph = false;
+  if(workspace)
+  {
+    for(size_type step = parameters.getSteps(); step > 0; step--)
+    {
+      std::string task = doublingTask(step);
+      if(pathGraphCheckpointExists(*workspace, task, "extend"))
+      {
+        restorePathGraph(*workspace, path_graph, task, "extend", checkpoint_buffer);
+        first_step = step + 1; restored_graph = true; break;
+      }
+      if(pathGraphCheckpointExists(*workspace, task, "prune"))
+      {
+        restorePathGraph(*workspace, path_graph, task, "prune", checkpoint_buffer);
+        first_step = step; restored_prune = true; restored_graph = true; break;
+      }
+    }
+    if(!restored_graph && pathGraphCheckpointExists(*workspace, "initial", "paths"))
+    {
+      restorePathGraph(*workspace, path_graph, "initial", "paths", checkpoint_buffer);
+      restored_graph = true;
+    }
+  }
+  if(!restored_graph)
+  {
+    PathGraph initial_graph(graph, distinct_labels);
+    path_graph.swap(initial_graph);
+    if(workspace)
+    {
+      checkpointPathGraph(*workspace, path_graph, "initial", "paths", checkpoint_buffer);
+      stopAfterCommittedPhase(parameters, "initial");
+    }
+  }
   sdsl::util::clear(distinct_labels);
   if(Verbosity::level >= Verbosity::EXTENDED)
   {
@@ -472,14 +624,24 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
   {
     std::cerr << "GCSA::GCSA(): Prefix-doubling from path length " << path_graph.k() << std::endl;
   }
-  for(size_type step = 1; step <= parameters.getSteps(); step++)
+  for(size_type step = first_step; step <= parameters.getSteps(); step++)
   {
     if(Verbosity::level >= Verbosity::BASIC)
     {
       std::cerr << "GCSA::GCSA(): Step " << step << " (path length " << path_graph.k() << " -> "
                 << (2 * path_graph.k()) << ")" << std::endl;
     }
-    path_graph.prune(lcp, parameters.getLimitBytes() - path_graph.bytes());
+    std::string task = doublingTask(step);
+    if(!(restored_prune && step == first_step))
+    {
+      path_graph.prune(lcp, parameters.getLimitBytes() - path_graph.bytes());
+      if(workspace)
+      {
+        checkpointPathGraph(*workspace, path_graph, task, "prune", checkpoint_buffer);
+        stopAfterCommittedPhase(parameters, task + "-prune");
+      }
+    }
+    restored_prune = false;
     if(parameters.externalMemory())
     {
       externalPathGraphExtend(path_graph,
@@ -489,6 +651,11 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
     {
       path_graph.extend(parameters.getLimitBytes() - path_graph.bytes(),
         parameters.getMemoryLimitBytes());
+    }
+    if(workspace)
+    {
+      checkpointPathGraph(*workspace, path_graph, task, "extend", checkpoint_buffer);
+      stopAfterCommittedPhase(parameters, task + "-extend");
     }
   }
   if(Verbosity::level >= Verbosity::EXTENDED)
