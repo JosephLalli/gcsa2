@@ -47,13 +47,13 @@ endif
 CXX_FLAGS=$(MY_CXX_FLAGS) $(VERIFY_FLAGS) $(PARALLEL_FLAGS) $(MY_CXX_OPT_FLAGS) -Iinclude -I$(INC_DIR)
 
 HEADERS=$(wildcard include/gcsa/*.h)
-LIBOBJS=$(addprefix $(BUILD_OBJ)/,algorithms.o dbg.o files.o gcsa.o internal.o lcp.o path_graph.o support.o utils.o)
+LIBOBJS=$(addprefix $(BUILD_OBJ)/,algorithms.o dbg.o files.o gcsa.o internal.o lcp.o path_graph.o support.o utils.o resources.o workspace.o)
 LIBRARY=$(BUILD_LIB)/libgcsa2.a
 
 PROGRAMS=$(addprefix $(BUILD_BIN)/,build_gcsa convert_graph gcsa_format try_extend)
 OBSOLETE=build_gcsa convert_graph gcsa_format try_extend
 
-.PHONY: all clean directories test
+.PHONY: all clean directories test workspace-test external-path-sort-test internal-buffer-test parameter-test
 all: directories $(LIBRARY) $(PROGRAMS)
 
 directories: $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)
@@ -75,6 +75,36 @@ $(LIBRARY):$(LIBOBJS)
 
 $(BUILD_BIN)/%:$(BUILD_OBJ)/%.o $(LIBRARY)
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $@ $< $(LIBRARY) $(LIBS)
+
+$(BUILD_OBJ)/test_workspace.o:tests/test_workspace.cpp include/gcsa/resources.h include/gcsa/workspace.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+workspace-test: directories $(BUILD_OBJ)/test_workspace.o $(BUILD_OBJ)/resources.o $(BUILD_OBJ)/workspace.o
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_workspace $(BUILD_OBJ)/test_workspace.o $(BUILD_OBJ)/resources.o $(BUILD_OBJ)/workspace.o -pthread
+	$(BUILD_BIN)/test_workspace
+
+$(BUILD_OBJ)/test_external_path_sort.o:tests/test_external_path_sort.cpp include/gcsa/path_graph.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+external-path-sort-test: directories $(BUILD_OBJ)/test_external_path_sort.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_external_path_sort $(BUILD_OBJ)/test_external_path_sort.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_external_path_sort
+
+$(BUILD_OBJ)/test_internal_buffers.o:tests/test_internal_buffers.cpp include/gcsa/internal.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+internal-buffer-test: directories $(BUILD_OBJ)/test_internal_buffers.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_internal_buffers $(BUILD_OBJ)/test_internal_buffers.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_internal_buffers
+
+$(BUILD_OBJ)/test_parameters.o:tests/test_parameters.cpp include/gcsa/support.h include/gcsa/utils.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+parameter-test: directories $(BUILD_OBJ)/test_parameters.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_parameters $(BUILD_OBJ)/test_parameters.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_parameters
+
+test: workspace-test external-path-sort-test internal-buffer-test parameter-test
 
 clean:
 	rm -rf $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)

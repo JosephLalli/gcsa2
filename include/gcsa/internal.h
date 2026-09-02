@@ -331,16 +331,16 @@ struct ReadBuffer
   std::condition_variable empty;  // Is read_buffer empty?
   std::thread             reader_thread;
 
-  // Read this many elements at once.
-  constexpr static size_type READ_BUFFER_SIZE = MEGABYTE;
-
-  // Refill the buffer if its size falls below this threshold.
-  constexpr static size_type MINIMUM_SIZE = READ_BUFFER_SIZE / 2;
+  // Buffer configuration is expressed in bytes. The old implementation used
+  // one million elements, which made a PathNode reader reserve many times as
+  // much memory as a byte reader and multiplied that difference per file.
+  constexpr static size_type DEFAULT_BUFFER_BYTES = MEGABYTE;
+  size_type buffer_elements, minimum_elements;
 
   ReadBuffer();
   ~ReadBuffer();
 
-  void open(const std::string& filename);
+  void open(const std::string& filename, size_type buffer_bytes = DEFAULT_BUFFER_BYTES);
   void close();
 
   inline size_type size() const { return this->elements; }
@@ -370,8 +370,8 @@ template<class Element>
 ReadBuffer<Element>::ReadBuffer()
 {
   this->elements = 0; this->file_offset = 0;
-  size_type buffer_size = READ_BUFFER_SIZE;  // avoid direct use
-  this->read_buffer.reserve(buffer_size);
+  this->buffer_elements = std::max((size_type)1, DEFAULT_BUFFER_BYTES / sizeof(Element));
+  this->minimum_elements = std::max((size_type)1, this->buffer_elements / 2);
 }
 
 template<class Element>
@@ -389,7 +389,7 @@ readerThread(ReadBuffer<Element>* buffer)
 
 template<class Element>
 void
-ReadBuffer<Element>::open(const std::string& filename)
+ReadBuffer<Element>::open(const std::string& filename, size_type buffer_bytes)
 {
   if(this->file.is_open())
   {
@@ -405,6 +405,10 @@ ReadBuffer<Element>::open(const std::string& filename)
   }
   this->elements = fileSize(this->file) / sizeof(Element);
   this->file_offset = 0;
+  this->buffer_elements = std::max((size_type)1, buffer_bytes / sizeof(Element));
+  this->minimum_elements = std::max((size_type)1, this->buffer_elements / 2);
+  sdsl::util::clear(this->read_buffer);
+  this->read_buffer.reserve(this->buffer_elements);
 
   this->reader_thread = std::thread(readerThread<Element>, this);
 }
@@ -425,6 +429,7 @@ ReadBuffer<Element>::close()
   this->elements = 0;
 
   sdsl::util::clear(this->buffer);
+  sdsl::util::clear(this->read_buffer);
 }
 
 template<class Element>
@@ -448,7 +453,7 @@ ReadBuffer<Element>::seek(size_type i)
   }
 
   // Force read but only if there is still something to read.
-  if(this->buffer.size() < MINIMUM_SIZE && i + this->buffer.size() < this->size())
+  if(this->buffer.size() < this->minimum_elements && i + this->buffer.size() < this->size())
   {
     std::unique_lock<std::mutex> lock(this->mtx);
     this->forceRead();
@@ -463,8 +468,7 @@ ReadBuffer<Element>::fill()
   std::unique_lock<std::mutex> lock(this->mtx);
   this->empty.wait(lock, [this]() { return read_buffer.empty(); } );
 
-  size_type read_buffer_size = READ_BUFFER_SIZE;  // avoid direct use
-  this->read_buffer.resize(std::min(read_buffer_size, this->size() - this->file_offset));
+  this->read_buffer.resize(std::min(this->buffer_elements, this->size() - this->file_offset));
   if(!DiskIO::read(this->file, this->read_buffer.data(), this->read_buffer.size()))
   {
     std::cerr << "ReadBuffer::fill(): Unexpected EOF" << std::endl;
@@ -493,8 +497,7 @@ ReadBuffer<Element>::forceRead()
 {
   if(this->read_buffer.empty())
   {
-    size_type read_buffer_size = READ_BUFFER_SIZE;  // avoid direct use
-    this->read_buffer.resize(std::min(read_buffer_size, this->size() - this->file_offset));
+    this->read_buffer.resize(std::min(this->buffer_elements, this->size() - this->file_offset));
     if(!DiskIO::read(this->file, this->read_buffer.data(), this->read_buffer.size()))
     {
       std::cerr << "ReadBuffer::forceRead(): Unexpected EOF" << std::endl;
@@ -517,10 +520,10 @@ template<class Element>
 struct WriteBuffer
 {
   WriteBuffer();
-  explicit WriteBuffer(const std::string& filename, size_type _buffer_size = MEGABYTE);
+  explicit WriteBuffer(const std::string& filename, size_type buffer_bytes = MEGABYTE);
   ~WriteBuffer();
 
-  void open(const std::string& filename, size_type _buffer_size = MEGABYTE);
+  void open(const std::string& filename, size_type buffer_bytes = MEGABYTE);
   void close();
 
   inline size_type size() const { return this->elements; }
@@ -550,9 +553,9 @@ WriteBuffer<Element>::WriteBuffer() :
 }
 
 template<class Element>
-WriteBuffer<Element>::WriteBuffer(const std::string& filename, size_type _buffer_size)
+WriteBuffer<Element>::WriteBuffer(const std::string& filename, size_type buffer_bytes)
 {
-  this->open(filename, _buffer_size);
+  this->open(filename, buffer_bytes);
 }
 
 template<class Element>
@@ -563,7 +566,7 @@ WriteBuffer<Element>::~WriteBuffer()
 
 template<class Element>
 void
-WriteBuffer<Element>::open(const std::string& filename, size_type _buffer_size)
+WriteBuffer<Element>::open(const std::string& filename, size_type buffer_bytes)
 {
   this->file.open(filename.c_str(), std::ios_base::binary);
   if(!(this->file))
@@ -572,7 +575,8 @@ WriteBuffer<Element>::open(const std::string& filename, size_type _buffer_size)
     std::exit(EXIT_FAILURE);
   }
 
-  this->buffer_size = _buffer_size; this->elements = 0;
+  this->buffer_size = std::max((size_type)1, buffer_bytes / sizeof(Element));
+  this->elements = 0;
   this->buffer.reserve(this->buffer_size);
 }
 

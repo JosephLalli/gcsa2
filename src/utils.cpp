@@ -27,8 +27,13 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
+#include <cmath>
+#include <iomanip>
+#include <limits>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 
 #include <sys/resource.h>
 #include <unistd.h>
@@ -156,6 +161,65 @@ size_type
 writeVolume()
 {
   return DiskIO::write_volume;
+}
+
+size_type
+parseBytes(const std::string& value)
+{
+  if(value.empty() || value[0] == '-')
+  {
+    throw std::invalid_argument("empty or negative byte count: " + value);
+  }
+
+  size_t parsed = 0;
+  long double number = std::stold(value, &parsed);
+  if(!std::isfinite(number) || number < 0.0L)
+  {
+    throw std::invalid_argument("non-finite or negative byte count: " + value);
+  }
+
+  std::string suffix = value.substr(parsed);
+  std::transform(suffix.begin(), suffix.end(), suffix.begin(),
+    [](unsigned char c) { return std::toupper(c); });
+  if(suffix.length() >= 2 && suffix.substr(suffix.length() - 2) == "IB")
+  {
+    suffix.resize(suffix.length() - 2);
+  }
+  else if(!(suffix.empty()) && suffix.back() == 'B')
+  {
+    suffix.pop_back();
+  }
+
+  size_type multiplier = 1;
+  if(suffix == "K") { multiplier = KILOBYTE; }
+  else if(suffix == "M") { multiplier = MEGABYTE; }
+  else if(suffix == "G") { multiplier = GIGABYTE; }
+  else if(suffix == "T") { multiplier = GIGABYTE * KILOBYTE; }
+  else if(suffix == "P") { multiplier = GIGABYTE * MEGABYTE; }
+  else if(!suffix.empty()) { throw std::invalid_argument("invalid byte suffix: " + value); }
+
+  long double result = number * static_cast<long double>(multiplier);
+  if(result > static_cast<long double>(std::numeric_limits<size_type>::max()))
+  {
+    throw std::out_of_range("byte count is too large: " + value);
+  }
+  return static_cast<size_type>(result);
+}
+
+std::string
+formatBytes(size_type bytes)
+{
+  const char* suffixes[] = { "B", "KiB", "MiB", "GiB", "TiB", "PiB" };
+  long double value = bytes;
+  size_type suffix = 0;
+  while(value >= 1024.0L && suffix + 1 < sizeof(suffixes) / sizeof(suffixes[0]))
+  {
+    value /= 1024.0L; suffix++;
+  }
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(value < 10.0L && suffix > 0 ? 2 : 1)
+      << static_cast<double>(value) << ' ' << suffixes[suffix];
+  return out.str();
 }
 
 //------------------------------------------------------------------------------

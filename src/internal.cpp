@@ -9,8 +9,7 @@ namespace gcsa
 
 constexpr size_type DiskIO::block_size;
 
-template<class Element> constexpr size_type ReadBuffer<Element>::READ_BUFFER_SIZE;
-template<class Element> constexpr size_type ReadBuffer<Element>::MINIMUM_SIZE;
+template<class Element> constexpr size_type ReadBuffer<Element>::DEFAULT_BUFFER_BYTES;
 
 //------------------------------------------------------------------------------
 
