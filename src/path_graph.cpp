@@ -25,7 +25,13 @@
 
 #include <gcsa/path_graph.h>
 
+#include <algorithm>
+#include <cstdio>
 #include <deque>
+#include <fcntl.h>
+#include <limits>
+#include <queue>
+#include <unistd.h>
 
 namespace gcsa
 {
@@ -318,7 +324,7 @@ struct PathGraphBuilder
   void write(PriorityNode& path);
   void write(std::vector<PathNode>& paths, std::vector<PathNode::rank_type>& labels, size_type memory_limit, size_type file);
 
-  void sort(size_type file);
+  void sort(size_type file, size_type byte_budget, size_type fan_in);
 };
 
 constexpr size_type PathGraphBuilder::WRITE_BUFFER_SIZE;
@@ -404,30 +410,353 @@ PathGraphBuilder::write(std::vector<PathNode>& paths, std::vector<PathNode::rank
 }
 
 void
-PathGraphBuilder::sort(size_type file)
+PathGraphBuilder::sort(size_type file, size_type byte_budget, size_type fan_in)
 {
   this->path_files[file].close();
   this->rank_files[file].close();
-
-  std::vector<PathNode> paths;
-  std::vector<PathNode::rank_type> labels;
-  this->graph.read(paths, labels, file);
-
-  PathFirstComparator first_c(labels);
-  parallelQuickSort(paths.begin(), paths.end(), first_c);
-
-  this->path_files[file].open(this->graph.path_names[file]);
-  this->rank_files[file].open(this->graph.rank_names[file]);
-  for(size_type i = 0; i < paths.size(); i++)
-  {
-    writePath(paths[i], labels.data(), this->path_files[file], this->rank_files[file]);
-  }
+  externalPathGraphSort(this->graph, file, byte_budget, fan_in);
 
   if(Verbosity::level >= Verbosity::FULL)
   {
     std::cerr << "PathGraphBuilder::sort(): File " << file << ": Sorted "
               << this->graph.path_counts[file] << " paths" << std::endl;
   }
+}
+
+//------------------------------------------------------------------------------
+
+namespace
+{
+
+/* A run record is deliberately self-contained: the rank pointer in node is
+   meaningful only while reading the source/final PathGraph pair. */
+struct PathSortRecord
+{
+  PathNode node;
+  PathNode::rank_type labels[PathLabel::LABEL_LENGTH + 1];
+};
+
+// Covers stream state, vector control blocks, allocator slack, and the heap.
+constexpr size_type PATH_SORT_FIXED_BYTES = 8192;
+
+inline void
+updatePathSortStats(ExternalPathSortStats* stats, size_type records, size_type bytes)
+{
+  if(stats == nullptr) { return; }
+  stats->max_records_resident = std::max(stats->max_records_resident, records);
+  stats->max_bytes_resident = std::max(stats->max_bytes_resident, bytes);
+}
+
+inline void
+externalSortFailure(const std::string& message)
+{
+  std::cerr << "externalPathGraphSort(): " << message << std::endl;
+  std::exit(EXIT_FAILURE);
+}
+
+inline bool
+pathSortLess(const PathSortRecord& a, const PathSortRecord& b)
+{
+  size_type order = std::min(a.node.order(), b.node.order());
+  for(size_type i = 0; i < order; i++)
+  {
+    if(a.labels[i] != b.labels[i]) { return (a.labels[i] < b.labels[i]); }
+  }
+  if(a.node.order() != b.node.order()) { return (a.node.order() < b.node.order()); }
+  if(a.node.from != b.node.from) { return (a.node.from < b.node.from); }
+  if(a.node.to != b.node.to) { return (a.node.to < b.node.to); }
+  if(a.node.predecessors() != b.node.predecessors()) { return (a.node.predecessors() < b.node.predecessors()); }
+  if(a.node.lcp() != b.node.lcp()) { return (a.node.lcp() < b.node.lcp()); }
+  for(size_type i = 0; i < a.node.ranks(); i++)
+  {
+    if(a.labels[i] != b.labels[i]) { return (a.labels[i] < b.labels[i]); }
+  }
+  return false; // Equal records are byte-equivalent after rank pointers are rewritten.
+}
+
+inline void
+validatePathSortRecord(const PathSortRecord& record, size_type expected_pointer,
+  size_type rank_count)
+{
+  if(record.node.ranks() > PathLabel::LABEL_LENGTH + 1 || record.node.lcp() > record.node.order())
+  {
+    externalSortFailure("invalid path order or lcp");
+  }
+  if(expected_pointer > rank_count || record.node.pointer() != expected_pointer ||
+     record.node.ranks() > rank_count - expected_pointer)
+  {
+    externalSortFailure("invalid rank pointer or rank count");
+  }
+}
+
+inline bool
+readPathSortRecord(std::ifstream& paths, std::ifstream& ranks, PathSortRecord& record,
+  size_type& rank_offset, size_type rank_count)
+{
+  paths.read(reinterpret_cast<char*>(&record.node), sizeof(PathNode));
+  if(paths.eof() && paths.gcount() == 0) { return false; }
+  if(paths.gcount() != sizeof(PathNode)) { externalSortFailure("truncated path file"); }
+  validatePathSortRecord(record, rank_offset, rank_count);
+  size_type count = record.node.ranks();
+  ranks.read(reinterpret_cast<char*>(record.labels), count * sizeof(PathNode::rank_type));
+  if(ranks.gcount() != (std::streamsize)(count * sizeof(PathNode::rank_type))) { externalSortFailure("truncated rank file"); }
+  rank_offset += count;
+  return true;
+}
+
+inline void
+syncPathSortFile(const std::string& name)
+{
+  int descriptor = ::open(name.c_str(), O_RDONLY);
+  if(descriptor < 0 || ::fsync(descriptor) != 0)
+  {
+    if(descriptor >= 0) { ::close(descriptor); }
+    externalSortFailure("cannot sync " + name);
+  }
+  ::close(descriptor);
+}
+
+struct PathSortRunReader
+{
+  std::ifstream file;
+  std::vector<PathSortRecord> buffer;
+  size_type offset, buffer_records;
+  bool at_end;
+
+  PathSortRunReader(const std::string& name, size_type buffer_records) :
+    file(name.c_str(), std::ios_base::binary), buffer(), offset(0), buffer_records(buffer_records), at_end(false)
+  {
+    if(!this->file) { externalSortFailure("cannot open run " + name); }
+    this->buffer.resize(this->buffer_records);
+    this->refill();
+  }
+
+  void refill()
+  {
+    this->file.read(reinterpret_cast<char*>(this->buffer.data()), this->buffer.size() * sizeof(PathSortRecord));
+    std::streamsize bytes = this->file.gcount();
+    if(bytes % (std::streamsize)sizeof(PathSortRecord) != 0) { externalSortFailure("truncated run"); }
+    this->buffer.resize(bytes / sizeof(PathSortRecord));
+    this->offset = 0;
+    this->at_end = this->buffer.empty();
+  }
+
+  const PathSortRecord& current() const { return this->buffer[this->offset]; }
+
+  void advance()
+  {
+    this->offset++;
+    if(this->offset == this->buffer.size())
+    {
+      this->buffer.resize(this->buffer_records);
+      this->refill();
+    }
+  }
+};
+
+struct PathSortHeapComparator
+{
+  const std::vector<PathSortRunReader>* readers;
+
+  explicit PathSortHeapComparator(const std::vector<PathSortRunReader>* _readers) : readers(_readers) { }
+
+  bool operator() (size_type a, size_type b) const
+  {
+    const PathSortRecord& left = (*this->readers)[a].current();
+    const PathSortRecord& right = (*this->readers)[b].current();
+    if(pathSortLess(left, right)) { return false; }
+    if(pathSortLess(right, left)) { return true; }
+    return (a > b);
+  }
+};
+
+void
+writePathSortRun(const std::string& name, const std::vector<PathSortRecord>& records)
+{
+  std::ofstream output(name.c_str(), std::ios_base::binary);
+  if(!output) { externalSortFailure("cannot create run " + name); }
+  if(!records.empty()) { DiskIO::write(output, records.data(), records.size()); }
+  output.close();
+}
+
+std::string
+mergePathSortRuns(const std::vector<std::string>& inputs, size_type buffer_records,
+  ExternalPathSortStats* stats)
+{
+  std::string output_name = TempFile::getName("gcsa_path_sort_run");
+  std::ofstream output(output_name.c_str(), std::ios_base::binary);
+  if(!output) { externalSortFailure("cannot create merged run"); }
+  std::vector<PathSortRunReader> readers;
+  readers.reserve(inputs.size());
+  for(size_type i = 0; i < inputs.size(); i++) { readers.emplace_back(inputs[i], buffer_records); }
+  std::vector<PathSortRecord> output_buffer;
+  output_buffer.reserve(std::max((size_type)1, buffer_records));
+  updatePathSortStats(stats, (inputs.size() + 1) * buffer_records,
+    PATH_SORT_FIXED_BYTES + (inputs.size() + 1) * buffer_records * sizeof(PathSortRecord) +
+    inputs.size() * (sizeof(PathSortRunReader) + 2 * sizeof(size_type)));
+  std::priority_queue<size_type, std::vector<size_type>, PathSortHeapComparator>
+    queue{PathSortHeapComparator(&readers)};
+  for(size_type i = 0; i < readers.size(); i++)
+  {
+    if(!readers[i].at_end) { queue.push(i); }
+  }
+  while(!queue.empty())
+  {
+    size_type best = queue.top(); queue.pop();
+    output_buffer.push_back(readers[best].current()); readers[best].advance();
+    if(!readers[best].at_end) { queue.push(best); }
+    if(output_buffer.size() >= output_buffer.capacity())
+    {
+      DiskIO::write(output, output_buffer.data(), output_buffer.size());
+      output_buffer.clear();
+    }
+  }
+  if(!output_buffer.empty()) { DiskIO::write(output, output_buffer.data(), output_buffer.size()); }
+  output.close();
+  return output_name;
+}
+
+void
+writeSortedPathPair(const std::string& run_name, const std::string& path_name,
+  const std::string& rank_name, size_type expected_paths, size_type expected_ranks,
+  size_type buffer_records, ExternalPathSortStats* stats)
+{
+  PathSortRunReader reader(run_name, buffer_records);
+  std::ofstream paths(path_name.c_str(), std::ios_base::binary), ranks(rank_name.c_str(), std::ios_base::binary);
+  if(!paths || !ranks) { externalSortFailure("cannot create sorted path pair"); }
+  std::vector<PathNode> path_buffer; path_buffer.reserve(std::max((size_type)1, buffer_records));
+  std::vector<PathNode::rank_type> rank_buffer;
+  rank_buffer.reserve(std::max((size_type)1, buffer_records) * (PathLabel::LABEL_LENGTH + 1));
+  updatePathSortStats(stats, 2 * buffer_records,
+    PATH_SORT_FIXED_BYTES + 2 * buffer_records * sizeof(PathSortRecord));
+  size_type path_count = 0, rank_count = 0;
+  while(!reader.at_end)
+  {
+    PathNode node = reader.current().node;
+    if(rank_buffer.size() + node.ranks() > rank_buffer.capacity())
+    {
+      DiskIO::write(ranks, rank_buffer.data(), rank_buffer.size()); rank_buffer.clear();
+    }
+    node.setPointer(rank_count);
+    path_buffer.push_back(node);
+    for(size_type i = 0; i < node.ranks(); i++) { rank_buffer.push_back(reader.current().labels[i]); }
+    path_count++; rank_count += node.ranks(); reader.advance();
+    if(rank_buffer.size() >= rank_buffer.capacity())
+    {
+      DiskIO::write(ranks, rank_buffer.data(), rank_buffer.size()); rank_buffer.clear();
+    }
+    if(path_buffer.size() == path_buffer.capacity())
+    {
+      DiskIO::write(paths, path_buffer.data(), path_buffer.size()); path_buffer.clear();
+    }
+  }
+  if(!path_buffer.empty()) { DiskIO::write(paths, path_buffer.data(), path_buffer.size()); }
+  if(!rank_buffer.empty()) { DiskIO::write(ranks, rank_buffer.data(), rank_buffer.size()); }
+  paths.close(); ranks.close();
+  if(path_count != expected_paths || rank_count != expected_ranks) { externalSortFailure("sorted path pair has incorrect counts"); }
+}
+
+} // namespace
+
+void
+externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, size_type fan_in,
+  ExternalPathSortStats* stats)
+{
+  if(file >= graph.files()) { externalSortFailure("invalid file number"); }
+  if(byte_budget < externalPathGraphSortMinimumBudget()) { externalSortFailure("byte budget is too small"); }
+  if(stats != nullptr) { *stats = ExternalPathSortStats(); }
+  size_type record_bytes = sizeof(PathSortRecord);
+  size_type available = byte_budget - PATH_SORT_FIXED_BYTES;
+  size_type reader_overhead = sizeof(PathSortRunReader) + 2 * sizeof(size_type);
+  size_type max_fan_in = (available - record_bytes) / (record_bytes + reader_overhead);
+  fan_in = std::min(std::max((size_type)2, fan_in), max_fan_in);
+  if(fan_in < 2) { externalSortFailure("byte budget cannot support a two-way merge"); }
+  size_type merge_available = available - fan_in * reader_overhead;
+  size_type merge_records = merge_available / ((fan_in + 1) * record_bytes);
+  if(merge_records == 0) { externalSortFailure("byte budget cannot buffer a merge"); }
+  // Reserve two thirds for sorting records and one third for allocator / I/O slack.
+  size_type run_records = std::max((size_type)1, available / (3 * record_bytes));
+
+  std::ifstream paths, ranks;
+  graph.open(paths, ranks, file);
+  if(graph.path_counts[file] > std::numeric_limits<size_type>::max() / sizeof(PathNode) ||
+     graph.rank_counts[file] > std::numeric_limits<size_type>::max() / sizeof(PathNode::rank_type) ||
+     fileSize(paths) != graph.path_counts[file] * sizeof(PathNode) ||
+     fileSize(ranks) != graph.rank_counts[file] * sizeof(PathNode::rank_type))
+  {
+    externalSortFailure("source path/rank file length does not match metadata");
+  }
+  std::vector<std::string> runs;
+  std::vector<PathSortRecord> records; records.reserve(run_records);
+  updatePathSortStats(stats, run_records, PATH_SORT_FIXED_BYTES + run_records * record_bytes);
+  size_type rank_offset = 0, path_count = 0;
+  PathSortRecord record;
+  while(readPathSortRecord(paths, ranks, record, rank_offset, graph.rank_counts[file]))
+  {
+    records.push_back(record); path_count++;
+    if(records.size() == run_records)
+    {
+      std::sort(records.begin(), records.end(), pathSortLess);
+      std::string name = TempFile::getName("gcsa_path_sort_run");
+      writePathSortRun(name, records); runs.push_back(name); records.clear();
+      if(stats != nullptr) { stats->runs++; }
+    }
+  }
+  if(rank_offset != graph.rank_counts[file] || path_count != graph.path_counts[file])
+  {
+    externalSortFailure("path/rank sidecar counts do not match metadata");
+  }
+  if(!records.empty())
+  {
+    std::sort(records.begin(), records.end(), pathSortLess);
+    std::string name = TempFile::getName("gcsa_path_sort_run");
+    writePathSortRun(name, records); runs.push_back(name);
+    if(stats != nullptr) { stats->runs++; }
+  }
+  paths.close(); ranks.close();
+
+  while(runs.size() > fan_in)
+  {
+    if(stats != nullptr) { stats->merge_passes++; }
+    std::vector<std::string> compacted;
+    for(size_type first = 0; first < runs.size(); first += fan_in)
+    {
+      size_type last = std::min(runs.size(), first + fan_in);
+      std::vector<std::string> group(runs.begin() + first, runs.begin() + last);
+      std::string merged = mergePathSortRuns(group, merge_records, stats);
+      for(size_type i = 0; i < group.size(); i++) { TempFile::remove(group[i]); }
+      compacted.push_back(merged);
+    }
+    runs.swap(compacted);
+  }
+  if(runs.empty())
+  {
+    std::string name = TempFile::getName("gcsa_path_sort_run");
+    writePathSortRun(name, records); runs.push_back(name);
+  }
+  std::string merged = mergePathSortRuns(runs, merge_records, stats);
+  for(size_type i = 0; i < runs.size(); i++) { TempFile::remove(runs[i]); }
+
+  std::string final_path = TempFile::getName(PathGraph::PREFIX), final_rank = TempFile::getName(PathGraph::PREFIX);
+  std::string partial_path = final_path + ".partial", partial_rank = final_rank + ".partial";
+  writeSortedPathPair(merged, partial_path, partial_rank, graph.path_counts[file], graph.rank_counts[file], merge_records, stats);
+  TempFile::remove(merged);
+  syncPathSortFile(partial_path); syncPathSortFile(partial_rank);
+  if(std::rename(partial_path.c_str(), final_path.c_str()) != 0 || std::rename(partial_rank.c_str(), final_rank.c_str()) != 0)
+  {
+    externalSortFailure("cannot atomically install sorted path pair");
+  }
+  std::string old_path = graph.path_names[file], old_rank = graph.rank_names[file];
+  graph.path_names[file] = final_path; graph.rank_names[file] = final_rank;
+  TempFile::remove(old_path); TempFile::remove(old_rank);
+}
+
+size_type
+externalPathGraphSortMinimumBudget()
+{
+  // One record for each side of a two-way merge, one output record, and fixed state.
+  return PATH_SORT_FIXED_BYTES + 3 * sizeof(PathSortRecord) +
+    2 * (sizeof(PathSortRunReader) + 2 * sizeof(size_type));
 }
 
 //------------------------------------------------------------------------------
@@ -702,8 +1031,16 @@ PathGraph::PathGraph(const InputGraph& source, sdsl::int_vector<0>& distinct_lab
   this->unsorted = UNKNOWN; this->nondeterministic = UNKNOWN;
   this->delete_files = true;
 
+  if(source.files() > std::numeric_limits<uint32_t>::max())
+  {
+    std::cerr << "PathGraph::PathGraph(): Too many logical input files" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+
   for(size_type file = 0; file < source.files(); file++)
   {
+    this->logical_file_ids.push_back(logical_file_id_t(static_cast<uint32_t>(file)));
+    this->physical_shard_ids.push_back(physical_shard_id_t(file));
     std::string path_name = TempFile::getName(PREFIX);
     this->path_names.push_back(path_name);
     std::string rank_name = TempFile::getName(PREFIX);
@@ -743,12 +1080,22 @@ PathGraph::PathGraph(const InputGraph& source, sdsl::int_vector<0>& distinct_lab
 
 PathGraph::PathGraph(size_type file_count, size_type path_order, size_type steps) :
   path_names(file_count), rank_names(file_count), path_counts(file_count, 0), rank_counts(file_count, 0),
+  logical_file_ids(), physical_shard_ids(),
   path_count(0), rank_count(0), range_count(0), order(path_order), doubling_steps(steps),
   unique(0), redundant(0), unsorted(0), nondeterministic(0),
   delete_files(true)
 {
+  if(file_count > std::numeric_limits<uint32_t>::max())
+  {
+    std::cerr << "PathGraph::PathGraph(): Too many logical input files" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  this->logical_file_ids.reserve(file_count);
+  this->physical_shard_ids.reserve(file_count);
   for(size_type file = 0; file < this->files(); file++)
   {
+    this->logical_file_ids.push_back(logical_file_id_t(static_cast<uint32_t>(file)));
+    this->physical_shard_ids.push_back(physical_shard_id_t(file));
     this->path_names[file] = TempFile::getName(PREFIX);
     this->rank_names[file] = TempFile::getName(PREFIX);
   }
@@ -763,6 +1110,8 @@ PathGraph::PathGraph(const std::string& path_name, const std::string& rank_name)
   this->delete_files = false;
 
   this->path_names.push_back(path_name);
+  this->logical_file_ids.push_back(logical_file_id_t(0));
+  this->physical_shard_ids.push_back(physical_shard_id_t(0));
   std::ifstream path_file(path_name, std::ios_base::binary);
   if(!path_file)
   {
@@ -805,6 +1154,8 @@ PathGraph::clear()
   this->rank_names.clear();
   this->path_counts.clear();
   this->rank_counts.clear();
+  this->logical_file_ids.clear();
+  this->physical_shard_ids.clear();
 
   this->path_count = 0; this->rank_count = 0;
   this->order = 0;
@@ -819,6 +1170,8 @@ PathGraph::swap(PathGraph& another)
   this->rank_names.swap(another.rank_names);
   this->path_counts.swap(another.path_counts);
   this->rank_counts.swap(another.rank_counts);
+  this->logical_file_ids.swap(another.logical_file_ids);
+  this->physical_shard_ids.swap(another.physical_shard_ids);
 
   std::swap(this->path_count, another.path_count);
   std::swap(this->rank_count, another.rank_count);
@@ -830,6 +1183,7 @@ PathGraph::swap(PathGraph& another)
   std::swap(this->redundant, another.redundant);
   std::swap(this->unsorted, another.unsorted);
   std::swap(this->nondeterministic, another.nondeterministic);
+  std::swap(this->delete_files, another.delete_files);
 }
 
 void
@@ -858,21 +1212,25 @@ PathGraph::open(std::ifstream& path_file, std::ifstream& rank_file, size_type fi
 
 //------------------------------------------------------------------------------
 
-struct SameFromFile
+struct SameFromLogicalFile
 {
   const PathGraphMerger& merger;
   node_type              from;
-  size_type              file;
+  logical_file_id_t      logical_file;
   bool                   same_from, same_file;
 
-  SameFromFile(const PathGraphMerger& source, range_type range) :
-    merger(source), from(source.buffer[range.first].node.from), file(source.buffer[range.first].file),
+  SameFromLogicalFile(const PathGraphMerger& source, range_type range) :
+    merger(source), from(source.buffer[range.first].node.from),
+    logical_file(source.graph.logicalFile(source.buffer[range.first].file)),
     same_from(true), same_file(true)
   {
     for(size_type i = range.first + 1; i <= range.second; i++)
     {
       if(this->merger.buffer[i].node.from != this->from) { this->same_from = false; }
-      if(this->merger.buffer[i].file != this->file) { this->same_file = false; }
+      if(this->merger.graph.logicalFile(this->merger.buffer[i].file) != this->logical_file)
+      {
+        this->same_file = false;
+      }
     }
   }
 
@@ -880,7 +1238,8 @@ struct SameFromFile
   {
     for(size_type i = range.first; i <= range.second; i++)
     {
-      if(this->merger.buffer[i].node.from != this->from || this->merger.buffer[i].file != this->file)
+      if(this->merger.buffer[i].node.from != this->from ||
+         this->merger.graph.logicalFile(this->merger.buffer[i].file) != this->logical_file)
       {
         return false;
       }
@@ -896,9 +1255,11 @@ PathGraph::prune(const LCP& lcp, size_type size_limit)
 
   PathGraphMerger merger(*this, lcp);
   PathGraphBuilder builder(this->files(), this->k(), this->step(), size_limit);
+  builder.graph.logical_file_ids = this->logical_file_ids;
+  builder.graph.physical_shard_ids = this->physical_shard_ids;
   for(range_type range = merger.first(); !(merger.atEnd(range)); range = merger.next())
   {
-    SameFromFile same_from(merger, range);
+    SameFromLogicalFile same_from(merger, range);
     if(same_from.same_from)
     {
       if(same_from.same_file)
@@ -955,6 +1316,8 @@ PathGraph::extend(size_type size_limit, size_type memory_limit)
   size_type old_path_count = this->size();
 
   PathGraphBuilder builder(this->files(), 2 * this->k(), this->step() + 1, size_limit);
+  builder.graph.logical_file_ids = this->logical_file_ids;
+  builder.graph.physical_shard_ids = this->physical_shard_ids;
   for(size_type file = 0; file < this->files(); file++)
   {
     // Read the current file.
@@ -1017,7 +1380,10 @@ PathGraph::extend(size_type size_limit, size_type memory_limit)
     }
 
     // Sort the next generation.
-    builder.sort(file);
+    // Sorting is deliberately single-threaded and uses only a conservative
+    // fraction of the extension memory allowance for run and merge buffers.
+    size_type sort_budget = std::max((size_type)sizeof(PathSortRecord), memory_limit / 8);
+    builder.sort(file, sort_budget, 8);
   }
   builder.close();
   this->clear(); this->swap(builder.graph);

@@ -49,11 +49,20 @@ struct ConstructionParameters
   constexpr static size_type DOUBLING_STEPS        = 4;
   constexpr static size_type MAX_STEPS             = 4;
   constexpr static size_type SIZE_LIMIT            = 2048;   // Gigabytes.
-  constexpr static size_type ABSOLUTE_LIMIT        = 16384;  // Gigabytes.
+  // The disk-first route may intentionally use tens or hundreds of terabytes.
+  // Keep a generous overflow guard instead of the historical 16 TiB ceiling.
+  constexpr static size_type ABSOLUTE_LIMIT        = 1048576;  // Gigabytes (1 PiB).
   constexpr static size_type MEMORY_LIMIT          = 1024;   // Gigabytes.
   constexpr static size_type ABSOLUTE_MEMORY_LIMIT = 8192;   // Gigabytes.
   constexpr static size_type SAMPLE_PERIOD         = 64;
   constexpr static size_type LCP_BRANCHING         = 64;
+  constexpr static size_type IO_BUFFER_SIZE        = 64 * MEGABYTE;
+  constexpr static size_type SORT_RUN_SIZE         = 4 * GIGABYTE;
+  constexpr static size_type JOIN_PARTITION_SIZE   = 16 * GIGABYTE;
+  constexpr static size_type MERGE_FAN_IN          = 64;
+  constexpr static size_type MAX_OPEN_FILES        = 128;
+  constexpr static size_type CHECKPOINT_RECORDS    = 16 * MILLION;
+  constexpr static size_type CHECKPOINT_BYTES      = GIGABYTE;
   
 
   ConstructionParameters();
@@ -65,18 +74,58 @@ struct ConstructionParameters
   void setMemoryLimitBytes(size_type bytes);
   void setSamplePeriod(size_type period);
   void setLCPBranching(size_type factor);
+  void setWorkDirectory(const std::string& directory);
+  void setResume(bool value = true);
+  void setKeepWork(bool value = true);
+  void setVerifyWorkspace(bool value = true);
+  void setCleanObsolete(bool value = true);
+  void setAllowPathExplosion(bool value = true);
+  void setIOBufferSize(size_type bytes);
+  void setSortRunSize(size_type bytes);
+  void setJoinPartitionSize(size_type bytes);
+  void setMergeFanIn(size_type fan_in);
+  void setMaxOpenFiles(size_type files);
+  void setCheckpointRecords(size_type records);
+  void setCheckpointBytes(size_type bytes);
+  void setStopAfter(const std::string& phase);
 
   size_type getSteps() const { return this->doubling_steps; }
   size_type getLimitBytes() const { return this->size_limit; }
   size_type getMemoryLimitBytes() const { return this->memory_limit; }
   size_type getSamplePeriod() const { return this->sample_period; }
   size_type getLCPBranching() const { return this->lcp_branching; }
+  const std::string& getWorkDirectory() const { return this->work_directory; }
+  bool getResume() const { return this->resume; }
+  bool getKeepWork() const { return this->keep_work; }
+  bool getVerifyWorkspace() const { return this->verify_workspace; }
+  bool getCleanObsolete() const { return this->clean_obsolete; }
+  bool getAllowPathExplosion() const { return this->allow_path_explosion; }
+  size_type getIOBufferSize() const { return this->io_buffer_size; }
+  size_type getSortRunSize() const { return this->sort_run_size; }
+  size_type getJoinPartitionSize() const { return this->join_partition_size; }
+  size_type getMergeFanIn() const { return this->merge_fan_in; }
+  size_type getMaxOpenFiles() const { return this->max_open_files; }
+  size_type getCheckpointRecords() const { return this->checkpoint_records; }
+  size_type getCheckpointBytes() const { return this->checkpoint_bytes; }
+  const std::string& getStopAfter() const { return this->stop_after; }
+
+  // The external route is opt-in until all legacy phases have disk-first
+  // implementations. A workspace is semantic state; the remaining knobs below
+  // are operational and may change when a build is resumed.
+  bool externalMemory() const { return !(this->work_directory.empty()); }
 
   size_type doubling_steps;
   size_type size_limit;
   size_type memory_limit;
   size_type sample_period;
   size_type lcp_branching;
+
+  std::string work_directory;
+  bool resume, keep_work, verify_workspace, clean_obsolete, allow_path_explosion;
+  size_type io_buffer_size, sort_run_size, join_partition_size;
+  size_type merge_fan_in, max_open_files;
+  size_type checkpoint_records, checkpoint_bytes;
+  std::string stop_after;
 };
 
 //------------------------------------------------------------------------------

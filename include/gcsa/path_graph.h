@@ -29,6 +29,7 @@
 #include <gcsa/dbg.h>
 #include <gcsa/files.h>
 #include <gcsa/internal.h>
+#include <gcsa/workspace.h>
 
 namespace gcsa
 {
@@ -295,6 +296,12 @@ struct PathGraph
   std::vector<std::string> path_names, rank_names;
   std::vector<size_type>   path_counts, rank_counts;
 
+  // `file` in the legacy code is a physical stream index. It must never be
+  // used as source-graph identity: one logical graph may have many spill
+  // shards. These strong, parallel identifiers make that distinction explicit.
+  std::vector<logical_file_id_t> logical_file_ids;
+  std::vector<physical_shard_id_t> physical_shard_ids;
+
   size_type path_count, rank_count, range_count;
   size_type order, doubling_steps;
 
@@ -321,6 +328,8 @@ struct PathGraph
   inline size_type k() const { return this->order; }
   inline size_type step() const { return this->doubling_steps; }
   inline size_type files() const { return this->path_names.size(); }
+  inline logical_file_id_t logicalFile(size_type file) const { return this->logical_file_ids.at(file); }
+  inline physical_shard_id_t physicalShard(size_type file) const { return this->physical_shard_ids.at(file); }
 
   inline size_type bytes() const
   {
@@ -343,6 +352,18 @@ struct PathGraph
   PathGraph(const PathGraph&) = delete;
   PathGraph& operator= (const PathGraph&) = delete;
 };
+
+struct ExternalPathSortStats
+{
+  size_type runs, merge_passes, max_records_resident, max_bytes_resident;
+
+  ExternalPathSortStats() : runs(0), merge_passes(0), max_records_resident(0), max_bytes_resident(0) { }
+};
+
+// Sort one physical PathGraph file without materializing it in memory.
+size_type externalPathGraphSortMinimumBudget();
+void externalPathGraphSort(PathGraph& graph, size_type file,
+  size_type byte_budget, size_type fan_in, ExternalPathSortStats* stats = nullptr);
 
 //------------------------------------------------------------------------------
 

@@ -41,6 +41,13 @@ constexpr size_type ConstructionParameters::MEMORY_LIMIT;
 constexpr size_type ConstructionParameters::ABSOLUTE_MEMORY_LIMIT;
 constexpr size_type ConstructionParameters::SAMPLE_PERIOD;
 constexpr size_type ConstructionParameters::LCP_BRANCHING;
+constexpr size_type ConstructionParameters::IO_BUFFER_SIZE;
+constexpr size_type ConstructionParameters::SORT_RUN_SIZE;
+constexpr size_type ConstructionParameters::JOIN_PARTITION_SIZE;
+constexpr size_type ConstructionParameters::MERGE_FAN_IN;
+constexpr size_type ConstructionParameters::MAX_OPEN_FILES;
+constexpr size_type ConstructionParameters::CHECKPOINT_RECORDS;
+constexpr size_type ConstructionParameters::CHECKPOINT_BYTES;
 
 constexpr Alphabet::size_type Alphabet::MAX_SIGMA;
 constexpr Alphabet::size_type Alphabet::SOURCE_COMP;
@@ -96,7 +103,12 @@ const sdsl::int_vector<8> Alphabet::DEFAULT_COMP2CHAR = { '$', 'A', 'C', 'G', 'T
 ConstructionParameters::ConstructionParameters() :
   doubling_steps(DOUBLING_STEPS), size_limit(SIZE_LIMIT * GIGABYTE),
   memory_limit(MEMORY_LIMIT * GIGABYTE), sample_period(SAMPLE_PERIOD),
-  lcp_branching(LCP_BRANCHING)
+  lcp_branching(LCP_BRANCHING),
+  resume(false), keep_work(false), verify_workspace(false), clean_obsolete(false),
+  allow_path_explosion(false), io_buffer_size(IO_BUFFER_SIZE),
+  sort_run_size(SORT_RUN_SIZE), join_partition_size(JOIN_PARTITION_SIZE),
+  merge_fan_in(MERGE_FAN_IN), max_open_files(MAX_OPEN_FILES),
+  checkpoint_records(CHECKPOINT_RECORDS), checkpoint_bytes(CHECKPOINT_BYTES)
 {
 }
 
@@ -147,6 +159,70 @@ void
 ConstructionParameters::setLCPBranching(size_type factor)
 {
   this->lcp_branching = std::max((size_type)2, factor);
+}
+
+void
+ConstructionParameters::setWorkDirectory(const std::string& directory)
+{
+  this->work_directory = directory;
+  while(this->work_directory.length() > 1 && this->work_directory.back() == '/')
+  {
+    this->work_directory.pop_back();
+  }
+}
+
+void ConstructionParameters::setResume(bool value) { this->resume = value; }
+void ConstructionParameters::setKeepWork(bool value) { this->keep_work = value; }
+void ConstructionParameters::setVerifyWorkspace(bool value) { this->verify_workspace = value; }
+void ConstructionParameters::setCleanObsolete(bool value) { this->clean_obsolete = value; }
+void ConstructionParameters::setAllowPathExplosion(bool value) { this->allow_path_explosion = value; }
+
+void
+ConstructionParameters::setIOBufferSize(size_type bytes)
+{
+  this->io_buffer_size = std::max((size_type)KILOBYTE, bytes);
+}
+
+void
+ConstructionParameters::setSortRunSize(size_type bytes)
+{
+  this->sort_run_size = std::max((size_type)KILOBYTE, bytes);
+}
+
+void
+ConstructionParameters::setJoinPartitionSize(size_type bytes)
+{
+  this->join_partition_size = std::max((size_type)KILOBYTE, bytes);
+}
+
+void
+ConstructionParameters::setMergeFanIn(size_type fan_in)
+{
+  this->merge_fan_in = std::max((size_type)2, fan_in);
+}
+
+void
+ConstructionParameters::setMaxOpenFiles(size_type files)
+{
+  this->max_open_files = std::max((size_type)4, files);
+}
+
+void
+ConstructionParameters::setCheckpointRecords(size_type records)
+{
+  this->checkpoint_records = std::max((size_type)1, records);
+}
+
+void
+ConstructionParameters::setCheckpointBytes(size_type bytes)
+{
+  this->checkpoint_bytes = std::max((size_type)KILOBYTE, bytes);
+}
+
+void
+ConstructionParameters::setStopAfter(const std::string& phase)
+{
+  this->stop_after = phase;
 }
 
 //------------------------------------------------------------------------------
