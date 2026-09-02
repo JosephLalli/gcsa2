@@ -660,6 +660,9 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
                   << join_stats.label_sort_runs << " label runs, "
                   << join_stats.label_merge_passes << " label merge passes, "
                   << join_stats.blocked_key_groups << " blocked key groups" << std::endl;
+        std::cerr << "externalPathGraphExtend(): "
+                  << join_stats.join_parallel_sorts << " parallel join sorts, "
+                  << join_stats.label_parallel_sorts << " parallel label sorts" << std::endl;
         std::cerr << "externalPathGraphExtend(): maximum bounded workspace "
                   << formatBytes(join_stats.max_bytes_resident) << " ("
                   << join_stats.max_records_resident << " records)" << std::endl;

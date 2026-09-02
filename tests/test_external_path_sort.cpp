@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
+#include <iostream>
 #include <sys/wait.h>
 #include <type_traits>
 #include <unistd.h>
@@ -82,6 +83,10 @@ static void check_sorted(PathGraph& graph, std::vector<TestRecord> expected)
   std::vector<PathNode> paths;
   std::vector<PathNode::rank_type> ranks;
   graph.read(paths, ranks, 0);
+  if(paths.size() != expected.size())
+  {
+    std::cerr << "path count mismatch: " << paths.size() << " != " << expected.size() << std::endl;
+  }
   require(paths.size() == expected.size());
   size_type pointer = 0;
   for(size_type i = 0; i < paths.size(); i++)
@@ -94,6 +99,11 @@ static void check_sorted(PathGraph& graph, std::vector<TestRecord> expected)
     require(paths[i].pointer() == pointer);
     for(size_type j = 0; j < paths[i].ranks(); j++)
     {
+      if(ranks[pointer + j] != expected[i].labels[j])
+      {
+        std::cerr << "rank mismatch at path " << i << ", rank " << j << ": "
+                  << ranks[pointer + j] << " != " << expected[i].labels[j] << std::endl;
+      }
       require(ranks[pointer + j] == expected[i].labels[j]);
     }
     pointer += paths[i].ranks();
@@ -139,7 +149,9 @@ int main()
     { 1, 25, 1, 2, 1, { 1, 5, 70 } }
   };
   std::vector<TestRecord> records;
-  for(size_type copy = 0; copy < 6; copy++)
+  // Keep enough records to force multiple merge levels even when the sorter
+  // uses the intended two-thirds of a minimum-sized budget for run records.
+  for(size_type copy = 0; copy < 12; copy++)
   {
     for(size_type i = 0; i < pattern.size(); i++)
     {
@@ -148,13 +160,28 @@ int main()
       records.push_back(record);
     }
   }
+  std::vector<TestRecord> parallel_records;
+  parallel_records.reserve(66000);
+  for(size_type copy = 0; copy < 11000; copy++)
+  {
+    for(size_type i = 0; i < pattern.size(); i++)
+    {
+      TestRecord record = pattern[i];
+      record.from += 100 * copy; record.to += 100 * copy;
+      parallel_records.push_back(record);
+    }
+  }
   const std::string base = "test_external_path_sort_" + std::to_string((unsigned long long)getpid());
   const std::string path_a = base + ".a.path", rank_a = base + ".a.rank";
   const std::string path_b = base + ".b.path", rank_b = base + ".b.rank";
   const std::string path_c = base + ".c.path", rank_c = base + ".c.rank";
   const std::string path_d = base + ".d.path", rank_d = base + ".d.rank";
+  const std::string path_e = base + ".e.path", rank_e = base + ".e.rank";
+  const std::string path_f = base + ".f.path", rank_f = base + ".f.rank";
   write_input(path_a, rank_a, records); write_input(path_b, rank_b, records);
   write_input(path_c, rank_c, records); write_input(path_d, rank_d, records);
+  write_input(path_e, rank_e, records);
+  write_input(path_f, rank_f, parallel_records);
 
   PathGraph first(path_a, rank_a);
   first.logical_file_ids[0] = logical_file_id_t(17);
@@ -164,6 +191,7 @@ int main()
   externalPathGraphSort(first, 0, budget, 2, &first_stats);
   check_sorted(first, records);
   require(first_stats.runs > 2);
+  require(first_stats.merge_operations > 0);
   require(first_stats.merge_passes >= 2);
   require(first_stats.max_records_resident < records.size());
   require(first_stats.max_bytes_resident <= budget);
@@ -177,15 +205,41 @@ int main()
   require(first_ranks == read_ranks(second.rank_names[0]));
   require(first.files() == 1 && second.files() == 1);
 
+  // With enough room for the input, the sole sorted run is consumed directly
+  // instead of being copied through a degenerate one-input merge.
+  PathGraph single_run(path_e, rank_e);
+  ExternalPathSortStats single_run_stats;
+  externalPathGraphSort(single_run, 0, MEGABYTE, 2, &single_run_stats);
+  check_sorted(single_run, records);
+  require(single_run_stats.runs == 1);
+  require(single_run_stats.merge_operations == 0);
+
+  // Force the production parallel-sort branch without making the ordinary
+  // forced-spill cases large. The comparator's complete semantic tie-breakers
+  // must produce the same order as the sequential reference.
+  int old_threads = omp_get_max_threads();
+  omp_set_num_threads(2);
+  PathGraph parallel_run(path_f, rank_f);
+  ExternalPathSortStats parallel_stats;
+  externalPathGraphSort(parallel_run, 0, 16 * MEGABYTE, 2, &parallel_stats);
+  omp_set_num_threads(old_threads);
+  check_sorted(parallel_run, parallel_records);
+  require(parallel_stats.runs == 1);
+  require(parallel_stats.parallel_sorts == 1);
+
   expect_sort_failure(path_c, rank_c, budget - 1, false, false);
   expect_sort_failure(path_c, rank_c, budget, true, false);
   expect_sort_failure(path_d, rank_d, budget, false, true);
 
   std::remove(first.path_names[0].c_str()); std::remove(first.rank_names[0].c_str());
   std::remove(second.path_names[0].c_str()); std::remove(second.rank_names[0].c_str());
+  std::remove(single_run.path_names[0].c_str()); std::remove(single_run.rank_names[0].c_str());
+  std::remove(parallel_run.path_names[0].c_str()); std::remove(parallel_run.rank_names[0].c_str());
   std::remove(path_a.c_str()); std::remove(rank_a.c_str());
   std::remove(path_b.c_str()); std::remove(rank_b.c_str());
   std::remove(path_c.c_str()); std::remove(rank_c.c_str());
   std::remove(path_d.c_str()); std::remove(rank_d.c_str());
+  std::remove(path_e.c_str()); std::remove(rank_e.c_str());
+  std::remove(path_f.c_str()); std::remove(rank_f.c_str());
   return 0;
 }
