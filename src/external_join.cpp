@@ -463,7 +463,7 @@ struct JoinHeapComparator
 
 JoinRun
 mergeJoinRuns(const std::vector<JoinRun>& inputs, logical_file_id_t logical,
-  JoinKeyKind kind, ExternalPathJoinStats* stats)
+  JoinKeyKind kind, bool verify_payloads, ExternalPathJoinStats* stats)
 {
   if(inputs.empty()) { throw joinError("cannot merge an empty run set"); }
   std::vector<std::unique_ptr<JoinFileReader>> readers;
@@ -473,7 +473,7 @@ mergeJoinRuns(const std::vector<JoinRun>& inputs, logical_file_id_t logical,
   for(size_type i = 0; i < inputs.size(); i++)
   {
     readers.emplace_back(new JoinFileReader(inputs[i], logical, kind));
-    readers.back()->validate();
+    if(verify_payloads) { readers.back()->validate(); }
     if(readers.back()->size() > 0) { readers.back()->read(0, current[i]); }
   }
   std::priority_queue<size_type, std::vector<size_type>, JoinHeapComparator>
@@ -509,9 +509,10 @@ class ExternalJoinSorter
 {
 public:
   ExternalJoinSorter(logical_file_id_t logical, JoinKeyKind kind,
-    size_type byte_budget, size_type requested_fan_in, ExternalPathJoinStats* stats) :
+    size_type byte_budget, size_type requested_fan_in, bool verify_payloads,
+    ExternalPathJoinStats* stats) :
     logical_id(logical), key_kind(kind), budget(byte_budget), fan_in(0),
-    run_records(0), statistics(stats)
+    run_records(0), verify_runs(verify_payloads), statistics(stats)
   {
     if(this->budget < externalPathJoinMinimumBudget())
     {
@@ -566,7 +567,8 @@ public:
         size_type last = std::min(remaining.size(), first + this->fan_in);
         if(last - first == 1) { next.push_back(remaining[first]); continue; }
         std::vector<JoinRun> group(remaining.begin() + first, remaining.begin() + last);
-        JoinRun merged = mergeJoinRuns(group, this->logical_id, this->key_kind, this->statistics);
+        JoinRun merged = mergeJoinRuns(group, this->logical_id, this->key_kind,
+          this->verify_runs, this->statistics);
         for(size_type i = 0; i < group.size(); i++) { TempFile::remove(group[i].name); }
         next.push_back(merged);
       }
@@ -598,7 +600,8 @@ private:
     this->levels[level].push_back(run);
     if(this->levels[level].size() < this->fan_in) { return; }
     std::vector<JoinRun> inputs; inputs.swap(this->levels[level]);
-    JoinRun merged = mergeJoinRuns(inputs, this->logical_id, this->key_kind, this->statistics);
+    JoinRun merged = mergeJoinRuns(inputs, this->logical_id, this->key_kind,
+      this->verify_runs, this->statistics);
     for(size_type i = 0; i < inputs.size(); i++) { TempFile::remove(inputs[i].name); }
     this->addRun(merged, level + 1);
   }
@@ -606,6 +609,7 @@ private:
   logical_file_id_t logical_id;
   JoinKeyKind key_kind;
   size_type budget, fan_in, run_records;
+  bool verify_runs;
   ExternalPathJoinStats* statistics;
   std::vector<JoinRecord> buffer;
   std::vector<std::vector<JoinRun>> levels;
@@ -833,11 +837,11 @@ extendRecord(const JoinRecord& left, const JoinRecord& right)
 void
 joinSortedRuns(const JoinRun& left_run, const JoinRun& right_run,
   logical_file_id_t logical, size_type byte_budget, PathPairWriter& output,
-  ExternalPathJoinStats* stats)
+  bool verify_payloads, ExternalPathJoinStats* stats)
 {
   JoinFileReader left(left_run, logical, LEFT_BY_TO);
   JoinFileReader right(right_run, logical, RIGHT_BY_FROM);
-  left.validate(); right.validate();
+  if(verify_payloads) { left.validate(); right.validate(); }
   size_type left_offset = 0, right_offset = 0;
   JoinRecord left_record, right_record;
   while(left_offset < left.size() && right_offset < right.size())
@@ -953,16 +957,17 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
     PathPairWriter output(next, output_file, size_limit, committed_bytes);
 
     ExternalJoinSorter right_sorter(logical, RIGHT_BY_FROM, join_budget,
-      join_fan_in, stats);
+      join_fan_in, parameters.getVerifyWorkspace(), stats);
     scanJoinSide(graph, group.second, logical, RIGHT_BY_FROM, right_sorter, &output, stats);
     JoinRun right = right_sorter.finish();
 
     ExternalJoinSorter left_sorter(logical, LEFT_BY_TO, join_budget,
-      join_fan_in, stats);
+      join_fan_in, parameters.getVerifyWorkspace(), stats);
     scanJoinSide(graph, group.second, logical, LEFT_BY_TO, left_sorter, nullptr, stats);
     JoinRun left = left_sorter.finish();
 
-    joinSortedRuns(left, right, logical, join_budget, output, stats);
+    joinSortedRuns(left, right, logical, join_budget, output,
+      parameters.getVerifyWorkspace(), stats);
     TempFile::remove(left.name); TempFile::remove(right.name);
     output.finish(committed_bytes);
     next.path_counts[output_file] = output.paths();
