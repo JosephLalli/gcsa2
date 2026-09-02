@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <limits>
 #include <queue>
+#include <stdexcept>
 #include <unistd.h>
 
 namespace gcsa
@@ -175,6 +176,50 @@ LCP::LCP(const std::vector<key_type>& keys, size_type _kmer_length)
   for(size_type i = 1; i < keys.size(); i++)
   {
     buffer[i] = Key::lcp(keys[i - 1], keys[i], this->kmer_length);
+  }
+  directConstruct(this->kmer_lcp, buffer);
+}
+
+LCP::LCP(const std::string& key_name, size_type key_count,
+  size_type _kmer_length, size_type buffer_bytes)
+{
+  this->kmer_length = _kmer_length;
+  this->total_keys = key_count;
+  sdsl::int_vector<8> buffer(key_count, 0);
+  if(key_count == 0)
+  {
+    directConstruct(this->kmer_lcp, buffer); return;
+  }
+  if(buffer_bytes < sizeof(key_type)) { buffer_bytes = sizeof(key_type); }
+  size_type records_per_block = std::max(static_cast<size_type>(1),
+    buffer_bytes / sizeof(key_type));
+  std::ifstream input;
+  input.rdbuf()->pubsetbuf(nullptr, 0);
+  input.open(key_name.c_str(), std::ios_base::binary);
+  if(!input) { throw std::runtime_error("LCP: cannot open key stream " + key_name); }
+  std::vector<key_type> keys(records_per_block);
+  key_type previous = 0;
+  size_type seen = 0;
+  while(seen < key_count)
+  {
+    size_type count = std::min(records_per_block, key_count - seen);
+    input.read(reinterpret_cast<char*>(keys.data()), count * sizeof(key_type));
+    if(input.gcount() != static_cast<std::streamsize>(count * sizeof(key_type)))
+    {
+      throw std::runtime_error("LCP: truncated key stream " + key_name);
+    }
+    for(size_type i = 0; i < count; i++)
+    {
+      if(seen + i > 0) { buffer[seen + i] = Key::lcp(previous, keys[i], this->kmer_length); }
+      previous = keys[i];
+    }
+    seen += count;
+  }
+  key_type extra;
+  input.read(reinterpret_cast<char*>(&extra), sizeof(extra));
+  if(input.gcount() != 0)
+  {
+    throw std::runtime_error("LCP: key stream has trailing records " + key_name);
   }
   directConstruct(this->kmer_lcp, buffer);
 }

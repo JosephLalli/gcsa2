@@ -32,6 +32,7 @@
 #include <unistd.h>
 
 #include <gcsa/algorithms.h>
+#include <gcsa/path_graph.h>
 
 using namespace gcsa;
 
