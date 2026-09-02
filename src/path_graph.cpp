@@ -726,8 +726,20 @@ writePathSortRun(const std::string& name, const std::vector<PathSortRecord>& rec
   if(!output) { externalSortFailure("cannot create run " + name); }
   int cache_descriptor = openPathSortCacheDescriptor(name, O_RDWR);
   off_t written = 0, cache_released = 0;
-  if(!records.empty()) { DiskIO::write(output, records.data(), records.size()); }
-  written = pathSortByteOffset(records.size(), sizeof(PathSortRecord));
+  // Do not hand a multi-gigabyte vector to the stream in one call. Linux
+  // charges the resulting dirty page cache to the same cgroup as the resident
+  // sort records; without intermediate eviction, run creation can temporarily
+  // require roughly twice the declared working set.
+  size_type chunk_records = std::max(static_cast<size_type>(1),
+    static_cast<size_type>(PATH_SORT_CACHE_FLUSH_BYTES) / sizeof(PathSortRecord));
+  for(size_type first = 0; first < records.size(); first += chunk_records)
+  {
+    size_type count = std::min(chunk_records, records.size() - first);
+    DiskIO::write(output, records.data() + first, count);
+    addPathSortBytes(written, count, sizeof(PathSortRecord));
+    trimPathSortWrittenCache(output, cache_descriptor, written,
+      cache_released, false, name);
+  }
   trimPathSortWrittenCache(output, cache_descriptor, written, cache_released, true, name);
   output.close();
   ::close(cache_descriptor);
