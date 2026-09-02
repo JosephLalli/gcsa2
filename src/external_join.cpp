@@ -76,6 +76,7 @@ writeAll(int descriptor, const void* source, size_type bytes, const std::string&
     ssize_t written = ::write(descriptor, data, bytes);
     if(written < 0 && errno == EINTR) { continue; }
     if(written <= 0) { throw joinError("write failed", path); }
+    DiskIO::write_volume += static_cast<size_type>(written);
     data += written; bytes -= written;
   }
 }
@@ -90,6 +91,7 @@ pwriteAll(int descriptor, const void* source, size_type bytes, off_t offset,
     ssize_t written = ::pwrite(descriptor, data, bytes, offset);
     if(written < 0 && errno == EINTR) { continue; }
     if(written <= 0) { throw joinError("write failed", path); }
+    DiskIO::write_volume += static_cast<size_type>(written);
     data += written; bytes -= written; offset += written;
   }
 }
@@ -105,6 +107,7 @@ preadAll(int descriptor, void* target, size_type bytes, off_t offset,
     if(read_bytes < 0 && errno == EINTR) { continue; }
     if(read_bytes == 0) { throw joinError("unexpected end of file", path); }
     if(read_bytes < 0) { throw joinError("read failed", path); }
+    DiskIO::read_volume += static_cast<size_type>(read_bytes);
     data += read_bytes; bytes -= read_bytes; offset += read_bytes;
   }
 }
@@ -858,8 +861,19 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
     next.path_counts[output_file] = output.paths();
     next.rank_counts[output_file] = output.ranks();
     next.path_count += output.paths(); next.rank_count += output.ranks();
+    ExternalPathSortStats sort_stats;
     externalPathGraphSort(next, output_file, sort_budget,
-      label_fan_in);
+      label_fan_in, (stats == nullptr ? nullptr : &sort_stats));
+    if(stats != nullptr)
+    {
+      stats->label_sort_runs += sort_stats.runs;
+      stats->label_merge_passes = std::max(stats->label_merge_passes,
+        sort_stats.merge_passes);
+      stats->max_records_resident = std::max(stats->max_records_resident,
+        sort_stats.max_records_resident);
+      stats->max_bytes_resident = std::max(stats->max_bytes_resident,
+        sort_stats.max_bytes_resident);
+    }
     output_file++;
   }
 

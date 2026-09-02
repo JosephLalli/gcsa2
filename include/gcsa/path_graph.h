@@ -369,11 +369,13 @@ struct ExternalPathJoinStats
 {
   size_type left_records, right_records, sorted_bypass, generated_records;
   size_type initial_runs, merge_operations, blocked_key_groups;
+  size_type label_sort_runs, label_merge_passes;
   size_type max_records_resident, max_bytes_resident;
 
   ExternalPathJoinStats() :
     left_records(0), right_records(0), sorted_bypass(0), generated_records(0),
     initial_runs(0), merge_operations(0), blocked_key_groups(0),
+    label_sort_runs(0), label_merge_passes(0),
     max_records_resident(0), max_bytes_resident(0) { }
 };
 

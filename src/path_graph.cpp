@@ -494,11 +494,13 @@ readPathSortRecord(std::ifstream& paths, std::ifstream& ranks, PathSortRecord& r
   size_type& rank_offset, size_type rank_count)
 {
   paths.read(reinterpret_cast<char*>(&record.node), sizeof(PathNode));
+  DiskIO::read_volume += paths.gcount();
   if(paths.eof() && paths.gcount() == 0) { return false; }
   if(paths.gcount() != sizeof(PathNode)) { externalSortFailure("truncated path file"); }
   validatePathSortRecord(record, rank_offset, rank_count);
   size_type count = record.node.ranks();
   ranks.read(reinterpret_cast<char*>(record.labels), count * sizeof(PathNode::rank_type));
+  DiskIO::read_volume += ranks.gcount();
   if(ranks.gcount() != (std::streamsize)(count * sizeof(PathNode::rank_type))) { externalSortFailure("truncated rank file"); }
   rank_offset += count;
   return true;
@@ -544,6 +546,7 @@ struct PathSortRunReader
   {
     this->file.read(reinterpret_cast<char*>(this->buffer.data()), this->buffer.size() * sizeof(PathSortRecord));
     std::streamsize bytes = this->file.gcount();
+    DiskIO::read_volume += bytes;
     if(bytes % (std::streamsize)sizeof(PathSortRecord) != 0) { externalSortFailure("truncated run"); }
     this->buffer.resize(bytes / sizeof(PathSortRecord));
     this->offset = 0;
