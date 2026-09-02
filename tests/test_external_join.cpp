@@ -187,7 +187,10 @@ int main()
   require(external.logicalFile(0) == logical_file_id_t(7));
   require(stats.generated_records == left.size() * right.size());
   require(stats.sorted_bypass == 1);
+  require(stats.direct_label_records == stats.generated_records + stats.sorted_bypass);
+  require(stats.intermediate_path_bytes_avoided > 0);
   require(stats.initial_runs > 2 && stats.merge_operations > 0);
+  require(stats.label_sort_runs > 2 && stats.label_merge_passes > 0);
   require(stats.blocked_key_groups > 0);
   require(stats.max_bytes_resident <= memory_budget);
 
