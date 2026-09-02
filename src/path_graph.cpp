@@ -898,9 +898,13 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   size_type merge_available = available - fan_in * reader_overhead;
   size_type merge_records = merge_available / ((fan_in + 1) * record_bytes);
   if(merge_records == 0) { externalSortFailure("byte budget cannot buffer a merge"); }
-  // Use two thirds for sorting records and leave one third for allocator / I/O
-  // slack. Compute the slack first to avoid overflowing on a large byte limit.
-  size_type run_bytes = available - available / 3;
+  // Use three quarters for the in-place record sort. The remaining quarter is
+  // deliberately much larger than the byte-counted stream buffers, OpenMP
+  // task stacks, allocator metadata, and rolling output-cache window. Keeping
+  // that safety reserve while crossing common one-run thresholds avoids a
+  // complete read/write merge pass. Compute the slack first to avoid overflow
+  // on a large byte limit.
+  size_type run_bytes = available - available / 4;
   size_type run_records = std::max((size_type)1, run_bytes / record_bytes);
 
   std::array<char, PATH_SORT_STREAM_BUFFER_BYTES> path_stream_buffer;
