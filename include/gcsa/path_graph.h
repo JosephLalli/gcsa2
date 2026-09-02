@@ -384,6 +384,8 @@ struct ExternalPathJoinStats
   size_type initial_runs, merge_operations, blocked_key_groups;
   size_type join_parallel_sorts, label_sort_runs, label_merge_passes, label_parallel_sorts;
   size_type direct_label_records, intermediate_path_bytes_avoided;
+  size_type join_partitions, worker_processes, restored_partitions;
+  size_type recursive_splits, left_range_splits, right_range_splits;
   size_type max_records_resident, max_bytes_resident;
 
   ExternalPathJoinStats() :
@@ -391,6 +393,8 @@ struct ExternalPathJoinStats
     initial_runs(0), merge_operations(0), blocked_key_groups(0),
     join_parallel_sorts(0), label_sort_runs(0), label_merge_passes(0), label_parallel_sorts(0),
     direct_label_records(0), intermediate_path_bytes_avoided(0),
+    join_partitions(0), worker_processes(0), restored_partitions(0),
+    recursive_splits(0), left_range_splits(0), right_range_splits(0),
     max_records_resident(0), max_bytes_resident(0) { }
 };
 
@@ -398,7 +402,12 @@ struct ExternalPathJoinStats
 // the same logical ID are joined together, regardless of physical layout.
 size_type externalPathJoinMinimumBudget();
 void externalPathGraphExtend(PathGraph& graph, size_type size_limit,
-  const ConstructionParameters& parameters, ExternalPathJoinStats* stats = nullptr);
+  const ConstructionParameters& parameters, ExternalPathJoinStats* stats = nullptr,
+  BuildWorkspace* workspace = nullptr, const std::string& checkpoint_task = std::string());
+
+// Hidden child-process entry point used by build_gcsa and vg. The task file is
+// versioned and contains immutable run ranges plus unique output paths.
+int externalPathJoinWorker(const std::string& task_file);
 
 //------------------------------------------------------------------------------
 

@@ -46,6 +46,7 @@ struct ConstructionParameters
   constexpr static size_type JOIN_PARTITION_SIZE   = 16 * GIGABYTE;
   constexpr static size_type MERGE_FAN_IN          = 64;
   constexpr static size_type MAX_OPEN_FILES        = 128;
+  constexpr static size_type PROCESS_WORKERS       = 1;
   constexpr static size_type CHECKPOINT_RECORDS    = 16 * MILLION;
   constexpr static size_type CHECKPOINT_BYTES      = GIGABYTE;
   
@@ -70,6 +71,8 @@ struct ConstructionParameters
   void setJoinPartitionSize(size_type bytes);
   void setMergeFanIn(size_type fan_in);
   void setMaxOpenFiles(size_type files);
+  void setProcessWorkers(size_type workers);
+  void setWorkerExecutable(const std::string& executable);
   void setCheckpointRecords(size_type records);
   void setCheckpointBytes(size_type bytes);
   void setStopAfter(const std::string& phase);
@@ -90,6 +93,8 @@ struct ConstructionParameters
   size_type getJoinPartitionSize() const { return this->join_partition_size; }
   size_type getMergeFanIn() const { return this->merge_fan_in; }
   size_type getMaxOpenFiles() const { return this->max_open_files; }
+  size_type getProcessWorkers() const { return this->process_workers; }
+  const std::string& getWorkerExecutable() const { return this->worker_executable; }
   size_type getCheckpointRecords() const { return this->checkpoint_records; }
   size_type getCheckpointBytes() const { return this->checkpoint_bytes; }
   const std::string& getStopAfter() const { return this->stop_after; }
@@ -109,6 +114,8 @@ struct ConstructionParameters
   bool resume, keep_work, verify_workspace, clean_obsolete, allow_path_explosion;
   size_type io_buffer_size, sort_run_size, join_partition_size;
   size_type merge_fan_in, max_open_files;
+  size_type process_workers;
+  std::string worker_executable;
   size_type checkpoint_records, checkpoint_bytes;
   std::string stop_after;
 };

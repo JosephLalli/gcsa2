@@ -125,15 +125,19 @@ readGraph(const PathGraph& graph)
 
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
-  omp_set_num_threads(1);
-  std::vector<TestRecord> left =
+  if(argc == 3 && std::string(argv[1]) == "gcsa-worker-task")
   {
-    { 1, 100, 1, 10, false },
-    { 2, 100, 2, 20, false },
-    { 3, 100, 4, 30, false }
-  };
+    return externalPathJoinWorker(argv[2]);
+  }
+  omp_set_num_threads(1);
+  std::vector<TestRecord> left;
+  for(size_type i = 0; i < 40; i++)
+  {
+    left.push_back({ i + 1, 100, static_cast<byte_type>(1 << (i % 4)),
+      static_cast<PathNode::rank_type>(10 + i), false });
+  }
   std::vector<TestRecord> right;
   // Exceed both the minimum-budget run buffer and the two-reader merge cache
   // so this remains a forced multi-run, pathological-key spill test even when
@@ -200,6 +204,73 @@ int main()
   semantic["fixture"] = "external-join";
   BuildWorkspace workspace(workspace_root, semantic, BuildWorkspace::Settings(),
     BuildWorkspace::NEW_WORKSPACE);
+
+  // The same skewed key must be splittable across fork-free worker processes.
+  // Every physical result shard retains logical ID 7, and the PathGraph merger
+  // must observe exactly the same semantic record multiset as the legacy path.
+  PathGraph process_graph(left_path, left_rank);
+  process_graph.order = 1;
+  process_graph.logical_file_ids[0] = logical_file_id_t(7);
+  process_graph.physical_shard_ids[0] = physical_shard_id_t(101);
+  appendShard(process_graph, right_path, right_rank,
+    logical_file_id_t(7), physical_shard_id_t(202));
+  ConstructionParameters process_parameters = parameters;
+  process_parameters.setMemoryLimitBytes(8 * MEGABYTE);
+  process_parameters.setJoinPartitionSize(2 * MEGABYTE);
+  process_parameters.setSortRunSize(2 * MEGABYTE);
+  process_parameters.setCheckpointBytes(32 * KILOBYTE);
+  process_parameters.setProcessWorkers(2);
+  process_parameters.setWorkerExecutable(argv[0]);
+  omp_set_num_threads(4);
+  ExternalPathJoinStats process_stats;
+  externalPathGraphExtend(process_graph, GIGABYTE,
+    process_parameters, &process_stats, &workspace, "step-process");
+  omp_set_num_threads(1);
+  require(readGraph(legacy) == readGraph(process_graph));
+  require(process_graph.files() > 1);
+  for(size_type file = 0; file < process_graph.files(); file++)
+  {
+    require(process_graph.logicalFile(file) == logical_file_id_t(7));
+  }
+  require(process_stats.join_partitions > 1);
+  require(process_stats.worker_processes == process_stats.join_partitions);
+  require(process_stats.recursive_splits > 0);
+  require(process_stats.left_range_splits > 0);
+  require(process_stats.right_range_splits > 0);
+  require(process_stats.generated_records == left.size() * right.size());
+  require(process_stats.sorted_bypass == 1);
+  require(process_stats.max_bytes_resident <= process_parameters.getMemoryLimitBytes());
+
+  PathGraph resumed_process(left_path, left_rank);
+  resumed_process.order = 1;
+  resumed_process.logical_file_ids[0] = logical_file_id_t(7);
+  resumed_process.physical_shard_ids[0] = physical_shard_id_t(101);
+  appendShard(resumed_process, right_path, right_rank,
+    logical_file_id_t(7), physical_shard_id_t(202));
+  ExternalPathJoinStats resumed_stats;
+  externalPathGraphExtend(resumed_process, GIGABYTE,
+    process_parameters, &resumed_stats, &workspace, "step-process");
+  require(readGraph(process_graph) == readGraph(resumed_process));
+  require(resumed_stats.worker_processes == 0);
+  require(resumed_stats.restored_partitions == resumed_stats.join_partitions);
+
+  // Requesting multiple workers must remain valid when the deterministic plan
+  // contains only one task. This is common for small logical inputs.
+  PathGraph one_partition(left_path, left_rank);
+  one_partition.order = 1;
+  one_partition.logical_file_ids[0] = logical_file_id_t(7);
+  one_partition.physical_shard_ids[0] = physical_shard_id_t(101);
+  appendShard(one_partition, right_path, right_rank,
+    logical_file_id_t(7), physical_shard_id_t(202));
+  ConstructionParameters one_parameters = process_parameters;
+  one_parameters.setCheckpointBytes(GIGABYTE);
+  ExternalPathJoinStats one_stats;
+  externalPathGraphExtend(one_partition, GIGABYTE, one_parameters, &one_stats);
+  require(readGraph(legacy) == readGraph(one_partition));
+  require(one_partition.files() == 1);
+  require(one_stats.join_partitions == 1);
+  require(one_stats.worker_processes == 1);
+
   checkpointPathGraph(workspace, external, "step-01", "extend", 4096);
   require(pathGraphCheckpointExists(workspace, "step-01", "extend"));
   PathGraph restored(0, 1, 0);
