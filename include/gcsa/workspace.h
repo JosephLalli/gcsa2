@@ -60,6 +60,11 @@ public:
   void commit_task(const std::string&,const std::string&,const std::vector<ArtifactRef>&,const std::vector<std::string>& dependencies=std::vector<std::string>());
   void validate_artifact(const ArtifactIdentity&,logical_file_id_t,physical_shard_id_t) const;
   void validate_artifact(logical_file_id_t,physical_shard_id_t) const;
+  bool task_completed(const std::string& task,const std::string& phase) const;
+  std::vector<uint8_t> read_artifact_payload(const ArtifactIdentity&,
+    logical_file_id_t,physical_shard_id_t,size_t maximum_bytes) const;
+  void restore_artifact(const ArtifactIdentity&,logical_file_id_t,
+    physical_shard_id_t,const std::string& output_path,size_t buffer_bytes) const;
   void recover(); static uint64_t checksum(const void*,size_t,uint64_t seed=1469598103934665603ULL);
 private:
   std::string directory_,fingerprint_; Settings semantic_,operational_;

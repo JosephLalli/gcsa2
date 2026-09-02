@@ -47,13 +47,13 @@ endif
 CXX_FLAGS=$(MY_CXX_FLAGS) $(VERIFY_FLAGS) $(PARALLEL_FLAGS) $(MY_CXX_OPT_FLAGS) -Iinclude -I$(INC_DIR)
 
 HEADERS=$(wildcard include/gcsa/*.h)
-LIBOBJS=$(addprefix $(BUILD_OBJ)/,algorithms.o dbg.o external_join.o files.o gcsa.o internal.o lcp.o path_graph.o support.o utils.o resources.o workspace.o)
+LIBOBJS=$(addprefix $(BUILD_OBJ)/,algorithms.o checkpoint.o dbg.o external_join.o files.o gcsa.o internal.o lcp.o path_graph.o support.o utils.o resources.o workspace.o)
 LIBRARY=$(BUILD_LIB)/libgcsa2.a
 
 PROGRAMS=$(addprefix $(BUILD_BIN)/,build_gcsa convert_graph gcsa_format try_extend)
 OBSOLETE=build_gcsa convert_graph gcsa_format try_extend
 
-.PHONY: all clean directories test workspace-test external-path-sort-test external-join-test internal-buffer-test parameter-test
+.PHONY: all clean directories test workspace-test external-path-sort-test external-join-test internal-buffer-test parameter-test construction-resume-test
 all: directories $(LIBRARY) $(PROGRAMS)
 
 directories: $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)
@@ -111,7 +111,14 @@ parameter-test: directories $(BUILD_OBJ)/test_parameters.o $(LIBRARY)
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_parameters $(BUILD_OBJ)/test_parameters.o $(LIBRARY) $(LIBS)
 	$(BUILD_BIN)/test_parameters
 
-test: workspace-test external-path-sort-test external-join-test internal-buffer-test parameter-test
+$(BUILD_OBJ)/test_construction_resume.o:tests/test_construction_resume.cpp include/gcsa/checkpoint.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+construction-resume-test: directories $(BUILD_OBJ)/test_construction_resume.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_construction_resume $(BUILD_OBJ)/test_construction_resume.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_construction_resume
+
+test: workspace-test external-path-sort-test external-join-test internal-buffer-test parameter-test construction-resume-test
 
 clean:
 	rm -rf $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)

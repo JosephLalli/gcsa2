@@ -520,17 +520,22 @@ struct PathSortRunReader
 {
   std::ifstream file;
   std::vector<PathSortRecord> buffer;
-  size_type offset, buffer_records;
+  size_type offset, buffer_records, total_records;
   bool at_end;
 
-  PathSortRunReader(const std::string& name, size_type buffer_records) :
-    file(), buffer(), offset(0), buffer_records(buffer_records), at_end(false)
+  PathSortRunReader(const std::string& name, size_type requested_records) :
+    file(), buffer(), offset(0), buffer_records(1), total_records(0), at_end(false)
   {
     // The explicit byte-counted vector is the only input buffer. Otherwise
     // libstdc++ adds an unaccounted buffer for every merge input stream.
     this->file.rdbuf()->pubsetbuf(nullptr, 0);
     this->file.open(name.c_str(), std::ios_base::binary);
     if(!this->file) { externalSortFailure("cannot open run " + name); }
+    size_type bytes = fileSize(this->file);
+    if(bytes % sizeof(PathSortRecord) != 0) { externalSortFailure("truncated run " + name); }
+    this->total_records = bytes / sizeof(PathSortRecord);
+    this->buffer_records = std::max((size_type)1,
+      std::min(requested_records, this->total_records));
     this->buffer.resize(this->buffer_records);
     this->refill();
   }
@@ -596,11 +601,19 @@ mergePathSortRuns(const std::vector<std::string>& inputs, size_type buffer_recor
   if(!output) { externalSortFailure("cannot create merged run"); }
   std::vector<PathSortRunReader> readers;
   readers.reserve(inputs.size());
-  for(size_type i = 0; i < inputs.size(); i++) { readers.emplace_back(inputs[i], buffer_records); }
+  size_type input_buffer_records = 0, total_records = 0;
+  for(size_type i = 0; i < inputs.size(); i++)
+  {
+    readers.emplace_back(inputs[i], buffer_records);
+    input_buffer_records += readers.back().buffer_records;
+    total_records += readers.back().total_records;
+  }
+  size_type output_records = std::max((size_type)1,
+    std::min(buffer_records, total_records));
   std::vector<PathSortRecord> output_buffer;
-  output_buffer.reserve(std::max((size_type)1, buffer_records));
-  updatePathSortStats(stats, (inputs.size() + 1) * buffer_records,
-    PATH_SORT_FIXED_BYTES + (inputs.size() + 1) * buffer_records * sizeof(PathSortRecord) +
+  output_buffer.reserve(output_records);
+  updatePathSortStats(stats, input_buffer_records + output_records,
+    PATH_SORT_FIXED_BYTES + (input_buffer_records + output_records) * sizeof(PathSortRecord) +
     inputs.size() * (sizeof(PathSortRunReader) + 2 * sizeof(size_type)));
   std::priority_queue<size_type, std::vector<size_type>, PathSortHeapComparator>
     queue{PathSortHeapComparator(&readers)};
@@ -635,11 +648,21 @@ writeSortedPathPair(const std::string& run_name, const std::string& path_name,
   paths.open(path_name.c_str(), std::ios_base::binary);
   ranks.open(rank_name.c_str(), std::ios_base::binary);
   if(!paths || !ranks) { externalSortFailure("cannot create sorted path pair"); }
-  std::vector<PathNode> path_buffer; path_buffer.reserve(std::max((size_type)1, buffer_records));
+  size_type path_buffer_records = std::max((size_type)1,
+    std::min(buffer_records, expected_paths));
+  size_type maximum_rank_records =
+    (buffer_records > std::numeric_limits<size_type>::max() / (PathLabel::LABEL_LENGTH + 1)
+      ? std::numeric_limits<size_type>::max()
+      : buffer_records * (PathLabel::LABEL_LENGTH + 1));
+  size_type rank_buffer_records = std::max((size_type)1,
+    std::min(maximum_rank_records, expected_ranks));
+  std::vector<PathNode> path_buffer; path_buffer.reserve(path_buffer_records);
   std::vector<PathNode::rank_type> rank_buffer;
-  rank_buffer.reserve(std::max((size_type)1, buffer_records) * (PathLabel::LABEL_LENGTH + 1));
-  updatePathSortStats(stats, 2 * buffer_records,
-    PATH_SORT_FIXED_BYTES + 2 * buffer_records * sizeof(PathSortRecord));
+  rank_buffer.reserve(rank_buffer_records);
+  updatePathSortStats(stats, reader.buffer_records + path_buffer_records,
+    PATH_SORT_FIXED_BYTES + reader.buffer_records * sizeof(PathSortRecord) +
+    path_buffer_records * sizeof(PathNode) +
+    rank_buffer_records * sizeof(PathNode::rank_type));
   size_type path_count = 0, rank_count = 0;
   while(!reader.at_end)
   {
@@ -714,6 +737,10 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   {
     externalSortFailure("source path/rank file length does not match metadata");
   }
+  // A budget is an upper bound, not an allocation target. Reserving the full
+  // budget for a tiny run caused small builds to touch many gigabytes.
+  run_records = std::max((size_type)1,
+    std::min(run_records, graph.path_counts[file]));
   // At most fan_in - 1 runs remain at each level. Run metadata therefore uses
   // O(fan_in * log(number_of_runs)) memory rather than one string per run.
   std::vector<std::vector<std::string>> levels;

@@ -1,9 +1,11 @@
 #include <gcsa/path_graph.h>
+#include <gcsa/checkpoint.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <filesystem>
 #include <limits>
 #include <string>
 #include <unistd.h>
@@ -186,6 +188,19 @@ int main()
   require(stats.blocked_key_groups > 0);
   require(stats.max_bytes_resident <= memory_budget);
 
+  char workspace_root[] = "/tmp/gcsa-path-checkpoint-XXXXXX";
+  require(mkdtemp(workspace_root) != nullptr);
+  BuildWorkspace::Settings semantic;
+  semantic["fixture"] = "external-join";
+  BuildWorkspace workspace(workspace_root, semantic, BuildWorkspace::Settings(),
+    BuildWorkspace::NEW_WORKSPACE);
+  checkpointPathGraph(workspace, external, "step-01", "extend", 4096);
+  require(pathGraphCheckpointExists(workspace, "step-01", "extend"));
+  PathGraph restored(0, 1, 0);
+  restorePathGraph(workspace, restored, "step-01", "extend", 4096);
+  require(readGraph(restored) == readGraph(external));
+  require(restored.logicalFile(0) == logical_file_id_t(7));
+
   // Physical shards with different logical IDs must never join.
   PathGraph separated(left_path, left_rank);
   separated.order = 1;
@@ -200,5 +215,6 @@ int main()
   std::remove(combined_path.c_str()); std::remove(combined_rank.c_str());
   std::remove(left_path.c_str()); std::remove(left_rank.c_str());
   std::remove(right_path.c_str()); std::remove(right_rank.c_str());
+  std::filesystem::remove_all(workspace_root);
   return 0;
 }

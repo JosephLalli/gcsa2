@@ -284,13 +284,13 @@ markSourceSinkNodes(std::vector<KMer>& kmers)
 //------------------------------------------------------------------------------
 
 InputGraph::InputGraph(const std::vector<std::string>& files, bool binary_format, const ConstructionParameters& parameters, const Alphabet& alphabet, const std::string& mapping_name) :
-  filenames(files), lcp_name(), alpha(alphabet), binary(binary_format)
+  filenames(files), lcp_name(), mapping_name(mapping_name), alpha(alphabet), binary(binary_format)
 {
   this->build(parameters, mapping_name);
 }
 
 InputGraph::InputGraph(size_type file_count, char** base_names, bool binary_format, const ConstructionParameters& parameters, const Alphabet& alphabet, const std::string& mapping_name) :
-  lcp_name(), alpha(alphabet), binary(binary_format)
+  lcp_name(), mapping_name(mapping_name), alpha(alphabet), binary(binary_format)
 {
   for(size_type file = 0; file < file_count; file++)
   {
@@ -343,8 +343,12 @@ InputGraph::build(const ConstructionParameters& parameters, const std::string& m
     input.close();
   }
   
-  if (this->size() * sizeof(KMer) > parameters.getMemoryLimitBytes()) {
-    std::cerr << "InputGraph::InputGraph(): Memory use of input kmers (" << inGigabytes(this->size() * sizeof(KMer)) << " GB) exceeds memory limit (" << inGigabytes(parameters.getMemoryLimitBytes()) << " GB)" << std::endl;
+  if (!parameters.externalMemory() &&
+      this->size() > parameters.getMemoryLimitBytes() / sizeof(KMer)) {
+    std::cerr << "InputGraph::InputGraph(): Memory use of input kmers ("
+              << (static_cast<double>(this->size()) * sizeof(KMer) / GIGABYTE_DOUBLE)
+              << " GB) exceeds memory limit ("
+              << inGigabytes(parameters.getMemoryLimitBytes()) << " GB)" << std::endl;
     std::exit(EXIT_SIZE_LIMIT_EXCEEDED);
   }
 
