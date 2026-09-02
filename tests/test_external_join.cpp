@@ -208,6 +208,9 @@ int main()
   separated.physical_shard_ids[0] = physical_shard_id_t(101);
   appendShard(separated, right_path, right_rank,
     logical_file_id_t(2), physical_shard_id_t(202));
+  // Exercise the optional full payload-checksum pass as well as the default
+  // header/footer/length validation used above.
+  parameters.setVerifyWorkspace();
   externalPathGraphExtend(separated, GIGABYTE, parameters);
   require(separated.files() == 2);
   require(separated.size() == 1); // Only the already-sorted bypass path remains.
