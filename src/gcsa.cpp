@@ -1,6 +1,8 @@
 #include <gcsa/algorithms.h>
 #include <gcsa/checkpoint.h>
+#include <gcsa/disk_array.h>
 #include <gcsa/external_preprocessing.h>
+#include <gcsa/final_events.h>
 #include <gcsa/internal.h>
 #include <gcsa/path_graph.h>
 #include <gcsa/workspace.h>
@@ -63,6 +65,7 @@ constructionSemanticSettings(const InputGraph& graph,
   // A workspace generated before disk-first preprocessing cannot safely mix
   // old initial/path checkpoints with the v1 reduced key/start artifacts.
   settings["external_preprocessing"] = "v1";
+  settings["external_final_events"] = "v1";
   settings["kmer_length"] = std::to_string(graph.k());
   settings["doubling_steps"] = std::to_string(parameters.getSteps());
   settings["sample_period"] = std::to_string(parameters.getSamplePeriod());
@@ -357,8 +360,11 @@ struct MergedGraphReader
   const DeBruijnGraph*            mapper;
   const sdsl::int_vector<0>*      last_char;
 
-  void init(const MergedGraph& graph, const DeBruijnGraph* _mapper, const sdsl::int_vector<0>* _last_char);
-  void init(const MergedGraph& graph, size_type comp);
+  void init(const MergedGraph& graph, const DeBruijnGraph* _mapper,
+    const sdsl::int_vector<0>* _last_char,
+    size_type buffer_bytes = ReadBuffer<PathNode>::DEFAULT_BUFFER_BYTES);
+  void init(const MergedGraph& graph, size_type comp,
+    size_type buffer_bytes = ReadBuffer<PathNode>::DEFAULT_BUFFER_BYTES);
   void close();
 
   void seek();
@@ -382,11 +388,12 @@ struct MergedGraphReader
 
 void
 MergedGraphReader::init(const MergedGraph& graph,
-  const DeBruijnGraph* _mapper, const sdsl::int_vector<0>* _last_char)
+  const DeBruijnGraph* _mapper, const sdsl::int_vector<0>* _last_char,
+  size_type buffer_bytes)
 {
-  this->paths.open(graph.path_name);
-  this->labels.open(graph.rank_name);
-  this->from_nodes.open(graph.from_name);
+  this->paths.open(graph.path_name, buffer_bytes);
+  this->labels.open(graph.rank_name, buffer_bytes);
+  this->from_nodes.open(graph.from_name, buffer_bytes);
 
   this->path = this->rank = this->from = 0;
   this->seek();
@@ -396,11 +403,12 @@ MergedGraphReader::init(const MergedGraph& graph,
 }
 
 void
-MergedGraphReader::init(const MergedGraph& graph, size_type comp)
+MergedGraphReader::init(const MergedGraph& graph, size_type comp,
+  size_type buffer_bytes)
 {
-  this->paths.open(graph.path_name);
-  this->labels.open(graph.rank_name);
-  this->from_nodes.open(graph.from_name);
+  this->paths.open(graph.path_name, buffer_bytes);
+  this->labels.open(graph.rank_name, buffer_bytes);
+  this->from_nodes.open(graph.from_name, buffer_bytes);
 
   this->path = graph.next[comp];
   this->from = graph.next_from[comp];
@@ -526,6 +534,272 @@ MergedGraphReader::fromNodes(std::vector<node_type>& results, const NodeMapping&
   Node::map(results, mapping);
   removeDuplicates(results, false);
 }
+
+//------------------------------------------------------------------------------
+
+namespace
+{
+
+struct ExternalFinalScanStats
+{
+  DiskBackedArray64::Stats previous_occurrences, suffix_tree_stack;
+  bool restored;
+
+  ExternalFinalScanStats() : previous_occurrences(), suffix_tree_stack(),
+    restored(false) { }
+};
+
+size_type
+checkedProduct(size_type first, size_type second, const std::string& label)
+{
+  if(second != 0 && first > std::numeric_limits<size_type>::max() / second)
+  {
+    throw std::runtime_error("GCSA::GCSA(): " + label + " size overflows");
+  }
+  return first * second;
+}
+
+/*
+  Scan the final MergedGraph once and publish compact immutable events. This is
+  intentionally one atomic task: prev_occ and the suffix-tree traversal stack
+  are mutable disk arrays, and a mid-scan checkpoint would require a committed,
+  idempotent assignment-log protocol. A crash before the task marker therefore
+  discards the event artifacts and restarts this scan, while a completed scan
+  is reusable across operational memory/thread changes.
+*/
+FinalEventMetadata
+produceExternalFinalEvents(const MergedGraph& merged_graph,
+  const DeBruijnGraph& mapper, const sdsl::int_vector<0>& last_char,
+  const sdsl::sd_vector<>& from_nodes,
+  const sdsl::sd_vector<>::rank_1_type& from_rank,
+  size_type unique_from_nodes, const InputGraph& graph,
+  const ConstructionParameters& parameters, BuildWorkspace& workspace,
+  FinalEventFiles& files, size_type checkpoint_buffer,
+  ExternalFinalScanStats* stats)
+{
+  FinalEventMetadata metadata;
+  if(restoreFinalEvents(workspace, files, metadata, merged_graph.size(),
+    graph.alpha.sigma, checkpoint_buffer))
+  {
+    if(stats != nullptr) { stats->restored = true; }
+    return metadata;
+  }
+
+  if(graph.alpha.sigma == 0 || graph.alpha.sigma > FinalEventMetadata::MAX_SIGMA)
+  {
+    throw std::runtime_error("GCSA::GCSA(): external final events require an alphabet of at most 8 components");
+  }
+  const size_type memory_limit = parameters.getMemoryLimitBytes();
+  const size_type safety_margin = memory_limit / 8;
+  MemoryBudget memory(memory_limit, safety_margin);
+
+  // Every ReadBuffer may simultaneously own its foreground window and its
+  // asynchronous refill vector. Reserve both for all three streams in each
+  // MergedGraphReader and for the leaf-LCP reader.
+  const size_type reader_streams = 3 * (graph.alpha.sigma + 1) + 1;
+  const size_type minimum_reader = std::max(sizeof(PathNode),
+    std::max(sizeof(PathNode::rank_type), sizeof(range_type)));
+  size_type reader_buffer = std::max(minimum_reader,
+    std::min(parameters.getIOBufferSize(),
+      memory.available() / std::max(static_cast<size_type>(1), 4 * reader_streams)));
+  size_type reader_reservation_bytes = checkedProduct(2 * reader_streams,
+    reader_buffer, "final reader reservation");
+  MemoryBudget::Reservation reader_reservation = memory.reserve(
+    reader_reservation_bytes, "final-merged-graph-readers");
+
+  const size_type writer_streams = graph.alpha.sigma + 6;
+  size_type writer_buffer = std::max(static_cast<size_type>(16),
+    std::min(parameters.getIOBufferSize(),
+      memory.available() / std::max(static_cast<size_type>(1), 2 * writer_streams)));
+  if(checkedProduct(writer_streams, writer_buffer,
+      "final writer reservation") > memory.available())
+  {
+    throw std::runtime_error("GCSA::GCSA(): memory limit cannot hold final event buffers");
+  }
+
+  std::string previous_name = TempFile::getName("gcsa_final_prev_occ");
+  std::string stack_name = TempFile::getName("gcsa_final_lcp_stack");
+  try
+  {
+    {
+      FinalEventWriter output(files, graph.alpha.sigma, writer_buffer, memory);
+      size_type cache_bytes = memory.available();
+      size_type previous_cache = cache_bytes / 2;
+      size_type stack_cache = cache_bytes - previous_cache;
+      if(unique_from_nodes > 0 && previous_cache < DiskBackedArray64::minimumCacheBytes())
+      {
+        throw std::runtime_error("GCSA::GCSA(): memory limit cannot hold previous-occurrence cache");
+      }
+      if(merged_graph.size() > 0 && stack_cache < DiskBackedArray64::minimumCacheBytes())
+      {
+        throw std::runtime_error("GCSA::GCSA(): memory limit cannot hold suffix-tree stack cache");
+      }
+      DiskBackedArray64 previous(previous_name, unique_from_nodes,
+        previous_cache, memory, true, 64 * KILOBYTE);
+      DiskBackedArray64 stack(stack_name,
+        checkedProduct(merged_graph.size(), 3, "suffix-tree stack"),
+        stack_cache, memory, true, 64 * KILOBYTE);
+
+      std::vector<MergedGraphReader> reader(graph.alpha.sigma + 1);
+      reader[0].init(merged_graph, &mapper, &last_char, reader_buffer);
+      for(size_type comp = 0; comp < graph.alpha.sigma; comp++)
+      {
+        reader[comp + 1].init(merged_graph, comp, reader_buffer);
+      }
+      ReadBuffer<uint8_t> lcp_array;
+      lcp_array.open(merged_graph.lcp_name, reader_buffer);
+
+      PathLabel first, last;
+      std::vector<node_type> pred_from, curr_from;
+      size_type stack_size = 0;
+      for(size_type i = 0; i < merged_graph.size(); i++, reader[0].advance())
+      {
+        size_type indegree = 0, pred_comp = 0;
+        byte_type predecessor_mask = 0;
+        bool sample_this = false;
+        for(size_type comp = 0; comp < graph.alpha.sigma; comp++)
+        {
+          if(!(reader[0].paths[reader[0].path].hasPredecessor(comp))) { continue; }
+          reader[0].predecessor(comp, first, last);
+          if(!(reader[comp + 1].intersect(first, last, 0)))
+          {
+            reader[comp + 1].advance();
+          }
+          if(reader[comp + 1].path >= merged_graph.size())
+          {
+            throw std::runtime_error("GCSA::GCSA(): final edge destination is outside the merged graph");
+          }
+          predecessor_mask |= static_cast<byte_type>(static_cast<size_type>(1) << comp);
+          output.edge(comp, reader[comp + 1].path);
+          indegree++; pred_comp = comp;
+        }
+        output.path(predecessor_mask);
+
+        reader[0].fromNodes(curr_from, graph.mapping);
+        if(curr_from.empty())
+        {
+          throw std::runtime_error("GCSA::GCSA(): merged path has no start node");
+        }
+        output.occurrence(i, curr_from.size() - 1);
+
+        lcp_array.seek(i);
+        size_type curr_lcp = lcp_array[i] + (i > 0 ? 1 : 0);
+        while(stack_size > 0 && stack.get(3 * (stack_size - 1)) > curr_lcp)
+        {
+          stack_size--;
+        }
+        if(stack_size > 0 && stack.get(3 * (stack_size - 1)) == curr_lcp)
+        {
+          stack.set(3 * (stack_size - 1) + 2, i);
+        }
+        else
+        {
+          stack.set(3 * stack_size, curr_lcp);
+          stack.set(3 * stack_size + 1, i);
+          stack.set(3 * stack_size + 2, i);
+          stack_size++;
+        }
+
+        for(node_type node : curr_from)
+        {
+          if(node >= from_nodes.size() || !from_nodes[node])
+          {
+            throw std::runtime_error("GCSA::GCSA(): start node is absent from the external start-node index");
+          }
+          size_type rank = from_rank(node);
+          size_type prior = previous.get(rank);
+          if(prior > 0)
+          {
+            size_type low = 0, high = stack_size;
+            while(low < high)
+            {
+              size_type middle = low + (high - low) / 2;
+              if(stack.get(3 * middle + 2) < prior) { low = middle + 1; }
+              else { high = middle; }
+            }
+            if(low >= stack_size)
+            {
+              throw std::runtime_error("GCSA::GCSA(): invalid previous-occurrence suffix-tree state");
+            }
+            size_type first_time = stack.get(3 * low + 1);
+            if(first_time == 0)
+            {
+              throw std::runtime_error("GCSA::GCSA(): redundancy position underflows");
+            }
+            output.redundancy(first_time - 1);
+          }
+          previous.set(rank, i + 1);
+        }
+
+        if(indegree > 1) { sample_this = true; }
+        if(reader[0].paths[reader[0].path].hasPredecessor(Alphabet::SINK_COMP))
+        {
+          sample_this = true;
+        }
+        for(node_type node : curr_from)
+        {
+          if(node % parameters.getSamplePeriod() == 0)
+          {
+            sample_this = true; break;
+          }
+        }
+
+        if(!sample_this)
+        {
+          if(indegree == 0)
+          {
+            throw std::runtime_error("GCSA::GCSA(): unsampled path has no predecessor");
+          }
+          reader[pred_comp + 1].fromNodes(pred_from, graph.mapping);
+          if(pred_from.size() != curr_from.size()) { sample_this = true; }
+          else
+          {
+            for(size_type j = 0; j < curr_from.size(); j++)
+            {
+              if(curr_from[j] != pred_from[j] + 1)
+              {
+                sample_this = true; break;
+              }
+            }
+          }
+        }
+
+        if(sample_this)
+        {
+          output.sampledPath(i);
+          for(node_type node : curr_from) { output.sample(node); }
+          output.sampleEnd();
+        }
+      }
+      for(MergedGraphReader& current : reader) { current.close(); }
+      lcp_array.close();
+      previous.flush(false); stack.flush(false);
+      if(stats != nullptr)
+      {
+        stats->previous_occurrences = previous.stats();
+        stats->suffix_tree_stack = stack.stats();
+      }
+      metadata = output.finish();
+    }
+
+    TempFile::remove(previous_name); TempFile::remove(stack_name);
+    metadata.fast_chars = graph.alpha.fast_chars;
+    if(metadata.paths != merged_graph.size())
+    {
+      throw std::runtime_error("GCSA::GCSA(): final event path count mismatch");
+    }
+    sortFinalRedundancy(files, parameters);
+    writeFinalEventMetadata(files, metadata);
+    checkpointFinalEvents(workspace, files, metadata, checkpoint_buffer);
+  }
+  catch(...)
+  {
+    TempFile::remove(previous_name); TempFile::remove(stack_name); throw;
+  }
+  return metadata;
+}
+
+} // namespace
 
 //------------------------------------------------------------------------------
 
@@ -753,6 +1027,52 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
   {
     std::cerr << "GCSA::GCSA(): Building the index" << std::endl;
   }
+  size_type occ_count = 0, red_count = 0;
+  if(parameters.externalMemory())
+  {
+    FinalEventFiles event_files(graph.alpha.sigma);
+    ExternalFinalScanStats event_stats;
+    FinalEventMetadata event_metadata = produceExternalFinalEvents(merged_graph,
+      mapper, last_char, from_nodes, from_rank, unique_from_nodes, graph,
+      parameters, *workspace, event_files, checkpoint_buffer, &event_stats);
+    stopAfterCommittedPhase(parameters, "final-events");
+
+    // No final component needs the construction mapper or mutable scan state.
+    // Releasing them before component assembly is an important part of the
+    // working-set reduction.
+    sdsl::util::clear(last_char); sdsl::util::clear(from_nodes);
+    sdsl::util::clear(mapper);
+    this->header.edges = event_metadata.total_edges;
+    buildFinalComponents(*this, graph.alpha, event_files, event_metadata,
+      parameters);
+    if(event_metadata.occurrence_extra >
+       std::numeric_limits<size_type>::max() - event_metadata.paths)
+    {
+      throw std::runtime_error("GCSA::GCSA(): occurrence count overflows");
+    }
+    occ_count = event_metadata.paths + event_metadata.occurrence_extra;
+    red_count = event_metadata.redundant;
+
+    if(Verbosity::level >= Verbosity::EXTENDED)
+    {
+      std::cerr << "GCSA::GCSA(): final events "
+                << (event_stats.restored ? "restored" : "produced") << ", "
+                << event_metadata.total_edges << " edges, "
+                << event_metadata.sample_ids << " sample ids, "
+                << event_metadata.occurrence_items << " nonzero occurrence events, "
+                << event_metadata.redundant << " redundancy events" << std::endl;
+      if(!event_stats.restored)
+      {
+        std::cerr << "GCSA::GCSA(): disk caches: prev-occ "
+                  << event_stats.previous_occurrences.block_reads << " reads / "
+                  << event_stats.previous_occurrences.block_writes << " writes; ST stack "
+                  << event_stats.suffix_tree_stack.block_reads << " reads / "
+                  << event_stats.suffix_tree_stack.block_writes << " writes" << std::endl;
+      }
+    }
+  }
+  else
+  {
   sdsl::int_vector<64> counts(graph.alpha.sigma, 0); // alpha
   std::vector<bit_vector> bwt(graph.alpha.sigma); // fast_bwt, sparse_bwt
   for(size_type comp = 0; comp < bwt.size(); comp++) { bwt[comp] = bit_vector(merged_graph.size(), 0); }
@@ -882,7 +1202,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
   sdsl::util::clear(mapper);
 
   // Initialize extra_pointers and redundant_pointers.
-  size_type occ_count = occurrences.sum() + occurrences.size(), red_count = redundant.sum();
+  occ_count = occurrences.sum() + occurrences.size(); red_count = redundant.sum();
   this->extra_pointers = SadaSparse(occurrences);
   this->redundant_pointers = SadaCount(redundant);
   sdsl::util::clear(occurrences); sdsl::util::clear(redundant);
@@ -917,6 +1237,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
   this->stored_samples = sdsl::int_vector<0>(sample_buffer.size(), 0, sample_bits);
   for(size_type i = 0; i < sample_buffer.size(); i++) { this->stored_samples[i] = sample_buffer[i]; }
   sdsl::util::clear(sample_buffer);
+  }
 
   // Transfer the LCP array from MergedGraph to InputGraph.
   TempFile::remove(graph.lcp_name);

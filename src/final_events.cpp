@@ -1,0 +1,1140 @@
+/*
+  Copyright (c) 2026 GCSA2 contributors
+
+  External event streams for final GCSA construction.
+*/
+
+#include <gcsa/final_events.h>
+
+#include <gcsa/external_sort.h>
+#include <gcsa/internal.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <fstream>
+#include <limits>
+#include <stdexcept>
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace gcsa
+{
+
+namespace
+{
+
+constexpr char EVENT_MAGIC[8] = { 'G', 'C', 'S', 'A', 'E', 'V', '1', '\0' };
+constexpr std::uint64_t EVENT_VERSION = 1;
+constexpr size_type EVENT_METADATA_WORDS = 11 + FinalEventMetadata::MAX_SIGMA;
+constexpr off_t CACHE_FLUSH_BYTES = 512 * 1024 * 1024;
+constexpr off_t CACHE_TAIL_BYTES = 64 * 1024 * 1024;
+
+const std::string FINAL_TASK = "final";
+const std::string FINAL_PHASE = "events";
+
+std::runtime_error
+eventError(const std::string& message, const std::string& path = std::string())
+{
+  return std::runtime_error("final GCSA events: " + message +
+    (path.empty() ? std::string() : ": " + path));
+}
+
+void
+put64(std::uint8_t* target, std::uint64_t value)
+{
+  for(size_type i = 0; i < 8; i++)
+  {
+    target[i] = static_cast<std::uint8_t>(value >> (8 * i));
+  }
+}
+
+std::uint64_t
+get64(const std::uint8_t* source)
+{
+  std::uint64_t result = 0;
+  for(size_type i = 0; i < 8; i++)
+  {
+    result |= static_cast<std::uint64_t>(source[i]) << (8 * i);
+  }
+  return result;
+}
+
+void
+writeAll(int descriptor, const void* source, size_type bytes,
+  const std::string& path)
+{
+  const std::uint8_t* data = static_cast<const std::uint8_t*>(source);
+  size_type done = 0;
+  while(done < bytes)
+  {
+    size_type request = std::min(bytes - done,
+      static_cast<size_type>(std::numeric_limits<ssize_t>::max()));
+    ssize_t written = ::write(descriptor, data + done, request);
+    if(written < 0 && errno == EINTR) { continue; }
+    if(written <= 0) { throw eventError("write failed", path); }
+    done += static_cast<size_type>(written);
+  }
+  DiskIO::write_volume += bytes;
+}
+
+void
+readAll(int descriptor, void* target, size_type bytes, const std::string& path)
+{
+  std::uint8_t* data = static_cast<std::uint8_t*>(target);
+  size_type done = 0;
+  while(done < bytes)
+  {
+    size_type request = std::min(bytes - done,
+      static_cast<size_type>(std::numeric_limits<ssize_t>::max()));
+    ssize_t got = ::read(descriptor, data + done, request);
+    if(got < 0 && errno == EINTR) { continue; }
+    if(got <= 0) { throw eventError("short read", path); }
+    done += static_cast<size_type>(got);
+  }
+  DiskIO::read_volume += bytes;
+}
+
+void
+adviseSequential(int descriptor)
+{
+#if defined(POSIX_FADV_SEQUENTIAL)
+  static_cast<void>(::posix_fadvise(descriptor, 0, 0, POSIX_FADV_SEQUENTIAL));
+#else
+  static_cast<void>(descriptor);
+#endif
+}
+
+void
+discardCache(int descriptor, off_t first, off_t bytes)
+{
+#if defined(POSIX_FADV_DONTNEED)
+  if(bytes > 0)
+  {
+    static_cast<void>(::posix_fadvise(descriptor, first, bytes,
+      POSIX_FADV_DONTNEED));
+  }
+#else
+  static_cast<void>(descriptor); static_cast<void>(first); static_cast<void>(bytes);
+#endif
+}
+
+size_type
+checkedBytes(size_type records, size_type width, const std::string& path)
+{
+  if(width != 0 && records > std::numeric_limits<size_type>::max() / width)
+  {
+    throw eventError("record stream length overflows", path);
+  }
+  return records * width;
+}
+
+size_type
+rawFileBytes(const std::string& path)
+{
+  struct stat status;
+  if(::stat(path.c_str(), &status) != 0 || status.st_size < 0)
+  {
+    throw eventError("cannot stat event stream", path);
+  }
+  if(static_cast<std::uintmax_t>(status.st_size) >
+     std::numeric_limits<size_type>::max())
+  {
+    throw eventError("event stream is too large for this build", path);
+  }
+  return static_cast<size_type>(status.st_size);
+}
+
+void
+requireFileSize(const std::string& path, size_type records, size_type width)
+{
+  size_type expected = checkedBytes(records, width, path);
+  size_type observed = rawFileBytes(path);
+  if(observed != expected)
+  {
+    throw eventError("event stream has " + std::to_string(observed) +
+      " bytes; expected " + std::to_string(expected), path);
+  }
+}
+
+class BufferedEventWriter
+{
+public:
+  BufferedEventWriter(const std::string& path, size_type buffer_bytes,
+    MemoryBudget& budget, const std::string& task) :
+    path_(path), descriptor_(-1), buffer_(), used_(0), written_(0),
+    cache_released_(0), closed_(false), reservation_()
+  {
+    buffer_bytes = std::max(static_cast<size_type>(16), buffer_bytes);
+    reservation_ = budget.reserve(buffer_bytes, task);
+    buffer_.resize(buffer_bytes);
+    descriptor_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if(descriptor_ < 0) { throw eventError("cannot create event stream", path); }
+    adviseSequential(descriptor_);
+  }
+
+  ~BufferedEventWriter()
+  {
+    if(!closed_)
+    {
+      try { close(); } catch(...) { }
+    }
+  }
+
+  void byte(std::uint8_t value) { append(&value, 1); }
+
+  void integer(std::uint64_t value)
+  {
+    std::uint8_t record[8]; put64(record, value); append(record, sizeof(record));
+  }
+
+  void pair(std::uint64_t first, std::uint64_t second)
+  {
+    std::uint8_t record[16]; put64(record, first); put64(record + 8, second);
+    append(record, sizeof(record));
+  }
+
+  void close()
+  {
+    if(closed_) { return; }
+    flush();
+    if(::fdatasync(descriptor_) != 0)
+    {
+      throw eventError("fdatasync failed", path_);
+    }
+    discardCache(descriptor_, 0, static_cast<off_t>(written_));
+    if(::close(descriptor_) != 0)
+    {
+      descriptor_ = -1; throw eventError("close failed", path_);
+    }
+    descriptor_ = -1; closed_ = true;
+    std::vector<std::uint8_t>().swap(buffer_);
+    reservation_ = MemoryBudget::Reservation();
+  }
+
+private:
+  std::string path_;
+  int descriptor_;
+  std::vector<std::uint8_t> buffer_;
+  size_type used_, written_;
+  off_t cache_released_;
+  bool closed_;
+  MemoryBudget::Reservation reservation_;
+
+  void append(const void* source, size_type bytes)
+  {
+    if(closed_) { throw eventError("write after close", path_); }
+    const std::uint8_t* data = static_cast<const std::uint8_t*>(source);
+    while(bytes > 0)
+    {
+      size_type count = std::min(bytes, buffer_.size() - used_);
+      std::memcpy(buffer_.data() + used_, data, count);
+      used_ += count; data += count; bytes -= count;
+      if(used_ == buffer_.size()) { flush(); }
+    }
+  }
+
+  void flush()
+  {
+    if(used_ == 0) { return; }
+    writeAll(descriptor_, buffer_.data(), used_, path_);
+    written_ += used_; used_ = 0;
+    if(static_cast<off_t>(written_) - cache_released_ >= CACHE_FLUSH_BYTES)
+    {
+      if(::fdatasync(descriptor_) != 0)
+      {
+        throw eventError("periodic fdatasync failed", path_);
+      }
+      off_t discard_end = std::max(cache_released_,
+        static_cast<off_t>(written_) - CACHE_TAIL_BYTES);
+      discardCache(descriptor_, cache_released_, discard_end - cache_released_);
+      cache_released_ = discard_end;
+    }
+  }
+};
+
+class BufferedEventReader
+{
+public:
+  BufferedEventReader(const std::string& path, size_type width,
+    size_type records, size_type buffer_bytes, MemoryBudget& budget,
+    const std::string& task) :
+    path_(path), descriptor_(-1), width_(width), records_(records), seen_(0),
+    buffer_(), buffered_(0), offset_(0), consumed_bytes_(0), cache_released_(0),
+    reservation_()
+  {
+    if(width_ == 0) { throw eventError("zero-width event stream", path); }
+    requireFileSize(path_, records_, width_);
+    size_type capacity = std::max(width_, buffer_bytes - buffer_bytes % width_);
+    reservation_ = budget.reserve(capacity, task);
+    buffer_.resize(capacity);
+    descriptor_ = ::open(path.c_str(), O_RDONLY);
+    if(descriptor_ < 0) { throw eventError("cannot open event stream", path); }
+    adviseSequential(descriptor_);
+  }
+
+  ~BufferedEventReader()
+  {
+    if(descriptor_ >= 0)
+    {
+      discardCache(descriptor_, 0, static_cast<off_t>(consumed_bytes_));
+      ::close(descriptor_);
+    }
+  }
+
+  bool nextByte(std::uint8_t& value)
+  {
+    if(width_ != 1) { throw eventError("wrong byte reader width", path_); }
+    return next(&value);
+  }
+
+  bool nextInteger(std::uint64_t& value)
+  {
+    if(width_ != 8) { throw eventError("wrong integer reader width", path_); }
+    std::uint8_t record[8];
+    if(!next(record)) { return false; }
+    value = get64(record); return true;
+  }
+
+  bool nextPair(std::uint64_t& first, std::uint64_t& second)
+  {
+    if(width_ != 16) { throw eventError("wrong pair reader width", path_); }
+    std::uint8_t record[16];
+    if(!next(record)) { return false; }
+    first = get64(record); second = get64(record + 8); return true;
+  }
+
+  void finish()
+  {
+    if(seen_ != records_)
+    {
+      throw eventError("event stream was not fully consumed", path_);
+    }
+  }
+
+private:
+  std::string path_;
+  int descriptor_;
+  size_type width_, records_, seen_;
+  std::vector<std::uint8_t> buffer_;
+  size_type buffered_, offset_, consumed_bytes_;
+  off_t cache_released_;
+  MemoryBudget::Reservation reservation_;
+
+  bool next(void* target)
+  {
+    if(seen_ == records_) { return false; }
+    if(offset_ == buffered_) { refill(); }
+    std::memcpy(target, buffer_.data() + offset_, width_);
+    offset_ += width_; seen_++; return true;
+  }
+
+  void refill()
+  {
+    size_type remaining = records_ - seen_;
+    size_type bytes = std::min(buffer_.size(), checkedBytes(remaining, width_, path_));
+    readAll(descriptor_, buffer_.data(), bytes, path_);
+    buffered_ = bytes; offset_ = 0; consumed_bytes_ += bytes;
+    if(static_cast<off_t>(consumed_bytes_) - cache_released_ >= CACHE_FLUSH_BYTES)
+    {
+      off_t discard_end = std::max(cache_released_,
+        static_cast<off_t>(consumed_bytes_) - CACHE_TAIL_BYTES);
+      discardCache(descriptor_, cache_released_, discard_end - cache_released_);
+      cache_released_ = discard_end;
+    }
+  }
+};
+
+ArtifactIdentity metadataArtifact()
+{
+  return ArtifactIdentity(FINAL_TASK, FINAL_PHASE, "metadata", "final-events-meta-v1");
+}
+
+ArtifactIdentity maskArtifact()
+{
+  return ArtifactIdentity(FINAL_TASK, FINAL_PHASE, "bwt-masks", "bwt-mask-u8-v1");
+}
+
+ArtifactIdentity edgeArtifact(size_type comp)
+{
+  return ArtifactIdentity(FINAL_TASK, FINAL_PHASE,
+    "edge-destinations-" + std::to_string(comp), "path-rank-u64le-v1");
+}
+
+ArtifactIdentity streamArtifact(const std::string& name, const std::string& kind)
+{
+  return ArtifactIdentity(FINAL_TASK, FINAL_PHASE, name, kind);
+}
+
+physical_shard_id_t edgeShard(size_type comp)
+{
+  return physical_shard_id_t(100 + comp);
+}
+
+BuildWorkspace::ArtifactRef
+checkpointFile(BuildWorkspace& workspace, const ArtifactIdentity& identity,
+  physical_shard_id_t shard, const std::string& path, size_type records,
+  size_type buffer_bytes, const std::string& sort_order)
+{
+  std::ifstream input;
+  input.rdbuf()->pubsetbuf(nullptr, 0);
+  input.open(path.c_str(), std::ios_base::binary);
+  if(!input) { throw eventError("cannot checkpoint event stream", path); }
+  BuildWorkspace::ArtifactWriter writer = workspace.open_artifact(identity,
+    logical_file_id_t(0), shard, sort_order, "all");
+  std::vector<std::uint8_t> buffer(std::max(static_cast<size_type>(1), buffer_bytes));
+  while(input)
+  {
+    input.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
+    std::streamsize bytes = input.gcount();
+    if(bytes > 0) { writer.write(buffer.data(), static_cast<size_type>(bytes)); }
+  }
+  if(!input.eof()) { throw eventError("failed while checkpointing", path); }
+  return writer.finish(records);
+}
+
+void
+restoreFile(const BuildWorkspace& workspace, const ArtifactIdentity& identity,
+  physical_shard_id_t shard, const std::string& path, size_type buffer_bytes)
+{
+  workspace.restore_artifact(identity, logical_file_id_t(0), shard, path,
+    std::max(static_cast<size_type>(1), buffer_bytes));
+}
+
+void
+validateMetadata(const FinalEventMetadata& metadata)
+{
+  if(metadata.sigma == 0 || metadata.sigma > FinalEventMetadata::MAX_SIGMA)
+  {
+    throw eventError("invalid alphabet size in metadata");
+  }
+  if(metadata.fast_chars >= metadata.sigma)
+  {
+    throw eventError("invalid fast-character count in metadata");
+  }
+  size_type edge_sum = 0;
+  for(size_type comp = 0; comp < metadata.sigma; comp++)
+  {
+    if(metadata.bwt_counts[comp] > metadata.paths)
+    {
+      throw eventError("BWT component count exceeds path count");
+    }
+    if(edge_sum > std::numeric_limits<size_type>::max() - metadata.bwt_counts[comp])
+    {
+      throw eventError("edge count overflows");
+    }
+    edge_sum += metadata.bwt_counts[comp];
+  }
+  if(edge_sum != metadata.total_edges)
+  {
+    throw eventError("component edge counts do not match total");
+  }
+  if(metadata.sampled_paths > metadata.paths ||
+     (metadata.sampled_paths == 0) != (metadata.sample_ids == 0))
+  {
+    throw eventError("inconsistent sample counts");
+  }
+  if(metadata.sample_bits > 64 ||
+     (metadata.sample_ids > 0 && metadata.sample_bits == 0) ||
+     (metadata.sample_ids == 0 && metadata.sample_bits != 0))
+  {
+    throw eventError("invalid sample identifier width");
+  }
+  if(metadata.occurrence_items > metadata.paths ||
+     metadata.occurrence_items > metadata.occurrence_extra)
+  {
+    throw eventError("inconsistent occurrence counts");
+  }
+  if(metadata.paths == 0 && (metadata.total_edges != 0 || metadata.redundant != 0))
+  {
+    throw eventError("events exist for an empty graph");
+  }
+}
+
+void
+validatePayloads(const FinalEventFiles& files, const FinalEventMetadata& metadata)
+{
+  if(files.edge_destinations.size() != metadata.sigma)
+  {
+    throw eventError("edge stream count does not match alphabet");
+  }
+  requireFileSize(files.metadata, 8 + EVENT_METADATA_WORDS * 8, 1);
+  requireFileSize(files.bwt_masks, metadata.paths, 1);
+  for(size_type comp = 0; comp < metadata.sigma; comp++)
+  {
+    requireFileSize(files.edge_destinations[comp], metadata.bwt_counts[comp], 8);
+  }
+  requireFileSize(files.sample_positions, metadata.sampled_paths, 8);
+  requireFileSize(files.sample_ids, metadata.sample_ids, 8);
+  requireFileSize(files.sample_ends, metadata.sampled_paths, 8);
+  requireFileSize(files.occurrences, metadata.occurrence_items, 16);
+  requireFileSize(files.redundant, metadata.redundant, 8);
+}
+
+size_type
+componentBufferBytes(const ConstructionParameters& parameters, size_type readers)
+{
+  readers = std::max(static_cast<size_type>(1), readers);
+  size_type share = parameters.getMemoryLimitBytes() / (4 * readers);
+  return std::max(static_cast<size_type>(16),
+    std::min(parameters.getIOBufferSize(), share));
+}
+
+int
+compareEncoded64(const void* left, const void* right)
+{
+  std::uint64_t a = get64(static_cast<const std::uint8_t*>(left));
+  std::uint64_t b = get64(static_cast<const std::uint8_t*>(right));
+  return (a < b ? -1 : (a > b ? 1 : 0));
+}
+
+} // namespace
+
+FinalEventMetadata::FinalEventMetadata() :
+  paths(0), sigma(0), fast_chars(0), total_edges(0), sampled_paths(0),
+  sample_ids(0), sample_bits(0), occurrence_items(0), occurrence_extra(0),
+  redundant(0), bwt_counts()
+{
+  bwt_counts.fill(0);
+}
+
+FinalEventFiles::FinalEventFiles(size_type sigma) :
+  metadata(TempFile::getName("gcsa_final_event_meta")),
+  bwt_masks(TempFile::getName("gcsa_final_bwt_masks")),
+  edge_destinations(),
+  sample_positions(TempFile::getName("gcsa_final_sample_paths")),
+  sample_ids(TempFile::getName("gcsa_final_sample_ids")),
+  sample_ends(TempFile::getName("gcsa_final_sample_ends")),
+  occurrences(TempFile::getName("gcsa_final_occurrences")),
+  redundant(TempFile::getName("gcsa_final_redundant")), delete_files(true)
+{
+  edge_destinations.reserve(sigma);
+  for(size_type comp = 0; comp < sigma; comp++)
+  {
+    edge_destinations.push_back(TempFile::getName("gcsa_final_edges"));
+  }
+}
+
+FinalEventFiles::FinalEventFiles(FinalEventFiles&& source) :
+  metadata(std::move(source.metadata)), bwt_masks(std::move(source.bwt_masks)),
+  edge_destinations(std::move(source.edge_destinations)),
+  sample_positions(std::move(source.sample_positions)),
+  sample_ids(std::move(source.sample_ids)), sample_ends(std::move(source.sample_ends)),
+  occurrences(std::move(source.occurrences)), redundant(std::move(source.redundant)),
+  delete_files(source.delete_files)
+{
+  source.delete_files = false;
+}
+
+FinalEventFiles&
+FinalEventFiles::operator=(FinalEventFiles&& source)
+{
+  if(this != &source)
+  {
+    this->clear();
+    this->metadata = std::move(source.metadata);
+    this->bwt_masks = std::move(source.bwt_masks);
+    this->edge_destinations = std::move(source.edge_destinations);
+    this->sample_positions = std::move(source.sample_positions);
+    this->sample_ids = std::move(source.sample_ids);
+    this->sample_ends = std::move(source.sample_ends);
+    this->occurrences = std::move(source.occurrences);
+    this->redundant = std::move(source.redundant);
+    this->delete_files = source.delete_files; source.delete_files = false;
+  }
+  return *this;
+}
+
+FinalEventFiles::~FinalEventFiles()
+{
+  this->clear();
+}
+
+void
+FinalEventFiles::clear()
+{
+  if(this->delete_files)
+  {
+    TempFile::remove(this->metadata); TempFile::remove(this->bwt_masks);
+    for(std::string& path : this->edge_destinations) { TempFile::remove(path); }
+    TempFile::remove(this->sample_positions); TempFile::remove(this->sample_ids);
+    TempFile::remove(this->sample_ends); TempFile::remove(this->occurrences);
+    TempFile::remove(this->redundant);
+  }
+  this->metadata.clear(); this->bwt_masks.clear(); this->edge_destinations.clear();
+  this->sample_positions.clear(); this->sample_ids.clear(); this->sample_ends.clear();
+  this->occurrences.clear(); this->redundant.clear(); this->delete_files = false;
+}
+
+struct FinalEventWriter::Impl
+{
+  size_type sigma;
+  std::unique_ptr<BufferedEventWriter> masks;
+  std::vector<std::unique_ptr<BufferedEventWriter>> edges;
+  std::unique_ptr<BufferedEventWriter> sample_positions, sample_ids, sample_ends;
+  std::unique_ptr<BufferedEventWriter> occurrences, redundant;
+  FinalEventMetadata metadata;
+  bool finished;
+
+  Impl(const FinalEventFiles& files, size_type alphabet_size,
+    size_type buffer_bytes, MemoryBudget& budget) :
+    sigma(alphabet_size), masks(), edges(), sample_positions(), sample_ids(),
+    sample_ends(), occurrences(), redundant(), metadata(), finished(false)
+  {
+    if(sigma == 0 || sigma > FinalEventMetadata::MAX_SIGMA ||
+       files.edge_destinations.size() != sigma)
+    {
+      throw eventError("invalid writer alphabet size");
+    }
+    metadata.sigma = sigma;
+    masks.reset(new BufferedEventWriter(files.bwt_masks, buffer_bytes, budget,
+      "final-event-bwt-mask"));
+    edges.reserve(sigma);
+    for(size_type comp = 0; comp < sigma; comp++)
+    {
+      edges.emplace_back(new BufferedEventWriter(files.edge_destinations[comp],
+        buffer_bytes, budget, "final-event-edge"));
+    }
+    sample_positions.reset(new BufferedEventWriter(files.sample_positions,
+      buffer_bytes, budget, "final-event-sampled-path"));
+    sample_ids.reset(new BufferedEventWriter(files.sample_ids, buffer_bytes,
+      budget, "final-event-sample-id"));
+    sample_ends.reset(new BufferedEventWriter(files.sample_ends, buffer_bytes,
+      budget, "final-event-sample-end"));
+    occurrences.reset(new BufferedEventWriter(files.occurrences, buffer_bytes,
+      budget, "final-event-occurrence"));
+    redundant.reset(new BufferedEventWriter(files.redundant, buffer_bytes,
+      budget, "final-event-redundancy"));
+  }
+
+  void closeAll()
+  {
+    masks->close();
+    for(auto& writer : edges) { writer->close(); }
+    sample_positions->close(); sample_ids->close(); sample_ends->close();
+    occurrences->close(); redundant->close();
+  }
+};
+
+FinalEventWriter::FinalEventWriter(const FinalEventFiles& files, size_type sigma,
+  size_type buffer_bytes, MemoryBudget& budget) :
+  impl_(new Impl(files, sigma, buffer_bytes, budget))
+{
+}
+
+FinalEventWriter::~FinalEventWriter()
+{
+}
+
+void
+FinalEventWriter::path(byte_type predecessor_mask)
+{
+  if(this->impl_->finished) { throw eventError("path event after finish"); }
+  if(this->impl_->sigma < 8 &&
+     (predecessor_mask >> this->impl_->sigma) != 0)
+  {
+    throw eventError("BWT mask has a component outside the alphabet");
+  }
+  this->impl_->masks->byte(predecessor_mask); this->impl_->metadata.paths++;
+}
+
+void
+FinalEventWriter::edge(comp_type comp, size_type source_path)
+{
+  if(this->impl_->finished || comp >= this->impl_->sigma)
+  {
+    throw eventError("invalid edge event");
+  }
+  this->impl_->edges[comp]->integer(source_path);
+  this->impl_->metadata.bwt_counts[comp]++;
+  this->impl_->metadata.total_edges++;
+}
+
+void
+FinalEventWriter::sampledPath(size_type path)
+{
+  this->impl_->sample_positions->integer(path);
+  this->impl_->metadata.sampled_paths++;
+}
+
+void
+FinalEventWriter::sample(node_type node)
+{
+  this->impl_->sample_ids->integer(node);
+  this->impl_->metadata.sample_ids++;
+  this->impl_->metadata.sample_bits = std::max(this->impl_->metadata.sample_bits,
+    bit_length(node));
+}
+
+void
+FinalEventWriter::sampleEnd()
+{
+  if(this->impl_->metadata.sample_ids == 0)
+  {
+    throw eventError("sample end without a sample ID");
+  }
+  this->impl_->sample_ends->integer(this->impl_->metadata.sample_ids - 1);
+}
+
+void
+FinalEventWriter::occurrence(size_type path, size_type extra)
+{
+  if(extra == 0) { return; }
+  this->impl_->occurrences->pair(path, extra);
+  this->impl_->metadata.occurrence_items++;
+  if(this->impl_->metadata.occurrence_extra >
+     std::numeric_limits<size_type>::max() - extra)
+  {
+    throw eventError("occurrence total overflows");
+  }
+  this->impl_->metadata.occurrence_extra += extra;
+}
+
+void
+FinalEventWriter::redundancy(size_type path)
+{
+  this->impl_->redundant->integer(path); this->impl_->metadata.redundant++;
+}
+
+FinalEventMetadata
+FinalEventWriter::finish()
+{
+  if(this->impl_->finished) { throw eventError("event writer already finished"); }
+  this->impl_->closeAll(); this->impl_->finished = true;
+  return this->impl_->metadata;
+}
+
+void
+sortFinalRedundancy(FinalEventFiles& files,
+  const ConstructionParameters& parameters)
+{
+  std::string sorted = TempFile::getName("gcsa_final_redundant_sorted");
+  try
+  {
+    size_type budget = std::min(parameters.getMemoryLimitBytes(),
+      parameters.getSortRunSize());
+    ExternalFixedRecordSorter::sort(files.redundant, sorted, 8, budget,
+      parameters.getMergeFanIn(), compareEncoded64);
+    TempFile::remove(files.redundant); files.redundant = sorted;
+  }
+  catch(...)
+  {
+    TempFile::remove(sorted); throw;
+  }
+}
+
+void
+writeFinalEventMetadata(const FinalEventFiles& files,
+  const FinalEventMetadata& metadata)
+{
+  validateMetadata(metadata);
+  std::vector<std::uint8_t> bytes(8 + EVENT_METADATA_WORDS * 8, 0);
+  std::memcpy(bytes.data(), EVENT_MAGIC, 8);
+  size_type word = 0;
+  const auto append = [&bytes, &word](size_type value)
+  {
+    put64(bytes.data() + 8 + 8 * word, value); word++;
+  };
+  append(EVENT_VERSION); append(metadata.paths); append(metadata.sigma);
+  append(metadata.fast_chars); append(metadata.total_edges);
+  append(metadata.sampled_paths); append(metadata.sample_ids);
+  append(metadata.sample_bits); append(metadata.occurrence_items);
+  append(metadata.occurrence_extra); append(metadata.redundant);
+  for(size_type comp = 0; comp < FinalEventMetadata::MAX_SIGMA; comp++)
+  {
+    append(metadata.bwt_counts[comp]);
+  }
+  if(word != EVENT_METADATA_WORDS) { throw eventError("internal metadata width mismatch"); }
+
+  int descriptor = ::open(files.metadata.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if(descriptor < 0) { throw eventError("cannot create metadata", files.metadata); }
+  try
+  {
+    writeAll(descriptor, bytes.data(), bytes.size(), files.metadata);
+    if(::fdatasync(descriptor) != 0) { throw eventError("metadata fdatasync failed", files.metadata); }
+    if(::close(descriptor) != 0) { descriptor = -1; throw eventError("metadata close failed", files.metadata); }
+    descriptor = -1;
+  }
+  catch(...)
+  {
+    if(descriptor >= 0) { ::close(descriptor); }
+    throw;
+  }
+}
+
+FinalEventMetadata
+readFinalEventMetadata(const FinalEventFiles& files)
+{
+  requireFileSize(files.metadata, 8 + EVENT_METADATA_WORDS * 8, 1);
+  std::vector<std::uint8_t> bytes(8 + EVENT_METADATA_WORDS * 8, 0);
+  int descriptor = ::open(files.metadata.c_str(), O_RDONLY);
+  if(descriptor < 0) { throw eventError("cannot open metadata", files.metadata); }
+  try
+  {
+    readAll(descriptor, bytes.data(), bytes.size(), files.metadata);
+    if(::close(descriptor) != 0) { descriptor = -1; throw eventError("metadata close failed", files.metadata); }
+    descriptor = -1;
+  }
+  catch(...)
+  {
+    if(descriptor >= 0) { ::close(descriptor); }
+    throw;
+  }
+  if(std::memcmp(bytes.data(), EVENT_MAGIC, 8) != 0)
+  {
+    throw eventError("invalid metadata magic", files.metadata);
+  }
+  size_type word = 0;
+  const auto next = [&bytes, &word]() -> size_type
+  {
+    return static_cast<size_type>(get64(bytes.data() + 8 + 8 * word++));
+  };
+  if(next() != EVENT_VERSION) { throw eventError("unsupported metadata version", files.metadata); }
+  FinalEventMetadata metadata;
+  metadata.paths = next(); metadata.sigma = next(); metadata.fast_chars = next();
+  metadata.total_edges = next(); metadata.sampled_paths = next();
+  metadata.sample_ids = next(); metadata.sample_bits = next();
+  metadata.occurrence_items = next(); metadata.occurrence_extra = next();
+  metadata.redundant = next();
+  for(size_type comp = 0; comp < FinalEventMetadata::MAX_SIGMA; comp++)
+  {
+    metadata.bwt_counts[comp] = next();
+  }
+  validateMetadata(metadata); return metadata;
+}
+
+void
+checkpointFinalEvents(BuildWorkspace& workspace,
+  const FinalEventFiles& files, const FinalEventMetadata& metadata,
+  size_type buffer_bytes)
+{
+  validatePayloads(files, metadata);
+  std::vector<BuildWorkspace::ArtifactRef> artifacts;
+  artifacts.push_back(checkpointFile(workspace, metadataArtifact(),
+    physical_shard_id_t(0), files.metadata, 1, buffer_bytes, "metadata"));
+  artifacts.push_back(checkpointFile(workspace, maskArtifact(),
+    physical_shard_id_t(1), files.bwt_masks, metadata.paths, buffer_bytes,
+    "path-rank"));
+  for(size_type comp = 0; comp < metadata.sigma; comp++)
+  {
+    artifacts.push_back(checkpointFile(workspace, edgeArtifact(comp), edgeShard(comp),
+      files.edge_destinations[comp], metadata.bwt_counts[comp], buffer_bytes,
+      "source-path-rank"));
+  }
+  artifacts.push_back(checkpointFile(workspace,
+    streamArtifact("sampled-paths", "path-rank-u64le-v1"), physical_shard_id_t(2),
+    files.sample_positions, metadata.sampled_paths, buffer_bytes, "path-rank"));
+  artifacts.push_back(checkpointFile(workspace,
+    streamArtifact("sample-ids", "node-id-u64le-v1"), physical_shard_id_t(3),
+    files.sample_ids, metadata.sample_ids, buffer_bytes, "sample-order"));
+  artifacts.push_back(checkpointFile(workspace,
+    streamArtifact("sample-ends", "sample-rank-u64le-v1"), physical_shard_id_t(4),
+    files.sample_ends, metadata.sampled_paths, buffer_bytes, "sample-order"));
+  artifacts.push_back(checkpointFile(workspace,
+    streamArtifact("occurrences", "path-value-u64le-v1"), physical_shard_id_t(5),
+    files.occurrences, metadata.occurrence_items, buffer_bytes, "path-rank"));
+  artifacts.push_back(checkpointFile(workspace,
+    streamArtifact("redundancy", "path-rank-u64le-v1"), physical_shard_id_t(6),
+    files.redundant, metadata.redundant, buffer_bytes, "path-rank"));
+  workspace.commit_task(FINAL_TASK, FINAL_PHASE, artifacts);
+}
+
+bool
+restoreFinalEvents(const BuildWorkspace& workspace,
+  FinalEventFiles& files, FinalEventMetadata& metadata,
+  size_type expected_paths, size_type expected_sigma, size_type buffer_bytes)
+{
+  if(!workspace.task_completed(FINAL_TASK, FINAL_PHASE)) { return false; }
+  restoreFile(workspace, metadataArtifact(), physical_shard_id_t(0),
+    files.metadata, buffer_bytes);
+  metadata = readFinalEventMetadata(files);
+  if(metadata.paths != expected_paths || metadata.sigma != expected_sigma ||
+     files.edge_destinations.size() != metadata.sigma)
+  {
+    throw eventError("committed events do not match the merged graph");
+  }
+  restoreFile(workspace, maskArtifact(), physical_shard_id_t(1),
+    files.bwt_masks, buffer_bytes);
+  for(size_type comp = 0; comp < metadata.sigma; comp++)
+  {
+    restoreFile(workspace, edgeArtifact(comp), edgeShard(comp),
+      files.edge_destinations[comp], buffer_bytes);
+  }
+  restoreFile(workspace, streamArtifact("sampled-paths", "path-rank-u64le-v1"),
+    physical_shard_id_t(2), files.sample_positions, buffer_bytes);
+  restoreFile(workspace, streamArtifact("sample-ids", "node-id-u64le-v1"),
+    physical_shard_id_t(3), files.sample_ids, buffer_bytes);
+  restoreFile(workspace, streamArtifact("sample-ends", "sample-rank-u64le-v1"),
+    physical_shard_id_t(4), files.sample_ends, buffer_bytes);
+  restoreFile(workspace, streamArtifact("occurrences", "path-value-u64le-v1"),
+    physical_shard_id_t(5), files.occurrences, buffer_bytes);
+  restoreFile(workspace, streamArtifact("redundancy", "path-rank-u64le-v1"),
+    physical_shard_id_t(6), files.redundant, buffer_bytes);
+  validatePayloads(files, metadata); return true;
+}
+
+void
+buildFinalComponents(GCSA& index, const Alphabet& source_alphabet,
+  const FinalEventFiles& files, const FinalEventMetadata& metadata,
+  const ConstructionParameters& parameters)
+{
+  validateMetadata(metadata); validatePayloads(files, metadata);
+  if(source_alphabet.sigma != metadata.sigma ||
+     source_alphabet.fast_chars != metadata.fast_chars)
+  {
+    throw eventError("event alphabet does not match the input alphabet");
+  }
+
+  sdsl::int_vector<64> counts(metadata.sigma, 0);
+  for(size_type comp = 0; comp < metadata.sigma; comp++)
+  {
+    counts[comp] = metadata.bwt_counts[comp];
+  }
+  index.alpha = Alphabet(counts, source_alphabet.char2comp,
+    source_alphabet.comp2char);
+
+  index.fast_bwt.resize(metadata.sigma); index.fast_rank.resize(metadata.sigma);
+  index.sparse_bwt.resize(metadata.sigma); index.sparse_rank.resize(metadata.sigma);
+  for(size_type comp = 0; comp < metadata.sigma; comp++)
+  {
+    MemoryBudget budget(parameters.getMemoryLimitBytes(),
+      parameters.getMemoryLimitBytes() / 8);
+    size_type buffer_bytes = componentBufferBytes(parameters, 1);
+    BufferedEventReader masks(files.bwt_masks, 1, metadata.paths,
+      buffer_bytes, budget, "final-bwt-mask-reader");
+    if(comp > 0 && comp <= metadata.fast_chars)
+    {
+      GCSA::bit_vector dense(metadata.paths, 0);
+      for(size_type path = 0; path < metadata.paths; path++)
+      {
+        std::uint8_t mask = 0; masks.nextByte(mask);
+        if(mask & (static_cast<size_type>(1) << comp)) { dense[path] = 1; }
+      }
+      masks.finish(); index.fast_bwt[comp] = dense; sdsl::util::clear(dense);
+    }
+    else
+    {
+      sdsl::sd_vector_builder builder(metadata.paths, metadata.bwt_counts[comp]);
+      size_type observed = 0;
+      for(size_type path = 0; path < metadata.paths; path++)
+      {
+        std::uint8_t mask = 0; masks.nextByte(mask);
+        if(mask & (static_cast<size_type>(1) << comp))
+        {
+          // Metadata is durable input here. Use the checked insertion so a
+          // corrupt one-count cannot overrun sd_vector_builder before the
+          // aggregate count check below reports the mismatch.
+          builder.set(path); observed++;
+        }
+      }
+      masks.finish();
+      if(observed != metadata.bwt_counts[comp])
+      {
+        throw eventError("BWT mask count does not match metadata");
+      }
+      index.sparse_bwt[comp] = GCSA::sparse_vector(builder);
+    }
+  }
+
+  // Each component's source ranks are nondecreasing. A bounded k-way merge
+  // reconstructs outdegrees without a full CounterArray.
+  {
+    MemoryBudget budget(parameters.getMemoryLimitBytes(),
+      parameters.getMemoryLimitBytes() / 8);
+    size_type buffer_bytes = componentBufferBytes(parameters, metadata.sigma);
+    std::vector<std::unique_ptr<BufferedEventReader>> readers;
+    std::vector<std::uint64_t> current(metadata.sigma, 0);
+    std::vector<bool> available(metadata.sigma, false);
+    readers.reserve(metadata.sigma);
+    for(size_type comp = 0; comp < metadata.sigma; comp++)
+    {
+      readers.emplace_back(new BufferedEventReader(files.edge_destinations[comp],
+        8, metadata.bwt_counts[comp], buffer_bytes, budget, "final-edge-reader"));
+      available[comp] = readers.back()->nextInteger(current[comp]);
+    }
+    GCSA::bit_vector edge_buffer(metadata.total_edges, 0);
+    size_type tail = 0;
+    for(size_type path = 0; path < metadata.paths; path++)
+    {
+      size_type degree = 0;
+      for(size_type comp = 0; comp < metadata.sigma; comp++)
+      {
+        if(available[comp] && current[comp] < path)
+        {
+          throw eventError("edge stream is not nondecreasing");
+        }
+        while(available[comp] && current[comp] == path)
+        {
+          degree++; available[comp] = readers[comp]->nextInteger(current[comp]);
+        }
+      }
+      if(degree == 0) { throw eventError("path has no outgoing edge"); }
+      if(degree > metadata.total_edges || tail > metadata.total_edges - degree)
+      {
+        throw eventError("edge stream exceeds declared total");
+      }
+      tail += degree; edge_buffer[tail - 1] = 1;
+    }
+    for(size_type comp = 0; comp < metadata.sigma; comp++)
+    {
+      if(available[comp])
+      {
+        throw eventError("edge rank exceeds path universe");
+      }
+      readers[comp]->finish();
+    }
+    if(tail != metadata.total_edges) { throw eventError("edge total mismatch"); }
+    index.edges = edge_buffer; sdsl::util::clear(edge_buffer);
+  }
+
+  // Sampled path positions, node identifiers, and path boundaries are separate
+  // monotone streams. This avoids the historical unbounded sample_buffer.
+  {
+    MemoryBudget budget(parameters.getMemoryLimitBytes(),
+      parameters.getMemoryLimitBytes() / 8);
+    size_type buffer_bytes = componentBufferBytes(parameters, 1);
+    BufferedEventReader positions(files.sample_positions, 8,
+      metadata.sampled_paths, buffer_bytes, budget, "final-sample-path-reader");
+    GCSA::bit_vector sampled(metadata.paths, 0);
+    std::uint64_t previous = 0;
+    for(size_type i = 0; i < metadata.sampled_paths; i++)
+    {
+      std::uint64_t path = 0; positions.nextInteger(path);
+      if(path >= metadata.paths || (i > 0 && path <= previous))
+      {
+        throw eventError("sampled path stream is not strictly increasing");
+      }
+      sampled[path] = 1; previous = path;
+    }
+    positions.finish(); index.sampled_paths = sampled; sdsl::util::clear(sampled);
+
+    index.stored_samples = sdsl::int_vector<0>(metadata.sample_ids, 0,
+      metadata.sample_bits);
+    BufferedEventReader ids(files.sample_ids, 8, metadata.sample_ids,
+      buffer_bytes, budget, "final-sample-id-reader");
+    for(size_type i = 0; i < metadata.sample_ids; i++)
+    {
+      std::uint64_t node = 0; ids.nextInteger(node);
+      if(metadata.sample_bits < 64 &&
+         node >= (static_cast<std::uint64_t>(1) << metadata.sample_bits))
+      {
+        throw eventError("sample identifier exceeds its declared width");
+      }
+      index.stored_samples[i] = node;
+    }
+    ids.finish();
+
+    index.samples = GCSA::bit_vector(metadata.sample_ids, 0);
+    BufferedEventReader ends(files.sample_ends, 8, metadata.sampled_paths,
+      buffer_bytes, budget, "final-sample-end-reader");
+    previous = 0;
+    for(size_type i = 0; i < metadata.sampled_paths; i++)
+    {
+      std::uint64_t end = 0; ends.nextInteger(end);
+      if(end >= metadata.sample_ids || (i > 0 && end <= previous))
+      {
+        throw eventError("sample endpoint stream is not strictly increasing");
+      }
+      index.samples[end] = 1; previous = end;
+    }
+    ends.finish();
+    if(metadata.sampled_paths > 0 && previous + 1 != metadata.sample_ids)
+    {
+      throw eventError("final sample endpoint does not cover all sample IDs");
+    }
+  }
+
+  // Construct Sada-S directly from nonzero occurrence events.
+  {
+    MemoryBudget budget(parameters.getMemoryLimitBytes(),
+      parameters.getMemoryLimitBytes() / 8);
+    BufferedEventReader input(files.occurrences, 16, metadata.occurrence_items,
+      componentBufferBytes(parameters, 1), budget, "final-occurrence-reader");
+    sdsl::sd_vector_builder filter(metadata.paths, metadata.occurrence_items);
+    sdsl::sd_vector_builder values(metadata.occurrence_extra,
+      metadata.occurrence_items);
+    size_type tail = 0; std::uint64_t previous = 0;
+    for(size_type i = 0; i < metadata.occurrence_items; i++)
+    {
+      std::uint64_t path = 0, extra = 0; input.nextPair(path, extra);
+      if(path >= metadata.paths || extra == 0 || (i > 0 && path <= previous))
+      {
+        throw eventError("invalid occurrence event order or value");
+      }
+      if(tail > metadata.occurrence_extra ||
+         extra > metadata.occurrence_extra - tail)
+      {
+        throw eventError("occurrence value total overflows metadata");
+      }
+      // Checked insertions turn malformed order, universe, or metadata counts
+      // into an exception instead of undefined writes inside SDSL.
+      filter.set(path);
+      tail += extra; values.set(tail - 1); previous = path;
+    }
+    input.finish();
+    if(tail != metadata.occurrence_extra)
+    {
+      throw eventError("occurrence value total mismatch");
+    }
+    index.extra_pointers.filter = SadaSparse::sd_vector(filter);
+    index.extra_pointers.values = SadaSparse::sd_vector(values);
+    sdsl::util::init_support(index.extra_pointers.filter_rank,
+      &(index.extra_pointers.filter));
+    sdsl::util::init_support(index.extra_pointers.value_select,
+      &(index.extra_pointers.values));
+  }
+
+  // Redundancy events were externally sorted after the scan. Duplicate ranks
+  // become the unary zero run for that suffix-tree slot.
+  {
+    if(metadata.paths == 0 && metadata.redundant != 0)
+    {
+      throw eventError("redundancy events exist for an empty graph");
+    }
+    if(metadata.redundant > std::numeric_limits<size_type>::max() -
+       (metadata.paths > 0 ? metadata.paths - 1 : 0))
+    {
+      throw eventError("redundancy bitvector length overflows");
+    }
+    size_type slots = (metadata.paths > 0 ? metadata.paths - 1 : 0);
+    GCSA::bit_vector data(slots + metadata.redundant, 0);
+    MemoryBudget budget(parameters.getMemoryLimitBytes(),
+      parameters.getMemoryLimitBytes() / 8);
+    BufferedEventReader input(files.redundant, 8, metadata.redundant,
+      componentBufferBytes(parameters, 1), budget, "final-redundancy-reader");
+    std::uint64_t current = 0;
+    bool available = input.nextInteger(current);
+    size_type cumulative = 0;
+    for(size_type slot = 0; slot < slots; slot++)
+    {
+      if(available && current < slot)
+      {
+        throw eventError("redundancy stream is not nondecreasing");
+      }
+      while(available && current == slot)
+      {
+        cumulative++; available = input.nextInteger(current);
+      }
+      data[slot + cumulative] = 1;
+    }
+    if(available || cumulative != metadata.redundant)
+    {
+      throw eventError("redundancy rank exceeds suffix-tree slot universe");
+    }
+    input.finish(); index.redundant_pointers.data = data; sdsl::util::clear(data);
+    sdsl::util::init_support(index.redundant_pointers.select,
+      &(index.redundant_pointers.data));
+  }
+
+  for(size_type comp = 0; comp < metadata.sigma; comp++)
+  {
+    sdsl::util::init_support(index.fast_rank[comp], &(index.fast_bwt[comp]));
+    sdsl::util::init_support(index.sparse_rank[comp], &(index.sparse_bwt[comp]));
+  }
+  sdsl::util::init_support(index.edge_rank, &(index.edges));
+  sdsl::util::init_support(index.sampled_path_rank, &(index.sampled_paths));
+  sdsl::util::init_support(index.sample_select, &(index.samples));
+}
+
+} // namespace gcsa
