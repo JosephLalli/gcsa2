@@ -110,10 +110,31 @@ main()
       std::string(workspace_root) + "/step-01--prune.complete"));
   }
 
-  // Resume with a different operational RAM ceiling. Semantic parameters and
-  // input checksums stay fixed, while the committed prune is restored.
+  // Resume through the final ordered scan, but stop before component assembly.
+  // This verifies that a completed event set is independently durable.
   {
     ConstructionParameters parameters = externalParameters(workspace_root, 640 * KILOBYTE);
+    parameters.setResume();
+    parameters.setStopAfter("final-events");
+    bool stopped = false;
+    try
+    {
+      InputGraph graph({ input_name }, false, parameters);
+      GCSA index(graph, parameters);
+    }
+    catch(const ConstructionStopped& event)
+    {
+      stopped = (event.completed_phase == "final-events");
+    }
+    require(stopped);
+    require(std::filesystem::exists(
+      std::string(workspace_root) + "/final--events.complete"));
+  }
+
+  // A second resume changes the operational RAM ceiling again, restores the
+  // immutable events, and assembles byte-identical final components.
+  {
+    ConstructionParameters parameters = externalParameters(workspace_root, 576 * KILOBYTE);
     parameters.setResume();
     InputGraph graph({ input_name }, false, parameters);
     GCSA index(graph, parameters);

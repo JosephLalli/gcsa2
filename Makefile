@@ -47,13 +47,13 @@ endif
 CXX_FLAGS=$(MY_CXX_FLAGS) $(VERIFY_FLAGS) $(PARALLEL_FLAGS) $(MY_CXX_OPT_FLAGS) -Iinclude -I$(INC_DIR)
 
 HEADERS=$(wildcard include/gcsa/*.h)
-LIBOBJS=$(addprefix $(BUILD_OBJ)/,algorithms.o checkpoint.o dbg.o disk_array.o external_join.o external_preprocessing.o external_sort.o files.o gcsa.o internal.o lcp.o path_graph.o support.o utils.o resources.o workspace.o)
+LIBOBJS=$(addprefix $(BUILD_OBJ)/,algorithms.o checkpoint.o dbg.o disk_array.o external_join.o external_preprocessing.o external_sort.o files.o final_events.o gcsa.o internal.o lcp.o path_graph.o support.o utils.o resources.o workspace.o)
 LIBRARY=$(BUILD_LIB)/libgcsa2.a
 
 PROGRAMS=$(addprefix $(BUILD_BIN)/,build_gcsa convert_graph gcsa_format try_extend)
 OBSOLETE=build_gcsa convert_graph gcsa_format try_extend
 
-.PHONY: all clean directories test workspace-test external-path-sort-test external-join-test external-sort-test external-preprocessing-test disk-array-test internal-buffer-test parameter-test construction-resume-test
+.PHONY: all clean directories test workspace-test external-path-sort-test external-join-test external-sort-test external-preprocessing-test final-events-test lcp-streaming-test disk-array-test internal-buffer-test parameter-test construction-resume-test
 all: directories $(LIBRARY) $(PROGRAMS)
 
 directories: $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)
@@ -104,6 +104,20 @@ external-preprocessing-test: directories $(BUILD_OBJ)/test_external_preprocessin
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_external_preprocessing $(BUILD_OBJ)/test_external_preprocessing.o $(LIBRARY) $(LIBS)
 	$(BUILD_BIN)/test_external_preprocessing
 
+$(BUILD_OBJ)/test_final_events.o:tests/test_final_events.cpp include/gcsa/final_events.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+final-events-test: directories $(BUILD_OBJ)/test_final_events.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_final_events $(BUILD_OBJ)/test_final_events.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_final_events
+
+$(BUILD_OBJ)/test_lcp_streaming.o:tests/test_lcp_streaming.cpp include/gcsa/lcp.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+lcp-streaming-test: directories $(BUILD_OBJ)/test_lcp_streaming.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_lcp_streaming $(BUILD_OBJ)/test_lcp_streaming.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_lcp_streaming
+
 $(BUILD_OBJ)/test_disk_array.o:tests/test_disk_array.cpp include/gcsa/disk_array.h
 	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
 
@@ -139,7 +153,7 @@ construction-resume-test: directories $(BUILD_OBJ)/test_construction_resume.o $(
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_construction_resume $(BUILD_OBJ)/test_construction_resume.o $(LIBRARY) $(LIBS)
 	$(BUILD_BIN)/test_construction_resume
 
-test: workspace-test external-path-sort-test external-join-test external-sort-test external-preprocessing-test disk-array-test internal-buffer-test parameter-test construction-resume-test
+test: workspace-test external-path-sort-test external-join-test external-sort-test external-preprocessing-test final-events-test lcp-streaming-test disk-array-test internal-buffer-test parameter-test construction-resume-test
 
 clean:
 	rm -rf $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)

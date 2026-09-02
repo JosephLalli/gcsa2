@@ -1,0 +1,223 @@
+#include <gcsa/final_events.h>
+#include <gcsa/internal.h>
+
+#include <array>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <sstream>
+#include <string>
+#include <unistd.h>
+
+using namespace gcsa;
+
+namespace
+{
+
+void require(bool value) { if(!value) { std::abort(); } }
+
+void writeByte(const std::string& filename, std::streamoff offset,
+  std::uint8_t value)
+{
+  std::fstream file(filename.c_str(), std::ios_base::binary |
+    std::ios_base::in | std::ios_base::out);
+  require(static_cast<bool>(file));
+  file.seekp(offset); file.put(static_cast<char>(value)); file.flush();
+  require(static_cast<bool>(file));
+}
+
+void writeInteger(const std::string& filename, std::streamoff offset,
+  std::uint64_t value)
+{
+  std::array<std::uint8_t, 8> encoded = {};
+  for(size_type i = 0; i < encoded.size(); i++)
+  {
+    encoded[i] = static_cast<std::uint8_t>(value >> (8 * i));
+  }
+  std::fstream file(filename.c_str(), std::ios_base::binary |
+    std::ios_base::in | std::ios_base::out);
+  require(static_cast<bool>(file));
+  file.seekp(offset);
+  file.write(reinterpret_cast<const char*>(encoded.data()), encoded.size());
+  file.flush(); require(static_cast<bool>(file));
+}
+
+void initSupports(GCSA& index)
+{
+  for(size_type comp = 0; comp < index.alpha.sigma; comp++)
+  {
+    sdsl::util::init_support(index.fast_rank[comp], &(index.fast_bwt[comp]));
+    sdsl::util::init_support(index.sparse_rank[comp], &(index.sparse_bwt[comp]));
+  }
+  sdsl::util::init_support(index.edge_rank, &(index.edges));
+  sdsl::util::init_support(index.sampled_path_rank, &(index.sampled_paths));
+  sdsl::util::init_support(index.sample_select, &(index.samples));
+}
+
+GCSA legacyEquivalent(const Alphabet& alphabet)
+{
+  GCSA expected;
+  expected.header.path_nodes = 4; expected.header.edges = 6; expected.header.order = 8;
+  sdsl::int_vector<64> counts(alphabet.sigma, 0);
+  counts[0] = 2; counts[1] = 2; counts[2] = 1; counts[5] = 1;
+  expected.alpha = Alphabet(counts, alphabet.char2comp, alphabet.comp2char);
+  expected.fast_bwt.resize(alphabet.sigma); expected.fast_rank.resize(alphabet.sigma);
+  expected.sparse_bwt.resize(alphabet.sigma); expected.sparse_rank.resize(alphabet.sigma);
+  std::vector<GCSA::bit_vector> raw(alphabet.sigma, GCSA::bit_vector(4, 0));
+  raw[0][0] = raw[1][0] = raw[1][1] = 1;
+  raw[2][2] = raw[5][2] = raw[0][3] = 1;
+  expected.sparse_bwt[0] = raw[0];
+  for(size_type comp = 1; comp <= alphabet.fast_chars; comp++)
+  {
+    expected.fast_bwt[comp] = raw[comp];
+  }
+  for(size_type comp = alphabet.fast_chars + 1; comp < alphabet.sigma; comp++)
+  {
+    expected.sparse_bwt[comp] = raw[comp];
+  }
+
+  GCSA::bit_vector edges(6, 0);
+  edges[1] = edges[2] = edges[4] = edges[5] = 1;
+  expected.edges = edges;
+  GCSA::bit_vector sampled(4, 0); sampled[0] = sampled[3] = 1;
+  expected.sampled_paths = sampled;
+  expected.stored_samples = sdsl::int_vector<0>(3, 0, bit_length(100));
+  expected.stored_samples[0] = 5; expected.stored_samples[1] = 7;
+  expected.stored_samples[2] = 100;
+  expected.samples = GCSA::bit_vector(3, 0);
+  expected.samples[1] = expected.samples[2] = 1;
+
+  CounterArray occurrences(4, 4), redundant(3, 4);
+  occurrences.increment(0, 2); occurrences.increment(2, 20);
+  redundant.increment(0); redundant.increment(2, 2);
+  expected.extra_pointers = SadaSparse(occurrences);
+  expected.redundant_pointers = SadaCount(redundant);
+  initSupports(expected);
+  return expected;
+}
+
+} // namespace
+
+int main()
+{
+  char root[] = "/tmp/gcsa-final-events-XXXXXX";
+  require(::mkdtemp(root) != nullptr);
+  TempFile::setDirectory(root);
+
+  ConstructionParameters parameters;
+  parameters.setMemoryLimitBytes(64 * KILOBYTE);
+  parameters.setSortRunSize(64 * KILOBYTE);
+  parameters.setIOBufferSize(128);
+  parameters.setMergeFanIn(2);
+
+  // Components 1..4 use the fast representation in the default alphabet;
+  // components 0, 5, and 6 exercise the sparse sides of the split.
+  Alphabet alphabet;
+  FinalEventFiles files(alphabet.sigma);
+  FinalEventMetadata metadata;
+  {
+    MemoryBudget budget(4096);
+    FinalEventWriter writer(files, alphabet.sigma, 32, budget);
+    writer.path((1U << 0) | (1U << 1));
+    writer.edge(0, 0); writer.edge(1, 0);
+    writer.sampledPath(0); writer.sample(5); writer.sample(7); writer.sampleEnd();
+    writer.occurrence(0, 2);
+
+    writer.path(1U << 1); writer.edge(1, 1);
+
+    writer.path((1U << 2) | (1U << 5));
+    writer.edge(2, 2); writer.edge(5, 3);
+    writer.occurrence(2, 20);
+
+    writer.path(1U << 0); writer.edge(0, 2);
+    writer.sampledPath(3); writer.sample(100); writer.sampleEnd();
+
+    // Deliberately unsorted with a duplicate; external sorting must produce
+    // counts [1, 0, 2] for the three suffix-tree slots.
+    writer.redundancy(2); writer.redundancy(0); writer.redundancy(2);
+    metadata = writer.finish();
+  }
+  metadata.fast_chars = alphabet.fast_chars;
+  sortFinalRedundancy(files, parameters);
+  writeFinalEventMetadata(files, metadata);
+
+  BuildWorkspace::Settings semantic;
+  semantic["fixture"] = "final-events";
+  BuildWorkspace workspace(root, semantic, BuildWorkspace::Settings(),
+    BuildWorkspace::NEW_WORKSPACE);
+  checkpointFinalEvents(workspace, files, metadata, 64);
+  require(workspace.task_completed("final", "events"));
+
+  FinalEventFiles restored(alphabet.sigma);
+  FinalEventMetadata restored_metadata;
+  require(restoreFinalEvents(workspace, restored, restored_metadata, 4,
+    alphabet.sigma, 64));
+  require(restored_metadata.total_edges == 6);
+  require(restored_metadata.occurrence_extra == 22);
+  require(restored_metadata.redundant == 3);
+
+  GCSA observed;
+  observed.header.path_nodes = 4; observed.header.edges = 6; observed.header.order = 8;
+  buildFinalComponents(observed, alphabet, restored, restored_metadata, parameters);
+  require(observed.extra_pointers.count(0, 0) == 2);
+  require(observed.extra_pointers.count(1, 1) == 0);
+  require(observed.extra_pointers.count(2, 2) == 20);
+  require(observed.redundant_pointers.count(0, 0) == 1);
+  require(observed.redundant_pointers.count(1, 1) == 0);
+  require(observed.redundant_pointers.count(2, 2) == 2);
+  require(observed.sampled(0) && observed.sampled(3));
+  require(observed.sampleCount() == 3);
+  require(observed.sample(0) == 5 && observed.sample(1) == 7 && observed.sample(2) == 100);
+
+  GCSA expected = legacyEquivalent(alphabet);
+  std::ostringstream observed_bytes, expected_bytes;
+  observed.serialize(observed_bytes); expected.serialize(expected_bytes);
+  require(observed_bytes.str() == expected_bytes.str());
+
+  const auto rejects = [&](const FinalEventMetadata& candidate_metadata)
+  {
+    GCSA candidate;
+    try
+    {
+      buildFinalComponents(candidate, alphabet, restored, candidate_metadata,
+        parameters);
+    }
+    catch(const std::runtime_error&) { return true; }
+    return false;
+  };
+
+  // Metadata and streams are validated before unchecked succinct-builder
+  // assumptions can become out-of-bounds writes.
+  FinalEventMetadata invalid_metadata = restored_metadata;
+  invalid_metadata.sample_bits = 65;
+  require(rejects(invalid_metadata));
+
+  // Path 1 originally has only component 1. Adding a second component-5 bit
+  // exceeds the declared sparse-BWT one-count and must fail closed.
+  writeByte(restored.bwt_masks, 1, static_cast<std::uint8_t>((1U << 1) | (1U << 5)));
+  require(rejects(restored_metadata));
+  writeByte(restored.bwt_masks, 1, static_cast<std::uint8_t>(1U << 1));
+
+  // A corrupt occurrence value larger than the declared total previously
+  // underflowed unsigned subtraction before set_unsafe().
+  writeInteger(restored.occurrences, 8,
+    std::numeric_limits<std::uint64_t>::max());
+  require(rejects(restored_metadata));
+  writeInteger(restored.occurrences, 8, 2);
+
+  invalid_metadata = restored_metadata;
+  invalid_metadata.sample_bits = 1;
+  require(rejects(invalid_metadata));
+
+  // Raw truncation is rejected before SDSL sees an inconsistent universe.
+  require(::truncate(restored.occurrences.c_str(), 16) == 0);
+  bool rejected = false;
+  try { buildFinalComponents(observed, alphabet, restored, restored_metadata, parameters); }
+  catch(const std::runtime_error&) { rejected = true; }
+  require(rejected);
+
+  restored.clear(); files.clear();
+  std::filesystem::remove_all(root);
+  return 0;
+}

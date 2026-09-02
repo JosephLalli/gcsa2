@@ -7,7 +7,7 @@ tracks which parts are actually implemented.
 
 ## Baseline audit
 
-The existing builder uses temporary files, but a temporary file is generally a
+The legacy builder uses temporary files, but a temporary file is generally a
 serialization point between whole-file in-memory operations rather than a
 bounded external-memory data structure.
 
@@ -30,6 +30,18 @@ The up-front estimate in `GCSA::GCSA()` and the future-file check in
 `PathGraphBuilder::write()` are guards. They can terminate before an allocation,
 but they do not provide an external execution route.
 
+All ten suspected peaks in the implementation request were present in the
+checked-out GCSA2 revision. Two details differed slightly from the initial
+description: `PathGraph::extend()` allocated the large path/rank staging
+vectors per OpenMP thread rather than as one shared pair, and
+`MergedGraph::MergedGraph()` was already mostly streaming but retained an
+unbounded `SameFromSet::nodes` group. The table describes the preserved legacy
+route. The workspace-selected route now replaces key/start/initial-path
+preprocessing, prefix-doubling joins and label sorting, final raw component
+construction, dense previous-occurrence state, and simultaneous raw LCP levels.
+Pruning equal-label groups and `MergedGraph` same-from groups remain resident
+limitations.
+
 ### Production fixture and measured legacy baseline
 
 The chromosome-scale acceptance fixture is the packed chr20 graph pruned with
@@ -40,6 +52,24 @@ benchmark cannot silently substitute a smaller or differently pruned graph:
 | --- | ---: | --- |
 | `chr20.exact_walk_k32_m0.pruned.vg` | 440,223,843 | `04e566fb4810e273fcaad1c4796b4dc785a336796b604089bbae1df6007bc525` |
 | `chr20.exact_walk_k32_m0.mapping` | 64,428,032 | `04843ec74911550700b051fed5579e3a7c29748309a7fb5b55c99dba17cd4a05` |
+
+The immutable files are under
+`/mnt/ssd/lalli/hprc_v2_vg_rna/smoke_chr20/exact_walk_k32_loss_diagnostic_v1_20260821T052743-0500/index/`.
+No benchmark step regenerates or reprunes them.
+
+The preferred second acceptance fixture is the existing chr21 k32-pruned retry
+under
+`/mnt/ssd/lalli/hprc_v2_vg_rna/smoke_chr21/exact_walk_k_sweep_v1_20260815T115236-0500/k32_gcsa_retry_cap400g/index/`:
+
+| Input | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `chr21.exact_walk_k32_m0.pruned.vg` | 246,263,907 | `1c75a17d98ceae0f1b0d7cf67649f91e1e4136f1929be8bf54b884759519129e` |
+| `chr21.exact_walk_k32_m0.mapping` | 25,928,080 | `85e0763a8b1040569694272492259f69cc87168b918d04a0576811c030ca2a99` |
+
+Its successful legacy `vg index -k16 -X4 -Z2048 -t32` run took 2:07:13
+and 105,438,580 KiB maximum RSS (100.55 GiB). This is the primary target for
+the requested approximately 25 GiB comparison once the host's other heavy
+`vg prune`/GCSA work and I/O contention are absent.
 
 The successful legacy command used `vg index -k 16 -X 4 -Z 700 -t 32 -V`.
 It produced a 682,869,673-byte GCSA and a 273,490,577-byte LCP in 1:55:35
@@ -76,13 +106,14 @@ reported 497.497 GB read and 417.810 GB written. A separate 23 GiB internal /
 terminated before its incomplete join phase committed. Resumption retained its
 predecessor and ignored the incomplete successor exactly as designed.
 
-The chromosome completion binary predates the later parallel run-sort and
-dirty-cache changes described below. Those changes pass unit and small
-integration tests, but their chromosome-scale runtime and RSS have not been
-remeasured. In particular, the newer 75/25 run allocation intentionally uses
-more of an explicitly generous budget to eliminate an otherwise unnecessary
-full merge pass; users seeking the smallest RSS should configure a smaller
-sort-run budget and retain the hard cgroup ceiling.
+The chromosome completion binary predates the later parallel run-sort,
+direct-join, external-preprocessing, final-event, streaming-LCP, and dirty-cache
+changes described below. Those changes pass unit and small integration tests,
+but their chromosome-scale runtime and RSS have not been remeasured. In
+particular, the newer 75/25 run allocation intentionally uses more of an
+explicitly generous budget to eliminate an otherwise unnecessary full merge
+pass; users seeking the smallest RSS should configure a smaller sort-run budget
+and retain the hard cgroup ceiling.
 
 ### `vg` integration audit
 
@@ -137,15 +168,17 @@ I/O buffer settings are bytes. The element capacity is computed as
 scheduled separately, but both consume tokens from the same budget.
 
 Linux cgroups charge clean filesystem page cache to `MemoryMax`. The external
-join, label sorter, and durable checkpoint writer/validator/restorer therefore
-treat cache as another bounded I/O window: sequential writers sync and evict
-completed prefixes every 512 MiB while retaining a 64 MiB tail, and readers
-evict prefixes after consuming them. A backwards seek for a pathological join
-key resets the reader watermark so every replay remains bounded.
-`posix_fadvise()` is best-effort and non-semantic; `fdatasync()` is the
-durability boundary. Legacy preprocessing, pruning, merged-graph, final-index,
-and LCP streams still need the same treatment before the in-process
-`MemoryBudget` alone can be called an end-to-end ceiling.
+preprocessor, join, label sorter, final-event streams, disk arrays, and durable
+checkpoint writer/validator/restorer therefore use bounded byte buffers and,
+where implemented, sequential access advice plus rolling cache eviction.
+Sequential join and final-event writers sync and evict completed prefixes every
+512 MiB while retaining a 64 MiB tail; readers evict consumed prefixes. A
+backwards seek for a pathological join key resets the reader watermark so every
+replay remains bounded. `posix_fadvise()` is best-effort and non-semantic;
+`fdatasync()` is the durability boundary. Pruning, `MergedGraph`, final SDSL
+component allocations, and some library-owned compression scratch are not all
+admitted through `MemoryBudget`, so the in-process token budget is not yet an
+end-to-end RSS ceiling. A hard cgroup remains the acceptance boundary.
 
 ### Compute and I/O concurrency
 
@@ -209,7 +242,8 @@ The final `MergedGraph` writer sustained roughly 100--120 MiB/s but retained
 about 18.3 GB of clean staging data in cache; rolling cache eviction is the
 first fix. The final index scan consumed approximately one CPU and 128 MiB/s of
 cached logical input with no physical reads. It cannot be naively split because
-`prev_occ`, the LCP stack, and redundant-pointer aggregation are ordered state;
+`prev_occ`, the suffix-tree stack, and redundant-pointer aggregation are
+ordered state;
 the event/component split is what exposes safe parallel work around that
 ordered core.
 
@@ -222,11 +256,16 @@ left-context-plus-right-references format can still reduce the larger
 fixed-record traffic. That compaction remains more valuable than running two
 encoders against the same disk.
 
-`DiskBudget` tracks committed live workspace bytes, bytes reserved by active
-writers, configured maximum bytes, `statvfs()` free bytes, and a free-space
-safety margin. A generation estimate is diagnostic. Construction stops only
-when an actual reservation cannot be honored, a write fails, an explicit growth
-cutoff is reached, or input is invalid. RAM size is never a disk-limit proxy.
+The current disk guard is exact for generated path/label sinks and deterministic
+join-partition output: it counts committed and pending generation bytes against
+`--disk-limit` and never compares those bytes with RAM. The `DiskBudget`
+primitive can also inspect recursively live workspace bytes and `statvfs()`
+free space, but it is not yet shared by every writer. In particular, final-event
+copies, LCP raw levels, and some checkpoint copies currently stop on a failed
+write/ENOSPC rather than reserving their complete output first. Consequently
+`--disk-limit` is presently a spill-generation budget, not a strict global
+workspace quota. A generation estimate remains diagnostic; RAM size is never a
+disk-limit proxy.
 
 ## Durable workspace
 
@@ -378,17 +417,24 @@ branches replay the group once. Physical shard IDs never participate in
 
 ### Final components and LCP
 
-The final merged-graph scan emits immutable BWT-set, edge-degree, sample,
-occurrence, redundancy, and LCP-leaf event streams. Unordered events are
-externally sorted and aggregated. Dense previous-occurrence state is a
-disk-backed block array: each scan block commits output events and an idempotent
-sorted assignment log before replaying the log into the synced base array.
+The implemented final merged-graph scan emits immutable BWT masks,
+per-character source-path edge ranks, sampled path positions, sample IDs and
+boundaries, nonzero occurrence pairs, and redundancy positions. Redundancy
+positions are externally sorted. Dense previous-occurrence state and the
+suffix-tree traversal stack are block-cached disk arrays. All streams are
+synced and committed together as one workspace task; a crash restarts only this
+ordered scan. Mid-scan resume and the assignment-log protocol remain future
+work.
 
-Each final component is built and released separately. A packer writes the
-unchanged `GCSA::serialize()` component order to a partial `.gcsa`, validates
-it, and atomically publishes it. LCP level `i+1` is produced by streaming groups
-of the configured branching factor from level `i`; levels are checkpointed and
-packed in legacy `LCPArray::serialize()` order without simultaneous residency.
+Final raw components are built serially, one at a time, from those streams.
+This preserves the fast/sparse BWT split and the unchanged public
+`GCSA::serialize()` format while eliminating the simultaneous raw BWT,
+outdegree, sample, occurrence, and redundancy arrays. The completed succinct
+members still coexist in the returned `GCSA` object, and direct component-blob
+packing is not implemented. LCP level `i+1` is produced by streaming groups of
+the configured branching factor from level `i`; each raw internal level is
+independently checkpointed and consumed. The final packed hierarchy necessarily
+resides in `LCPArray::data`, in legacy leaf-to-root serialization order.
 
 ## Implementation ledger
 
@@ -397,37 +443,41 @@ when its production call path and forced-spill/recovery tests pass.
 
 | Slice | State |
 | --- | --- |
-| Shared byte-token `MemoryBudget` and statvfs-aware `DiskBudget` | primitives implemented and tested; global allocation admission pending |
-| Versioned workspace artifacts, atomic publication, manifest compatibility, recovery tests | phase-level checkpoints and abrupt-exit commit-boundary tests implemented; per-join-run task records pending |
+| Shared byte-token `MemoryBudget` and statvfs-aware `DiskBudget` | memory primitives and major external-phase byte caps implemented; SDSL/library allocations and legacy groups are not globally admitted; disk guard covers generated path/join volume but not every final/LCP/checkpoint writer |
+| Versioned workspace artifacts, atomic publication, manifest compatibility, recovery tests | phase and join-range checkpoints plus abrupt-exit commit-boundary tests implemented; transient distribution-run task records pending |
 | Human-readable operational construction parameters | core budget/run controls implemented and parser-tested; cleanup/cadence controls are not all wired |
 | Bounded external path-label runs and leveled multi-pass merge | parallel in-place run sorting, rolling cache windows, one-run bypass, and forced multi-pass spilling implemented and tested |
 | Logical/physical `PathGraph` identity in pruning and joining | implemented; durable run-set manifest pending |
 | External prefix-doubling join | bounded sort-merge, rolling page-cache windows, deterministic range partitioning, recursive two-dimensional heavy-key splitting, and selectable checksum scans implemented; sampled/radix planning pending |
 | Direct join-to-label pipeline | implemented and forced-spill tested; the unsorted generated path/rank pair is no longer materialized |
 | Process worker scheduler and partition resume | implemented with fork-free spawn, global byte admission, semantic range checkpoints, and one-/multi-partition tests |
-| External keys/start nodes/initial paths | not implemented |
+| External keys/start nodes/initial paths | implemented with bounded fixed-record runs, global duplicate reduction, streaming support construction, durable key/start checkpoints, and physical initial shards preserving logical IDs |
 | Spillable pruning groups | not implemented |
-| Final event/component passes and transactional `prev_occ` | not implemented |
-| Streaming LCP levels and legacy packer | not implemented |
+| Final event/component passes | implemented with one-task event checkpoint, disk-backed `prev_occ` and suffix-tree stack, external redundancy sort, and component-at-a-time construction; mid-scan assignment logs and direct component packer pending |
+| Streaming LCP levels | implemented and resume-tested with one raw level resident at a time and byte-identical legacy serialization; final packed hierarchy remains resident |
 | Standalone and `vg index` / `vg autoindex` CLI integration | implemented; forced-spill/resume integration tested |
 | Chromosome-scale benchmark | preexisting chr20 k32-pruned fixture completed and verified at 32.36 GiB RSS under a 128 GiB cgroup; outputs are byte-identical to legacy; separate 25 GiB forced-spill/recovery path exercised |
 
 Current limitations are intentionally explicit. The external route is selected
-only when `ConstructionParameters::work_directory` is nonempty. Key extraction,
-start-node extraction, initial path construction, pruning groups, final GCSA
-components, and LCP levels still use the legacy resident algorithms. Join
-distribution runs are checksummed immutable files but are not yet registered as
-resumable workspace tasks, so an incomplete generation rebuilds them before it
-restores completed join ranges. Recursive range planning is exact but performs
-an additional sequential group-summary pass and does not yet use sampled
-MSD/radix boundaries. These limitations mean the full construction
-does not yet satisfy the end-to-end RAM invariant, even though prefix-doubling
-extension itself no longer requires a chromosome or join key to fit in memory.
-The explicit label-run disk format, final event streams, and per-filesystem
-writer admission described above are designs, not completed code. The direct
-join-to-label pipeline and subprocess range executor are implemented; they
-retain the same fixed-width external label runs but avoid the preceding
-variable-width path/rank write and reread.
+only when `ConstructionParameters::work_directory` is nonempty. Pruning still
+retains an equal-label/extended group, and `MergedGraph` still retains a
+same-from group. Final-scan `curr_from` and `pred_from` vectors may grow with one
+path's start-node set. Final SDSL bitvectors and succinct components allocate
+outside the token budget and all completed components coexist in the returned
+object; callers may also retain the completed GCSA while constructing the LCP.
+These gaps prevent a strict end-to-end RAM guarantee today.
+
+Join distribution runs are checksummed immutable files but are not yet
+registered as resumable workspace tasks, so an incomplete generation rebuilds
+them before restoring completed join ranges. Recursive range planning is exact
+but performs an additional sequential group-summary pass and does not yet use
+sampled MSD/radix boundaries. Initial and label-sort fixed records repeat full
+payloads; grouped expansion/super-k-mer-like compression is not implemented.
+Final component construction is serial and the ordered event scan resumes only
+at its task boundary. Process workers currently accelerate independent join
+ranges only. Even with these limitations, preprocessing and prefix doubling no
+longer require a logical chromosome, physical shard, join key, or generated
+label run to fit in RAM, and LCP no longer retains all raw hierarchy levels.
 
 ## Build, test, and usage
 
@@ -497,5 +547,5 @@ scripts/benchmark-gcsa-external.sh \
   --run-dir /large-local-disk/chr6-run \
   --memory-limit 94G --cgroup-limit 96G --disk-limit 40T \
   --sort-run-size 64G --join-partition-size 64G \
-  --threads 32 --kmer-length 16 --doubling-steps 4
+  --process-workers 4 --threads 32 --kmer-length 16 --doubling-steps 4
 ```

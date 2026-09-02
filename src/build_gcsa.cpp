@@ -100,8 +100,8 @@ main(int argc, char** argv)
     std::cerr << "      --work-dir PATH            durable construction workspace" << std::endl;
     std::cerr << "      --resume                   resume compatible committed phases" << std::endl;
     std::cerr << "      --keep-work                retain workspace after success" << std::endl;
-    std::cerr << "      --memory-limit SIZE        strict external working-set ceiling" << std::endl;
-    std::cerr << "      --disk-limit SIZE          workspace/output disk ceiling" << std::endl;
+    std::cerr << "      --memory-limit SIZE        external working-set byte budget" << std::endl;
+    std::cerr << "      --disk-limit SIZE          spill-generation disk budget" << std::endl;
     std::cerr << "      --io-buffer-size SIZE      byte size of sequential I/O buffers" << std::endl;
     std::cerr << "      --sort-run-size SIZE       maximum label-sort working set" << std::endl;
     std::cerr << "      --join-partition-size SIZE maximum join working set" << std::endl;

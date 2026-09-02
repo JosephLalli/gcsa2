@@ -26,10 +26,14 @@
 #ifndef GCSA_LCP_H
 #define GCSA_LCP_H
 
+#include <string>
+
 #include <gcsa/files.h>
 
 namespace gcsa
 {
+
+class BuildWorkspace;
 
 /*
   lcp.h: LCP array that provides additional functionality to a GCSA index.
@@ -83,6 +87,25 @@ std::ostream& operator<< (std::ostream& out, const STNode& node);
 //------------------------------------------------------------------------------
 
 /*
+  Bounded temporary storage used while constructing the range-minimum levels.
+  The final packed LCPArray::data is deliberately not included: constructing an
+  LCPArray necessarily retains its complete serialized hierarchy.
+*/
+struct LCPStreamingStats
+{
+  size_type levels, generated_levels, restored_levels, checkpointed_levels;
+  size_type max_bytes_resident;
+
+  LCPStreamingStats() :
+    levels(0), generated_levels(0), restored_levels(0), checkpointed_levels(0),
+    max_bytes_resident(0)
+  {
+  }
+};
+
+//------------------------------------------------------------------------------
+
+/*
   LCP array with support for some suffix tree operations using nsv/psv/rmq queries via
   a range minimum tree.
 */
@@ -118,6 +141,16 @@ public:
   */
 
   explicit LCPArray(const InputGraph& graph, const ConstructionParameters& parameters = ConstructionParameters());
+
+  /*
+    Build from the merged leaf-LCP byte stream. Internal range-minimum levels
+    are generated and consumed one at a time; byte_budget must be at least 2.
+    If a workspace is supplied, each generated internal level is checkpointed
+    independently and can be restored on a later invocation.
+  */
+  LCPArray(const std::string& leaf_filename, size_type branching,
+    size_type byte_budget, BuildWorkspace* workspace = nullptr,
+    LCPStreamingStats* stats = nullptr);
 
 //------------------------------------------------------------------------------
 
