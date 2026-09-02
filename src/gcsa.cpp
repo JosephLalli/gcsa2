@@ -644,8 +644,26 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
     restored_prune = false;
     if(parameters.externalMemory())
     {
+      ExternalPathJoinStats join_stats;
       externalPathGraphExtend(path_graph,
-        parameters.getLimitBytes() - path_graph.bytes(), parameters);
+        parameters.getLimitBytes() - path_graph.bytes(), parameters, &join_stats);
+      if(Verbosity::level >= Verbosity::EXTENDED)
+      {
+        std::cerr << "externalPathGraphExtend(): "
+                  << join_stats.left_records << " left, "
+                  << join_stats.right_records << " right, "
+                  << join_stats.generated_records << " generated, "
+                  << join_stats.sorted_bypass << " bypassed" << std::endl;
+        std::cerr << "externalPathGraphExtend(): "
+                  << join_stats.initial_runs << " join runs, "
+                  << join_stats.merge_operations << " join merges, "
+                  << join_stats.label_sort_runs << " label runs, "
+                  << join_stats.label_merge_passes << " label merge passes, "
+                  << join_stats.blocked_key_groups << " blocked key groups" << std::endl;
+        std::cerr << "externalPathGraphExtend(): maximum bounded workspace "
+                  << formatBytes(join_stats.max_bytes_resident) << " ("
+                  << join_stats.max_records_resident << " records)" << std::endl;
+      }
     }
     else
     {
