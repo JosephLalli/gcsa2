@@ -161,16 +161,15 @@ intentionally chosen so the chr20 step-4 label set (about 67.1 GiB of 96-byte
 records) is one run with a 96 GiB phase budget rather than narrowly exceeding a
 64 GiB run and paying for a full merge pass.
 
-The current implementation deliberately keeps each merge and join emitter
-single-writer and sequential. More writer threads would multiply dirty-cache
-windows and seek pressure without helping when one filesystem is saturated.
-The next parallel unit is a deterministic range partition of
-`(logical_file_id, join_key)`: worker tasks will reserve byte tokens, consume
-disjoint immutable input ranges, and publish separate physical output shards.
-Those shards retain their shared logical ID and can be merged or concatenated
-in range order. Compute admission and writer admission should be separate; many
-range tasks may sort concurrently when tokens permit, while normally only one
-or two writers per backing filesystem drain bounded queues.
+Merge emitters remain single-writer, while prefix-doubling joins can now use
+deterministic range partitions of `(logical_file_id, join_key)`. Worker tasks
+reserve byte tokens, consume disjoint immutable input ranges, and publish
+separate physical output shards. Those shards retain their shared logical ID
+and are consumed as a run set. A heavy key is recursively split on both left
+and right record ranges; splitting the left range suppresses duplicate sorted
+bypasses, while splitting the right range gives each task a disjoint bypass.
+Separate admission for compute and writers remains future work for filesystems
+that cannot sustain all admitted writers concurrently.
 
 The intended bounded pipeline is therefore read-ahead for partition N+1,
 parallel join/sort for partition N, and ordered writeback for partition N-1.
@@ -179,16 +178,18 @@ budget. Independent merge groups can use the same scheduler. Work stealing may
 change task completion order, but semantic range names and ordered publication
 keep committed artifacts byte-deterministic.
 
-Range tasks also form a clean optional multiprocessing ABI. A coordinator can
-`exec` workers with immutable input artifact IDs, exact key ranges, unique
+Range tasks use a versioned multiprocessing ABI. The coordinator uses
+`posix_spawn()` to `exec` workers with immutable input paths, exact key ranges, unique
 partial output names, and explicit memory/disk reservations. Workers finalize
 artifacts, but only the coordinator validates them and commits task markers.
 This isolates allocator fragmentation and worker crashes and permits per-worker
-cgroup controls. It must not `fork` a live OpenMP process, and the sum of worker
-reservations, bounded queues, and cgroup-charged page cache must still be
-admitted by one global scheduler. This subprocess executor is designed but not
-implemented in the current slice; the in-process OpenMP sorter is the tested
-execution path.
+cgroup controls. It never `fork`s a live OpenMP process. The parent admits the
+sum of worker reservations under one byte-token budget with a 1/16 safety
+margin, divides OpenMP threads among admitted children, validates exact output
+counts and lengths, and kills sibling workers after a failure. Each completed
+semantic range is committed independently, so a resumed generation restores
+valid ranges and only respawns missing work. Cgroup-charged filesystem cache
+still needs a deployment-level ceiling in addition to allocator byte tokens.
 
 The largest remaining I/O opportunity is record compaction, not extra writer
 processes. Current fixed-width join runs repeat complete path labels and may be
@@ -248,8 +249,10 @@ logs/
 The current slice commits `inputs/` plus semantic phase artifacts and
 `*.complete` task records directly under the workspace root. Join and label
 sort runs are immutable while in use, but are still PID-named transient files
-inside a phase. Moving those run tasks into the directory hierarchy above is
-required for partition-granularity resume; the current frontier is phase-level.
+inside a phase. Completed join-range outputs are durable semantic tasks keyed
+by logical input and exact left/right half-open ranges, enabling
+partition-granularity resume. Moving transient distribution and label runs into
+the directory hierarchy remains format work.
 
 `build.json` contains the workspace format, GCSA2 version, final format
 versions, input identities/sizes/checksums, mapping identity, k-mer length,
@@ -399,8 +402,9 @@ when its production call path and forced-spill/recovery tests pass.
 | Human-readable operational construction parameters | core budget/run controls implemented and parser-tested; cleanup/cadence controls are not all wired |
 | Bounded external path-label runs and leveled multi-pass merge | parallel in-place run sorting, rolling cache windows, one-run bypass, and forced multi-pass spilling implemented and tested |
 | Logical/physical `PathGraph` identity in pruning and joining | implemented; durable run-set manifest pending |
-| External prefix-doubling join | bounded sort-merge, rolling page-cache windows, and selectable checksum scans implemented; sampled range partitioning pending |
+| External prefix-doubling join | bounded sort-merge, rolling page-cache windows, deterministic range partitioning, recursive two-dimensional heavy-key splitting, and selectable checksum scans implemented; sampled/radix planning pending |
 | Direct join-to-label pipeline | implemented and forced-spill tested; the unsorted generated path/rank pair is no longer materialized |
+| Process worker scheduler and partition resume | implemented with fork-free spawn, global byte admission, semantic range checkpoints, and one-/multi-partition tests |
 | External keys/start nodes/initial paths | not implemented |
 | Spillable pruning groups | not implemented |
 | Final event/component passes and transactional `prev_occ` | not implemented |
@@ -411,18 +415,19 @@ when its production call path and forced-spill/recovery tests pass.
 Current limitations are intentionally explicit. The external route is selected
 only when `ConstructionParameters::work_directory` is nonempty. Key extraction,
 start-node extraction, initial path construction, pruning groups, final GCSA
-components, and LCP levels still use the legacy resident algorithms. Join runs
-are checksummed immutable files but are not yet registered as resumable
-workspace tasks. The current heavy-key fallback uses one-record left blocks and
-repeated right-range reads; it is bounded but can perform much more I/O than a
-larger blocked implementation. These limitations mean the full construction
+components, and LCP levels still use the legacy resident algorithms. Join
+distribution runs are checksummed immutable files but are not yet registered as
+resumable workspace tasks, so an incomplete generation rebuilds them before it
+restores completed join ranges. Recursive range planning is exact but performs
+an additional sequential group-summary pass and does not yet use sampled
+MSD/radix boundaries. These limitations mean the full construction
 does not yet satisfy the end-to-end RAM invariant, even though prefix-doubling
 extension itself no longer requires a chromosome or join key to fit in memory.
-The subprocess range executor, explicit label-run disk format, final event
-streams, and per-filesystem writer admission described above are designs, not
-completed code. The direct join-to-label pipeline is implemented; it retains
-the same fixed-width external label runs but avoids the preceding variable-width
-path/rank write and reread.
+The explicit label-run disk format, final event streams, and per-filesystem
+writer admission described above are designs, not completed code. The direct
+join-to-label pipeline and subprocess range executor are implemented; they
+retain the same fixed-width external label runs but avoid the preceding
+variable-width path/rank write and reread.
 
 ## Build, test, and usage
 
@@ -459,7 +464,7 @@ deps/gcsa2/bin/build_gcsa \
   --resume --keep-work \
   --memory-limit 96G --disk-limit 40T \
   --io-buffer-size 64M --sort-run-size 4G \
-  --join-partition-size 16G --merge-fan-in 64 \
+  --join-partition-size 16G --process-workers 4 --merge-fan-in 64 \
   --max-open-files 128 --allow-path-explosion \
   -T 32 -o chr6 chr6
 ```
@@ -473,6 +478,7 @@ vg index -p -V -g chr6.gcsa -k 16 -X 4 -t 32 \
   --gcsa-work-dir /large-local-disk/chr6.gcsa-work \
   --gcsa-resume \
   --gcsa-memory-limit 96G --gcsa-disk-limit 40T \
+  --gcsa-process-workers 4 \
   --gcsa-sort-run-size 64G --gcsa-join-partition-size 64G \
   -f chr6.mapping chr6.pruned.vg
 ```

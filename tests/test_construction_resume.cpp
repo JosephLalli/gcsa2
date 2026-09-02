@@ -17,10 +17,17 @@ namespace
 {
 
 void
-require(bool condition)
+requireAt(bool condition, size_type line)
 {
-  if(!condition) { std::exit(EXIT_FAILURE); }
+  if(!condition)
+  {
+    std::cerr << "test_construction_resume: requirement failed at line "
+              << line << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
 }
+
+#define require(condition) requireAt((condition), __LINE__)
 
 std::vector<char>
 readFile(const std::string& filename)

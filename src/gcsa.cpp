@@ -129,6 +129,7 @@ constructionOperationalSettings(const ConstructionParameters& parameters)
   settings["join_partition_size"] = std::to_string(parameters.getJoinPartitionSize());
   settings["merge_fan_in"] = std::to_string(parameters.getMergeFanIn());
   settings["max_open_files"] = std::to_string(parameters.getMaxOpenFiles());
+  settings["process_workers"] = std::to_string(parameters.getProcessWorkers());
   settings["threads"] = std::to_string(omp_get_max_threads());
   return settings;
 }
@@ -671,7 +672,8 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
     {
       ExternalPathJoinStats join_stats;
       externalPathGraphExtend(path_graph,
-        parameters.getLimitBytes() - path_graph.bytes(), parameters, &join_stats);
+        parameters.getLimitBytes() - path_graph.bytes(), parameters, &join_stats,
+        workspace.get(), task);
       if(Verbosity::level >= Verbosity::EXTENDED)
       {
         std::cerr << "externalPathGraphExtend(): "
@@ -682,6 +684,10 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
         std::cerr << "externalPathGraphExtend(): "
                   << join_stats.initial_runs << " join runs, "
                   << join_stats.merge_operations << " join merges, "
+                  << join_stats.join_partitions << " join partitions, "
+                  << join_stats.worker_processes << " worker processes, "
+                  << join_stats.restored_partitions << " restored partitions, "
+                  << join_stats.recursive_splits << " recursive splits, "
                   << join_stats.label_sort_runs << " label runs, "
                   << join_stats.label_merge_passes << " label merge passes, "
                   << join_stats.blocked_key_groups << " blocked key groups" << std::endl;

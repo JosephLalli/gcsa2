@@ -70,6 +70,10 @@ atomicStore(const IndexType& index, const std::string& final_name)
 int
 main(int argc, char** argv)
 {
+  if(argc == 3 && std::string(argv[1]) == "gcsa-worker-task")
+  {
+    return externalPathJoinWorker(argv[2]);
+  }
   if(argc < 2)
   {
     Version::print(std::cerr, "GCSA2 builder");
@@ -102,6 +106,7 @@ main(int argc, char** argv)
     std::cerr << "      --join-partition-size SIZE maximum join working set" << std::endl;
     std::cerr << "      --merge-fan-in N           maximum merge inputs" << std::endl;
     std::cerr << "      --max-open-files N         construction descriptor ceiling" << std::endl;
+    std::cerr << "      --process-workers N        parallel external join worker processes" << std::endl;
     std::cerr << "      --checkpoint-records N     record checkpoint interval" << std::endl;
     std::cerr << "      --checkpoint-bytes SIZE    byte checkpoint interval" << std::endl;
     std::cerr << "      --verify-workspace         verify payload checksums on reuse" << std::endl;
@@ -123,7 +128,7 @@ main(int argc, char** argv)
     OPT_DISK_LIMIT, OPT_IO_BUFFER, OPT_SORT_RUN, OPT_JOIN_PARTITION,
     OPT_MERGE_FAN_IN, OPT_MAX_OPEN_FILES, OPT_CHECKPOINT_RECORDS,
     OPT_CHECKPOINT_BYTES, OPT_VERIFY_WORKSPACE, OPT_CLEAN_OBSOLETE,
-    OPT_STOP_AFTER, OPT_ALLOW_PATH_EXPLOSION
+    OPT_STOP_AFTER, OPT_ALLOW_PATH_EXPLOSION, OPT_PROCESS_WORKERS
   };
   static struct option long_options[] =
   {
@@ -137,6 +142,7 @@ main(int argc, char** argv)
     { "join-partition-size", required_argument, nullptr, OPT_JOIN_PARTITION },
     { "merge-fan-in", required_argument, nullptr, OPT_MERGE_FAN_IN },
     { "max-open-files", required_argument, nullptr, OPT_MAX_OPEN_FILES },
+    { "process-workers", required_argument, nullptr, OPT_PROCESS_WORKERS },
     { "checkpoint-records", required_argument, nullptr, OPT_CHECKPOINT_RECORDS },
     { "checkpoint-bytes", required_argument, nullptr, OPT_CHECKPOINT_BYTES },
     { "verify-workspace", no_argument, nullptr, OPT_VERIFY_WORKSPACE },
@@ -200,6 +206,8 @@ main(int argc, char** argv)
       parameters.setMergeFanIn(std::stoull(optarg)); break;
     case OPT_MAX_OPEN_FILES:
       parameters.setMaxOpenFiles(std::stoull(optarg)); break;
+    case OPT_PROCESS_WORKERS:
+      parameters.setProcessWorkers(std::stoull(optarg)); break;
     case OPT_CHECKPOINT_RECORDS:
       parameters.setCheckpointRecords(std::stoull(optarg)); break;
     case OPT_CHECKPOINT_BYTES:
@@ -233,6 +241,7 @@ main(int argc, char** argv)
     std::cerr << "build_gcsa: --resume requires --work-dir" << std::endl;
     std::exit(EXIT_FAILURE);
   }
+  parameters.setWorkerExecutable(argv[0]);
   if(parameters.externalMemory())
   {
     std::error_code error;

@@ -108,6 +108,7 @@ ConstructionParameters::ConstructionParameters() :
   allow_path_explosion(false), io_buffer_size(IO_BUFFER_SIZE),
   sort_run_size(SORT_RUN_SIZE), join_partition_size(JOIN_PARTITION_SIZE),
   merge_fan_in(MERGE_FAN_IN), max_open_files(MAX_OPEN_FILES),
+  process_workers(PROCESS_WORKERS),
   checkpoint_records(CHECKPOINT_RECORDS), checkpoint_bytes(CHECKPOINT_BYTES)
 {
 }
@@ -205,6 +206,18 @@ void
 ConstructionParameters::setMaxOpenFiles(size_type files)
 {
   this->max_open_files = std::max((size_type)6, files);
+}
+
+void
+ConstructionParameters::setProcessWorkers(size_type workers)
+{
+  this->process_workers = std::max((size_type)1, workers);
+}
+
+void
+ConstructionParameters::setWorkerExecutable(const std::string& executable)
+{
+  this->worker_executable = executable;
 }
 
 void

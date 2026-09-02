@@ -29,11 +29,15 @@ int main()
   parameters.setSortRunSize(parseBytes("4G"));
   parameters.setJoinPartitionSize(parseBytes("16G"));
   parameters.setMergeFanIn(32); parameters.setMaxOpenFiles(96);
+  parameters.setProcessWorkers(4);
+  parameters.setWorkerExecutable("/tmp/build_gcsa");
   require(parameters.externalMemory());
   require(parameters.getWorkDirectory() == "/tmp/example.gcsa-work");
   require(parameters.getResume() && parameters.getKeepWork());
   require(parameters.getMemoryLimitBytes() == 96 * GIGABYTE);
   require(parameters.getLimitBytes() == 40 * KILOBYTE * GIGABYTE);
   require(parameters.getMergeFanIn() == 32 && parameters.getMaxOpenFiles() == 96);
+  require(parameters.getProcessWorkers() == 4);
+  require(parameters.getWorkerExecutable() == "/tmp/build_gcsa");
   return 0;
 }
