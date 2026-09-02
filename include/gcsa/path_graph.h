@@ -368,17 +368,52 @@ size_type externalPathGraphSortMinimumBudget();
 void externalPathGraphSort(PathGraph& graph, size_type file,
   size_type byte_budget, size_type fan_in, ExternalPathSortStats* stats = nullptr);
 
+/*
+  A bounded sink for records that are produced incrementally but must become a
+  label-sorted PathGraph shard. Full buffers are sorted into immutable runs;
+  finish() performs bounded multi-pass merging and installs the final
+  path/rank pair. The producer never has to materialize an unsorted pair and
+  then read it back through externalPathGraphSort().
+
+  The target shard must be empty. committed_bytes accounts for other target
+  shards under the same disk limit and is advanced only after finish().
+*/
+class ExternalPathSortSink
+{
+public:
+  ExternalPathSortSink(PathGraph& graph, size_type file,
+    size_type byte_budget, size_type fan_in, size_type size_limit,
+    size_type& committed_bytes, ExternalPathSortStats* stats = nullptr);
+  ~ExternalPathSortSink();
+
+  void write(const PathNode& node, const PathNode::rank_type* labels);
+  void finish();
+
+  size_type paths() const;
+  size_type ranks() const;
+  size_type bytes() const;
+
+private:
+  struct Impl;
+  Impl* impl;
+
+  ExternalPathSortSink(const ExternalPathSortSink&);
+  ExternalPathSortSink& operator=(const ExternalPathSortSink&);
+};
+
 struct ExternalPathJoinStats
 {
   size_type left_records, right_records, sorted_bypass, generated_records;
   size_type initial_runs, merge_operations, blocked_key_groups;
   size_type join_parallel_sorts, label_sort_runs, label_merge_passes, label_parallel_sorts;
+  size_type direct_label_records, intermediate_path_bytes_avoided;
   size_type max_records_resident, max_bytes_resident;
 
   ExternalPathJoinStats() :
     left_records(0), right_records(0), sorted_bypass(0), generated_records(0),
     initial_runs(0), merge_operations(0), blocked_key_groups(0),
     join_parallel_sorts(0), label_sort_runs(0), label_merge_passes(0), label_parallel_sorts(0),
+    direct_label_records(0), intermediate_path_bytes_avoided(0),
     max_records_resident(0), max_bytes_resident(0) { }
 };
 

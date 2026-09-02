@@ -797,119 +797,10 @@ private:
   size_type rank_buffer_first, rank_buffer_records;
 };
 
-class PathPairWriter
-{
-public:
-  PathPairWriter(const PathGraph& graph, size_type file, size_type size_limit,
-    size_type& committed_bytes) :
-    path_name(graph.path_names.at(file)), rank_name(graph.rank_names.at(file)),
-    path_descriptor(-1), rank_descriptor(-1), limit(size_limit),
-    predecessor_bytes(committed_bytes), path_count(0), rank_count(0), bytes(0), closed(false),
-    path_buffer(), rank_buffer()
-  {
-    this->path_descriptor = ::open(this->path_name.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
-    this->rank_descriptor = ::open(this->rank_name.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
-    if(this->path_descriptor < 0 || this->rank_descriptor < 0)
-    {
-      throw joinError("cannot create generated path pair", this->path_name);
-    }
-    adviseSequential(this->path_descriptor); adviseSequential(this->rank_descriptor);
-    this->path_buffer.reserve(std::max(static_cast<size_type>(1),
-      JOIN_IO_BUFFER_BYTES / sizeof(PathNode)));
-    this->rank_buffer.reserve(std::max(static_cast<size_type>(1),
-      JOIN_IO_BUFFER_BYTES / sizeof(PathNode::rank_type)));
-  }
-
-  ~PathPairWriter()
-  {
-    if(this->path_descriptor >= 0) { ::close(this->path_descriptor); }
-    if(this->rank_descriptor >= 0) { ::close(this->rank_descriptor); }
-  }
-
-  void writeRecord(const JoinRecord& record)
-  {
-    size_type record_bytes = sizeof(PathNode) + record.node.ranks() * sizeof(PathNode::rank_type);
-    if(record_bytes > this->limit || this->predecessor_bytes > this->limit - record_bytes ||
-       this->bytes > this->limit - this->predecessor_bytes - record_bytes)
-    {
-      throw joinError("configured disk limit exceeded while generating paths");
-    }
-    if(this->rank_count >= (static_cast<size_type>(1) << 40))
-    {
-      throw joinError("rank sidecar exceeds the 40-bit PathNode pointer format");
-    }
-    PathNode node = record.node; node.setPointer(this->rank_count);
-    if(this->path_buffer.size() >= JOIN_IO_BUFFER_BYTES / sizeof(PathNode))
-    {
-      this->flushPaths();
-    }
-    if(this->rank_buffer.size() + node.ranks() >
-       JOIN_IO_BUFFER_BYTES / sizeof(PathNode::rank_type))
-    {
-      this->flushRanks();
-    }
-    this->path_buffer.push_back(node);
-    this->rank_buffer.insert(this->rank_buffer.end(), record.labels,
-      record.labels + node.ranks());
-    this->path_count++; this->rank_count += node.ranks(); this->bytes += record_bytes;
-  }
-
-  void finish(size_type& committed_bytes)
-  {
-    if(this->closed) { return; }
-    this->flushPaths(); this->flushRanks();
-    trimWrittenCache(this->path_descriptor, this->path_cache_released, true,
-      this->path_name);
-    trimWrittenCache(this->rank_descriptor, this->rank_cache_released, true,
-      this->rank_name);
-    if(::close(this->path_descriptor) != 0 || ::close(this->rank_descriptor) != 0)
-    {
-      throw joinError("cannot close generated path pair", this->path_name);
-    }
-    this->path_descriptor = -1; this->rank_descriptor = -1;
-    committed_bytes += this->bytes; this->closed = true;
-  }
-
-  size_type paths() const { return this->path_count; }
-  size_type ranks() const { return this->rank_count; }
-
-private:
-  void flushPaths()
-  {
-    if(this->path_buffer.empty()) { return; }
-    writeAll(this->path_descriptor, this->path_buffer.data(),
-      this->path_buffer.size() * sizeof(PathNode), this->path_name);
-    this->path_buffer.clear();
-    trimWrittenCache(this->path_descriptor, this->path_cache_released, false,
-      this->path_name);
-  }
-
-  void flushRanks()
-  {
-    if(this->rank_buffer.empty()) { return; }
-    writeAll(this->rank_descriptor, this->rank_buffer.data(),
-      this->rank_buffer.size() * sizeof(PathNode::rank_type), this->rank_name);
-    this->rank_buffer.clear();
-    trimWrittenCache(this->rank_descriptor, this->rank_cache_released, false,
-      this->rank_name);
-  }
-
-  PathPairWriter(const PathPairWriter&);
-  PathPairWriter& operator=(const PathPairWriter&);
-
-  std::string path_name, rank_name;
-  int path_descriptor, rank_descriptor;
-  size_type limit, predecessor_bytes, path_count, rank_count, bytes;
-  off_t path_cache_released = 0, rank_cache_released = 0;
-  bool closed;
-  std::vector<PathNode> path_buffer;
-  std::vector<PathNode::rank_type> rank_buffer;
-};
-
 void
 scanJoinSide(const PathGraph& graph, const std::vector<size_type>& shards,
   logical_file_id_t logical, JoinKeyKind kind, ExternalJoinSorter& sorter,
-  PathPairWriter* bypass, ExternalPathJoinStats* stats)
+  ExternalPathJoinStats* stats)
 {
   std::uint64_t ordinal = 0;
   for(size_type shard : shards)
@@ -923,12 +814,6 @@ scanJoinSide(const PathGraph& graph, const std::vector<size_type>& shards,
       {
         record.key = record.node.from; sorter.add(record);
         if(stats != nullptr) { stats->right_records++; }
-        if(record.node.sorted())
-        {
-          if(bypass == nullptr) { throw joinError("missing sorted-path bypass writer"); }
-          bypass->writeRecord(record);
-          if(stats != nullptr) { stats->sorted_bypass++; }
-        }
       }
       else if(!record.node.sorted())
       {
@@ -961,8 +846,23 @@ extendRecord(const JoinRecord& left, const JoinRecord& right)
 }
 
 void
+writeLabelRecord(const JoinRecord& record, ExternalPathSortSink& output,
+  bool bypass, ExternalPathJoinStats* stats)
+{
+  output.write(record.node, record.labels);
+  if(stats != nullptr)
+  {
+    stats->direct_label_records++;
+    stats->intermediate_path_bytes_avoided += sizeof(PathNode) +
+      record.node.ranks() * sizeof(PathNode::rank_type);
+    if(bypass) { stats->sorted_bypass++; }
+    else { stats->generated_records++; }
+  }
+}
+
+void
 joinSortedRuns(const JoinRun& left_run, const JoinRun& right_run,
-  logical_file_id_t logical, size_type byte_budget, PathPairWriter& output,
+  logical_file_id_t logical, size_type byte_budget, ExternalPathSortSink& output,
   bool verify_payloads, ExternalPathJoinStats* stats)
 {
   JoinFileReader left(left_run, logical, LEFT_BY_TO);
@@ -974,7 +874,15 @@ joinSortedRuns(const JoinRun& left_run, const JoinRun& right_run,
   {
     left.read(left_offset, left_record); right.read(right_offset, right_record);
     if(left_record.key < right_record.key) { left_offset++; continue; }
-    if(right_record.key < left_record.key) { right_offset++; continue; }
+    if(right_record.key < left_record.key)
+    {
+      if(right_record.node.sorted())
+      {
+        writeLabelRecord(right_record, output, true, stats);
+      }
+      right_offset++;
+      continue;
+    }
     node_type key = left_record.key;
     size_type left_limit = left_offset;
     do
@@ -990,6 +898,17 @@ joinSortedRuns(const JoinRun& left_run, const JoinRun& right_run,
       if(right_limit >= right.size()) { break; }
       right.read(right_limit, right_record);
     } while(right_record.key == key);
+    // Sorted paths no longer extend on the left, but they remain part of the
+    // next generation and may still be right-hand extension targets. Emit the
+    // bypass while this right-key group is already resident in the join scan.
+    for(size_type j = right_offset; j < right_limit; j++)
+    {
+      right.read(j, right_record);
+      if(right_record.node.sorted())
+      {
+        writeLabelRecord(right_record, output, true, stats);
+      }
+    }
     size_type group_records = (left_limit - left_offset) + (right_limit - right_offset);
     if(stats != nullptr && group_records >
        std::max(static_cast<size_type>(1),
@@ -1005,11 +924,21 @@ joinSortedRuns(const JoinRun& left_run, const JoinRun& right_run,
       for(size_type j = right_offset; j < right_limit; j++)
       {
         right.read(j, right_record);
-        output.writeRecord(extendRecord(left_record, right_record));
-        if(stats != nullptr) { stats->generated_records++; }
+        JoinRecord generated = extendRecord(left_record, right_record);
+        writeLabelRecord(generated, output, false, stats);
       }
     }
     left_offset = left_limit; right_offset = right_limit;
+  }
+  // The left stream can end before the right stream. Such right records cannot
+  // participate in joins, but sorted records must still bypass expansion.
+  while(right_offset < right.size())
+  {
+    right.read(right_offset++, right_record);
+    if(right_record.node.sorted())
+    {
+      writeLabelRecord(right_record, output, true, stats);
+    }
   }
 }
 
@@ -1084,28 +1013,28 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
     logical_file_id_t logical = group.first;
     next.logical_file_ids[output_file] = logical;
     next.physical_shard_ids[output_file] = physical_shard_id_t(output_file);
-    PathPairWriter output(next, output_file, size_limit, committed_bytes);
 
     ExternalJoinSorter right_sorter(logical, RIGHT_BY_FROM, join_budget,
       join_fan_in, parameters.getVerifyWorkspace(), stats);
-    scanJoinSide(graph, group.second, logical, RIGHT_BY_FROM, right_sorter, &output, stats);
+    scanJoinSide(graph, group.second, logical, RIGHT_BY_FROM, right_sorter, stats);
     JoinRun right = right_sorter.finish();
 
     ExternalJoinSorter left_sorter(logical, LEFT_BY_TO, join_budget,
       join_fan_in, parameters.getVerifyWorkspace(), stats);
-    scanJoinSide(graph, group.second, logical, LEFT_BY_TO, left_sorter, nullptr, stats);
+    scanJoinSide(graph, group.second, logical, LEFT_BY_TO, left_sorter, stats);
     JoinRun left = left_sorter.finish();
 
+    // Both join sorters have released their run-sized buffers. Reuse that
+    // working set for label run generation and feed expansion records directly
+    // into it, avoiding a complete unsorted path/rank write and reread.
+    ExternalPathSortStats sort_stats;
+    ExternalPathSortSink output(next, output_file, sort_budget,
+      label_fan_in, size_limit, committed_bytes,
+      (stats == nullptr ? nullptr : &sort_stats));
     joinSortedRuns(left, right, logical, join_budget, output,
       parameters.getVerifyWorkspace(), stats);
     TempFile::remove(left.name); TempFile::remove(right.name);
-    output.finish(committed_bytes);
-    next.path_counts[output_file] = output.paths();
-    next.rank_counts[output_file] = output.ranks();
-    next.path_count += output.paths(); next.rank_count += output.ranks();
-    ExternalPathSortStats sort_stats;
-    externalPathGraphSort(next, output_file, sort_budget,
-      label_fan_in, (stats == nullptr ? nullptr : &sort_stats));
+    output.finish();
     if(stats != nullptr)
     {
       stats->label_sort_runs += sort_stats.runs;
@@ -1116,6 +1045,13 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
         sort_stats.max_records_resident);
       stats->max_bytes_resident = std::max(stats->max_bytes_resident,
         sort_stats.max_bytes_resident);
+      // Label run generation overlaps with exactly two bounded join readers.
+      // Include them in the reported peak instead of treating the sequential
+      // sort and join budgets as independent maxima.
+      size_type direct_pipeline_bytes = sort_stats.max_bytes_resident +
+        2 * (JOIN_IO_BUFFER_BYTES + sizeof(JoinRecord) + 256);
+      stats->max_bytes_resident = std::max(stats->max_bytes_resident,
+        direct_pipeline_bytes);
     }
     output_file++;
   }

@@ -905,6 +905,240 @@ addPathSortRun(std::vector<std::vector<std::string>>& levels, const std::string&
 
 } // namespace
 
+struct ExternalPathSortSink::Impl
+{
+  Impl(PathGraph& target, size_type target_file, size_type byte_budget,
+    size_type requested_fan_in, size_type size_limit,
+    size_type& already_committed, ExternalPathSortStats* statistics) :
+    graph(target), file(target_file), limit(size_limit),
+    committed_bytes(already_committed), stats(statistics), fan_in(0),
+    merge_records(0), run_records(0), path_count(0), rank_count(0),
+    payload_bytes(0), complete(false)
+  {
+    if(this->file >= this->graph.files()) { externalSortFailure("invalid sink file number"); }
+    if(this->graph.path_counts[this->file] != 0 || this->graph.rank_counts[this->file] != 0)
+    {
+      externalSortFailure("streaming sort sink target is not empty");
+    }
+    if(byte_budget < externalPathGraphSortMinimumBudget())
+    {
+      externalSortFailure("streaming sort sink byte budget is too small");
+    }
+    if(this->stats != nullptr) { *(this->stats) = ExternalPathSortStats(); }
+
+    size_type record_bytes = sizeof(PathSortRecord);
+    size_type available = byte_budget - PATH_SORT_FIXED_BYTES;
+    size_type reader_overhead = sizeof(PathSortRunReader) + 2 * sizeof(size_type);
+    size_type maximum_fan_in = (available - record_bytes) /
+      (record_bytes + reader_overhead);
+    this->fan_in = std::min(std::max(static_cast<size_type>(2), requested_fan_in),
+      maximum_fan_in);
+    if(this->fan_in < 2)
+    {
+      externalSortFailure("streaming sort sink cannot support a two-way merge");
+    }
+    size_type merge_available = available - this->fan_in * reader_overhead;
+    this->merge_records = merge_available /
+      ((this->fan_in + 1) * record_bytes);
+    if(this->merge_records == 0)
+    {
+      externalSortFailure("streaming sort sink cannot buffer a merge");
+    }
+
+    // The producer and this sink overlap only during the final join scan. The
+    // quarter-budget reserve covers its two bounded join readers, allocator
+    // metadata, OpenMP worker stacks, and the rolling dirty-cache tail.
+    size_type run_bytes = available - available / 4;
+    this->run_records = std::max(static_cast<size_type>(1),
+      run_bytes / record_bytes);
+    this->records.reserve(this->run_records);
+    updatePathSortStats(this->stats, this->run_records,
+      PATH_SORT_FIXED_BYTES + this->run_records * record_bytes);
+  }
+
+  ~Impl()
+  {
+    for(size_type level = 0; level < this->levels.size(); level++)
+    {
+      for(std::string& run : this->levels[level]) { TempFile::remove(run); }
+    }
+  }
+
+  void write(const PathNode& source, const PathNode::rank_type* labels)
+  {
+    if(this->complete) { externalSortFailure("cannot write to a finished streaming sort sink"); }
+    if(source.ranks() > PathLabel::LABEL_LENGTH + 1 || source.lcp() > source.order())
+    {
+      externalSortFailure("invalid path supplied to streaming sort sink");
+    }
+    if(source.ranks() > 0 && labels == nullptr)
+    {
+      externalSortFailure("missing labels for streaming sort sink record");
+    }
+    size_type record_bytes = sizeof(PathNode) +
+      source.ranks() * sizeof(PathNode::rank_type);
+    if(record_bytes > this->limit ||
+       this->committed_bytes > this->limit - record_bytes ||
+       this->payload_bytes > this->limit - this->committed_bytes - record_bytes)
+    {
+      externalSortFailure("configured disk limit exceeded while generating sorted paths");
+    }
+    if(this->rank_count >= (static_cast<size_type>(1) << 40))
+    {
+      externalSortFailure("rank sidecar exceeds the 40-bit PathNode pointer format");
+    }
+
+    PathSortRecord record;
+    record.node = source;
+    // Run records are self-contained; the pointer is rewritten only when the
+    // final rank sidecar is emitted.
+    record.node.setPointer(0);
+    size_type i = 0;
+    for(; i < source.ranks(); i++) { record.labels[i] = labels[i]; }
+    for(; i < PathLabel::LABEL_LENGTH + 1; i++)
+    {
+      record.labels[i] = PathLabel::NO_RANK;
+    }
+    this->records.push_back(record);
+    this->path_count++;
+    this->rank_count += source.ranks();
+    this->payload_bytes += record_bytes;
+    if(this->records.size() == this->run_records) { this->flush(); }
+  }
+
+  void flush()
+  {
+    if(this->records.empty()) { return; }
+    sortPathRecords(this->records, this->stats);
+    std::string name = TempFile::getName("gcsa_path_sort_run");
+    writePathSortRun(name, this->records);
+
+    // A leveled merge may start immediately in addPathSortRun(). Release the
+    // run buffer first so sort and merge reservations never coexist.
+    std::vector<PathSortRecord>().swap(this->records);
+    addPathSortRun(this->levels, name, 0, this->fan_in,
+      this->merge_records, this->stats);
+    if(this->stats != nullptr) { this->stats->runs++; }
+    this->records.reserve(this->run_records);
+  }
+
+  std::string finishRuns()
+  {
+    this->flush();
+    std::vector<PathSortRecord>().swap(this->records);
+    std::vector<std::string> runs;
+    for(size_type level = 0; level < this->levels.size(); level++)
+    {
+      runs.insert(runs.end(), this->levels[level].begin(), this->levels[level].end());
+      this->levels[level].clear();
+    }
+    while(runs.size() > this->fan_in)
+    {
+      std::vector<std::string> compacted;
+      for(size_type first = 0; first < runs.size(); first += this->fan_in)
+      {
+        size_type last = std::min(runs.size(), first + this->fan_in);
+        std::vector<std::string> group(runs.begin() + first, runs.begin() + last);
+        std::string merged = mergePathSortRuns(group, this->merge_records, this->stats);
+        for(std::string& run : group) { TempFile::remove(run); }
+        compacted.push_back(merged);
+      }
+      runs.swap(compacted);
+      if(this->stats != nullptr) { this->stats->merge_passes++; }
+    }
+    if(runs.empty())
+    {
+      std::string name = TempFile::getName("gcsa_path_sort_run");
+      writePathSortRun(name, this->records);
+      runs.push_back(name);
+    }
+    if(runs.size() == 1) { return runs.front(); }
+    std::string merged = mergePathSortRuns(runs, this->merge_records, this->stats);
+    for(std::string& run : runs) { TempFile::remove(run); }
+    return merged;
+  }
+
+  void finish()
+  {
+    if(this->complete) { return; }
+    std::string merged = this->finishRuns();
+    const std::string& final_path = this->graph.path_names[this->file];
+    const std::string& final_rank = this->graph.rank_names[this->file];
+    std::string partial_path = final_path + ".partial";
+    std::string partial_rank = final_rank + ".partial";
+    std::remove(partial_path.c_str()); std::remove(partial_rank.c_str());
+    writeSortedPathPair(merged, partial_path, partial_rank,
+      this->path_count, this->rank_count, this->merge_records, this->stats);
+    TempFile::remove(merged);
+    syncPathSortFile(partial_path); syncPathSortFile(partial_rank);
+    if(std::rename(partial_path.c_str(), final_path.c_str()) != 0 ||
+       std::rename(partial_rank.c_str(), final_rank.c_str()) != 0)
+    {
+      externalSortFailure("cannot atomically install streaming sorted path pair");
+    }
+
+    this->graph.path_counts[this->file] = this->path_count;
+    this->graph.rank_counts[this->file] = this->rank_count;
+    this->graph.path_count += this->path_count;
+    this->graph.rank_count += this->rank_count;
+    this->committed_bytes += this->payload_bytes;
+    this->complete = true;
+  }
+
+  PathGraph& graph;
+  size_type file, limit;
+  size_type& committed_bytes;
+  ExternalPathSortStats* stats;
+  size_type fan_in, merge_records, run_records;
+  size_type path_count, rank_count, payload_bytes;
+  bool complete;
+  std::vector<PathSortRecord> records;
+  std::vector<std::vector<std::string>> levels;
+};
+
+ExternalPathSortSink::ExternalPathSortSink(PathGraph& graph, size_type file,
+  size_type byte_budget, size_type fan_in, size_type size_limit,
+  size_type& committed_bytes, ExternalPathSortStats* stats) :
+  impl(new Impl(graph, file, byte_budget, fan_in, size_limit,
+    committed_bytes, stats))
+{
+}
+
+ExternalPathSortSink::~ExternalPathSortSink()
+{
+  delete this->impl;
+}
+
+void
+ExternalPathSortSink::write(const PathNode& node, const PathNode::rank_type* labels)
+{
+  this->impl->write(node, labels);
+}
+
+void
+ExternalPathSortSink::finish()
+{
+  this->impl->finish();
+}
+
+size_type
+ExternalPathSortSink::paths() const
+{
+  return this->impl->path_count;
+}
+
+size_type
+ExternalPathSortSink::ranks() const
+{
+  return this->impl->rank_count;
+}
+
+size_type
+ExternalPathSortSink::bytes() const
+{
+  return this->impl->payload_bytes;
+}
+
 void
 externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, size_type fan_in,
   ExternalPathSortStats* stats)

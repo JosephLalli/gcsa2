@@ -212,13 +212,14 @@ cached logical input with no physical reads. It cannot be naively split because
 the event/component split is what exposes safe parallel work around that
 ordered core.
 
-Before adding processes, generated and bypass paths should also feed the label
-run builder directly. Step 4 currently materializes an approximately 61.5 GB
-path/rank pair and then decodes it into 67.1 GiB of fixed-width sort records.
-Direct streaming removes one complete write/read cycle. A blocked
-left-context-plus-right-references format then reduces the larger fixed-record
-traffic. Both changes save more I/O than running two encoders against the same
-disk.
+Generated paths and sorted bypass paths now feed the label-run builder directly
+during the final join scan. The previous route materialized an approximately
+61.5 GB step-4 path/rank pair and then decoded it into 67.1 GiB of fixed-width
+sort records. The fused route removes one complete write/read cycle and reports
+the exact avoided bytes for each generation. A blocked
+left-context-plus-right-references format can still reduce the larger
+fixed-record traffic. That compaction remains more valuable than running two
+encoders against the same disk.
 
 `DiskBudget` tracks committed live workspace bytes, bytes reserved by active
 writers, configured maximum bytes, `statvfs()` free bytes, and a free-space
@@ -399,6 +400,7 @@ when its production call path and forced-spill/recovery tests pass.
 | Bounded external path-label runs and leveled multi-pass merge | parallel in-place run sorting, rolling cache windows, one-run bypass, and forced multi-pass spilling implemented and tested |
 | Logical/physical `PathGraph` identity in pruning and joining | implemented; durable run-set manifest pending |
 | External prefix-doubling join | bounded sort-merge, rolling page-cache windows, and selectable checksum scans implemented; sampled range partitioning pending |
+| Direct join-to-label pipeline | implemented and forced-spill tested; the unsorted generated path/rank pair is no longer materialized |
 | External keys/start nodes/initial paths | not implemented |
 | Spillable pruning groups | not implemented |
 | Final event/component passes and transactional `prev_occ` | not implemented |
@@ -416,9 +418,11 @@ repeated right-range reads; it is bounded but can perform much more I/O than a
 larger blocked implementation. These limitations mean the full construction
 does not yet satisfy the end-to-end RAM invariant, even though prefix-doubling
 extension itself no longer requires a chromosome or join key to fit in memory.
-The subprocess range executor, direct join-to-label pipeline, explicit
-label-run disk format, final event streams, and per-filesystem writer admission
-described above are designs, not completed code.
+The subprocess range executor, explicit label-run disk format, final event
+streams, and per-filesystem writer admission described above are designs, not
+completed code. The direct join-to-label pipeline is implemented; it retains
+the same fixed-width external label runs but avoids the preceding variable-width
+path/rank write and reread.
 
 ## Build, test, and usage
 
