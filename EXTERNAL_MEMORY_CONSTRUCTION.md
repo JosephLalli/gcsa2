@@ -30,6 +30,78 @@ The up-front estimate in `GCSA::GCSA()` and the future-file check in
 `PathGraphBuilder::write()` are guards. They can terminate before an allocation,
 but they do not provide an external execution route.
 
+### Production fixture and measured legacy baseline
+
+The chromosome-scale acceptance fixture is the packed chr20 graph pruned with
+`vg prune -k 32` from the panSC indexing work. Its identities are fixed so a
+benchmark cannot silently substitute a smaller or differently pruned graph:
+
+| Input | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `chr20.exact_walk_k32_m0.pruned.vg` | 440,223,843 | `04e566fb4810e273fcaad1c4796b4dc785a336796b604089bbae1df6007bc525` |
+| `chr20.exact_walk_k32_m0.mapping` | 64,428,032 | `04843ec74911550700b051fed5579e3a7c29748309a7fb5b55c99dba17cd4a05` |
+
+The successful legacy command used `vg index -k 16 -X 4 -Z 700 -t 32 -V`.
+It produced a 682,869,673-byte GCSA and a 273,490,577-byte LCP in 1:55:35
+wall time. `/usr/bin/time -v` measured 63,554,776 KiB maximum RSS (60.61 GiB),
+while GCSA2 reported 223.140 GB read and 193.262 GB written. The often-quoted
+“about 100 GB” was a conservative recollection rather than the recorded peak
+for this exact fixture.
+
+The external completion run resumed after a committed step-2 prune with a
+96 GiB GCSA2 budget and a hard 128 GiB cgroup ceiling. It completed and passed
+`vg index` verification in 2:51:15. Maximum process RSS was 33,936,664 KiB
+(32.36 GiB), 46.6% below the legacy peak. Sampled cgroup peak was
+82,382,069,760 bytes (76.73 GiB); live inspection showed that the difference
+was inactive clean filesystem cache accumulated by the still-legacy final
+merge, not anonymous heap. Swap was disabled and no memory-limit or OOM event
+occurred. Peak live run-directory usage was 337,799,719,952 bytes (314.60 GiB),
+below the explicit 1 TiB disk limit, and the retained completed workspace plus
+outputs occupied about 177 GiB.
+
+The completed GCSA and LCP are byte-identical to the legacy outputs:
+
+| Output | Bytes | SHA-256 |
+| --- | ---: | --- |
+| GCSA | 682,869,673 | `f4d0f89a6f188802aeb5ad19c3cc4cd6d6ac9cbee892cef5776b8c3eaee45eca` |
+| LCP | 273,490,577 | `2a98d96f0a19c1a169f408b7b93f7cfadcf0f2176b86da6c82c5cb6cf0476940` |
+
+This was deliberately a feasibility-first completion run, not a clean-wall-
+time comparison: it reused the committed frontier created by earlier forced-
+spill attempts. The command itself read 451,411,742,720 bytes and wrote
+541,563,432,960 bytes according to `/usr/bin/time`; GCSA2's logical counters
+reported 497.497 GB read and 417.810 GB written. A separate 23 GiB internal /
+25 GiB cgroup run forced multiple immutable join spills, reached only
+10,824,118,272 bytes (10.08 GiB) sampled cgroup peak, and was deliberately
+terminated before its incomplete join phase committed. Resumption retained its
+predecessor and ignored the incomplete successor exactly as designed.
+
+The chromosome completion binary predates the later parallel run-sort and
+dirty-cache changes described below. Those changes pass unit and small
+integration tests, but their chromosome-scale runtime and RSS have not been
+remeasured. In particular, the newer 75/25 run allocation intentionally uses
+more of an explicitly generous budget to eliminate an otherwise unnecessary
+full merge pass; users seeking the smallest RSS should configure a smaller
+sort-run budget and retain the hard cgroup ceiling.
+
+### `vg` integration audit
+
+`vg index` previously constructed `ConstructionParameters` with only doubling
+steps and the legacy `-Z` size limit. Generated de Bruijn files were anonymous
+temporary files and were deleted after construction. `vg autoindex` similarly
+exposed a GCSA temporary-size setting but had no durable construction frontier.
+The convenience helper in `src/build_index.cpp` still constructs an in-memory
+index for small programmatic/test callers; it is not used by the production
+`vg index` or autoindex recipes.
+
+The external route now gives both production entry points a workspace, resume
+flag, byte-valued memory limit, and byte-valued disk limit. `vg` records source
+graph size and checksum, atomically commits its generated de Bruijn inputs into
+`WORK/inputs`, and restores them only when their semantic manifest matches.
+The GCSA and LCP outputs are each written to a partial path and renamed only
+after successful serialization. Publishing the two-file pair through one
+atomic marker remains future work.
+
 ### Logical inputs are not spill shards
 
 `PriorityNode::file` currently denotes the original `PathGraph` file index.
@@ -64,6 +136,90 @@ I/O buffer settings are bytes. The element capacity is computed as
 `max(1, bytes / sizeof(T))`. Compute concurrency and I/O concurrency are
 scheduled separately, but both consume tokens from the same budget.
 
+Linux cgroups charge clean filesystem page cache to `MemoryMax`. The external
+join, label sorter, and durable checkpoint writer/validator/restorer therefore
+treat cache as another bounded I/O window: sequential writers sync and evict
+completed prefixes every 512 MiB while retaining a 64 MiB tail, and readers
+evict prefixes after consuming them. A backwards seek for a pathological join
+key resets the reader watermark so every replay remains bounded.
+`posix_fadvise()` is best-effort and non-semantic; `fdatasync()` is the
+durability boundary. Legacy preprocessing, pruning, merged-graph, final-index,
+and LCP streams still need the same treatment before the in-process
+`MemoryBudget` alone can be called an end-to-end ceiling.
+
+### Compute and I/O concurrency
+
+Large initial join and label runs are sorted in place with the existing OpenMP
+parallel quicksort. The vector is already covered by the phase reservation, so
+using the construction thread team does not add one run-sized allocation per
+worker. Small runs remain sequential to avoid team-startup overhead. Run
+generation uses three quarters of the available phase budget; the remaining
+quarter covers allocator/OpenMP slack and bounded decoding and output-cache
+state. A sole sorted run flows directly to final path/rank encoding instead of
+being copied through a degenerate one-way merge. The 75/25 split is
+intentionally chosen so the chr20 step-4 label set (about 67.1 GiB of 96-byte
+records) is one run with a 96 GiB phase budget rather than narrowly exceeding a
+64 GiB run and paying for a full merge pass.
+
+The current implementation deliberately keeps each merge and join emitter
+single-writer and sequential. More writer threads would multiply dirty-cache
+windows and seek pressure without helping when one filesystem is saturated.
+The next parallel unit is a deterministic range partition of
+`(logical_file_id, join_key)`: worker tasks will reserve byte tokens, consume
+disjoint immutable input ranges, and publish separate physical output shards.
+Those shards retain their shared logical ID and can be merged or concatenated
+in range order. Compute admission and writer admission should be separate; many
+range tasks may sort concurrently when tokens permit, while normally only one
+or two writers per backing filesystem drain bounded queues.
+
+The intended bounded pipeline is therefore read-ahead for partition N+1,
+parallel join/sort for partition N, and ordered writeback for partition N-1.
+Queues, decompression state, and prefetched pages count against the same global
+budget. Independent merge groups can use the same scheduler. Work stealing may
+change task completion order, but semantic range names and ordered publication
+keep committed artifacts byte-deterministic.
+
+Range tasks also form a clean optional multiprocessing ABI. A coordinator can
+`exec` workers with immutable input artifact IDs, exact key ranges, unique
+partial output names, and explicit memory/disk reservations. Workers finalize
+artifacts, but only the coordinator validates them and commits task markers.
+This isolates allocator fragmentation and worker crashes and permits per-worker
+cgroup controls. It must not `fork` a live OpenMP process, and the sum of worker
+reservations, bounded queues, and cgroup-charged page cache must still be
+admitted by one global scheduler. This subprocess executor is designed but not
+implemented in the current slice; the in-process OpenMP sorter is the tested
+execution path.
+
+The largest remaining I/O opportunity is record compaction, not extra writer
+processes. Current fixed-width join runs repeat complete path labels and may be
+larger than the variable-width source path/rank pair. Versioned blocked records
+that store one left context followed by a sequence of right references would
+reduce both bytes and comparison work for high-fanout keys. Asynchronous
+writeback (`sync_file_range` where available, followed by `fdatasync` only at a
+commit boundary) may later overlap compute and flushing, but is not yet used:
+the portable implementation currently syncs every 512 MiB before evicting that
+prefix.
+
+The chr20 trace makes the scheduling priorities concrete. Join-run encoding
+occasionally used one CPU at about 39 MiB/s while the device was not saturated;
+parallel block encoding/checksumming can help there. The label merge sustained
+roughly 240--280 MiB/s and was storage-bound, so additional writers would not.
+The final `MergedGraph` writer sustained roughly 100--120 MiB/s but retained
+about 18.3 GB of clean staging data in cache; rolling cache eviction is the
+first fix. The final index scan consumed approximately one CPU and 128 MiB/s of
+cached logical input with no physical reads. It cannot be naively split because
+`prev_occ`, the LCP stack, and redundant-pointer aggregation are ordered state;
+the event/component split is what exposes safe parallel work around that
+ordered core.
+
+Before adding processes, generated and bypass paths should also feed the label
+run builder directly. Step 4 currently materializes an approximately 61.5 GB
+path/rank pair and then decodes it into 67.1 GiB of fixed-width sort records.
+Direct streaming removes one complete write/read cycle. A blocked
+left-context-plus-right-references format then reduces the larger fixed-record
+traffic. Both changes save more I/O than running two encoders against the same
+disk.
+
 `DiskBudget` tracks committed live workspace bytes, bytes reserved by active
 writers, configured maximum bytes, `statvfs()` free bytes, and a free-space
 safety margin. A generation estimate is diagnostic. Construction stops only
@@ -72,7 +228,7 @@ cutoff is reached, or input is invalid. RAM size is never a disk-limit proxy.
 
 ## Durable workspace
 
-The workspace is persistent and semantic:
+The target persistent semantic organization is:
 
 ```text
 build.json
@@ -88,6 +244,12 @@ tasks/
 logs/
 ```
 
+The current slice commits `inputs/` plus semantic phase artifacts and
+`*.complete` task records directly under the workspace root. Join and label
+sort runs are immutable while in use, but are still PID-named transient files
+inside a phase. Moving those run tasks into the directory hierarchy above is
+required for partition-granularity resume; the current frontier is phase-level.
+
 `build.json` contains the workspace format, GCSA2 version, final format
 versions, input identities/sizes/checksums, mapping identity, k-mer length,
 doubling steps, sample period, LCP branching, alphabet, and logical input IDs.
@@ -95,11 +257,13 @@ Those fields form the semantic fingerprint. Memory, threads, run size,
 partition target, merge fan-in, open-file limit, and I/O buffer size are stored
 for provenance but excluded from the fingerprint.
 
-Every binary artifact has an explicit little-endian header and footer with
+Durable phase artifacts have explicit little-endian headers and footers with
 magic, format version, artifact kind, logical ID, physical shard ID, record and
-payload byte counts, checksum, sort order, and key range. On-disk phase records
-are explicit formats; raw C++ layouts are used only for the unchanged legacy
-final index format.
+payload byte counts, checksum, sort order, and key range. Join runs also use an
+explicit versioned encoding. Transient label-sort runs still write the raw
+`PathSortRecord` layout and therefore are not reusable across builds; replacing
+that layout is a remaining format-hardening task. The final public index keeps
+its unchanged legacy format.
 
 ### Commit and recovery protocol
 
@@ -108,16 +272,26 @@ final index format.
 3. Flush, `fdatasync()`, close, rename to the semantic final name, and sync its
    parent directory.
 4. After every output artifact for a task exists, validate their metadata and
-   atomically commit a task record under `tasks/` using the same sync protocol.
+   atomically commit its semantic `*.complete` record using the same sync
+   protocol. A later layout may place those records under `tasks/`.
 5. Only a task record makes its outputs part of the restart frontier.
 
 On resume, partial files and artifacts without a committed task are removed or
 quarantined; immutable inputs and committed predecessors remain. Task records
 are replayed in dependency order. Headers, lengths, footers, and task metadata
-are always checked. Payload checksums are selected by validation level. A task
+are always checked. Join-run payload checksums are selected by
+`--verify-workspace`; normal construction trusts the checksum computed while a
+newly synced run was written and avoids immediately rereading it. Phase
+checkpoint payloads are currently always checksummed on restore. A task
 with a missing, truncated, or corrupt output is invalidated and rerun along with
 its dependants. Cleanup is itself idempotent and never removes the newest
 committed predecessor of an incomplete task.
+
+Crash tests use deterministic process termination, without stack unwinding,
+immediately before and after artifact rename, immediately before and after task
+marker rename, and after one cleanup removal. A fresh process then reconstructs
+the frontier. Renamed-but-unmarked artifacts are discarded; a marker that has
+crossed its rename boundary keeps every referenced immutable artifact.
 
 ## External algorithms
 
@@ -219,18 +393,18 @@ when its production call path and forced-spill/recovery tests pass.
 
 | Slice | State |
 | --- | --- |
-| Shared byte-token `MemoryBudget` and statvfs-aware `DiskBudget` | in review |
-| Versioned workspace artifacts, atomic publication, manifest compatibility, recovery tests | in review |
-| Human-readable operational construction parameters | in review |
-| Bounded external path-label runs and leveled multi-pass merge | implemented; forced-spill tested |
+| Shared byte-token `MemoryBudget` and statvfs-aware `DiskBudget` | primitives implemented and tested; global allocation admission pending |
+| Versioned workspace artifacts, atomic publication, manifest compatibility, recovery tests | phase-level checkpoints and abrupt-exit commit-boundary tests implemented; per-join-run task records pending |
+| Human-readable operational construction parameters | core budget/run controls implemented and parser-tested; cleanup/cadence controls are not all wired |
+| Bounded external path-label runs and leveled multi-pass merge | parallel in-place run sorting, rolling cache windows, one-run bypass, and forced multi-pass spilling implemented and tested |
 | Logical/physical `PathGraph` identity in pruning and joining | implemented; durable run-set manifest pending |
-| External prefix-doubling join | bounded sort-merge implemented; sampled range partitioning pending |
+| External prefix-doubling join | bounded sort-merge, rolling page-cache windows, and selectable checksum scans implemented; sampled range partitioning pending |
 | External keys/start nodes/initial paths | not implemented |
 | Spillable pruning groups | not implemented |
 | Final event/component passes and transactional `prev_occ` | not implemented |
 | Streaming LCP levels and legacy packer | not implemented |
-| Standalone and vg CLI integration | not implemented |
-| Chromosome-scale benchmark | not run |
+| Standalone and `vg index` / `vg autoindex` CLI integration | implemented; forced-spill/resume integration tested |
+| Chromosome-scale benchmark | preexisting chr20 k32-pruned fixture completed and verified at 32.36 GiB RSS under a 128 GiB cgroup; outputs are byte-identical to legacy; separate 25 GiB forced-spill/recovery path exercised |
 
 Current limitations are intentionally explicit. The external route is selected
 only when `ConstructionParameters::work_directory` is nonempty. Key extraction,
@@ -242,3 +416,76 @@ repeated right-range reads; it is bounded but can perform much more I/O than a
 larger blocked implementation. These limitations mean the full construction
 does not yet satisfy the end-to-end RAM invariant, even though prefix-doubling
 extension itself no longer requires a chromosome or join key to fit in memory.
+The subprocess range executor, direct join-to-label pipeline, explicit
+label-run disk format, final event streams, and per-filesystem writer admission
+described above are designs, not completed code.
+
+## Build, test, and usage
+
+From the containing `vg` checkout, use its local toolchain wrapper. The GCSA2
+library tests deliberately use tiny byte budgets so the same records create
+multiple runs and resume checkpoints:
+
+```bash
+JOBS=8 ./build-local.sh -C deps/gcsa2 test
+JOBS=8 ./build-local.sh -C deps/gcsa2 all
+```
+
+The containing `vg` Makefile must track `deps/gcsa2/src/*.cpp` as archive
+prerequisites. Otherwise a source-only GCSA2 change can leave a successfully
+relinked `vg` using an older copied `lib/libgcsa2.a`; the local fork carries
+that dependency correction.
+
+The `vg` integration is exercised by the ordinary index regressions and a
+dedicated two-logical-input equivalence/recovery fixture:
+
+```bash
+./build-local.sh bin/vg
+(cd test && prove -v t/58_vg_gcsa_external.t)
+(cd test && prove -v t/06_vg_index.t t/52_vg_autoindex.t)
+```
+
+Standalone GCSA2 accepts binary de Bruijn graph inputs. The external route is
+selected by a workspace; operational settings can change on resume, while a
+semantic mismatch is rejected:
+
+```bash
+deps/gcsa2/bin/build_gcsa \
+  --work-dir /large-local-disk/chr6.gcsa-work \
+  --resume --keep-work \
+  --memory-limit 96G --disk-limit 40T \
+  --io-buffer-size 64M --sort-run-size 4G \
+  --join-partition-size 16G --merge-fan-in 64 \
+  --max-open-files 128 --allow-path-explosion \
+  -T 32 -o chr6 chr6
+```
+
+`vg index` persists the graph-derived k-mer stream before entering GCSA2. One
+named source graph remains one semantic GCSA2 input even when later phases spill
+to many physical files:
+
+```bash
+vg index -p -V -g chr6.gcsa -k 16 -X 4 -t 32 \
+  --gcsa-work-dir /large-local-disk/chr6.gcsa-work \
+  --gcsa-resume \
+  --gcsa-memory-limit 96G --gcsa-disk-limit 40T \
+  --gcsa-sort-run-size 64G --gcsa-join-partition-size 64G \
+  -f chr6.mapping chr6.pruned.vg
+```
+
+For a hard end-to-end process ceiling, including allocator overhead and charged
+filesystem cache, use the benchmark harness. It binds input and executable
+hashes before launch, records the exact command and `/usr/bin/time -v`, and
+samples phase, anonymous/cache/dirty memory, cgroup CPU, block I/O, tasks, and
+live workspace bytes. `phase_summary.tsv` aggregates those counters by phase;
+`summary.tsv` records the whole-run maxima and totals:
+
+```bash
+TMPDIR=/large-local-disk/chr6-run/vg-tmp \
+scripts/benchmark-gcsa-external.sh \
+  --vg ./bin/vg --graph chr6.pruned.vg --mapping chr6.mapping \
+  --run-dir /large-local-disk/chr6-run \
+  --memory-limit 94G --cgroup-limit 96G --disk-limit 40T \
+  --sort-run-size 64G --join-partition-size 64G \
+  --threads 32 --kmer-length 16 --doubling-steps 4
+```
