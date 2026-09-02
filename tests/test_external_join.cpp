@@ -135,7 +135,10 @@ int main()
     { 3, 100, 4, 30, false }
   };
   std::vector<TestRecord> right;
-  for(size_type i = 0; i < 80; i++)
+  // Exceed both the minimum-budget run buffer and the two-reader merge cache
+  // so this remains a forced multi-run, pathological-key spill test even when
+  // phase I/O is buffered in bytes.
+  for(size_type i = 0; i < 1200; i++)
   {
     right.push_back({ 100, 1000 + i, static_cast<byte_type>(1),
       static_cast<PathNode::rank_type>(1000 + i), false });

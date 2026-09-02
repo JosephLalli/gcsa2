@@ -29,12 +29,22 @@ namespace
 constexpr std::uint64_t JOIN_HEADER_MAGIC = 0x314e494f4a534347ULL; // "GCSJOIN1"
 constexpr std::uint64_t JOIN_FOOTER_MAGIC = 0x31444e454a534347ULL; // "GCSJEND1"
 constexpr std::uint32_t JOIN_FORMAT_VERSION = 1;
-constexpr size_type JOIN_FIXED_BYTES = 32 * KILOBYTE;
+constexpr size_type JOIN_BASE_FIXED_BYTES = 32 * KILOBYTE;
 constexpr size_type JOIN_LABEL_COUNT = PathLabel::LABEL_LENGTH + 1;
 constexpr size_type JOIN_HEADER_BYTES = 8 + 4 + 4 + 4 + 8;
 constexpr size_type JOIN_FOOTER_BYTES = 8 + 8 + 8;
 constexpr size_type JOIN_RECORD_BYTES =
   4 + 3 * sizeof(node_type) + 4 + 8 + JOIN_LABEL_COUNT * sizeof(PathNode::rank_type);
+// Join records are compact on disk, so issuing one system call per record can
+// turn a sequential spill into syscall-bound I/O. Keep all phase-local I/O
+// caches byte-sized and account for them in the same join reservation.
+constexpr size_type JOIN_IO_BUFFER_BYTES = 64 * KILOBYTE;
+constexpr size_type JOIN_IO_BUFFER_RECORDS = JOIN_IO_BUFFER_BYTES / JOIN_RECORD_BYTES;
+// Run generation may simultaneously have a join writer, path/rank source
+// caches, and path/rank output caches. Merge reader caches are accounted per
+// input when selecting fan-in below.
+constexpr size_type JOIN_FIXED_BYTES = JOIN_BASE_FIXED_BYTES + 5 * JOIN_IO_BUFFER_BYTES;
+static_assert(JOIN_IO_BUFFER_RECORDS > 0, "join record exceeds the I/O buffer");
 // Clean page cache is charged to a cgroup's MemoryMax. Keep a small rolling
 // tail and evict completed sequential prefixes so disk, not cache, remains the
 // authoritative working set. The larger flush interval amortizes fdatasync().
@@ -283,7 +293,7 @@ class JoinFileWriter
 public:
   JoinFileWriter(const std::string& path, logical_file_id_t logical, JoinKeyKind kind) :
     name(path), logical_id(logical), key_kind(kind), descriptor(-1), count(0),
-    checksum(1469598103934665603ULL), cache_released(0), finished(false)
+    checksum(1469598103934665603ULL), cache_released(0), finished(false), buffer()
   {
     this->descriptor = ::open(this->name.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
     if(this->descriptor < 0) { throw joinError("cannot create join run", this->name); }
@@ -296,6 +306,7 @@ public:
     encodeLittle<std::uint32_t>(out, this->logical_id.value);
     encodeLittle<std::uint64_t>(out, 0);
     writeAll(this->descriptor, header.data(), header.size(), this->name);
+    this->buffer.reserve(JOIN_IO_BUFFER_RECORDS);
   }
 
   ~JoinFileWriter()
@@ -306,21 +317,18 @@ public:
 
   void writeRecord(const JoinRecord& record)
   {
-    std::array<std::uint8_t, JOIN_RECORD_BYTES> buffer;
-    encodeJoinRecord(record, buffer);
-    writeAll(this->descriptor, buffer.data(), buffer.size(), this->name);
-    this->checksum = joinChecksum(buffer.data(), buffer.size(), this->checksum);
+    std::array<std::uint8_t, JOIN_RECORD_BYTES> encoded;
+    encodeJoinRecord(record, encoded);
+    this->checksum = joinChecksum(encoded.data(), encoded.size(), this->checksum);
+    this->buffer.push_back(encoded);
     this->count++;
-    off_t written = JOIN_HEADER_BYTES + this->count * JOIN_RECORD_BYTES;
-    if(written - this->cache_released >= JOIN_CACHE_FLUSH_BYTES)
-    {
-      trimWrittenCache(this->descriptor, this->cache_released, false, this->name);
-    }
+    if(this->buffer.size() >= JOIN_IO_BUFFER_RECORDS) { this->flushRecords(); }
   }
 
   JoinRun finish()
   {
     if(this->finished) { throw joinError("join run already finished", this->name); }
+    this->flushRecords();
     std::array<std::uint8_t, 8> encoded_count;
     std::uint8_t* count_out = encoded_count.data();
     encodeLittle<std::uint64_t>(count_out, this->count);
@@ -338,6 +346,19 @@ public:
   }
 
 private:
+  void flushRecords()
+  {
+    if(this->buffer.empty()) { return; }
+    writeAll(this->descriptor, this->buffer.data(),
+      this->buffer.size() * JOIN_RECORD_BYTES, this->name);
+    this->buffer.clear();
+    off_t written = JOIN_HEADER_BYTES + this->count * JOIN_RECORD_BYTES;
+    if(written - this->cache_released >= JOIN_CACHE_FLUSH_BYTES)
+    {
+      trimWrittenCache(this->descriptor, this->cache_released, false, this->name);
+    }
+  }
+
   JoinFileWriter(const JoinFileWriter&);
   JoinFileWriter& operator=(const JoinFileWriter&);
 
@@ -349,6 +370,7 @@ private:
   std::uint64_t checksum;
   off_t cache_released;
   bool finished;
+  std::vector<std::array<std::uint8_t, JOIN_RECORD_BYTES>> buffer;
 };
 
 class JoinFileReader
@@ -356,7 +378,8 @@ class JoinFileReader
 public:
   JoinFileReader(const JoinRun& run, logical_file_id_t logical, JoinKeyKind kind) :
     name(run.name), descriptor(-1), record_count(0), expected_checksum(0),
-    cache_released(0)
+    cache_released(0), buffer(JOIN_IO_BUFFER_RECORDS), buffer_first(0),
+    buffer_records(0)
   {
     this->descriptor = ::open(this->name.c_str(), O_RDONLY);
     if(this->descriptor < 0) { throw joinError("cannot open join run", this->name); }
@@ -411,32 +434,45 @@ public:
   void read(size_type index, JoinRecord& record) const
   {
     if(index >= this->record_count) { throw joinError("join record index out of range", this->name); }
-    std::array<std::uint8_t, JOIN_RECORD_BYTES> buffer;
-    preadAll(this->descriptor, buffer.data(), buffer.size(),
-      JOIN_HEADER_BYTES + index * JOIN_RECORD_BYTES, this->name);
-    decodeJoinRecord(buffer, record);
-    trimReadCache(this->descriptor,
-      JOIN_HEADER_BYTES + (index + 1) * JOIN_RECORD_BYTES, this->cache_released);
+    if(this->buffer_records == 0 || index < this->buffer_first ||
+       index >= this->buffer_first + this->buffer_records)
+    {
+      this->refill(index);
+    }
+    decodeJoinRecord(this->buffer[index - this->buffer_first], record);
   }
 
   void validate() const
   {
     std::uint64_t checksum = 1469598103934665603ULL;
-    std::array<std::uint8_t, JOIN_RECORD_BYTES> buffer;
-    for(size_type i = 0; i < this->record_count; i++)
+    for(size_type first = 0; first < this->record_count; first += this->buffer.size())
     {
-      preadAll(this->descriptor, buffer.data(), buffer.size(),
-        JOIN_HEADER_BYTES + i * JOIN_RECORD_BYTES, this->name);
-      checksum = joinChecksum(buffer.data(), buffer.size(), checksum);
+      size_type records = std::min(this->buffer.size(), this->record_count - first);
+      preadAll(this->descriptor, this->buffer.data(), records * JOIN_RECORD_BYTES,
+        JOIN_HEADER_BYTES + first * JOIN_RECORD_BYTES, this->name);
+      checksum = joinChecksum(this->buffer.data(), records * JOIN_RECORD_BYTES, checksum);
       trimReadCache(this->descriptor,
-        JOIN_HEADER_BYTES + (i + 1) * JOIN_RECORD_BYTES, this->cache_released);
+        JOIN_HEADER_BYTES + (first + records) * JOIN_RECORD_BYTES, this->cache_released);
     }
     if(checksum != this->expected_checksum) { throw joinError("join run checksum mismatch", this->name); }
     discardCachedRange(this->descriptor, 0, 0);
     this->cache_released = 0;
+    this->buffer_records = 0;
   }
 
 private:
+  void refill(size_type first) const
+  {
+    this->buffer_first = first;
+    this->buffer_records = std::min(this->buffer.size(), this->record_count - first);
+    preadAll(this->descriptor, this->buffer.data(),
+      this->buffer_records * JOIN_RECORD_BYTES,
+      JOIN_HEADER_BYTES + first * JOIN_RECORD_BYTES, this->name);
+    trimReadCache(this->descriptor,
+      JOIN_HEADER_BYTES + (first + this->buffer_records) * JOIN_RECORD_BYTES,
+      this->cache_released);
+  }
+
   JoinFileReader(const JoinFileReader&);
   JoinFileReader& operator=(const JoinFileReader&);
 
@@ -445,6 +481,8 @@ private:
   size_type record_count;
   std::uint64_t expected_checksum;
   mutable off_t cache_released;
+  mutable std::vector<std::array<std::uint8_t, JOIN_RECORD_BYTES>> buffer;
+  mutable size_type buffer_first, buffer_records;
 };
 
 struct JoinHeapComparator
@@ -500,7 +538,8 @@ mergeJoinRuns(const std::vector<JoinRun>& inputs, logical_file_id_t logical,
       2 * static_cast<size_type>(inputs.size()));
     stats->max_bytes_resident = std::max(stats->max_bytes_resident,
       JOIN_FIXED_BYTES + inputs.size() *
-      (sizeof(JoinRecord) + sizeof(size_type) + sizeof(std::unique_ptr<JoinFileReader>)));
+      (JOIN_IO_BUFFER_BYTES + sizeof(JoinRecord) + sizeof(size_type) +
+       sizeof(std::unique_ptr<JoinFileReader>)));
   }
   return output.finish();
 }
@@ -519,7 +558,7 @@ public:
       throw joinError("memory budget is too small for an external join");
     }
     size_type per_input = sizeof(JoinRecord) + sizeof(size_type) +
-      sizeof(std::unique_ptr<JoinFileReader>) + 128;
+      sizeof(std::unique_ptr<JoinFileReader>) + JOIN_IO_BUFFER_BYTES + 128;
     size_type maximum_fan_in = (this->budget - JOIN_FIXED_BYTES) / per_input;
     this->fan_in = std::min(std::max(static_cast<size_type>(2), requested_fan_in),
       maximum_fan_in);
@@ -622,7 +661,12 @@ public:
     path_name(graph.path_names.at(file)), rank_name(graph.rank_names.at(file)),
     path_descriptor(-1), rank_descriptor(-1), path_count(graph.path_counts.at(file)),
     rank_count(graph.rank_counts.at(file)), path_offset(0), rank_offset(0),
-    path_cache_released(0), rank_cache_released(0)
+    path_cache_released(0), rank_cache_released(0),
+    path_buffer(std::max(static_cast<size_type>(1), JOIN_IO_BUFFER_BYTES / sizeof(PathNode))),
+    rank_buffer(std::max(static_cast<size_type>(1),
+      JOIN_IO_BUFFER_BYTES / sizeof(PathNode::rank_type))),
+    path_buffer_first(0), path_buffer_records(0),
+    rank_buffer_first(0), rank_buffer_records(0)
   {
     this->path_descriptor = ::open(this->path_name.c_str(), O_RDONLY);
     this->rank_descriptor = ::open(this->rank_name.c_str(), O_RDONLY);
@@ -662,31 +706,72 @@ public:
       }
       return false;
     }
-    preadAll(this->path_descriptor, &record.node, sizeof(PathNode),
-      this->path_offset * sizeof(PathNode), this->path_name);
+    if(this->path_buffer_records == 0 || this->path_offset < this->path_buffer_first ||
+       this->path_offset >= this->path_buffer_first + this->path_buffer_records)
+    {
+      this->refillPaths();
+    }
+    record.node = this->path_buffer[this->path_offset - this->path_buffer_first];
     if(record.node.pointer() != this->rank_offset || record.node.order() == 0 ||
        record.node.order() > PathLabel::LABEL_LENGTH || record.node.lcp() > record.node.order() ||
        record.node.ranks() > this->rank_count - this->rank_offset)
     {
       throw joinError("invalid path or rank pointer", this->path_name);
     }
-    preadAll(this->rank_descriptor, record.labels,
-      record.node.ranks() * sizeof(PathNode::rank_type),
-      this->rank_offset * sizeof(PathNode::rank_type), this->rank_name);
+    this->readRanks(record.labels, record.node.ranks());
     for(size_type i = record.node.ranks(); i < JOIN_LABEL_COUNT; i++)
     {
       record.labels[i] = PathLabel::NO_RANK;
     }
-    this->rank_offset += record.node.ranks(); this->path_offset++;
+    this->path_offset++;
     record.node.setPointer(0);
-    trimReadCache(this->path_descriptor,
-      this->path_offset * sizeof(PathNode), this->path_cache_released);
-    trimReadCache(this->rank_descriptor,
-      this->rank_offset * sizeof(PathNode::rank_type), this->rank_cache_released);
     return true;
   }
 
 private:
+  void refillPaths()
+  {
+    this->path_buffer_first = this->path_offset;
+    this->path_buffer_records = std::min(this->path_buffer.size(),
+      this->path_count - this->path_buffer_first);
+    preadAll(this->path_descriptor, this->path_buffer.data(),
+      this->path_buffer_records * sizeof(PathNode),
+      this->path_buffer_first * sizeof(PathNode), this->path_name);
+    trimReadCache(this->path_descriptor,
+      (this->path_buffer_first + this->path_buffer_records) * sizeof(PathNode),
+      this->path_cache_released);
+  }
+
+  void refillRanks()
+  {
+    this->rank_buffer_first = this->rank_offset;
+    this->rank_buffer_records = std::min(this->rank_buffer.size(),
+      this->rank_count - this->rank_buffer_first);
+    preadAll(this->rank_descriptor, this->rank_buffer.data(),
+      this->rank_buffer_records * sizeof(PathNode::rank_type),
+      this->rank_buffer_first * sizeof(PathNode::rank_type), this->rank_name);
+    trimReadCache(this->rank_descriptor,
+      (this->rank_buffer_first + this->rank_buffer_records) * sizeof(PathNode::rank_type),
+      this->rank_cache_released);
+  }
+
+  void readRanks(PathNode::rank_type* target, size_type records)
+  {
+    while(records > 0)
+    {
+      if(this->rank_buffer_records == 0 || this->rank_offset < this->rank_buffer_first ||
+         this->rank_offset >= this->rank_buffer_first + this->rank_buffer_records)
+      {
+        this->refillRanks();
+      }
+      size_type offset = this->rank_offset - this->rank_buffer_first;
+      size_type copied = std::min(records, this->rank_buffer_records - offset);
+      std::copy(this->rank_buffer.begin() + offset,
+        this->rank_buffer.begin() + offset + copied, target);
+      target += copied; records -= copied; this->rank_offset += copied;
+    }
+  }
+
   PathShardReader(const PathShardReader&);
   PathShardReader& operator=(const PathShardReader&);
 
@@ -694,6 +779,10 @@ private:
   int path_descriptor, rank_descriptor;
   size_type path_count, rank_count, path_offset, rank_offset;
   off_t path_cache_released, rank_cache_released;
+  std::vector<PathNode> path_buffer;
+  std::vector<PathNode::rank_type> rank_buffer;
+  size_type path_buffer_first, path_buffer_records;
+  size_type rank_buffer_first, rank_buffer_records;
 };
 
 class PathPairWriter
@@ -703,7 +792,8 @@ public:
     size_type& committed_bytes) :
     path_name(graph.path_names.at(file)), rank_name(graph.rank_names.at(file)),
     path_descriptor(-1), rank_descriptor(-1), limit(size_limit),
-    predecessor_bytes(committed_bytes), path_count(0), rank_count(0), bytes(0), closed(false)
+    predecessor_bytes(committed_bytes), path_count(0), rank_count(0), bytes(0), closed(false),
+    path_buffer(), rank_buffer()
   {
     this->path_descriptor = ::open(this->path_name.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
     this->rank_descriptor = ::open(this->rank_name.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
@@ -712,6 +802,10 @@ public:
       throw joinError("cannot create generated path pair", this->path_name);
     }
     adviseSequential(this->path_descriptor); adviseSequential(this->rank_descriptor);
+    this->path_buffer.reserve(std::max(static_cast<size_type>(1),
+      JOIN_IO_BUFFER_BYTES / sizeof(PathNode)));
+    this->rank_buffer.reserve(std::max(static_cast<size_type>(1),
+      JOIN_IO_BUFFER_BYTES / sizeof(PathNode::rank_type)));
   }
 
   ~PathPairWriter()
@@ -733,27 +827,25 @@ public:
       throw joinError("rank sidecar exceeds the 40-bit PathNode pointer format");
     }
     PathNode node = record.node; node.setPointer(this->rank_count);
-    writeAll(this->path_descriptor, &node, sizeof(node), this->path_name);
-    writeAll(this->rank_descriptor, record.labels,
-      node.ranks() * sizeof(PathNode::rank_type), this->rank_name);
+    if(this->path_buffer.size() >= JOIN_IO_BUFFER_BYTES / sizeof(PathNode))
+    {
+      this->flushPaths();
+    }
+    if(this->rank_buffer.size() + node.ranks() >
+       JOIN_IO_BUFFER_BYTES / sizeof(PathNode::rank_type))
+    {
+      this->flushRanks();
+    }
+    this->path_buffer.push_back(node);
+    this->rank_buffer.insert(this->rank_buffer.end(), record.labels,
+      record.labels + node.ranks());
     this->path_count++; this->rank_count += node.ranks(); this->bytes += record_bytes;
-    if(static_cast<off_t>(this->path_count * sizeof(PathNode)) -
-       this->path_cache_released >= JOIN_CACHE_FLUSH_BYTES)
-    {
-      trimWrittenCache(this->path_descriptor, this->path_cache_released, false,
-        this->path_name);
-    }
-    if(static_cast<off_t>(this->rank_count * sizeof(PathNode::rank_type)) -
-       this->rank_cache_released >= JOIN_CACHE_FLUSH_BYTES)
-    {
-      trimWrittenCache(this->rank_descriptor, this->rank_cache_released, false,
-        this->rank_name);
-    }
   }
 
   void finish(size_type& committed_bytes)
   {
     if(this->closed) { return; }
+    this->flushPaths(); this->flushRanks();
     trimWrittenCache(this->path_descriptor, this->path_cache_released, true,
       this->path_name);
     trimWrittenCache(this->rank_descriptor, this->rank_cache_released, true,
@@ -770,6 +862,26 @@ public:
   size_type ranks() const { return this->rank_count; }
 
 private:
+  void flushPaths()
+  {
+    if(this->path_buffer.empty()) { return; }
+    writeAll(this->path_descriptor, this->path_buffer.data(),
+      this->path_buffer.size() * sizeof(PathNode), this->path_name);
+    this->path_buffer.clear();
+    trimWrittenCache(this->path_descriptor, this->path_cache_released, false,
+      this->path_name);
+  }
+
+  void flushRanks()
+  {
+    if(this->rank_buffer.empty()) { return; }
+    writeAll(this->rank_descriptor, this->rank_buffer.data(),
+      this->rank_buffer.size() * sizeof(PathNode::rank_type), this->rank_name);
+    this->rank_buffer.clear();
+    trimWrittenCache(this->rank_descriptor, this->rank_cache_released, false,
+      this->rank_name);
+  }
+
   PathPairWriter(const PathPairWriter&);
   PathPairWriter& operator=(const PathPairWriter&);
 
@@ -778,6 +890,8 @@ private:
   size_type limit, predecessor_bytes, path_count, rank_count, bytes;
   off_t path_cache_released = 0, rank_cache_released = 0;
   bool closed;
+  std::vector<PathNode> path_buffer;
+  std::vector<PathNode::rank_type> rank_buffer;
 };
 
 void
@@ -892,7 +1006,11 @@ joinSortedRuns(const JoinRun& left_run, const JoinRun& right_run,
 size_type
 externalPathJoinMinimumBudget()
 {
-  return JOIN_FIXED_BYTES + 8 * sizeof(JoinRecord);
+  // The smallest useful task must support two buffered merge inputs and a
+  // bounded output writer, not merely a handful of in-memory records.
+  size_type per_input = JOIN_IO_BUFFER_BYTES + sizeof(JoinRecord) +
+    sizeof(size_type) + sizeof(std::unique_ptr<JoinFileReader>) + 128;
+  return JOIN_FIXED_BYTES + 2 * per_input;
 }
 
 void
