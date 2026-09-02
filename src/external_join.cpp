@@ -35,6 +35,11 @@ constexpr size_type JOIN_HEADER_BYTES = 8 + 4 + 4 + 4 + 8;
 constexpr size_type JOIN_FOOTER_BYTES = 8 + 8 + 8;
 constexpr size_type JOIN_RECORD_BYTES =
   4 + 3 * sizeof(node_type) + 4 + 8 + JOIN_LABEL_COUNT * sizeof(PathNode::rank_type);
+// Clean page cache is charged to a cgroup's MemoryMax. Keep a small rolling
+// tail and evict completed sequential prefixes so disk, not cache, remains the
+// authoritative working set. The larger flush interval amortizes fdatasync().
+constexpr off_t JOIN_CACHE_TAIL_BYTES = 64 * MEGABYTE;
+constexpr off_t JOIN_CACHE_FLUSH_BYTES = 512 * MEGABYTE;
 
 enum JoinKeyKind : std::uint32_t
 {
@@ -65,6 +70,59 @@ joinError(const std::string& message, const std::string& path = std::string())
 {
   return std::runtime_error("externalPathGraphExtend(): " + message +
     (path.empty() ? std::string() : ": " + path));
+}
+
+void
+adviseSequential(int descriptor)
+{
+#if defined(POSIX_FADV_SEQUENTIAL)
+  // Advice is an optimization. Correctness and durability do not depend on a
+  // filesystem implementing it, so unsupported advice is deliberately ignored.
+  static_cast<void>(::posix_fadvise(descriptor, 0, 0, POSIX_FADV_SEQUENTIAL));
+#else
+  static_cast<void>(descriptor);
+#endif
+}
+
+void
+discardCachedRange(int descriptor, off_t offset, off_t bytes)
+{
+#if defined(POSIX_FADV_DONTNEED)
+  if(bytes >= 0)
+  {
+    static_cast<void>(::posix_fadvise(descriptor, offset, bytes, POSIX_FADV_DONTNEED));
+  }
+#else
+  static_cast<void>(descriptor); static_cast<void>(offset); static_cast<void>(bytes);
+#endif
+}
+
+void
+trimWrittenCache(int descriptor, off_t& released, bool complete,
+  const std::string& path)
+{
+  off_t end = ::lseek(descriptor, 0, SEEK_CUR);
+  if(end < 0) { throw joinError("cannot determine output position", path); }
+  if(!complete && end - released < JOIN_CACHE_FLUSH_BYTES) { return; }
+  if(::fdatasync(descriptor) != 0) { throw joinError("cannot sync sequential output", path); }
+  off_t discard_end = (complete ? end : std::max(released, end - JOIN_CACHE_TAIL_BYTES));
+  if(discard_end > released)
+  {
+    discardCachedRange(descriptor, released, discard_end - released);
+    released = discard_end;
+  }
+}
+
+void
+trimReadCache(int descriptor, off_t consumed, off_t& released)
+{
+  // A pathological key may replay a range. Resetting the watermark on a large
+  // backwards seek ensures each replay still has a bounded cache footprint.
+  if(consumed + JOIN_CACHE_FLUSH_BYTES < released) { released = 0; }
+  if(consumed - released < JOIN_CACHE_FLUSH_BYTES) { return; }
+  off_t discard_end = std::max(released, consumed - JOIN_CACHE_TAIL_BYTES);
+  discardCachedRange(descriptor, released, discard_end - released);
+  released = discard_end;
 }
 
 void
@@ -225,10 +283,11 @@ class JoinFileWriter
 public:
   JoinFileWriter(const std::string& path, logical_file_id_t logical, JoinKeyKind kind) :
     name(path), logical_id(logical), key_kind(kind), descriptor(-1), count(0),
-    checksum(1469598103934665603ULL), finished(false)
+    checksum(1469598103934665603ULL), cache_released(0), finished(false)
   {
     this->descriptor = ::open(this->name.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
     if(this->descriptor < 0) { throw joinError("cannot create join run", this->name); }
+    adviseSequential(this->descriptor);
     std::array<std::uint8_t, JOIN_HEADER_BYTES> header;
     std::uint8_t* out = header.data();
     encodeLittle<std::uint64_t>(out, JOIN_HEADER_MAGIC);
@@ -252,6 +311,11 @@ public:
     writeAll(this->descriptor, buffer.data(), buffer.size(), this->name);
     this->checksum = joinChecksum(buffer.data(), buffer.size(), this->checksum);
     this->count++;
+    off_t written = JOIN_HEADER_BYTES + this->count * JOIN_RECORD_BYTES;
+    if(written - this->cache_released >= JOIN_CACHE_FLUSH_BYTES)
+    {
+      trimWrittenCache(this->descriptor, this->cache_released, false, this->name);
+    }
   }
 
   JoinRun finish()
@@ -267,7 +331,7 @@ public:
     encodeLittle<std::uint64_t>(out, this->count);
     encodeLittle<std::uint64_t>(out, this->checksum);
     writeAll(this->descriptor, footer.data(), footer.size(), this->name);
-    if(::fdatasync(this->descriptor) != 0) { throw joinError("cannot sync join run", this->name); }
+    trimWrittenCache(this->descriptor, this->cache_released, true, this->name);
     if(::close(this->descriptor) != 0) { throw joinError("cannot close join run", this->name); }
     this->descriptor = -1; this->finished = true;
     return JoinRun(this->name, this->count);
@@ -283,6 +347,7 @@ private:
   int descriptor;
   size_type count;
   std::uint64_t checksum;
+  off_t cache_released;
   bool finished;
 };
 
@@ -290,10 +355,12 @@ class JoinFileReader
 {
 public:
   JoinFileReader(const JoinRun& run, logical_file_id_t logical, JoinKeyKind kind) :
-    name(run.name), descriptor(-1), record_count(0), expected_checksum(0)
+    name(run.name), descriptor(-1), record_count(0), expected_checksum(0),
+    cache_released(0)
   {
     this->descriptor = ::open(this->name.c_str(), O_RDONLY);
     if(this->descriptor < 0) { throw joinError("cannot open join run", this->name); }
+    adviseSequential(this->descriptor);
     std::array<std::uint8_t, JOIN_HEADER_BYTES> header;
     preadAll(this->descriptor, header.data(), header.size(), 0, this->name);
     const std::uint8_t* in = header.data();
@@ -331,7 +398,13 @@ public:
     this->expected_checksum = decodeLittle<std::uint64_t>(in);
   }
 
-  ~JoinFileReader() { if(this->descriptor >= 0) { ::close(this->descriptor); } }
+  ~JoinFileReader()
+  {
+    if(this->descriptor >= 0)
+    {
+      discardCachedRange(this->descriptor, 0, 0); ::close(this->descriptor);
+    }
+  }
 
   size_type size() const { return this->record_count; }
 
@@ -342,6 +415,8 @@ public:
     preadAll(this->descriptor, buffer.data(), buffer.size(),
       JOIN_HEADER_BYTES + index * JOIN_RECORD_BYTES, this->name);
     decodeJoinRecord(buffer, record);
+    trimReadCache(this->descriptor,
+      JOIN_HEADER_BYTES + (index + 1) * JOIN_RECORD_BYTES, this->cache_released);
   }
 
   void validate() const
@@ -353,8 +428,12 @@ public:
       preadAll(this->descriptor, buffer.data(), buffer.size(),
         JOIN_HEADER_BYTES + i * JOIN_RECORD_BYTES, this->name);
       checksum = joinChecksum(buffer.data(), buffer.size(), checksum);
+      trimReadCache(this->descriptor,
+        JOIN_HEADER_BYTES + (i + 1) * JOIN_RECORD_BYTES, this->cache_released);
     }
     if(checksum != this->expected_checksum) { throw joinError("join run checksum mismatch", this->name); }
+    discardCachedRange(this->descriptor, 0, 0);
+    this->cache_released = 0;
   }
 
 private:
@@ -365,6 +444,7 @@ private:
   int descriptor;
   size_type record_count;
   std::uint64_t expected_checksum;
+  mutable off_t cache_released;
 };
 
 struct JoinHeapComparator
@@ -537,7 +617,8 @@ public:
   PathShardReader(const PathGraph& graph, size_type file) :
     path_name(graph.path_names.at(file)), rank_name(graph.rank_names.at(file)),
     path_descriptor(-1), rank_descriptor(-1), path_count(graph.path_counts.at(file)),
-    rank_count(graph.rank_counts.at(file)), path_offset(0), rank_offset(0)
+    rank_count(graph.rank_counts.at(file)), path_offset(0), rank_offset(0),
+    path_cache_released(0), rank_cache_released(0)
   {
     this->path_descriptor = ::open(this->path_name.c_str(), O_RDONLY);
     this->rank_descriptor = ::open(this->rank_name.c_str(), O_RDONLY);
@@ -545,6 +626,7 @@ public:
     {
       throw joinError("cannot open path shard", this->path_name);
     }
+    adviseSequential(this->path_descriptor); adviseSequential(this->rank_descriptor);
     struct stat paths, ranks;
     if(::fstat(this->path_descriptor, &paths) != 0 || ::fstat(this->rank_descriptor, &ranks) != 0 ||
        static_cast<size_type>(paths.st_size) != this->path_count * sizeof(PathNode) ||
@@ -556,8 +638,14 @@ public:
 
   ~PathShardReader()
   {
-    if(this->path_descriptor >= 0) { ::close(this->path_descriptor); }
-    if(this->rank_descriptor >= 0) { ::close(this->rank_descriptor); }
+    if(this->path_descriptor >= 0)
+    {
+      discardCachedRange(this->path_descriptor, 0, 0); ::close(this->path_descriptor);
+    }
+    if(this->rank_descriptor >= 0)
+    {
+      discardCachedRange(this->rank_descriptor, 0, 0); ::close(this->rank_descriptor);
+    }
   }
 
   bool read(JoinRecord& record)
@@ -587,6 +675,10 @@ public:
     }
     this->rank_offset += record.node.ranks(); this->path_offset++;
     record.node.setPointer(0);
+    trimReadCache(this->path_descriptor,
+      this->path_offset * sizeof(PathNode), this->path_cache_released);
+    trimReadCache(this->rank_descriptor,
+      this->rank_offset * sizeof(PathNode::rank_type), this->rank_cache_released);
     return true;
   }
 
@@ -597,6 +689,7 @@ private:
   std::string path_name, rank_name;
   int path_descriptor, rank_descriptor;
   size_type path_count, rank_count, path_offset, rank_offset;
+  off_t path_cache_released, rank_cache_released;
 };
 
 class PathPairWriter
@@ -614,6 +707,7 @@ public:
     {
       throw joinError("cannot create generated path pair", this->path_name);
     }
+    adviseSequential(this->path_descriptor); adviseSequential(this->rank_descriptor);
   }
 
   ~PathPairWriter()
@@ -639,15 +733,27 @@ public:
     writeAll(this->rank_descriptor, record.labels,
       node.ranks() * sizeof(PathNode::rank_type), this->rank_name);
     this->path_count++; this->rank_count += node.ranks(); this->bytes += record_bytes;
+    if(static_cast<off_t>(this->path_count * sizeof(PathNode)) -
+       this->path_cache_released >= JOIN_CACHE_FLUSH_BYTES)
+    {
+      trimWrittenCache(this->path_descriptor, this->path_cache_released, false,
+        this->path_name);
+    }
+    if(static_cast<off_t>(this->rank_count * sizeof(PathNode::rank_type)) -
+       this->rank_cache_released >= JOIN_CACHE_FLUSH_BYTES)
+    {
+      trimWrittenCache(this->rank_descriptor, this->rank_cache_released, false,
+        this->rank_name);
+    }
   }
 
   void finish(size_type& committed_bytes)
   {
     if(this->closed) { return; }
-    if(::fdatasync(this->path_descriptor) != 0 || ::fdatasync(this->rank_descriptor) != 0)
-    {
-      throw joinError("cannot sync generated path pair", this->path_name);
-    }
+    trimWrittenCache(this->path_descriptor, this->path_cache_released, true,
+      this->path_name);
+    trimWrittenCache(this->rank_descriptor, this->rank_cache_released, true,
+      this->rank_name);
     if(::close(this->path_descriptor) != 0 || ::close(this->rank_descriptor) != 0)
     {
       throw joinError("cannot close generated path pair", this->path_name);
@@ -666,6 +772,7 @@ private:
   std::string path_name, rank_name;
   int path_descriptor, rank_descriptor;
   size_type limit, predecessor_bytes, path_count, rank_count, bytes;
+  off_t path_cache_released = 0, rank_cache_released = 0;
   bool closed;
 };
 
