@@ -69,9 +69,37 @@ under
 | `chr21.exact_walk_k32_m0.mapping` | 25,928,080 | `85e0763a8b1040569694272492259f69cc87168b918d04a0576811c030ca2a99` |
 
 Its successful legacy `vg index -k16 -X4 -Z2048 -t32` run took 2:07:13
-and 105,438,580 KiB maximum RSS (100.55 GiB). This is the primary target for
-the requested approximately 25 GiB comparison once the host's other heavy
-`vg prune`/GCSA work and I/O contention are absent.
+and 105,438,580 KiB maximum RSS (100.55 GiB).
+
+The external-memory acceptance build completed on the same immutable fixture
+with a 23 GiB GCSA2 working-set goal, a hard 25 GiB cgroup limit, swap disabled,
+four process workers, and a 1 TiB disk limit. The initial process was stopped
+only after step 4 had committed; `--gcsa-resume` restored that frontier and the
+successor process completed normally. Active construction time across the two
+processes was approximately 15:45 (16:15 elapsed including the planned pause),
+favoring feasibility over the 2:07 legacy runtime. The resume process used
+22,375,576 KiB maximum RSS (21.34 GiB), 78.8% below the legacy peak, while the
+cgroup reached its exact 25 GiB ceiling through reclaimable file cache without
+an OOM, OOM kill, or swap. Peak live run-directory bytes were 432,556,537,957
+(402.85 GiB), and the completed retained run occupied about 262 GiB.
+
+Step 4 generated 1,109,279,137 joined paths and streamed 1,208,172,107 records
+directly into label runs. Grouped left-context records avoided 10.8 GiB of
+transient payload, while direct join-to-label streaming avoided 97.3 GiB of
+intermediate path/rank I/O in each direction. The final graph contained
+399,778,113 paths, 413,060,024 edges, 631,824,030 pointers, and 177,682,537
+samples. `vg index -V` queried 54,709,753 patterns and reported `Index
+verification complete`.
+
+| External output | Bytes | SHA-256 |
+| --- | ---: | --- |
+| GCSA | 1,357,870,701 | `2b1021eb926596de29c2cdd280e35b7f0c69d4d8a47ab9152e72fab81614b05f` |
+| LCP | 406,123,913 | `7a74ef3b67cb0243cb9433ee240ee4fb7cf225b8f7775aea1a013b0e4eb11e7f` |
+
+The acceptance binary used GCSA2 `30b4886`. Later component-streaming,
+phase-lifetime, aggregate-budget sizing, and incremental-checksum commits pass
+the fixture tests but are not included in the chromosome-scale measurements
+above.
 
 Only preexisting pruned fixtures are eligible for acceptance runs. The chr19
 production prune exited successfully after 49:45:06 at 154,737,660 KiB maximum
@@ -595,7 +623,7 @@ when its production call path and forced-spill/recovery tests pass.
 | Streaming LCP levels and direct packing | implemented and resume-tested with one raw level resident at a time, bounded direct final serialization, atomic publication, and byte-identical legacy output including padding edge cases |
 | External verification | implemented and forced-spill tested with bounded input blocks, external expected/actual occurrence sorts, callback-based locate, and sequential set comparison; resumable runs and parallel label ranges pending |
 | Standalone and `vg index` / `vg autoindex` CLI integration | implemented; forced-spill/resume integration tested |
-| Chromosome-scale benchmark | preexisting chr20 k32-pruned fixture completed and verified at 32.36 GiB RSS under a 128 GiB cgroup; outputs are byte-identical to legacy; separate 25 GiB forced-spill/recovery path exercised |
+| Chromosome-scale benchmark | preexisting chr20 k32-pruned fixture completed and verified at 32.36 GiB RSS under a 128 GiB cgroup with byte-identical legacy outputs; preexisting chr21 k32-pruned fixture completed and verified at 21.34 GiB process RSS under a hard 25 GiB cgroup, including a successful step-4 resume |
 
 Current limitations are intentionally explicit. The external route is selected
 only when `ConstructionParameters::work_directory` is nonempty. The production
