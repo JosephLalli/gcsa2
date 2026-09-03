@@ -22,6 +22,8 @@ struct TestRecord
   byte_type predecessors;
   PathNode::rank_type label;
   bool sorted;
+  size_type order = 1;
+  size_type lcp = 1;
 };
 
 struct SemanticRecord
@@ -72,11 +74,12 @@ writePathPair(const std::string& path_name, const std::string& rank_name,
     node.from = record.from; node.to = record.to; node.fields = 0;
     if(record.sorted) { node.makeSorted(); }
     node.setPredecessors(record.predecessors);
-    node.setOrder(1); node.setLCP(1); node.setPointer(pointer);
+    node.setOrder(record.order); node.setLCP(record.lcp); node.setPointer(pointer);
     PathNode::rank_type label[2] = { record.label, 0 };
     paths.write(reinterpret_cast<const char*>(&node), sizeof(node));
-    ranks.write(reinterpret_cast<const char*>(label), sizeof(label));
-    pointer += 2;
+    ranks.write(reinterpret_cast<const char*>(label),
+      node.ranks() * sizeof(PathNode::rank_type));
+    pointer += node.ranks();
   }
 }
 
@@ -149,6 +152,9 @@ int main(int argc, char** argv)
   }
   // A sorted path bypasses left expansion, but remains a valid right target.
   right.push_back({ 100, std::numeric_limits<node_type>::max(), 8, 5000, true });
+  // Pruning can collapse a unique range to order 0. It still has one boundary
+  // rank, bypasses left expansion, and can be joined on its from node.
+  right.push_back({ 100, std::numeric_limits<node_type>::max(), 8, 6000, true, 0, 0 });
 
   std::vector<TestRecord> combined = left;
   combined.insert(combined.end(), right.begin(), right.end());
@@ -190,7 +196,7 @@ int main(int argc, char** argv)
   require(external.files() == 1);
   require(external.logicalFile(0) == logical_file_id_t(7));
   require(stats.generated_records == left.size() * right.size());
-  require(stats.sorted_bypass == 1);
+  require(stats.sorted_bypass == 2);
   require(stats.direct_label_records == stats.generated_records + stats.sorted_bypass);
   require(stats.intermediate_path_bytes_avoided > 0);
   require(stats.initial_runs > 2 && stats.merge_operations > 0);
@@ -260,7 +266,7 @@ int main(int argc, char** argv)
   require(process_stats.left_range_splits > 0);
   require(process_stats.right_range_splits > 0);
   require(process_stats.generated_records == left.size() * right.size());
-  require(process_stats.sorted_bypass == 1);
+  require(process_stats.sorted_bypass == 2);
   require(process_stats.sampled_plan_records > 0);
   require(process_stats.radix_plan_bins >= 1);
   require(process_stats.grouped_expansion_records > 0);
@@ -409,7 +415,7 @@ int main(int argc, char** argv)
   parameters.setVerifyWorkspace();
   externalPathGraphExtend(separated, GIGABYTE, parameters);
   require(separated.files() == 2);
-  require(separated.size() == 1); // Only the already-sorted bypass path remains.
+  require(separated.size() == 2); // Only the already-sorted bypass paths remain.
 
   std::remove(combined_path.c_str()); std::remove(combined_rank.c_str());
   std::remove(left_path.c_str()); std::remove(left_rank.c_str());
