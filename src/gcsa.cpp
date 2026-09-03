@@ -981,17 +981,31 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
       std::string task = doublingTask(step);
       if(pathGraphCheckpointExists(*workspace, task, "extend"))
       {
+        if(Verbosity::level >= Verbosity::BASIC)
+        {
+          std::cerr << "GCSA::GCSA(): Restoring checkpoint "
+                    << task << "/extend" << std::endl;
+        }
         restorePathGraph(*workspace, path_graph, task, "extend", checkpoint_buffer);
         first_step = step + 1; restored_graph = true; break;
       }
       if(pathGraphCheckpointExists(*workspace, task, "prune"))
       {
+        if(Verbosity::level >= Verbosity::BASIC)
+        {
+          std::cerr << "GCSA::GCSA(): Restoring checkpoint "
+                    << task << "/prune" << std::endl;
+        }
         restorePathGraph(*workspace, path_graph, task, "prune", checkpoint_buffer);
         first_step = step; restored_prune = true; restored_graph = true; break;
       }
     }
     if(!restored_graph && pathGraphCheckpointExists(*workspace, "initial", "paths"))
     {
+      if(Verbosity::level >= Verbosity::BASIC)
+      {
+        std::cerr << "GCSA::GCSA(): Restoring checkpoint initial/paths" << std::endl;
+      }
       restorePathGraph(*workspace, path_graph, "initial", "paths", checkpoint_buffer);
       restored_graph = true;
     }
