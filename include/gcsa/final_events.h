@@ -170,6 +170,13 @@ void serializeSampleBoundaries(std::ostream& out,
   const std::string& sample_end_file, size_type sample_ids,
   size_type sampled_paths, const ConstructionParameters& parameters);
 
+// Stream the existing SadaSparse occurrence-pointer representation from the
+// sorted (path, extra-count) event file. Public for exact-format tests.
+void serializeOccurrencePointers(std::ostream& out,
+  const std::string& occurrence_file, size_type paths,
+  size_type occurrence_items, size_type occurrence_extra,
+  const ConstructionParameters& parameters);
+
 // Stream SadaCount's ordinary bit_vector and select_support_mcl payload from
 // sorted redundancy events without materializing the dense unary vector.
 // Public only for exact-format regression tests.

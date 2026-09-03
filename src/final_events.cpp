@@ -651,54 +651,97 @@ serializeSelectMCL(std::ostream& out, size_type bits, size_type ones,
 {
   sdsl::write_member(ones, out);
   if(ones == 0) { return; }
+  if(ones > bits)
+  {
+    throw eventError("select one-count exceeds its universe");
+  }
 
   const size_type block_size = 4096;
+  if(ones > std::numeric_limits<size_type>::max() - (block_size - 1))
+  {
+    throw eventError("select one-count overflows");
+  }
   const size_type blocks = (ones + block_size - 1) / block_size;
+  if(bits > std::numeric_limits<size_type>::max() - 63)
+  {
+    throw eventError("select universe overflows");
+  }
   const size_type logn = sdsl::bits::hi(((bits + 63) / 64) * 64) + 1;
   const size_type logn4 = logn * logn * logn * logn;
-  std::vector<size_type> superblocks; superblocks.reserve(blocks);
-  // SDSL calls this vector mini_or_long, but its bit convention is slightly
-  // surprising: 1 denotes a compact miniblock and 0 denotes a long block.
-  // The vector is omitted entirely when every block is compact.
-  GCSA::bit_vector mini_or_long(blocks, 0);
   bool has_long_block = false;
+  std::string metadata_name = TempFile::getName("gcsa_select_metadata");
   std::string payload_name = TempFile::getName("gcsa_select_payload");
+  std::FILE* metadata = std::fopen(metadata_name.c_str(), "w+b");
+  if(metadata == nullptr)
+  {
+    const std::string failed_name = metadata_name;
+    TempFile::remove(metadata_name); TempFile::remove(payload_name);
+    throw eventError("cannot create select metadata spool", failed_name);
+  }
   std::FILE* payload = std::fopen(payload_name.c_str(), "w+b");
   if(payload == nullptr)
   {
     const std::string failed_name = payload_name;
-    TempFile::remove(payload_name);
+    std::fclose(metadata);
+    metadata = nullptr;
+    TempFile::remove(metadata_name); TempFile::remove(payload_name);
     throw eventError("cannot create select payload spool", failed_name);
   }
 
   try
   {
     std::array<size_type, block_size> positions;
-    size_type next = 0, seen = 0;
+    size_type next = 0, seen = 0, previous = 0;
+    bool have_previous = false;
     bool available = next_position(next);
     for(size_type block = 0; block < blocks; block++)
     {
       const size_type count = std::min(block_size, ones - seen);
       for(size_type i = 0; i < count; i++)
       {
-        if(!available || (i > 0 && next <= positions[i - 1]))
+        if(!available || next >= bits ||
+           (have_previous && next <= previous))
         {
-          throw eventError("select positions are not strictly increasing");
+          throw eventError("select positions are invalid");
         }
-        positions[i] = next; seen++; available = next_position(next);
+        positions[i] = next; previous = next; have_previous = true;
+        seen++; available = next_position(next);
       }
-      const size_type span = positions[count - 1] - positions[0];
       const bool fast = (bits >= 100000);
+      if(fast && count == block_size && available &&
+         (next >= bits || next <= positions[count - 1]))
+      {
+        throw eventError("select lookahead position is invalid");
+      }
+      // SDSL's fast initializer samples positions 0,64,...,4032, then scans
+      // 64 more arguments to choose the block width. For every nonterminal
+      // full block this scan includes position 4096: the first one in the next
+      // block. Although that off-by-one argument is not stored in this block,
+      // reproducing it here is required for byte-identical public indexes.
+      const size_type width_position =
+        (fast && count == block_size && available ? next : positions[count - 1]);
+      const size_type span = width_position - positions[0];
       // init_fast() encodes the final partial block as long and, unlike the
       // slow initializer, leaves its otherwise-unused superblock entry zero.
       const bool partial_fast_block = (fast && count < block_size);
       const bool is_long = (span > logn4 || partial_fast_block);
-      superblocks.push_back(partial_fast_block ? 0 : positions[0]);
-      mini_or_long[block] = !is_long;
       has_long_block = has_long_block || is_long;
+      // SDSL calls the second field mini_or_long, but its bit convention is
+      // slightly surprising: 1 denotes a compact miniblock and 0 denotes a
+      // long block. Keep this directory on disk as an explicit 9-byte record
+      // per select block instead of an unbudgeted proportional vector.
+      std::array<std::uint8_t, 9> block_metadata = {};
+      put64(block_metadata.data(), partial_fast_block ? 0 : positions[0]);
+      block_metadata[8] = static_cast<std::uint8_t>(!is_long);
+      if(std::fwrite(block_metadata.data(), 1, block_metadata.size(), metadata) !=
+         block_metadata.size())
+      {
+        throw eventError("cannot write select metadata spool");
+      }
+      DiskIO::write_volume += block_metadata.size();
       sdsl::int_vector<0> encoded(is_long ? block_size : 64, 0,
         is_long ? sdsl::bits::hi(partial_fast_block ? bits - 1 :
-          positions[count - 1]) + 1 :
+          width_position) + 1 :
         sdsl::bits::hi(span) + 1);
       if(is_long)
       {
@@ -724,11 +767,58 @@ serializeSelectMCL(std::ostream& out, size_type bits, size_type ones,
     {
       throw eventError("select position count does not match metadata");
     }
-    sdsl::int_vector<0> superblock_vector(blocks, 0, logn);
-    for(size_type i = 0; i < blocks; i++) { superblock_vector[i] = superblocks[i]; }
-    superblock_vector.serialize(out);
-    if(has_long_block) { mini_or_long.serialize(out); }
+
+    const auto rewind_metadata = [&]()
+    {
+      if(std::fflush(metadata) != 0 || std::fseek(metadata, 0, SEEK_SET) != 0)
+      {
+        throw eventError("cannot rewind select metadata spool");
+      }
+    };
+    const auto read_metadata = [&](std::array<std::uint8_t, 9>& record)
+    {
+      if(std::fread(record.data(), 1, record.size(), metadata) != record.size())
+      {
+        throw eventError("cannot read select metadata spool");
+      }
+      DiskIO::read_volume += record.size();
+    };
+
+    rewind_metadata();
+    serializePackedVector(out, blocks, logn, [&]()
+    {
+      std::array<std::uint8_t, 9> record = {};
+      read_metadata(record); return get64(record.data());
+    });
+
+    // The indicator vector is omitted entirely when every block is compact.
+    if(has_long_block)
+    {
+      rewind_metadata();
+      size_type block = 0;
+      serializePlainBitVector(out, blocks, [&](size_type& mini_block)
+      {
+        while(block < blocks)
+        {
+          std::array<std::uint8_t, 9> record = {};
+          read_metadata(record);
+          const size_type current = block++;
+          if(record[8] != 0) { mini_block = current; return true; }
+        }
+        return false;
+      });
+    }
     else { GCSA::bit_vector empty; empty.serialize(out); }
+
+    if(std::fclose(metadata) != 0)
+    {
+      metadata = nullptr;
+      TempFile::remove(metadata_name);
+      throw eventError("cannot close select metadata spool");
+    }
+    metadata = nullptr;
+    TempFile::remove(metadata_name);
+
     if(std::fflush(payload) != 0 || std::fseek(payload, 0, SEEK_SET) != 0)
     {
       throw eventError("cannot rewind select payload spool");
@@ -760,10 +850,138 @@ serializeSelectMCL(std::ostream& out, size_type bits, size_type ones,
   }
   catch(...)
   {
+    if(metadata != nullptr) { std::fclose(metadata); }
     if(payload != nullptr) { std::fclose(payload); }
-    TempFile::remove(payload_name);
+    TempFile::remove(metadata_name); TempFile::remove(payload_name);
     throw;
   }
+}
+
+/*
+  Serialize the default sdsl::sd_vector from a replayable monotone position
+  stream. The ordinary builder retains both Elias--Fano vectors and their
+  select supports. Replaying an immutable event file lets us write the exact
+  same low/high layout with only a bounded input buffer and one 4096-position
+  select block resident at a time.
+
+  replay(consumer) must create a fresh source and call consumer(next), where
+  next(position) yields exactly `ones` strictly increasing positions in the
+  half-open universe [0, universe).
+*/
+template<class Replay>
+void
+serializeSparseVector(std::ostream& out, size_type universe, size_type ones,
+  const Replay& replay)
+{
+  if(ones > universe)
+  {
+    throw eventError("sparse-vector one-count exceeds its universe");
+  }
+  const std::pair<size_type, size_type> params =
+    SadaSparse::sd_vector::get_params(universe, ones);
+  const size_type low_width = params.first, high_bits = params.second;
+  if(low_width == 0 || low_width > 64 || high_bits < ones)
+  {
+    throw eventError("invalid sparse-vector parameters");
+  }
+
+  sdsl::write_member(universe, out);
+  sdsl::write_member(static_cast<std::uint8_t>(low_width), out);
+  const std::uint64_t low_mask = (low_width == 64 ?
+    std::numeric_limits<std::uint64_t>::max() : sdsl::bits::lo_set[low_width]);
+
+  replay([&](const auto& next_position)
+  {
+    serializePackedVector(out, ones, low_width, [&]()
+    {
+      size_type position = 0;
+      if(!next_position(position))
+      {
+        throw eventError("sparse-vector position stream ended early");
+      }
+      return static_cast<std::uint64_t>(position) & low_mask;
+    });
+  });
+
+  const auto encode_high_positions = [&](const auto& serialize)
+  {
+    replay([&](const auto& next_position)
+    {
+      size_type ordinal = 0;
+      const auto next_high = [&](size_type& high_position)
+      {
+        size_type position = 0;
+        if(!next_position(position)) { return false; }
+        if(position >= universe || ordinal >= ones)
+        {
+          throw eventError("sparse-vector position exceeds metadata");
+        }
+        // get_params() currently never returns 64 for a valid size_type
+        // universe, but keep the serializer free of an undefined 64-bit shift
+        // if that implementation detail changes.
+        const size_type high_part = (low_width == 64 ? 0 : position >> low_width);
+        if(high_part > std::numeric_limits<size_type>::max() - ordinal)
+        {
+          throw eventError("sparse-vector high position overflows");
+        }
+        high_position = high_part + ordinal;
+        if(high_position >= high_bits)
+        {
+          throw eventError("sparse-vector high position exceeds its universe");
+        }
+        ordinal++;
+        return true;
+      };
+      serialize(next_high);
+      if(ordinal != ones)
+      {
+        throw eventError("sparse-vector position count does not match metadata");
+      }
+    });
+  };
+
+  encode_high_positions([&](const auto& next_high)
+  {
+    serializePlainBitVector(out, high_bits, next_high);
+  });
+  encode_high_positions([&](const auto& next_high)
+  {
+    serializeSelectMCL(out, high_bits, ones, next_high);
+  });
+
+  // The high vector has one zero per Elias--Fano bucket. Derive those zero
+  // positions from the same monotone high-one stream instead of materializing
+  // the high vector for select_0 construction.
+  const size_type zeros = high_bits - ones;
+  encode_high_positions([&](const auto& next_high)
+  {
+    size_type cursor = 0, one = 0;
+    bool one_available = next_high(one);
+    const auto next_zero = [&](size_type& zero)
+    {
+      while(cursor < high_bits)
+      {
+        if(one_available && one < cursor)
+        {
+          throw eventError("sparse-vector high positions are not increasing");
+        }
+        if(one_available && one == cursor)
+        {
+          cursor++;
+          one_available = next_high(one);
+          continue;
+        }
+        zero = cursor++; return true;
+      }
+      if(one_available)
+      {
+        throw eventError("sparse-vector high position exceeds its universe");
+      }
+      return false;
+    };
+    serializeSelectMCL(out, high_bits, zeros, next_zero);
+  });
+  if(!out) { throw eventError("cannot serialize sparse vector"); }
 }
 
 void
@@ -1237,6 +1455,69 @@ serializeSampleBoundaries(std::ostream& out,
   {
     serializeSelectMCL(out, sample_ids, sampled_paths, next);
   });
+}
+
+void
+serializeOccurrencePointers(std::ostream& out,
+  const std::string& occurrence_file, size_type paths,
+  size_type occurrence_items, size_type occurrence_extra,
+  const ConstructionParameters& parameters)
+{
+  if(occurrence_items > paths || occurrence_items > occurrence_extra ||
+     (paths == 0 && (occurrence_items != 0 || occurrence_extra != 0)))
+  {
+    throw eventError("inconsistent occurrence counts");
+  }
+
+  // Every sparse-vector component replays the same immutable event stream.
+  // This deliberately trades sequential reads for a construction whose RSS
+  // does not grow with the number of paths or nonzero occurrence values.
+  const auto replay = [&](bool cumulative_values, const auto& consume)
+  {
+    MemoryBudget budget(parameters.getMemoryLimitBytes(),
+      parameters.getMemoryLimitBytes() / 8);
+    BufferedEventReader input(occurrence_file, 16, occurrence_items,
+      componentBufferBytes(parameters, 1), budget, "final-occurrence-reader");
+    size_type seen = 0, tail = 0;
+    std::uint64_t previous = 0;
+    const auto next = [&](size_type& position)
+    {
+      if(seen == occurrence_items) { return false; }
+      std::uint64_t path = 0, extra = 0;
+      input.nextPair(path, extra);
+      if(path >= paths || extra == 0 || (seen > 0 && path <= previous) ||
+         tail > occurrence_extra || extra > occurrence_extra - tail)
+      {
+        throw eventError("invalid occurrence event");
+      }
+      tail += static_cast<size_type>(extra);
+      position = (cumulative_values ? tail - 1 : static_cast<size_type>(path));
+      previous = path; seen++;
+      return true;
+    };
+    consume(next);
+    input.finish();
+    if(seen != occurrence_items || tail != occurrence_extra)
+    {
+      throw eventError("occurrence value total mismatch");
+    }
+  };
+
+  serializeSparseVector(out, paths, occurrence_items, [&](const auto& consume)
+  {
+    replay(false, consume);
+  });
+  SadaSparse::sd_vector::rank_1_type empty_rank;
+  empty_rank.serialize(out);
+
+  serializeSparseVector(out, occurrence_extra, occurrence_items,
+    [&](const auto& consume)
+    {
+      replay(true, consume);
+    });
+  SadaSparse::sd_vector::select_1_type empty_select;
+  empty_select.serialize(out);
+  if(!out) { throw eventError("cannot serialize occurrence pointers"); }
 }
 
 void
@@ -2163,43 +2444,9 @@ storeFinalComponents(const GCSAHeader& header,
       if(!out) { throw eventError("cannot write partial final index", partial); }
     }
 
-    {
-      MemoryBudget budget(parameters.getMemoryLimitBytes(),
-        parameters.getMemoryLimitBytes() / 8);
-      BufferedEventReader input(files.occurrences, 16, metadata.occurrence_items,
-        componentBufferBytes(parameters, 1), budget, "final-occurrence-reader");
-      sdsl::sd_vector_builder filter(metadata.paths, metadata.occurrence_items);
-      sdsl::sd_vector_builder values(metadata.occurrence_extra,
-        metadata.occurrence_items);
-      size_type tail = 0;
-      std::uint64_t previous = 0;
-      for(size_type i = 0; i < metadata.occurrence_items; i++)
-      {
-        std::uint64_t path = 0, extra = 0;
-        input.nextPair(path, extra);
-        if(path >= metadata.paths || extra == 0 ||
-           (i > 0 && path <= previous) || tail > metadata.occurrence_extra ||
-           extra > metadata.occurrence_extra - tail)
-        {
-          throw eventError("invalid occurrence event");
-        }
-        filter.set(path);
-        tail += extra;
-        values.set(tail - 1);
-        previous = path;
-      }
-      input.finish();
-      if(tail != metadata.occurrence_extra)
-      {
-        throw eventError("occurrence value total mismatch");
-      }
-      SadaSparse pointers;
-      pointers.filter = SadaSparse::sd_vector(filter);
-      pointers.values = SadaSparse::sd_vector(values);
-      sdsl::util::init_support(pointers.filter_rank, &(pointers.filter));
-      sdsl::util::init_support(pointers.value_select, &(pointers.values));
-      write(pointers);
-    }
+    serializeOccurrencePointers(out, files.occurrences, metadata.paths,
+      metadata.occurrence_items, metadata.occurrence_extra, parameters);
+    if(!out) { throw eventError("cannot write partial final index", partial); }
     {
       if(metadata.paths == 0 && metadata.redundant != 0)
       {

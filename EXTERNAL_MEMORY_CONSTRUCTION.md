@@ -523,15 +523,20 @@ Sample boundaries replay the monotone endpoint stream twice to write the dense
 bit payload and `select_support_mcl` payload directly. The latter is spooled in
 4096-one blocks, matching SDSL's slow and fast initialization layouts without
 retaining either a bit per sample ID or all select blocks in RAM.
+Occurrence pointers replay their sorted `(path, extra-count)` events to write
+both Elias--Fano `sd_vector` members directly: packed low bits, unary high bits,
+and high-bit select supports. Select directories and block payloads spill to
+the workspace, so no builder or directory grows with the occurrence count.
+This currently uses eight sequential event passes in exchange for the bounded
+RSS invariant; a fused multi-output encoder is a later bandwidth optimization.
 Sorted redundancy events likewise stream the exact ordinary `sdsl::bit_vector`
 and `select_support_mcl` payload used by `SadaCount`; its select payload is
 spooled in 4096-one blocks, so direct packing retains no dense unary vector.
 The partial file is synced and atomically published. Standalone `build_gcsa`,
 `vg index`, and `vg autoindex` use this direct packer whenever a workspace is
 configured; they reload the index only for explicit verification. This removes
-the cumulative completed-index peak, but sparse SDSL builders, occurrence
-members, and their conversion scratch can still allocate outside
-`MemoryBudget`.
+the cumulative completed-index peak, but sparse BWT SDSL builders and their
+conversion scratch can still allocate outside `MemoryBudget`.
 
 LCP level `i+1` is produced by streaming groups of the configured branching
 factor from level `i`; each raw internal level is independently checkpointed
@@ -568,7 +573,7 @@ when its production call path and forced-spill/recovery tests pass.
 | Process worker scheduler and partition resume | implemented with fork-free spawn, global byte admission, immutable-payload semantic range checkpoints, same-filesystem zero-copy restore, and one-/multi-partition tests |
 | External keys/start nodes/initial paths | implemented with bounded fixed-record runs, global duplicate reduction, streaming support construction, durable key/start checkpoints, and physical initial shards preserving logical IDs |
 | Spillable pruning groups | implemented and forced-spill tested for equal-label priority groups, extended ranges, external same-from sets, and bounded input/output descriptor caches |
-| Final event/component passes | implemented with one-task immutable-payload event checkpoint, same-filesystem zero-copy restore, spillable mapped start-node sets, disk-backed `prev_occ` and suffix-tree stack, external redundancy sort, streaming fast-vector, packed-sample-ID, sample-boundary, and SadaCount serialization, and direct component-at-a-time packing in standalone/vg/autoindex; mid-scan assignment logs and remaining sparse/occurrence SDSL token admission pending |
+| Final event/component passes | implemented with one-task immutable-payload event checkpoint, same-filesystem zero-copy restore, spillable mapped start-node sets, disk-backed `prev_occ` and suffix-tree stack, external redundancy sort, streaming fast-vector, packed-sample-ID, sample-boundary, SadaSparse, and SadaCount serialization, and direct component-at-a-time packing in standalone/vg/autoindex; mid-scan assignment logs and remaining sparse-BWT SDSL token admission pending |
 | Streaming LCP levels and direct packing | implemented and resume-tested with one raw level resident at a time, bounded direct final serialization, atomic publication, and byte-identical legacy output including padding edge cases |
 | External verification | implemented and forced-spill tested with bounded input blocks, external expected/actual occurrence sorts, callback-based locate, and sequential set comparison; resumable runs and parallel label ranges pending |
 | Standalone and `vg index` / `vg autoindex` CLI integration | implemented; forced-spill/resume integration tested |
@@ -579,8 +584,9 @@ only when `ConstructionParameters::work_directory` is nonempty. The production
 file-building routes no longer retain all completed GCSA components or retain a
 completed GCSA while constructing LCP. Fast BWT/edge/sample vectors, packed
 sample IDs, sample boundaries, and redundancy pointers stream in bounded
-memory, but individual sparse SDSL builders, occurrence structures, and their
-conversion scratch still allocate outside the token budget. These are
+memory, and occurrence pointers use bounded multi-pass Elias--Fano packing.
+Individual sparse BWT SDSL builders and their conversion scratch still allocate
+outside the token budget. These are
 bounded by one final component rather than total intermediate path volume, but
 they keep the in-process budget from being a strict whole-process RSS ceiling;
 production runs retain a cgroup limit.
@@ -628,10 +634,10 @@ feasibility, RSS, then speed policy:
    must preserve one explicit logical GCSA2 input identity across all physical
    chunks.
 2. Bound the remaining resident floor: `NodeMapping`, de Bruijn support, and
-   one sparse/occurrence SDSL final-component builder or conversion allocate
-   outside the shared token budget. External mapping
-   lookup and direct serialization for those remaining component types are the
-   principal greater-than-RAM changes. Until then, measured component floors
+   one sparse-BWT SDSL final-component builder or conversion allocate outside
+   the shared token budget. External mapping lookup and direct serialization
+   for those remaining component types are the principal greater-than-RAM
+   changes. Until then, measured component floors
    must be reserved below the deployment hard cap.
 3. Make `DiskBudget` global. Join/path generation is reserved today, but
    checkpoint payloads, final events, verification runs, and LCP levels can

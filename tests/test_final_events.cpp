@@ -45,6 +45,16 @@ void writeInteger(const std::string& filename, std::streamoff offset,
   file.flush(); require(static_cast<bool>(file));
 }
 
+void appendInteger(std::ostream& out, std::uint64_t value)
+{
+  std::array<std::uint8_t, 8> encoded = {};
+  for(size_type i = 0; i < encoded.size(); i++)
+  {
+    encoded[i] = static_cast<std::uint8_t>(value >> (8 * i));
+  }
+  out.write(reinterpret_cast<const char*>(encoded.data()), encoded.size());
+}
+
 void initSupports(GCSA& index)
 {
   for(size_type comp = 0; comp < index.alpha.sigma; comp++)
@@ -257,6 +267,72 @@ int main()
   require(streamed_boundaries.str() == expected_boundary_bytes.str());
   require(std::filesystem::remove(boundary_file));
 
+  // Exercise a complete long select block as well as the fast initializer's
+  // final partial block. The complete block uses its actual last position for
+  // packed width, while the partial block uses the bitvector universe.
+  const size_type long_boundary_count = 4097;
+  const size_type long_boundary_universe = 1000003;
+  const std::string long_boundary_file = std::string(root) + "/long-sample-boundaries";
+  GCSA::bit_vector expected_long_boundaries(long_boundary_universe, 0);
+  {
+    std::ofstream output(long_boundary_file.c_str(), std::ios_base::binary);
+    require(static_cast<bool>(output));
+    for(size_type i = 0; i < long_boundary_count; i++)
+    {
+      const std::uint64_t endpoint = (i + 1 == long_boundary_count ?
+        long_boundary_universe - 1 : i * 200);
+      appendInteger(output, endpoint);
+      expected_long_boundaries[endpoint] = 1;
+    }
+    require(static_cast<bool>(output));
+  }
+  GCSA::bit_vector::select_1_type expected_long_boundary_select;
+  sdsl::util::init_support(expected_long_boundary_select,
+    &expected_long_boundaries);
+  std::ostringstream streamed_long_boundaries, expected_long_boundary_bytes;
+  serializeSampleBoundaries(streamed_long_boundaries, long_boundary_file,
+    long_boundary_universe, long_boundary_count, parameters);
+  expected_long_boundaries.serialize(expected_long_boundary_bytes);
+  expected_long_boundary_select.serialize(expected_long_boundary_bytes);
+  require(streamed_long_boundaries.str() == expected_long_boundary_bytes.str());
+  require(std::filesystem::remove(long_boundary_file));
+
+  // The fast initializer's cross-block lookahead can also change a full block
+  // from compact to long. Pin that private SDSL quirk because final GCSA files
+  // must remain byte-compatible with the existing loader and serializer.
+  const size_type lookahead_boundary_count = 4097;
+  const size_type lookahead_boundary_universe = 1000000;
+  const std::string lookahead_boundary_file =
+    std::string(root) + "/lookahead-sample-boundaries";
+  GCSA::bit_vector expected_lookahead_boundaries(
+    lookahead_boundary_universe, 0);
+  {
+    std::ofstream output(lookahead_boundary_file.c_str(), std::ios_base::binary);
+    require(static_cast<bool>(output));
+    for(size_type i = 0; i < lookahead_boundary_count; i++)
+    {
+      const std::uint64_t endpoint = (i + 1 == lookahead_boundary_count ?
+        lookahead_boundary_universe - 1 : i);
+      appendInteger(output, endpoint);
+      expected_lookahead_boundaries[endpoint] = 1;
+    }
+    require(static_cast<bool>(output));
+  }
+  GCSA::bit_vector::select_1_type expected_lookahead_boundary_select;
+  sdsl::util::init_support(expected_lookahead_boundary_select,
+    &expected_lookahead_boundaries);
+  std::ostringstream streamed_lookahead_boundaries,
+    expected_lookahead_boundary_bytes;
+  serializeSampleBoundaries(streamed_lookahead_boundaries,
+    lookahead_boundary_file, lookahead_boundary_universe,
+    lookahead_boundary_count, parameters);
+  expected_lookahead_boundaries.serialize(expected_lookahead_boundary_bytes);
+  expected_lookahead_boundary_select.serialize(
+    expected_lookahead_boundary_bytes);
+  require(streamed_lookahead_boundaries.str() ==
+    expected_lookahead_boundary_bytes.str());
+  require(std::filesystem::remove(lookahead_boundary_file));
+
   // A path may represent more mapped start nodes than fit in RAM. Exercise
   // both reusable in-memory sets and the forced external sort/dedup path with
   // the minimum legal byte reservation.
@@ -457,6 +533,101 @@ int main()
   large_native.serialize(expected_large_redundancy);
   require(streamed_large_redundancy.str() == expected_large_redundancy.str());
   require(std::filesystem::remove(large_redundancy));
+
+  // Both Elias--Fano vectors cross the select_support_mcl fast-construction
+  // threshold. Exact equality proves the direct writer preserves SadaSparse's
+  // low/high vectors and both high-bit select supports without resident
+  // sd_vector_builder instances.
+  const size_type occurrence_paths = 1000003;
+  const std::string large_occurrence_file = std::string(root) + "/large-occurrences";
+  CounterArray large_occurrences(occurrence_paths, 4);
+  size_type occurrence_items = 0, occurrence_extra = 0;
+  {
+    std::ofstream output(large_occurrence_file.c_str(), std::ios_base::binary);
+    require(static_cast<bool>(output));
+    for(size_type path = 3; path < occurrence_paths; path += 19)
+    {
+      const std::uint64_t extra = 1 + (occurrence_items % 13);
+      const std::uint64_t encoded_path = path;
+      appendInteger(output, encoded_path);
+      appendInteger(output, extra);
+      large_occurrences.increment(path, extra);
+      occurrence_items++; occurrence_extra += extra;
+    }
+    require(static_cast<bool>(output));
+  }
+  SadaSparse native_occurrences(large_occurrences);
+  std::ostringstream streamed_occurrences, expected_occurrences;
+  serializeOccurrencePointers(streamed_occurrences, large_occurrence_file,
+    occurrence_paths, occurrence_items, occurrence_extra, parameters);
+  native_occurrences.serialize(expected_occurrences);
+  require(streamed_occurrences.str() == expected_occurrences.str());
+  require(std::filesystem::remove(large_occurrence_file));
+
+  // Regression for select_support_mcl::init_fast(): for each nonterminal full
+  // 4096-one block, SDSL includes the first position of the next block when it
+  // chooses the miniblock width. This dense fixture has exactly 24 blocks and
+  // exposed a byte mismatch in the first streaming implementation.
+  const size_type dense_occurrence_paths = 196608;
+  const std::string dense_occurrence_file =
+    std::string(root) + "/dense-occurrences";
+  CounterArray dense_occurrences(dense_occurrence_paths, 2);
+  size_type dense_occurrence_items = 0;
+  {
+    std::ofstream output(dense_occurrence_file.c_str(), std::ios_base::binary);
+    require(static_cast<bool>(output));
+    for(size_type path = 0; path < dense_occurrence_paths; path += 2)
+    {
+      const std::uint64_t encoded_path = path, extra = 1;
+      appendInteger(output, encoded_path);
+      appendInteger(output, extra);
+      dense_occurrences.increment(path, extra);
+      dense_occurrence_items++;
+    }
+    require(static_cast<bool>(output));
+  }
+  SadaSparse native_dense_occurrences(dense_occurrences);
+  std::ostringstream streamed_dense_occurrences, expected_dense_occurrences;
+  serializeOccurrencePointers(streamed_dense_occurrences,
+    dense_occurrence_file, dense_occurrence_paths, dense_occurrence_items,
+    dense_occurrence_items, parameters);
+  native_dense_occurrences.serialize(expected_dense_occurrences);
+  require(streamed_dense_occurrences.str() == expected_dense_occurrences.str());
+  require(std::filesystem::remove(dense_occurrence_file));
+
+  const std::string empty_occurrence_file = std::string(root) + "/empty-occurrences";
+  { std::ofstream create(empty_occurrence_file.c_str(), std::ios_base::binary); }
+  // A large empty filter still has a large Elias--Fano high vector and a
+  // nonempty select_0 support; keep it above init_fast()'s threshold.
+  const size_type empty_occurrence_paths = 200000;
+  CounterArray empty_occurrences(empty_occurrence_paths, 2);
+  SadaSparse native_empty_occurrences(empty_occurrences);
+  std::ostringstream streamed_empty_occurrences, expected_empty_occurrences;
+  serializeOccurrencePointers(streamed_empty_occurrences, empty_occurrence_file,
+    empty_occurrence_paths, 0, 0, parameters);
+  native_empty_occurrences.serialize(expected_empty_occurrences);
+  require(streamed_empty_occurrences.str() == expected_empty_occurrences.str());
+  require(std::filesystem::remove(empty_occurrence_file));
+
+  const std::string malformed_occurrence_file =
+    std::string(root) + "/malformed-occurrences";
+  {
+    std::ofstream output(malformed_occurrence_file.c_str(),
+      std::ios_base::binary);
+    appendInteger(output, 7); appendInteger(output, 1);
+    appendInteger(output, 7); appendInteger(output, 1);
+    require(static_cast<bool>(output));
+  }
+  bool rejected_malformed_occurrences = false;
+  try
+  {
+    std::ostringstream ignored;
+    serializeOccurrencePointers(ignored, malformed_occurrence_file,
+      10, 2, 2, parameters);
+  }
+  catch(const std::runtime_error&) { rejected_malformed_occurrences = true; }
+  require(rejected_malformed_occurrences);
+  require(std::filesystem::remove(malformed_occurrence_file));
 
   // Direct packing preserves the public serialization exactly while keeping
   // component construction local to the writer. Loading proves that the
