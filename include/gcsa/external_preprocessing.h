@@ -41,9 +41,17 @@ public:
     const ConstructionParameters& parameters, BuildWorkspace* workspace = nullptr);
   ~ExternalInputPreprocessor();
 
-  // Build the compact supports from the label-sorted unique key stream.
+  // Build all compact supports from the label-sorted unique key stream. This
+  // compatibility wrapper is useful to callers that need them together.
   void buildKeySupport(DeBruijnGraph& mapper, LCP& lcp,
     sdsl::int_vector<0>& last_char);
+
+  // Construction does not need every key support at the same time. Splitting
+  // the scans lets GCSA retain only the LCP support during prefix doubling,
+  // then create the mapper and last-character vector close to their use.
+  void buildMapper(DeBruijnGraph& mapper);
+  void buildLCP(LCP& lcp);
+  void buildLastCharacters(sdsl::int_vector<0>& last_char);
 
   // Build the mapped, unique start-node set in two bounded scans.
   void buildStartNodes(sdsl::sd_vector<>& from_nodes);
