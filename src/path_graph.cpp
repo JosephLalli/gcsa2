@@ -1571,12 +1571,13 @@ struct SpillableGroup
   std::vector<Element> memory;
   std::string          filename;
   int                  file;
-  size_type            elements, disk_elements, offset, byte_limit, write_bytes, read_bytes, advised_write;
+  size_type            elements, disk_elements, offset, file_begin;
+  size_type            byte_limit, write_bytes, read_bytes, advised_write;
   mutable size_type    cache_offset;
   mutable std::vector<Element> read_cache;
   size_type*           spill_counter;
 
-  SpillableGroup(size_type limit, size_type* counter = nullptr) : file(-1), elements(0), disk_elements(0), offset(0),
+  SpillableGroup(size_type limit, size_type* counter = nullptr) : file(-1), elements(0), disk_elements(0), offset(0), file_begin(0),
     byte_limit(std::max(2 * static_cast<size_type>(sizeof(Element)), limit)),
     write_bytes(this->byte_limit / 2), read_bytes(this->byte_limit - this->write_bytes), advised_write(0), cache_offset(0),
     spill_counter(counter)
@@ -1603,6 +1604,16 @@ struct SpillableGroup
       static_cast<void>(::posix_fadvise(this->file, 0, 0, POSIX_FADV_SEQUENTIAL));
 #endif
       if(this->spill_counter != nullptr) { (*this->spill_counter)++; }
+      // The merger may have already discarded many small label ranges before
+      // the first oversized range appears. Spill indexes are absolute merger
+      // positions, while the new file starts at the current live window.
+      // Establish that coordinate origin before flush(); otherwise get(i)
+      // treats an absolute index as an index into the unflushed tail and can
+      // return a corrupted PriorityNode (including a bogus source shard).
+      this->file_begin = this->offset;
+      this->disk_elements = this->offset;
+      this->advised_write = this->offset;
+      this->cache_offset = this->offset;
       this->flush();
     }
     this->memory.push_back(value);
@@ -1650,7 +1661,8 @@ struct SpillableGroup
     if(this->file >= 0) { ::close(this->file); this->file = -1; }
     if(!this->filename.empty()) { TempFile::remove(this->filename); this->filename.clear(); }
     sdsl::util::clear(this->memory); sdsl::util::clear(this->read_cache);
-    this->elements = 0; this->disk_elements = 0; this->offset = 0; this->advised_write = 0; this->cache_offset = 0;
+    this->elements = 0; this->disk_elements = 0; this->offset = 0; this->file_begin = 0;
+    this->advised_write = 0; this->cache_offset = 0;
   }
 
 private:
@@ -1674,9 +1686,13 @@ private:
     return count * sizeof(Element);
   }
 
-  static off_t fileOffset(size_type start)
+  off_t fileOffset(size_type start) const
   {
-    size_type offset = bytesFor(start);
+    if(start < this->file_begin)
+    {
+      throw std::out_of_range("PathGraph::prune(): spill offset before live window");
+    }
+    size_type offset = bytesFor(start - this->file_begin);
     if(offset > static_cast<size_type>(std::numeric_limits<off_t>::max()))
     {
       throw std::overflow_error("PathGraph::prune(): spill offset overflow");

@@ -787,7 +787,11 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
         {
           if(node >= from_nodes.size() || !from_nodes[node])
           {
-            throw std::runtime_error("GCSA::GCSA(): start node is absent from the external start-node index");
+            throw std::runtime_error(
+              "GCSA::GCSA(): start node " + Node::decode(node) +
+              " (encoded " + std::to_string(node) +
+              ") is absent from the external start-node index of universe " +
+              std::to_string(from_nodes.size()));
           }
           size_type rank = from_rank(node);
           size_type prior = previous.get(rank);

@@ -28,6 +28,26 @@ static void write_input(const std::string& path_name, const std::string& rank_na
   }
 }
 
+// A large equal-label range need not be the first range in the merge. This is
+// the important late-spill shape: the in-memory window has a nonzero absolute
+// offset when it is first converted into a disk-backed window.
+static void write_delayed_spill_input(const std::string& path_name,
+  const std::string& rank_name, size_type records)
+{
+  std::ofstream paths(path_name.c_str(), std::ios_base::binary);
+  std::ofstream ranks(rank_name.c_str(), std::ios_base::binary);
+  for(size_type i = 0; i < records; i++)
+  {
+    PathNode node; node.from = (i == 0 ? 7 : 42); node.to = i + 1; node.fields = 0;
+    node.setPredecessors(1); node.setOrder(1); node.setLCP(1); node.setPointer(2 * i);
+    PathNode::rank_type label[] = {
+      static_cast<PathNode::rank_type>(i == 0 ? 0 : 1), 9
+    };
+    paths.write(reinterpret_cast<const char*>(&node), sizeof(node));
+    ranks.write(reinterpret_cast<const char*>(label), sizeof(label));
+  }
+}
+
 static std::vector<char> contents(const std::string& name)
 {
   std::ifstream input(name.c_str(), std::ios_base::binary);
@@ -95,6 +115,30 @@ static PathGraphMergeStats compare_prune(const std::string& base,
   remove_inputs(base + ".reference", logical.size());
   remove_inputs(base + ".spilled", logical.size());
   return stats;
+}
+
+static void compare_delayed_spill(const std::string& base, const LCP& lcp)
+{
+  const std::string reference_path = base + ".reference.path";
+  const std::string reference_rank = base + ".reference.rank";
+  const std::string spilled_path = base + ".spilled.path";
+  const std::string spilled_rank = base + ".spilled.rank";
+  write_delayed_spill_input(reference_path, reference_rank, 80);
+  write_delayed_spill_input(spilled_path, spilled_rank, 80);
+  PathGraph reference(reference_path, reference_rank);
+  PathGraph spilled(spilled_path, spilled_rank);
+  reference.order = 1; spilled.order = 1;
+  reference.prune(lcp, MEGABYTE);
+  PathGraphMergeStats stats;
+  const size_type one_record = sizeof(PathNode) +
+    (PathLabel::LABEL_LENGTH + 1) * sizeof(PathNode::rank_type);
+  spilled.prune(lcp, MEGABYTE, one_record, &stats, 8);
+  require(stats.priority_spills > 0);
+  require(reference.size() == spilled.size());
+  require(contents(reference.path_names[0]) == contents(spilled.path_names[0]));
+  require(contents(reference.rank_names[0]) == contents(spilled.rank_names[0]));
+  std::remove(reference_path.c_str()); std::remove(reference_rank.c_str());
+  std::remove(spilled_path.c_str()); std::remove(spilled_rank.c_str());
 }
 
 static void write_merged_fixture(const std::string& name)
@@ -180,6 +224,9 @@ int main()
 
   // One large equal-label group exercises the spill path against the former in-memory result.
   compare_prune(std::string(root) + "/one", { logical_file_id_t(7) }, lcp);
+  // First consume a small range, then spill. Absolute merger offsets must not
+  // be confused with offsets relative to a newly created spill file.
+  compare_delayed_spill(std::string(root) + "/delayed", lcp);
   // Physical shards 0/1 represent logical input 7; shard 2 is logical input 8.
   // The spill path must retain exactly the same multi-logical-file output semantics.
   compare_prune(std::string(root) + "/many", { logical_file_id_t(7), logical_file_id_t(7), logical_file_id_t(8) }, lcp);
