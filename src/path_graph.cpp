@@ -24,15 +24,20 @@
 */
 
 #include <gcsa/path_graph.h>
+#include <gcsa/external_sort.h>
+#include <gcsa/path_sort_run.h>
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdio>
-#include <deque>
+#include <cstring>
 #include <fcntl.h>
 #include <limits>
+#include <memory>
 #include <queue>
 #include <stdexcept>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace gcsa
@@ -474,18 +479,16 @@ PathGraphBuilder::sort(size_type file, size_type byte_budget, size_type fan_in)
 namespace
 {
 
-/* A run record is deliberately self-contained: the rank pointer in node is
-   meaningful only while reading the source/final PathGraph pair. */
-struct PathSortRecord
-{
-  PathNode node;
-  PathNode::rank_type labels[PathLabel::LABEL_LENGTH + 1];
-};
+// A run record is deliberately self-contained: the rank pointer in node is
+// meaningful only while reading the source/final PathGraph pair. The transient
+// disk representation is versioned and prefix-compressed by path_sort_run.cpp.
+using PathSortRecord = PathSortRunRecord;
 
 // The source PathGraph uses record-at-a-time decoding because each PathNode
 // points to a variable number of ranks. Explicit stream buffers avoid one
 // syscall per decoded record while remaining part of the declared budget.
 constexpr size_type PATH_SORT_STREAM_BUFFER_BYTES = 64 * KILOBYTE;
+constexpr size_type PATH_SORT_RUN_BUFFER_BYTES = 64 * KILOBYTE;
 constexpr size_type PATH_SORT_PARALLEL_MIN_RECORDS = 64 * 1024;
 // Covers the two source stream buffers, stream state, vector control blocks,
 // allocator slack, and the heap.
@@ -498,6 +501,20 @@ constexpr size_type PATH_SORT_FIXED_BYTES =
 constexpr off_t PATH_SORT_CACHE_TAIL_BYTES = 64 * MEGABYTE;
 constexpr off_t PATH_SORT_CACHE_FLUSH_BYTES = 512 * MEGABYTE;
 constexpr size_type PATH_SORT_SOURCE_CACHE_CHECK_RECORDS = 1024 * 1024;
+
+inline size_type
+pathSortReaderReservation()
+{
+  return PATH_SORT_RUN_BUFFER_BYTES + sizeof(PathSortRunReader) +
+    2 * sizeof(size_type);
+}
+
+inline size_type
+pathSortOutputRecordReservation()
+{
+  return sizeof(PathNode) +
+    (PathLabel::LABEL_LENGTH + 1) * sizeof(PathNode::rank_type);
+}
 
 inline void
 updatePathSortStats(ExternalPathSortStats* stats, size_type records, size_type bytes)
@@ -512,6 +529,19 @@ externalSortFailure(const std::string& message)
 {
   std::cerr << "externalPathGraphSort(): " << message << std::endl;
   std::exit(EXIT_FAILURE);
+}
+
+inline void
+recordPathSortRun(ExternalPathSortStats* stats, const PathSortRunWriter& writer)
+{
+  if(stats == nullptr) { return; }
+  if(stats->run_uncompressed_bytes > std::numeric_limits<size_type>::max() - writer.uncompressedBytes() ||
+     stats->run_compressed_bytes > std::numeric_limits<size_type>::max() - writer.bytes())
+  {
+    externalSortFailure("path-sort run byte counter overflow");
+  }
+  stats->run_uncompressed_bytes += writer.uncompressedBytes();
+  stats->run_compressed_bytes += writer.bytes();
 }
 
 inline off_t
@@ -672,90 +702,17 @@ syncPathSortFile(const std::string& name)
   ::close(descriptor);
 }
 
-struct PathSortRunReader
-{
-  std::ifstream file;
-  std::vector<PathSortRecord> buffer;
-  size_type offset, buffer_records, total_records;
-  bool at_end;
-  int cache_descriptor;
-  off_t bytes_read, cache_released;
-
-  PathSortRunReader(const std::string& name, size_type requested_records) :
-    file(), buffer(), offset(0), buffer_records(1), total_records(0), at_end(false),
-    cache_descriptor(-1), bytes_read(0), cache_released(0)
-  {
-    // The explicit byte-counted vector is the only input buffer. Otherwise
-    // libstdc++ adds an unaccounted buffer for every merge input stream.
-    this->file.rdbuf()->pubsetbuf(nullptr, 0);
-    this->file.open(name.c_str(), std::ios_base::binary);
-    if(!this->file) { externalSortFailure("cannot open run " + name); }
-    size_type bytes = fileSize(this->file);
-    if(bytes % sizeof(PathSortRecord) != 0) { externalSortFailure("truncated run " + name); }
-    this->total_records = bytes / sizeof(PathSortRecord);
-    this->cache_descriptor = openPathSortCacheDescriptor(name, O_RDONLY);
-    this->buffer_records = std::max((size_type)1,
-      std::min(requested_records, this->total_records));
-    this->buffer.resize(this->buffer_records);
-    this->refill();
-  }
-
-  PathSortRunReader(PathSortRunReader&& another) noexcept :
-    file(std::move(another.file)), buffer(std::move(another.buffer)),
-    offset(another.offset), buffer_records(another.buffer_records),
-    total_records(another.total_records), at_end(another.at_end),
-    cache_descriptor(another.cache_descriptor), bytes_read(another.bytes_read),
-    cache_released(another.cache_released)
-  {
-    another.cache_descriptor = -1;
-  }
-
-  ~PathSortRunReader()
-  {
-    if(this->cache_descriptor >= 0) { ::close(this->cache_descriptor); }
-  }
-
-  void refill()
-  {
-    bool complete = (this->bytes_read == pathSortByteOffset(this->total_records, sizeof(PathSortRecord)));
-    trimPathSortReadCache(this->cache_descriptor, this->bytes_read, this->cache_released, complete);
-    this->file.read(reinterpret_cast<char*>(this->buffer.data()), this->buffer.size() * sizeof(PathSortRecord));
-    std::streamsize bytes = this->file.gcount();
-    DiskIO::read_volume += bytes;
-    if(bytes % (std::streamsize)sizeof(PathSortRecord) != 0) { externalSortFailure("truncated run"); }
-    this->bytes_read += bytes;
-    this->buffer.resize(bytes / sizeof(PathSortRecord));
-    this->offset = 0;
-    this->at_end = this->buffer.empty();
-  }
-
-  const PathSortRecord& current() const { return this->buffer[this->offset]; }
-
-  void advance()
-  {
-    this->offset++;
-    if(this->offset == this->buffer.size())
-    {
-      this->buffer.resize(this->buffer_records);
-      this->refill();
-    }
-  }
-
-  PathSortRunReader(const PathSortRunReader&) = delete;
-  PathSortRunReader& operator=(const PathSortRunReader&) = delete;
-  PathSortRunReader& operator=(PathSortRunReader&&) = delete;
-};
-
 struct PathSortHeapComparator
 {
-  const std::vector<PathSortRunReader>* readers;
+  const std::vector<std::unique_ptr<PathSortRunReader>>* readers;
 
-  explicit PathSortHeapComparator(const std::vector<PathSortRunReader>* _readers) : readers(_readers) { }
+  explicit PathSortHeapComparator(
+    const std::vector<std::unique_ptr<PathSortRunReader>>* _readers) : readers(_readers) { }
 
   bool operator() (size_type a, size_type b) const
   {
-    const PathSortRecord& left = (*this->readers)[a].current();
-    const PathSortRecord& right = (*this->readers)[b].current();
+    const PathSortRecord& left = (*this->readers)[a]->current();
+    const PathSortRecord& right = (*this->readers)[b]->current();
     if(pathSortLess(left, right)) { return false; }
     if(pathSortLess(right, left)) { return true; }
     return (a > b);
@@ -763,90 +720,49 @@ struct PathSortHeapComparator
 };
 
 void
-writePathSortRun(const std::string& name, const std::vector<PathSortRecord>& records)
+writePathSortRun(const std::string& name, const std::vector<PathSortRecord>& records,
+  ExternalPathSortStats* stats)
 {
-  std::ofstream output;
-  output.rdbuf()->pubsetbuf(nullptr, 0);
-  output.open(name.c_str(), std::ios_base::binary);
-  if(!output) { externalSortFailure("cannot create run " + name); }
-  int cache_descriptor = openPathSortCacheDescriptor(name, O_RDWR);
-  off_t written = 0, cache_released = 0;
-  // Do not hand a multi-gigabyte vector to the stream in one call. Linux
-  // charges the resulting dirty page cache to the same cgroup as the resident
-  // sort records; without intermediate eviction, run creation can temporarily
-  // require roughly twice the declared working set.
-  size_type chunk_records = std::max(static_cast<size_type>(1),
-    static_cast<size_type>(PATH_SORT_CACHE_FLUSH_BYTES) / sizeof(PathSortRecord));
-  for(size_type first = 0; first < records.size(); first += chunk_records)
-  {
-    size_type count = std::min(chunk_records, records.size() - first);
-    DiskIO::write(output, records.data() + first, count);
-    addPathSortBytes(written, count, sizeof(PathSortRecord));
-    trimPathSortWrittenCache(output, cache_descriptor, written,
-      cache_released, false, name);
-  }
-  trimPathSortWrittenCache(output, cache_descriptor, written, cache_released, true, name);
-  output.close();
-  ::close(cache_descriptor);
+  PathSortRunWriter output(name, records.size(), PATH_SORT_RUN_BUFFER_BYTES);
+  for(const PathSortRecord& record : records) { output.write(record); }
+  output.finish(); recordPathSortRun(stats, output);
 }
 
 std::string
-mergePathSortRuns(const std::vector<std::string>& inputs, size_type buffer_records,
+mergePathSortRuns(const std::vector<std::string>& inputs, size_type,
   ExternalPathSortStats* stats)
 {
   if(stats != nullptr) { stats->merge_operations++; }
   std::string output_name = TempFile::getName("gcsa_path_sort_run");
-  std::ofstream output;
-  output.rdbuf()->pubsetbuf(nullptr, 0);
-  output.open(output_name.c_str(), std::ios_base::binary);
-  if(!output) { externalSortFailure("cannot create merged run"); }
-  int output_cache_descriptor = openPathSortCacheDescriptor(output_name, O_RDWR);
-  off_t output_bytes = 0, output_cache_released = 0;
-  std::vector<PathSortRunReader> readers;
+  std::vector<std::unique_ptr<PathSortRunReader>> readers;
   readers.reserve(inputs.size());
-  size_type input_buffer_records = 0, total_records = 0;
+  size_type total_records = 0;
   for(size_type i = 0; i < inputs.size(); i++)
   {
-    readers.emplace_back(inputs[i], buffer_records);
-    input_buffer_records += readers.back().buffer_records;
-    total_records += readers.back().total_records;
+    readers.emplace_back(new PathSortRunReader(inputs[i], PATH_SORT_RUN_BUFFER_BYTES));
+    if(total_records > std::numeric_limits<size_type>::max() - readers.back()->records())
+    {
+      externalSortFailure("merged path-sort record count overflow");
+    }
+    total_records += readers.back()->records();
   }
-  size_type output_records = std::max((size_type)1,
-    std::min(buffer_records, total_records));
-  std::vector<PathSortRecord> output_buffer;
-  output_buffer.reserve(output_records);
-  updatePathSortStats(stats, input_buffer_records + output_records,
-    PATH_SORT_FIXED_BYTES + (input_buffer_records + output_records) * sizeof(PathSortRecord) +
-    inputs.size() * (sizeof(PathSortRunReader) + 2 * sizeof(size_type)));
+  PathSortRunWriter output(output_name, total_records, PATH_SORT_RUN_BUFFER_BYTES);
+  updatePathSortStats(stats, readers.size() + 1,
+    PATH_SORT_FIXED_BYTES + PATH_SORT_RUN_BUFFER_BYTES + readers.size() *
+      (PATH_SORT_RUN_BUFFER_BYTES + sizeof(PathSortRunReader) + 2 * sizeof(size_type)));
   std::priority_queue<size_type, std::vector<size_type>, PathSortHeapComparator>
     queue{PathSortHeapComparator(&readers)};
   for(size_type i = 0; i < readers.size(); i++)
   {
-    if(!readers[i].at_end) { queue.push(i); }
+    if(!(readers[i]->atEnd())) { queue.push(i); }
   }
   while(!queue.empty())
   {
     size_type best = queue.top(); queue.pop();
-    output_buffer.push_back(readers[best].current()); readers[best].advance();
-    if(!readers[best].at_end) { queue.push(best); }
-    if(output_buffer.size() >= output_buffer.capacity())
-    {
-      DiskIO::write(output, output_buffer.data(), output_buffer.size());
-      addPathSortBytes(output_bytes, output_buffer.size(), sizeof(PathSortRecord));
-      trimPathSortWrittenCache(output, output_cache_descriptor, output_bytes,
-        output_cache_released, false, output_name);
-      output_buffer.clear();
-    }
+    output.write(readers[best]->current()); readers[best]->advance();
+    if(!(readers[best]->atEnd())) { queue.push(best); }
   }
-  if(!output_buffer.empty())
-  {
-    DiskIO::write(output, output_buffer.data(), output_buffer.size());
-    addPathSortBytes(output_bytes, output_buffer.size(), sizeof(PathSortRecord));
-  }
-  trimPathSortWrittenCache(output, output_cache_descriptor, output_bytes,
-    output_cache_released, true, output_name);
-  output.close();
-  ::close(output_cache_descriptor);
+  output.finish(); recordPathSortRun(stats, output);
   return output_name;
 }
 
@@ -855,7 +771,7 @@ writeSortedPathPair(const std::string& run_name, const std::string& path_name,
   const std::string& rank_name, size_type expected_paths, size_type expected_ranks,
   size_type buffer_records, ExternalPathSortStats* stats)
 {
-  PathSortRunReader reader(run_name, buffer_records);
+  PathSortRunReader reader(run_name, PATH_SORT_RUN_BUFFER_BYTES);
   std::ofstream paths, ranks;
   paths.rdbuf()->pubsetbuf(nullptr, 0); ranks.rdbuf()->pubsetbuf(nullptr, 0);
   paths.open(path_name.c_str(), std::ios_base::binary);
@@ -876,12 +792,12 @@ writeSortedPathPair(const std::string& run_name, const std::string& path_name,
   std::vector<PathNode> path_buffer; path_buffer.reserve(path_buffer_records);
   std::vector<PathNode::rank_type> rank_buffer;
   rank_buffer.reserve(rank_buffer_records);
-  updatePathSortStats(stats, reader.buffer_records + path_buffer_records,
-    PATH_SORT_FIXED_BYTES + reader.buffer_records * sizeof(PathSortRecord) +
+  updatePathSortStats(stats, 1 + path_buffer_records,
+    PATH_SORT_FIXED_BYTES + reader.bufferBytes() + sizeof(PathSortRunReader) +
     path_buffer_records * sizeof(PathNode) +
     rank_buffer_records * sizeof(PathNode::rank_type));
   size_type path_count = 0, rank_count = 0;
-  while(!reader.at_end)
+  while(!(reader.atEnd()))
   {
     PathNode node = reader.current().node;
     if(rank_buffer.size() + node.ranks() > rank_buffer.capacity())
@@ -973,18 +889,18 @@ struct ExternalPathSortSink::Impl
 
     size_type record_bytes = sizeof(PathSortRecord);
     size_type available = byte_budget - PATH_SORT_FIXED_BYTES;
-    size_type reader_overhead = sizeof(PathSortRunReader) + 2 * sizeof(size_type);
-    size_type maximum_fan_in = (available - record_bytes) /
-      (record_bytes + reader_overhead);
+    size_type reader_bytes = pathSortReaderReservation();
+    size_type merge_available = available - PATH_SORT_RUN_BUFFER_BYTES;
+    size_type maximum_fan_in = merge_available / reader_bytes;
     this->fan_in = std::min(std::max(static_cast<size_type>(2), requested_fan_in),
       maximum_fan_in);
     if(this->fan_in < 2)
     {
       externalSortFailure("streaming sort sink cannot support a two-way merge");
     }
-    size_type merge_available = available - this->fan_in * reader_overhead;
-    this->merge_records = merge_available /
-      ((this->fan_in + 1) * record_bytes);
+    size_type materialize_available = available - reader_bytes;
+    this->merge_records = materialize_available /
+      pathSortOutputRecordReservation();
     if(this->merge_records == 0)
     {
       externalSortFailure("streaming sort sink cannot buffer a merge");
@@ -993,12 +909,14 @@ struct ExternalPathSortSink::Impl
     // The producer and this sink overlap only during the final join scan. The
     // quarter-budget reserve covers its two bounded join readers, allocator
     // metadata, OpenMP worker stacks, and the rolling dirty-cache tail.
-    size_type run_bytes = available - available / 4;
+    size_type run_available = available - PATH_SORT_RUN_BUFFER_BYTES;
+    size_type run_bytes = run_available - run_available / 4;
     this->run_records = std::max(static_cast<size_type>(1),
       run_bytes / record_bytes);
     this->records.reserve(this->run_records);
     updatePathSortStats(this->stats, this->run_records,
-      PATH_SORT_FIXED_BYTES + this->run_records * record_bytes);
+      PATH_SORT_FIXED_BYTES + PATH_SORT_RUN_BUFFER_BYTES +
+      this->run_records * record_bytes);
   }
 
   ~Impl()
@@ -1056,7 +974,7 @@ struct ExternalPathSortSink::Impl
     if(this->records.empty()) { return; }
     sortPathRecords(this->records, this->stats);
     std::string name = TempFile::getName("gcsa_path_sort_run");
-    writePathSortRun(name, this->records);
+    writePathSortRun(name, this->records, this->stats);
 
     // A leveled merge may start immediately in addPathSortRun(). Release the
     // run buffer first so sort and merge reservations never coexist.
@@ -1094,7 +1012,7 @@ struct ExternalPathSortSink::Impl
     if(runs.empty())
     {
       std::string name = TempFile::getName("gcsa_path_sort_run");
-      writePathSortRun(name, this->records);
+      writePathSortRun(name, this->records, this->stats);
       runs.push_back(name);
     }
     if(runs.size() == 1) { return runs.front(); }
@@ -1193,12 +1111,14 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   if(stats != nullptr) { *stats = ExternalPathSortStats(); }
   size_type record_bytes = sizeof(PathSortRecord);
   size_type available = byte_budget - PATH_SORT_FIXED_BYTES;
-  size_type reader_overhead = sizeof(PathSortRunReader) + 2 * sizeof(size_type);
-  size_type max_fan_in = (available - record_bytes) / (record_bytes + reader_overhead);
+  size_type reader_bytes = pathSortReaderReservation();
+  size_type merge_available = available - PATH_SORT_RUN_BUFFER_BYTES;
+  size_type max_fan_in = merge_available / reader_bytes;
   fan_in = std::min(std::max((size_type)2, fan_in), max_fan_in);
   if(fan_in < 2) { externalSortFailure("byte budget cannot support a two-way merge"); }
-  size_type merge_available = available - fan_in * reader_overhead;
-  size_type merge_records = merge_available / ((fan_in + 1) * record_bytes);
+  size_type materialize_available = available - reader_bytes;
+  size_type merge_records = materialize_available /
+    pathSortOutputRecordReservation();
   if(merge_records == 0) { externalSortFailure("byte budget cannot buffer a merge"); }
   // Use three quarters for the in-place record sort. The remaining quarter is
   // deliberately much larger than the byte-counted stream buffers, OpenMP
@@ -1206,7 +1126,8 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   // that safety reserve while crossing common one-run thresholds avoids a
   // complete read/write merge pass. Compute the slack first to avoid overflow
   // on a large byte limit.
-  size_type run_bytes = available - available / 4;
+  size_type run_available = available - PATH_SORT_RUN_BUFFER_BYTES;
+  size_type run_bytes = run_available - run_available / 4;
   size_type run_records = std::max((size_type)1, run_bytes / record_bytes);
 
   std::array<char, PATH_SORT_STREAM_BUFFER_BYTES> path_stream_buffer;
@@ -1233,7 +1154,8 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   // O(fan_in * log(number_of_runs)) memory rather than one string per run.
   std::vector<std::vector<std::string>> levels;
   std::vector<PathSortRecord> records; records.reserve(run_records);
-  updatePathSortStats(stats, run_records, PATH_SORT_FIXED_BYTES + run_records * record_bytes);
+  updatePathSortStats(stats, run_records, PATH_SORT_FIXED_BYTES +
+    PATH_SORT_RUN_BUFFER_BYTES + run_records * record_bytes);
   size_type rank_offset = 0, path_count = 0;
   PathSortRecord record;
   while(readPathSortRecord(paths, ranks, record, rank_offset, graph.rank_counts[file]))
@@ -1250,7 +1172,7 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
     {
       sortPathRecords(records, stats);
       std::string name = TempFile::getName("gcsa_path_sort_run");
-      writePathSortRun(name, records); records.clear();
+      writePathSortRun(name, records, stats); records.clear();
       addPathSortRun(levels, name, 0, fan_in, merge_records, stats);
       if(stats != nullptr) { stats->runs++; }
     }
@@ -1268,7 +1190,7 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   {
     sortPathRecords(records, stats);
     std::string name = TempFile::getName("gcsa_path_sort_run");
-    writePathSortRun(name, records);
+    writePathSortRun(name, records, stats);
     addPathSortRun(levels, name, 0, fan_in, merge_records, stats);
     if(stats != nullptr) { stats->runs++; }
   }
@@ -1300,7 +1222,7 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   if(runs.empty())
   {
     std::string name = TempFile::getName("gcsa_path_sort_run");
-    writePathSortRun(name, records); runs.push_back(name);
+    writePathSortRun(name, records, stats); runs.push_back(name);
   }
   // A run is already in final label order. Sending a single run through the
   // k-way merger only copies the complete payload once before the normal
@@ -1337,14 +1259,185 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
 size_type
 externalPathGraphSortMinimumBudget()
 {
-  // One record for each side of a two-way merge, one output record, and fixed state.
-  return PATH_SORT_FIXED_BYTES + 3 * sizeof(PathSortRecord) +
-    2 * (sizeof(PathSortRunReader) + 2 * sizeof(size_type));
+  // The largest minimum phase is a two-way merge: two independently decoded
+  // input byte streams plus one prefix-compressed output stream. All three are
+  // fixed-size; no decoded input vector scales with the run length.
+  return PATH_SORT_FIXED_BYTES + PATH_SORT_RUN_BUFFER_BYTES +
+    2 * pathSortReaderReservation();
 }
 
 //------------------------------------------------------------------------------
 
 struct PathGraphMerger;
+
+/*
+  PathGraphMerger normally only needs a sliding window. An equal-label range
+  can, however, be arbitrarily long before prune() decides how to emit it.
+  Keep that range addressable on disk once its resident budget is exhausted.
+*/
+template<class Element>
+struct SpillableGroup
+{
+  std::vector<Element> memory;
+  std::string          filename;
+  int                  file;
+  size_type            elements, disk_elements, offset, byte_limit, write_bytes, read_bytes, advised_write;
+  mutable size_type    cache_offset;
+  mutable std::vector<Element> read_cache;
+  size_type*           spill_counter;
+
+  SpillableGroup(size_type limit, size_type* counter = nullptr) : file(-1), elements(0), disk_elements(0), offset(0),
+    byte_limit(std::max(2 * static_cast<size_type>(sizeof(Element)), limit)),
+    write_bytes(this->byte_limit / 2), read_bytes(this->byte_limit - this->write_bytes), advised_write(0), cache_offset(0),
+    spill_counter(counter)
+  {
+    this->memory.reserve(this->byte_limit / sizeof(Element));
+  }
+  ~SpillableGroup() { this->clear(); }
+
+  inline bool spilled() const { return this->file >= 0; }
+  inline size_type size() const { return this->elements - this->offset; }
+  inline bool buffered(size_type i) const
+  {
+    return (i >= this->offset && i < this->elements);
+  }
+
+  void push_back(const Element& value)
+  {
+    if(!this->spilled() && (this->memory.size() + 1) * sizeof(Element) > this->byte_limit)
+    {
+      this->filename = TempFile::getName("gcsa_prune_group");
+      this->file = ::open(this->filename.c_str(), O_CREAT | O_TRUNC | O_RDWR, 0600);
+      if(this->file < 0) { throw std::runtime_error("PathGraph::prune(): cannot create spill file"); }
+#if defined(POSIX_FADV_SEQUENTIAL)
+      static_cast<void>(::posix_fadvise(this->file, 0, 0, POSIX_FADV_SEQUENTIAL));
+#endif
+      if(this->spill_counter != nullptr) { (*this->spill_counter)++; }
+      this->flush();
+    }
+    this->memory.push_back(value);
+    this->elements++;
+    if(this->spilled() && this->memory.size() * sizeof(Element) >= this->write_bytes) { this->flush(); }
+  }
+
+  Element get(size_type i) const
+  {
+    if(i < this->offset || i >= this->elements) { throw std::out_of_range("PathGraph::prune(): spill index"); }
+    if(!this->spilled()) { return this->memory[i - this->offset]; }
+    if(i >= this->disk_elements) { return this->memory[i - this->disk_elements]; }
+    if(i < this->cache_offset || i >= this->cache_offset + this->read_cache.size())
+    {
+      this->discard(this->cache_offset, this->read_cache.size());
+      this->cache_offset = i;
+      size_type count = std::min(this->read_bytes / sizeof(Element), this->disk_elements - i);
+      this->read_cache.resize(count); this->read(this->read_cache.data(), count, i);
+    }
+    return this->read_cache[i - this->cache_offset];
+  }
+
+  void set(size_type i, const Element& value)
+  {
+    if(i < this->offset || i >= this->elements) { throw std::out_of_range("PathGraph::prune(): spill index"); }
+    if(!this->spilled()) { this->memory[i - this->offset] = value; return; }
+    if(i >= this->disk_elements) { this->memory[i - this->disk_elements] = value; return; }
+    this->flush(); this->write(&value, 1, i);
+    if(::fdatasync(this->file) != 0) { throw std::runtime_error("PathGraph::prune(): spill sync failed"); }
+    this->discard(i, 1); sdsl::util::clear(this->read_cache);
+  }
+
+  void seek(size_type i)
+  {
+    if(i > this->elements) { throw std::out_of_range("PathGraph::prune(): spill seek"); }
+    if(!this->spilled())
+    {
+      this->memory.erase(this->memory.begin(), this->memory.begin() + (i - this->offset));
+    }
+    this->offset = i;
+  }
+
+  void clear()
+  {
+    if(this->file >= 0) { ::close(this->file); this->file = -1; }
+    if(!this->filename.empty()) { TempFile::remove(this->filename); this->filename.clear(); }
+    sdsl::util::clear(this->memory); sdsl::util::clear(this->read_cache);
+    this->elements = 0; this->disk_elements = 0; this->offset = 0; this->advised_write = 0; this->cache_offset = 0;
+  }
+
+private:
+  void flush()
+  {
+    if(this->memory.empty()) { return; }
+    this->write(this->memory.data(), this->memory.size(), this->disk_elements);
+    this->disk_elements += this->memory.size(); sdsl::util::clear(this->memory);
+    this->memory.reserve(std::max(static_cast<size_type>(1), this->write_bytes / sizeof(Element)));
+    if(::fdatasync(this->file) != 0) { throw std::runtime_error("PathGraph::prune(): spill sync failed"); }
+    this->discard(this->advised_write, this->disk_elements - this->advised_write);
+    this->advised_write = this->disk_elements;
+  }
+
+  static size_type bytesFor(size_type count)
+  {
+    if(count > std::numeric_limits<size_type>::max() / sizeof(Element))
+    {
+      throw std::overflow_error("PathGraph::prune(): spill byte count overflow");
+    }
+    return count * sizeof(Element);
+  }
+
+  static off_t fileOffset(size_type start)
+  {
+    size_type offset = bytesFor(start);
+    if(offset > static_cast<size_type>(std::numeric_limits<off_t>::max()))
+    {
+      throw std::overflow_error("PathGraph::prune(): spill offset overflow");
+    }
+    return static_cast<off_t>(offset);
+  }
+
+  void discard(size_type start, size_type count) const
+  {
+#if defined(POSIX_FADV_DONTNEED)
+    if(count > 0 && this->file >= 0)
+    {
+      size_type bytes = bytesFor(count); off_t offset = fileOffset(start);
+      static_cast<void>(::posix_fadvise(this->file, offset,
+        static_cast<off_t>(bytes), POSIX_FADV_DONTNEED));
+    }
+#else
+    static_cast<void>(start); static_cast<void>(count);
+#endif
+  }
+
+  void write(const Element* values, size_type count, size_type start) const
+  {
+    if(values == nullptr && count != 0) { throw std::invalid_argument("PathGraph::prune(): null spill write"); }
+    const char* data = reinterpret_cast<const char*>(values);
+    size_type bytes = bytesFor(count), done = 0; off_t offset = fileOffset(start);
+    while(done < bytes)
+    {
+      ssize_t result = ::pwrite(this->file, data + done, bytes - done, offset + static_cast<off_t>(done));
+      if(result < 0 && errno == EINTR) { continue; }
+      if(result <= 0) { throw std::runtime_error("PathGraph::prune(): spill write failed"); }
+      DiskIO::write_volume += static_cast<size_type>(result);
+      done += static_cast<size_type>(result);
+    }
+  }
+
+  void read(Element* values, size_type count, size_type start) const
+  {
+    if(values == nullptr && count != 0) { throw std::invalid_argument("PathGraph::prune(): null spill read"); }
+    char* data = reinterpret_cast<char*>(values);
+    size_type bytes = bytesFor(count), done = 0; off_t offset = fileOffset(start);
+    while(done < bytes)
+    {
+      ssize_t result = ::pread(this->file, data + done, bytes - done, offset + static_cast<off_t>(done));
+      if(result < 0 && errno == EINTR) { continue; }
+      if(result <= 0) { throw std::runtime_error("PathGraph::prune(): spill read failed"); }
+      DiskIO::read_volume += static_cast<size_type>(result);
+      done += static_cast<size_type>(result);
+    }
+  }
+};
 
 struct PathRange
 {
@@ -1354,8 +1447,443 @@ struct PathRange
   inline range_type range() const { return range_type(this->from, this->to); }
   inline size_type length() const { return this->to + 1 - this->from; }
 
+  PathRange() : from(0), to(0), left_lcp(0, 0), range_lcp(0, 0), right_lcp(0, 0) { }
   PathRange(size_type start, size_type stop, range_type _left_lcp, PathGraphMerger& merger);
 };
+
+struct PathRangeRecord
+{
+  size_type from, to;
+  size_type left_first, left_second;
+  size_type range_first, range_second;
+  size_type right_first, right_second;
+};
+
+template<class Element> struct SpillableDequeCodec;
+
+template<>
+struct SpillableDequeCodec<PathRange>
+{
+  typedef PathRangeRecord record_type;
+
+  static record_type encode(const PathRange& value)
+  {
+    return { value.from, value.to,
+      value.left_lcp.first, value.left_lcp.second,
+      value.range_lcp.first, value.range_lcp.second,
+      value.right_lcp.first, value.right_lcp.second };
+  }
+
+  static PathRange decode(const record_type& value)
+  {
+    PathRange result;
+    result.from = value.from; result.to = value.to;
+    result.left_lcp = range_type(value.left_first, value.left_second);
+    result.range_lcp = range_type(value.range_first, value.range_second);
+    result.right_lcp = range_type(value.right_first, value.right_second);
+    return result;
+  }
+};
+
+/*
+  An append-only spill file with deque-relative access. The only mutation the
+  merger needs is replacing the current front after a batched prefix removal;
+  keep that replacement as a one-record overlay instead of dirtying a random
+  disk page. All accessors return copies, so spilling or popping never leaves
+  an invalid reference in the caller.
+*/
+template<class Element>
+struct SpillableDeque
+{
+  typedef SpillableDequeCodec<Element> codec_type;
+  typedef typename codec_type::record_type record_type;
+
+  std::vector<record_type> memory;
+  std::string          filename;
+  int                  file;
+  size_type            begin_index, end_index, disk_end;
+  size_type            resident_records, write_records, read_records;
+  mutable size_type    cache_offset;
+  mutable std::vector<record_type> read_cache;
+  bool                 replaced_front;
+  Element              front_value;
+  size_type*           spill_counter;
+
+  SpillableDeque(size_type byte_limit, size_type* counter = nullptr) :
+    file(-1), begin_index(0), end_index(0), disk_end(0),
+    resident_records(std::max(static_cast<size_type>(2), byte_limit / sizeof(record_type))),
+    write_records(std::max(static_cast<size_type>(1), this->resident_records / 2)),
+    read_records(std::max(static_cast<size_type>(1), this->resident_records - this->write_records)),
+    cache_offset(0), replaced_front(false), front_value(), spill_counter(counter)
+  {
+    this->memory.reserve(this->resident_records);
+  }
+
+  ~SpillableDeque() { this->release(); }
+
+  inline bool spilled() const { return (this->file >= 0); }
+  inline bool empty() const { return (this->size() == 0); }
+  inline size_type size() const { return (this->end_index - this->begin_index); }
+
+  Element front() const
+  {
+    if(this->empty()) { throw std::out_of_range("PathGraphMerger: empty range deque"); }
+    return (this->replaced_front ? this->front_value : this->at(0));
+  }
+
+  Element back() const
+  {
+    if(this->empty()) { throw std::out_of_range("PathGraphMerger: empty range deque"); }
+    return (this->size() == 1 && this->replaced_front ? this->front_value : this->at(this->size() - 1));
+  }
+
+  Element operator[](size_type i) const
+  {
+    if(i == 0 && this->replaced_front)
+    {
+      if(this->empty()) { throw std::out_of_range("PathGraphMerger: empty range deque"); }
+      return this->front_value;
+    }
+    return this->at(i);
+  }
+
+  void replaceFront(const Element& value)
+  {
+    if(this->empty()) { throw std::out_of_range("PathGraphMerger: empty range deque"); }
+    this->front_value = value; this->replaced_front = true;
+  }
+
+  void pushBack(const Element& value)
+  {
+    if(!this->spilled() && this->memory.capacity() < this->resident_records)
+    {
+      this->memory.reserve(this->resident_records);
+    }
+    if(!this->spilled() && this->memory.size() == this->resident_records)
+    {
+      this->openSpill(); this->flush();
+    }
+    if(this->spilled() && this->memory.size() == this->write_records) { this->flush(); }
+    this->memory.push_back(codec_type::encode(value)); this->end_index++;
+  }
+
+  void popFront(size_type count)
+  {
+    if(count > this->size()) { throw std::out_of_range("PathGraphMerger: range deque pop"); }
+    if(count == 0) { return; }
+    this->replaced_front = false;
+
+    if(!this->spilled())
+    {
+      this->memory.erase(this->memory.begin(), this->memory.begin() + count);
+      this->begin_index = 0; this->end_index = this->memory.size();
+      return;
+    }
+
+    size_type old_begin = this->begin_index;
+    this->begin_index += count;
+    size_type disk_stop = std::min(this->begin_index, this->disk_end);
+    if(disk_stop > old_begin) { this->discard(old_begin, disk_stop - old_begin); }
+    sdsl::util::clear(this->read_cache); this->cache_offset = 0;
+
+    if(this->begin_index > this->disk_end)
+    {
+      size_type consumed = this->begin_index - this->disk_end;
+      this->memory.erase(this->memory.begin(), this->memory.begin() + consumed);
+      this->disk_end = this->begin_index;
+    }
+    if(this->empty()) { this->resetEmpty(); }
+  }
+
+  void clear()
+  {
+    this->release();
+  }
+
+private:
+  Element at(size_type i) const
+  {
+    if(i >= this->size()) { throw std::out_of_range("PathGraphMerger: range deque index"); }
+    size_type absolute = this->begin_index + i;
+    if(!this->spilled()) { return codec_type::decode(this->memory[absolute]); }
+    if(absolute >= this->disk_end) { return codec_type::decode(this->memory[absolute - this->disk_end]); }
+    if(absolute < this->cache_offset || absolute >= this->cache_offset + this->read_cache.size())
+    {
+      this->discard(this->cache_offset, this->read_cache.size());
+      this->cache_offset = absolute;
+      size_type count = std::min(this->read_records, this->disk_end - absolute);
+      this->read_cache.resize(count); this->read(this->read_cache.data(), count, absolute);
+    }
+    return codec_type::decode(this->read_cache[absolute - this->cache_offset]);
+  }
+
+  void openSpill()
+  {
+    this->filename = TempFile::getName("gcsa_prune_ranges");
+    this->file = ::open(this->filename.c_str(), O_CREAT | O_TRUNC | O_RDWR, 0600);
+    if(this->file < 0) { throw std::runtime_error("PathGraphMerger: cannot create range spill file"); }
+#if defined(POSIX_FADV_SEQUENTIAL)
+    static_cast<void>(::posix_fadvise(this->file, 0, 0, POSIX_FADV_SEQUENTIAL));
+#endif
+    if(this->spill_counter != nullptr) { (*this->spill_counter)++; }
+  }
+
+  void flush()
+  {
+    if(this->memory.empty()) { return; }
+    this->write(this->memory.data(), this->memory.size(), this->disk_end);
+    size_type start = this->disk_end; this->disk_end += this->memory.size();
+    sdsl::util::clear(this->memory); this->memory.reserve(this->write_records);
+    if(::fdatasync(this->file) != 0) { throw std::runtime_error("PathGraphMerger: range spill sync failed"); }
+    this->discard(start, this->disk_end - start);
+  }
+
+  void resetEmpty()
+  {
+    sdsl::util::clear(this->memory); this->memory.reserve(this->write_records);
+    sdsl::util::clear(this->read_cache);
+    if(::ftruncate(this->file, 0) != 0) { throw std::runtime_error("PathGraphMerger: range spill truncate failed"); }
+    this->begin_index = 0; this->end_index = 0; this->disk_end = 0;
+    this->cache_offset = 0;
+  }
+
+  void release()
+  {
+    if(this->file >= 0) { ::close(this->file); this->file = -1; }
+    if(!this->filename.empty()) { TempFile::remove(this->filename); this->filename.clear(); }
+    sdsl::util::clear(this->memory); sdsl::util::clear(this->read_cache);
+    this->begin_index = 0; this->end_index = 0; this->disk_end = 0;
+    this->cache_offset = 0; this->replaced_front = false;
+  }
+
+  static size_type bytesFor(size_type count)
+  {
+    if(count > std::numeric_limits<size_type>::max() / sizeof(record_type))
+    {
+      throw std::overflow_error("PathGraphMerger: range spill byte count overflow");
+    }
+    return count * sizeof(record_type);
+  }
+
+  static off_t fileOffset(size_type start)
+  {
+    size_type offset = bytesFor(start);
+    if(offset > static_cast<size_type>(std::numeric_limits<off_t>::max()))
+    {
+      throw std::overflow_error("PathGraphMerger: range spill offset overflow");
+    }
+    return static_cast<off_t>(offset);
+  }
+
+  void discard(size_type start, size_type count) const
+  {
+#if defined(POSIX_FADV_DONTNEED)
+    if(count > 0 && this->file >= 0)
+    {
+      size_type bytes = bytesFor(count);
+      static_cast<void>(::posix_fadvise(this->file, fileOffset(start),
+        static_cast<off_t>(bytes), POSIX_FADV_DONTNEED));
+    }
+#else
+    static_cast<void>(start); static_cast<void>(count);
+#endif
+  }
+
+  void write(const record_type* values, size_type count, size_type start) const
+  {
+    const char* data = reinterpret_cast<const char*>(values);
+    size_type bytes = bytesFor(count), done = 0; off_t offset = fileOffset(start);
+    while(done < bytes)
+    {
+      ssize_t result = ::pwrite(this->file, data + done, bytes - done,
+        offset + static_cast<off_t>(done));
+      if(result < 0 && errno == EINTR) { continue; }
+      if(result <= 0) { throw std::runtime_error("PathGraphMerger: range spill write failed"); }
+      DiskIO::write_volume += static_cast<size_type>(result);
+      done += static_cast<size_type>(result);
+    }
+  }
+
+  void read(record_type* values, size_type count, size_type start) const
+  {
+    char* data = reinterpret_cast<char*>(values);
+    size_type bytes = bytesFor(count), done = 0; off_t offset = fileOffset(start);
+    while(done < bytes)
+    {
+      ssize_t result = ::pread(this->file, data + done, bytes - done,
+        offset + static_cast<off_t>(done));
+      if(result < 0 && errno == EINTR) { continue; }
+      if(result <= 0) { throw std::runtime_error("PathGraphMerger: range spill read failed"); }
+      DiskIO::read_volume += static_cast<size_type>(result);
+      done += static_cast<size_type>(result);
+    }
+  }
+};
+
+/*
+  Keep a fixed number of path/rank descriptor pairs and read one current head
+  synchronously. This removes the former two 1 MiB buffers, two descriptors,
+  and two reader threads per physical shard. The heap still owns one compact
+  PriorityNode per shard because exact k-way merge ordering requires a head.
+*/
+struct PathGraphInputCache
+{
+  struct Entry
+  {
+    size_type file, stamp;
+    int path, rank;
+    off_t path_high, rank_high, path_released, rank_released;
+
+    Entry() : file(PathGraph::UNKNOWN), stamp(0), path(-1), rank(-1),
+      path_high(0), rank_high(0), path_released(0), rank_released(0) { }
+  };
+
+  const PathGraph& graph;
+  std::vector<Entry> entries;
+  size_type clock;
+  PathGraphMergeStats* stats;
+
+  constexpr static size_type MAX_PAIRS = 32;
+  constexpr static off_t CACHE_TAIL = 64 * KILOBYTE;
+
+  PathGraphInputCache(const PathGraph& source, PathGraphMergeStats* merge_stats) :
+    graph(source), entries(), clock(0), stats(merge_stats)
+  {
+    this->entries.reserve(MAX_PAIRS);
+  }
+
+  ~PathGraphInputCache() { this->close(); }
+
+  void read(size_type file, size_type offset, PathNode& node,
+    PathNode::rank_type* labels)
+  {
+    Entry& entry = this->get(file);
+    off_t path_offset = this->checkedOffset(offset, sizeof(PathNode));
+    this->preadAll(entry.path, &node, sizeof(node), path_offset);
+    entry.path_high = std::max(entry.path_high,
+      path_offset + static_cast<off_t>(sizeof(node)));
+    this->trim(entry.path, entry.path_high, entry.path_released);
+
+    if(node.ranks() > PathLabel::LABEL_LENGTH + 1)
+    {
+      throw std::runtime_error("PathGraphMerger: invalid path rank count");
+    }
+    size_type rank_bytes = node.ranks() * sizeof(PathNode::rank_type);
+    off_t rank_offset = this->checkedOffset(node.pointer(), sizeof(PathNode::rank_type));
+    this->preadAll(entry.rank, labels, rank_bytes, rank_offset);
+    entry.rank_high = std::max(entry.rank_high,
+      rank_offset + static_cast<off_t>(rank_bytes));
+    this->trim(entry.rank, entry.rank_high, entry.rank_released);
+  }
+
+  void close()
+  {
+    for(Entry& entry : this->entries) { this->close(entry); }
+    this->entries.clear();
+  }
+
+private:
+  Entry& get(size_type file)
+  {
+    this->clock++;
+    for(Entry& entry : this->entries)
+    {
+      if(entry.file == file) { entry.stamp = this->clock; return entry; }
+    }
+
+    Entry* target = nullptr;
+    if(this->entries.size() < MAX_PAIRS)
+    {
+      this->entries.push_back(Entry()); target = &(this->entries.back());
+      if(this->stats != nullptr)
+      {
+        this->stats->max_open_input_pairs = std::max(
+          this->stats->max_open_input_pairs, static_cast<size_type>(this->entries.size()));
+      }
+    }
+    else
+    {
+      target = &(*std::min_element(this->entries.begin(), this->entries.end(),
+        [](const Entry& left, const Entry& right) { return left.stamp < right.stamp; }));
+      this->close(*target); *target = Entry();
+    }
+
+    target->file = file; target->stamp = this->clock;
+    target->path = ::open(this->graph.path_names[file].c_str(), O_RDONLY);
+    if(target->path < 0) { throw std::runtime_error("PathGraphMerger: cannot open path input"); }
+    target->rank = ::open(this->graph.rank_names[file].c_str(), O_RDONLY);
+    if(target->rank < 0)
+    {
+      ::close(target->path); target->path = -1;
+      throw std::runtime_error("PathGraphMerger: cannot open rank input");
+    }
+#if defined(POSIX_FADV_SEQUENTIAL)
+    static_cast<void>(::posix_fadvise(target->path, 0, 0, POSIX_FADV_SEQUENTIAL));
+    static_cast<void>(::posix_fadvise(target->rank, 0, 0, POSIX_FADV_SEQUENTIAL));
+#endif
+    return *target;
+  }
+
+  void close(Entry& entry)
+  {
+    if(entry.path >= 0)
+    {
+      this->discard(entry.path, entry.path_released, entry.path_high);
+      ::close(entry.path); entry.path = -1;
+    }
+    if(entry.rank >= 0)
+    {
+      this->discard(entry.rank, entry.rank_released, entry.rank_high);
+      ::close(entry.rank); entry.rank = -1;
+    }
+  }
+
+  static off_t checkedOffset(size_type records, size_type width)
+  {
+    if(width != 0 && records > static_cast<size_type>(std::numeric_limits<off_t>::max()) / width)
+    {
+      throw std::overflow_error("PathGraphMerger: input offset overflow");
+    }
+    return static_cast<off_t>(records * width);
+  }
+
+  static void preadAll(int descriptor, void* target, size_type bytes, off_t offset)
+  {
+    char* data = reinterpret_cast<char*>(target); size_type done = 0;
+    while(done < bytes)
+    {
+      ssize_t result = ::pread(descriptor, data + done, bytes - done,
+        offset + static_cast<off_t>(done));
+      if(result < 0 && errno == EINTR) { continue; }
+      if(result <= 0) { throw std::runtime_error("PathGraphMerger: truncated input"); }
+      DiskIO::read_volume += static_cast<size_type>(result);
+      done += static_cast<size_type>(result);
+    }
+  }
+
+  static void trim(int descriptor, off_t high, off_t& released)
+  {
+    if(high <= released + 2 * CACHE_TAIL) { return; }
+    off_t keep_from = high - CACHE_TAIL;
+    discard(descriptor, released, keep_from); released = keep_from;
+  }
+
+  static void discard(int descriptor, off_t from, off_t to)
+  {
+#if defined(POSIX_FADV_DONTNEED)
+    if(to > from)
+    {
+      static_cast<void>(::posix_fadvise(descriptor, from, to - from,
+        POSIX_FADV_DONTNEED));
+    }
+#else
+    static_cast<void>(descriptor); static_cast<void>(from); static_cast<void>(to);
+#endif
+  }
+};
+
+constexpr size_type PathGraphInputCache::MAX_PAIRS;
+constexpr off_t PathGraphInputCache::CACHE_TAIL;
 
 /*
   This structure reads a buffered stream of PriorityNodes in sorted order and outputs a
@@ -1368,16 +1896,17 @@ struct PathGraphMerger
   const LCP&                                    lcp;
 
   // Buffers.
-  std::deque<PathRange>                         ranges;
-  BufferWindow<PriorityNode>                    buffer;
+  SpillableDeque<PathRange>                     ranges;
+  SpillableGroup<PriorityNode>                  buffer;
 
-  // Priority queue.
-  std::vector<ReadBuffer<PathNode>>             path_files;
-  std::vector<ReadBuffer<PathNode::rank_type>>  rank_files;
+  // Input cache and priority queue.
+  PathGraphInputCache                           input_files;
   std::vector<size_type>                        offsets;
   PriorityQueue<PriorityNode>                   inputs;
 
-  PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lcp);
+  PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lcp,
+    size_type group_buffer_bytes = MEGABYTE,
+    PathGraphMergeStats* stats = nullptr);
   void close();
 
   inline size_type size() const { return this->graph.size(); }
@@ -1391,14 +1920,14 @@ struct PathGraphMerger
 
   inline range_type range_lcp(size_type i, size_type j) const // i < j
   {
-    return this->lcp.min_lcp(this->buffer[i].node, this->buffer[j].node,
-      this->buffer[i].label, this->buffer[j].label);
+    PriorityNode left = this->buffer.get(i), right = this->buffer.get(j);
+    return this->lcp.min_lcp(left.node, right.node, left.label, right.label);
   }
 
   inline range_type border_lcp(size_type i, size_type j) const // i < j
   {
-    return this->lcp.max_lcp(this->buffer[i].node, this->buffer[j].node,
-      this->buffer[i].label, this->buffer[j].label);
+    PriorityNode left = this->buffer.get(i), right = this->buffer.get(j);
+    return this->lcp.max_lcp(left.node, right.node, left.label, right.label);
   }
 
   /*
@@ -1425,15 +1954,17 @@ struct PathGraphMerger
   void read(PriorityNode& path);
 };
 
-PathGraphMerger::PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lcp) :
+PathGraphMerger::PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lcp,
+  size_type group_buffer_bytes, PathGraphMergeStats* stats) :
   graph(path_graph), lcp(kmer_lcp),
-  path_files(path_graph.files()), rank_files(path_graph.files()),
+  ranges(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->range_spills))),
+  buffer(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->priority_spills))),
+  input_files(path_graph, stats),
   offsets(path_graph.files()), inputs(path_graph.files())
 {
+  if(stats != nullptr) { *stats = PathGraphMergeStats(); }
   for(size_type file = 0; file < path_graph.files(); file++)
   {
-    this->path_files[file].open(path_graph.path_names[file]);
-    this->rank_files[file].open(path_graph.rank_names[file]);
     this->offsets[file] = 0;
     this->inputs[file].file = file; this->read(this->inputs[file]);
   }
@@ -1443,16 +1974,9 @@ PathGraphMerger::PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lc
 void
 PathGraphMerger::close()
 {
-  sdsl::util::clear(this->ranges);
-  sdsl::util::clear(this->buffer);
-
-  for(size_type file = 0; file < this->graph.files(); file++)
-  {
-    this->path_files[file].close();
-    this->rank_files[file].close();
-  }
-  this->path_files.clear();
-  this->rank_files.clear();
+  this->ranges.clear();
+  this->buffer.clear();
+  this->input_files.close();
   this->offsets.clear();
   this->inputs.clear();
 }
@@ -1467,17 +1991,17 @@ PathGraphMerger::first()
   }
   this->ranges.clear();
 
-  this->ranges.push_back(PathRange(0, this->rangeEnd(0), range_type(0, 0), *this));
+  this->ranges.pushBack(PathRange(0, this->rangeEnd(0), range_type(0, 0), *this));
   return this->ranges.front().range();
 }
 
 range_type
 PathGraphMerger::next()
 {
-  PathRange temp = this->ranges.front(); this->ranges.pop_front();
+  PathRange temp = this->ranges.front(); this->ranges.popFront(1);
   if(this->ranges.empty())
   {
-    this->ranges.push_back(
+    this->ranges.pushBack(
       PathRange(temp.to + 1, this->rangeEnd(temp.to + 1), temp.right_lcp, *this));
   }
   this->buffer.seek(this->ranges.front().from);
@@ -1497,10 +2021,10 @@ PathGraphMerger::extendRange(FromComparator& comp)
     // Find the next range.
     if(curr >= this->ranges.size())
     {
-      const PathRange& temp = this->ranges.back();
-      this->ranges.push_back(PathRange(temp.to + 1, this->rangeEnd(temp.to + 1), temp.right_lcp, *this));
+      PathRange temp = this->ranges.back();
+      this->ranges.pushBack(PathRange(temp.to + 1, this->rangeEnd(temp.to + 1), temp.right_lcp, *this));
     }
-    const PathRange& next_range = this->ranges[curr];
+    PathRange next_range = this->ranges[curr];
     if(next_range.from >= this->size()) { break; }
 
     // Is this a suffix tree node with the same start nodes as range and lcp > range.left_lcp?
@@ -1512,8 +2036,8 @@ PathGraphMerger::extendRange(FromComparator& comp)
     // Replace range with [range.from, next_range.to].
     range.to = next_range.to;
     range.range_lcp = parent_lcp; range.right_lcp = next_range.right_lcp;
-    for(size_type i = 0; i <= curr; i++) { this->ranges.pop_front(); }
-    this->ranges.push_front(range); curr = 1;
+    this->ranges.popFront(curr);
+    this->ranges.replaceFront(range); curr = 1;
   }
 
   return range.range();
@@ -1522,30 +2046,35 @@ PathGraphMerger::extendRange(FromComparator& comp)
 void
 PathGraphMerger::mergePathNodes()
 {
-  PathRange& range = this->ranges.front();
+  PathRange range = this->ranges.front();
   if(range.length() == 1)
   {
-    this->buffer[range.to].node.makeSorted();
+    PriorityNode node = this->buffer.get(range.to);
+    node.node.makeSorted(); this->buffer.set(range.to, node);
     return;
   }
+
+  PriorityNode first = this->buffer.get(range.from);
+  PriorityNode merged = this->buffer.get(range.to);
 
   size_type order = range.range_lcp.first;
   if(range.range_lcp.second > 0)
   {
-    range_type ranks(this->buffer[range.from].node.firstLabel(order, this->buffer[range.from].label),
-      this->buffer[range.to].node.lastLabel(order, this->buffer[range.to].label));
-    this->buffer[range.to].label[order] = ranks.first;
-    this->buffer[range.to].label[order + 1] = ranks.second;
+    range_type ranks(first.node.firstLabel(order, first.label),
+      merged.node.lastLabel(order, merged.label));
+    merged.label[order] = ranks.first;
+    merged.label[order + 1] = ranks.second;
     order++;
   }
 
-  this->buffer[range.to].node.makeSorted();
-  this->buffer[range.to].node.setOrder(order);
-  this->buffer[range.to].node.setLCP(range.range_lcp.first);
+  merged.node.makeSorted();
+  merged.node.setOrder(order);
+  merged.node.setLCP(range.range_lcp.first);
   for(size_type i = range.from; i < range.to; i++)
   {
-    this->buffer[range.to].node.addPredecessors(this->buffer[i].node);
+    merged.node.addPredecessors(this->buffer.get(i).node);
   }
+  this->buffer.set(range.to, merged);
 }
 
 size_type
@@ -1557,7 +2086,7 @@ PathGraphMerger::rangeEnd(size_type start)
   while(stop + 1 < this->size())
   {
     if(!(this->buffer.buffered(stop + 1))) { this->bufferNext(); }
-    if(this->buffer[start] < this->buffer[stop + 1]) { break; }
+    if(this->buffer.get(start) < this->buffer.get(stop + 1)) { break; }
     stop++;
   }
   return stop;
@@ -1582,13 +2111,7 @@ PathGraphMerger::read(PriorityNode& path)
   }
   else
   {
-    this->path_files[path.file].seek(this->offsets[path.file]);
-    path.node = this->path_files[path.file][this->offsets[path.file]];
-    this->rank_files[path.file].seek(path.node.pointer());
-    for(size_type i = 0; i < path.node.ranks(); i++)
-    {
-      path.label[i] = this->rank_files[path.file][path.node.pointer() + i];
-    }
+    this->input_files.read(path.file, this->offsets[path.file], path.node, path.label);
     path.node.setPointer(0);  // Label is now stored in the PriorityNode.
     this->offsets[path.file]++;
   }
@@ -1803,14 +2326,15 @@ struct SameFromLogicalFile
   bool                   same_from, same_file;
 
   SameFromLogicalFile(const PathGraphMerger& source, range_type range) :
-    merger(source), from(source.buffer[range.first].node.from),
-    logical_file(source.graph.logicalFile(source.buffer[range.first].file)),
+    merger(source), from(source.buffer.get(range.first).node.from),
+    logical_file(source.graph.logicalFile(source.buffer.get(range.first).file)),
     same_from(true), same_file(true)
   {
     for(size_type i = range.first + 1; i <= range.second; i++)
     {
-      if(this->merger.buffer[i].node.from != this->from) { this->same_from = false; }
-      if(this->merger.graph.logicalFile(this->merger.buffer[i].file) != this->logical_file)
+      PriorityNode node = this->merger.buffer.get(i);
+      if(node.node.from != this->from) { this->same_from = false; }
+      if(this->merger.graph.logicalFile(node.file) != this->logical_file)
       {
         this->same_file = false;
       }
@@ -1821,8 +2345,9 @@ struct SameFromLogicalFile
   {
     for(size_type i = range.first; i <= range.second; i++)
     {
-      if(this->merger.buffer[i].node.from != this->from ||
-         this->merger.graph.logicalFile(this->merger.buffer[i].file) != this->logical_file)
+      PriorityNode node = this->merger.buffer.get(i);
+      if(node.node.from != this->from ||
+         this->merger.graph.logicalFile(node.file) != this->logical_file)
       {
         return false;
       }
@@ -1832,11 +2357,12 @@ struct SameFromLogicalFile
 };
 
 void
-PathGraph::prune(const LCP& lcp, size_type size_limit)
+PathGraph::prune(const LCP& lcp, size_type size_limit,
+  size_type group_buffer_bytes, PathGraphMergeStats* stats)
 {
   size_type old_path_count = this->size();
 
-  PathGraphMerger merger(*this, lcp);
+  PathGraphMerger merger(*this, lcp, group_buffer_bytes, stats);
   PathGraphBuilder builder(this->files(), this->k(), this->step(), size_limit);
   builder.graph.logical_file_ids = this->logical_file_ids;
   builder.graph.physical_shard_ids = this->physical_shard_ids;
@@ -1849,7 +2375,8 @@ PathGraph::prune(const LCP& lcp, size_type size_limit)
       {
         range = merger.extendRange(same_from);
         merger.mergePathNodes();
-        builder.write(merger.buffer[range.second]);
+        PriorityNode node = merger.buffer.get(range.second);
+        builder.write(node);
         builder.graph.unique++;
       }
       else
@@ -1857,8 +2384,8 @@ PathGraph::prune(const LCP& lcp, size_type size_limit)
         // FIXME Later: Write just one path per file.
         for(size_type i = range.first; i <= range.second; i++)
         {
-          merger.buffer[i].node.makeSorted();
-          builder.write(merger.buffer[i]);
+          PriorityNode node = merger.buffer.get(i);
+          node.node.makeSorted(); builder.write(node);
         }
         builder.graph.redundant += Range::length(range);
       }
@@ -1867,9 +2394,10 @@ PathGraph::prune(const LCP& lcp, size_type size_limit)
     {
       for(size_type i = range.first; i <= range.second; i++)
       {
-        if(merger.buffer[i].node.sorted()) { builder.graph.nondeterministic++; }
+        PriorityNode node = merger.buffer.get(i);
+        if(node.node.sorted()) { builder.graph.nondeterministic++; }
         else { builder.graph.unsorted++; }
-        builder.write(merger.buffer[i]);
+        builder.write(node);
       }
     }
     builder.graph.range_count++;
@@ -2064,48 +2592,281 @@ PathGraph::read(std::vector<PathNode>& paths, std::vector<PathNode::rank_type>& 
 
 //------------------------------------------------------------------------------
 
-struct SameFromSet
+template<class Element>
+struct SequentialRecordWriter
 {
-  const PathGraphMerger& merger;
-  std::vector<node_type> nodes, buffer;
+  std::string name;
+  int descriptor;
+  std::vector<Element> buffer;
+  off_t written, released;
 
-  SameFromSet(const PathGraphMerger& source) :
-    merger(source)
+  constexpr static off_t CACHE_TAIL = 8 * MEGABYTE;
+  constexpr static off_t CACHE_FLUSH = 64 * MEGABYTE;
+
+  SequentialRecordWriter(const std::string& filename, size_type buffer_bytes) :
+    name(filename), descriptor(-1), buffer(), written(0), released(0)
   {
+    size_type records = std::max(static_cast<size_type>(1), buffer_bytes / sizeof(Element));
+    this->buffer.reserve(records);
+    this->descriptor = ::open(this->name.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    if(this->descriptor < 0) { throw std::runtime_error("SameFromSet: cannot create raw set file"); }
+#if defined(POSIX_FADV_SEQUENTIAL)
+    static_cast<void>(::posix_fadvise(this->descriptor, 0, 0, POSIX_FADV_SEQUENTIAL));
+#endif
   }
 
-  inline void fromNodes(range_type range, std::vector<node_type>& to) const
+  ~SequentialRecordWriter() { if(this->descriptor >= 0) { ::close(this->descriptor); } }
+
+  void pushBack(const Element& value)
   {
-    to.clear();
-    node_type prev = ~(node_type)0;
-    for(size_type i = range.first; i <= range.second; i++)
+    if(this->buffer.size() == this->buffer.capacity()) { this->flush(); }
+    this->buffer.push_back(value);
+  }
+
+  void close()
+  {
+    if(this->descriptor < 0) { return; }
+    this->flush(); this->syncAndTrim(true);
+    if(::close(this->descriptor) != 0)
     {
-      node_type curr = this->merger.buffer[i].node.from;
-      if(curr != prev) { to.push_back(curr); prev = curr; }
+      this->descriptor = -1;
+      throw std::runtime_error("SameFromSet: cannot close raw set file");
     }
-    if(to.size() > 1) { removeDuplicates(to, false); }
+    this->descriptor = -1;
   }
 
-  inline bool operator() (range_type range)
+private:
+  void flush()
   {
-    this->fromNodes(range, this->buffer);
-
-    // Manual comparison guarantees using a single thread.
-    if(this->buffer.size() != this->nodes.size()) { return false; }
-    for(size_type i = 0; i < this->buffer.size(); i++)
+    if(this->buffer.empty()) { return; }
+    const char* data = reinterpret_cast<const char*>(this->buffer.data());
+    size_type bytes = this->buffer.size() * sizeof(Element), done = 0;
+    while(done < bytes)
     {
-      if(this->buffer[i] != this->nodes[i]) { return false; }
+      ssize_t result = ::write(this->descriptor, data + done, bytes - done);
+      if(result < 0 && errno == EINTR) { continue; }
+      if(result <= 0) { throw std::runtime_error("SameFromSet: raw set write failed"); }
+      DiskIO::write_volume += static_cast<size_type>(result);
+      done += static_cast<size_type>(result);
     }
-    return true;
+    this->written += static_cast<off_t>(bytes); this->buffer.clear();
+    this->syncAndTrim(false);
   }
 
-  inline void select(range_type range)
+  void syncAndTrim(bool complete)
   {
-    this->fromNodes(range, this->nodes);
+    if(!complete && this->written - this->released < CACHE_FLUSH) { return; }
+    if(::fdatasync(this->descriptor) != 0)
+    {
+      throw std::runtime_error("SameFromSet: raw set sync failed");
+    }
+    off_t discard_end = (complete ? this->written : this->written - CACHE_TAIL);
+#if defined(POSIX_FADV_DONTNEED)
+    if(discard_end > this->released)
+    {
+      static_cast<void>(::posix_fadvise(this->descriptor, this->released,
+        discard_end - this->released, POSIX_FADV_DONTNEED));
+    }
+#endif
+    this->released = discard_end;
   }
 };
 
-MergedGraph::MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper, const LCP& kmer_lcp, size_type size_limit) :
+template<class Element>
+constexpr off_t SequentialRecordWriter<Element>::CACHE_TAIL;
+template<class Element>
+constexpr off_t SequentialRecordWriter<Element>::CACHE_FLUSH;
+
+template<class Element>
+struct SequentialRecordReader
+{
+  int descriptor;
+  std::vector<Element> buffer;
+  size_type total, loaded, offset;
+  off_t released;
+
+  SequentialRecordReader(const std::string& filename, size_type buffer_bytes) :
+    descriptor(::open(filename.c_str(), O_RDONLY)), buffer(),
+    total(0), loaded(0), offset(0), released(0)
+  {
+    if(this->descriptor < 0) { throw std::runtime_error("SameFromSet: cannot open set file"); }
+    struct stat info;
+    if(::fstat(this->descriptor, &info) != 0 || info.st_size < 0 ||
+       info.st_size % static_cast<off_t>(sizeof(Element)) != 0)
+    {
+      ::close(this->descriptor); this->descriptor = -1;
+      throw std::runtime_error("SameFromSet: invalid set file");
+    }
+    this->total = static_cast<size_type>(info.st_size / sizeof(Element));
+    size_type records = std::max(static_cast<size_type>(1), buffer_bytes / sizeof(Element));
+    this->buffer.reserve(records);
+#if defined(POSIX_FADV_SEQUENTIAL)
+    static_cast<void>(::posix_fadvise(this->descriptor, 0, 0, POSIX_FADV_SEQUENTIAL));
+#endif
+  }
+
+  ~SequentialRecordReader()
+  {
+    if(this->descriptor >= 0)
+    {
+      this->discard(static_cast<off_t>(this->loaded * sizeof(Element)));
+      ::close(this->descriptor);
+    }
+  }
+
+  bool next(Element& value)
+  {
+    if(this->offset == this->buffer.size())
+    {
+      if(this->loaded == this->total) { return false; }
+      this->refill();
+    }
+    value = this->buffer[this->offset++]; return true;
+  }
+
+private:
+  void refill()
+  {
+    this->discard(static_cast<off_t>(this->loaded * sizeof(Element)));
+    size_type count = std::min(static_cast<size_type>(this->buffer.capacity()),
+      this->total - this->loaded);
+    this->buffer.resize(count); size_type bytes = count * sizeof(Element), done = 0;
+    off_t file_offset = static_cast<off_t>(this->loaded * sizeof(Element));
+    while(done < bytes)
+    {
+      ssize_t result = ::pread(this->descriptor,
+        reinterpret_cast<char*>(this->buffer.data()) + done, bytes - done,
+        file_offset + static_cast<off_t>(done));
+      if(result < 0 && errno == EINTR) { continue; }
+      if(result <= 0) { throw std::runtime_error("SameFromSet: truncated set file"); }
+      DiskIO::read_volume += static_cast<size_type>(result);
+      done += static_cast<size_type>(result);
+    }
+    this->loaded += count; this->offset = 0;
+  }
+
+  void discard(off_t through)
+  {
+#if defined(POSIX_FADV_DONTNEED)
+    if(through > this->released)
+    {
+      static_cast<void>(::posix_fadvise(this->descriptor, this->released,
+        through - this->released, POSIX_FADV_DONTNEED));
+    }
+#endif
+    this->released = through;
+  }
+};
+
+struct SameFromSet
+{
+  const PathGraphMerger& merger;
+  std::string            selected;
+  size_type              selected_nodes, budget, stream_buffer;
+  PathGraphMergeStats*   stats;
+
+  SameFromSet(const PathGraphMerger& source, size_type group_buffer_bytes,
+    PathGraphMergeStats* merge_stats) :
+    merger(source), selected(), selected_nodes(0),
+    budget(std::max(ExternalFixedRecordSorter::minimumBudget(sizeof(node_type)),
+      group_buffer_bytes)),
+    stream_buffer(std::max(static_cast<size_type>(sizeof(node_type)),
+      std::min(static_cast<size_type>(64 * KILOBYTE), this->budget / 4))),
+    stats(merge_stats)
+  {
+  }
+
+  ~SameFromSet() { if(!this->selected.empty()) { TempFile::remove(this->selected); } }
+
+  std::pair<std::string, size_type> fromNodes(range_type range) const
+  {
+    std::string raw = TempFile::getName("gcsa_same_from_raw");
+    std::string reduced = TempFile::getName("gcsa_same_from_set");
+    size_type count = 0;
+    try
+    {
+      {
+        SequentialRecordWriter<node_type> output(raw, this->stream_buffer);
+        for(size_type i = range.first; i <= range.second; i++)
+        {
+          output.pushBack(this->merger.buffer.get(i).node.from);
+        }
+        output.close();
+      }
+      if(this->stats != nullptr) { this->stats->from_set_sorts++; }
+      ExternalFixedRecordSorter::sortAndReduce(raw, reduced, sizeof(node_type), this->budget, 2,
+        [](const void* left, const void* right) {
+          node_type a, b; std::memcpy(&a, left, sizeof(a)); std::memcpy(&b, right, sizeof(b));
+          return (a < b ? -1 : (a > b ? 1 : 0));
+        },
+        [&count](const void* record, bool first, bool, std::ostream& stream) {
+          if(first) { stream.write(reinterpret_cast<const char*>(record), sizeof(node_type)); count++; }
+        });
+    }
+    catch(...)
+    {
+      TempFile::remove(raw); TempFile::remove(reduced); throw;
+    }
+    TempFile::remove(raw); return std::make_pair(reduced, count);
+  }
+
+  bool operator() (range_type range)
+  {
+    std::pair<std::string, size_type> next_set = this->fromNodes(range);
+    bool equal = (next_set.second == this->selected_nodes);
+    try
+    {
+      if(equal)
+      {
+        SequentialRecordReader<node_type> left(this->selected, this->stream_buffer);
+        SequentialRecordReader<node_type> right(next_set.first, this->stream_buffer);
+        node_type a, b;
+        for(size_type i = 0; equal && i < this->selected_nodes; i++)
+        {
+          equal = (left.next(a) && right.next(b) && a == b);
+        }
+        if(equal) { equal = (!left.next(a) && !right.next(b)); }
+      }
+    }
+    catch(...)
+    {
+      TempFile::remove(next_set.first); throw;
+    }
+    TempFile::remove(next_set.first); return equal;
+  }
+
+  void select(range_type range)
+  {
+    std::pair<std::string, size_type> result = this->fromNodes(range);
+    if(result.second == 0)
+    {
+      TempFile::remove(result.first);
+      throw std::runtime_error("SameFromSet: empty selected set");
+    }
+    if(!this->selected.empty()) { TempFile::remove(this->selected); }
+    this->selected = result.first; this->selected_nodes = result.second;
+  }
+
+  template<class Callback>
+  node_type streamAfterFirst(Callback callback) const
+  {
+    SequentialRecordReader<node_type> input(this->selected, this->stream_buffer);
+    node_type first_value;
+    if(!input.next(first_value)) { throw std::runtime_error("SameFromSet: empty selected set"); }
+    node_type value;
+    size_type seen = 1;
+    while(input.next(value)) { callback(value); seen++; }
+    if(seen != this->selected_nodes)
+    {
+      throw std::runtime_error("SameFromSet: selected set size changed");
+    }
+    return first_value;
+  }
+};
+
+MergedGraph::MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper,
+  const LCP& kmer_lcp, size_type size_limit, size_type group_buffer_bytes,
+  PathGraphMergeStats* stats) :
   path_name(TempFile::getName(PREFIX)), rank_name(TempFile::getName(PREFIX)),
   from_name(TempFile::getName(PREFIX)), lcp_name(TempFile::getName(PREFIX)),
   path_count(0), rank_count(0), from_count(0),
@@ -2129,8 +2890,8 @@ MergedGraph::MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper, c
   this->next[mapper.alpha.sigma] = ~(size_type)0;
   this->next_from[mapper.alpha.sigma] = ~(size_type)0;
 
-  PathGraphMerger merger(source, kmer_lcp);
-  SameFromSet same_from_set(merger);
+  PathGraphMerger merger(source, kmer_lcp, group_buffer_bytes, stats);
+  SameFromSet same_from_set(merger, group_buffer_bytes, stats);
   size_type curr_comp = 0;  // Used to transform next.
 
   size_type bytes = 0;
@@ -2140,21 +2901,18 @@ MergedGraph::MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper, c
     same_from_set.select(range);
     range = merger.extendRange(same_from_set);
     merger.mergePathNodes();
-    PriorityNode& curr = merger.buffer[range.second];
-    curr.node.from = same_from_set.nodes[0];
+    PriorityNode curr = merger.buffer.get(range.second);
 
     // Write the actual data
-    bytes += curr.node.bytes() + (same_from_set.nodes.size() - 1) * sizeof(range_type) + 1;
+    bytes += curr.node.bytes() + (same_from_set.selected_nodes - 1) * sizeof(range_type) + 1;
     if(bytes > size_limit)
     {
       std::cerr << "MergedGraph::MergedGraph(): Size limit exceeded, construction aborted" << std::endl;
       std::exit(EXIT_SIZE_LIMIT_EXCEEDED);
     }
+    curr.node.from = same_from_set.streamAfterFirst(
+      [&](node_type from) { from_file.push_back(range_type(this->path_count, from)); });
     writePath(curr.node, curr.label, path_file, rank_file);
-    for(size_type i = 1; i < same_from_set.nodes.size(); i++)
-    {
-      from_file.push_back(range_type(this->path_count, same_from_set.nodes[i]));
-    }
     lcp_file.push_back(path_lcp.first * mapper.order() + path_lcp.second);
 
     // Update the counts and the pointers to paths starting with each comp value.
@@ -2166,7 +2924,7 @@ MergedGraph::MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper, c
     }
     this->path_count++;
     this->rank_count += curr.node.ranks();
-    this->from_count += same_from_set.nodes.size() - 1;
+    this->from_count += same_from_set.selected_nodes - 1;
   }
   merger.close();
   path_file.close(); rank_file.close(); from_file.close(); lcp_file.close();

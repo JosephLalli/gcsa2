@@ -176,8 +176,8 @@ int main(int argc, char** argv)
     logical_file_id_t(7), physical_shard_id_t(202));
 
   ConstructionParameters parameters;
-  size_type memory_budget = std::max(externalPathJoinMinimumBudget(),
-    externalPathGraphSortMinimumBudget());
+  size_type memory_budget = externalPathJoinMinimumBudget() +
+    externalPathGraphSortMinimumBudget();
   parameters.setMemoryLimitBytes(memory_budget);
   parameters.setJoinPartitionSize(externalPathJoinMinimumBudget());
   parameters.setSortRunSize(externalPathGraphSortMinimumBudget());
@@ -197,6 +197,23 @@ int main(int argc, char** argv)
   require(stats.label_sort_runs > 2 && stats.label_merge_passes > 0);
   require(stats.blocked_key_groups > 0);
   require(stats.max_bytes_resident <= memory_budget);
+
+  // A tiny single-process budget forces the same high-fanout key through
+  // several bounded disk-backed blocks (1201 records cannot fit in the
+  // join-block reservation), while retaining the legacy result exactly.
+  PathGraph blocked_graph(left_path, left_rank);
+  blocked_graph.order = 1;
+  blocked_graph.logical_file_ids[0] = logical_file_id_t(7);
+  blocked_graph.physical_shard_ids[0] = physical_shard_id_t(101);
+  appendShard(blocked_graph, right_path, right_rank,
+    logical_file_id_t(7), physical_shard_id_t(202));
+  ConstructionParameters blocked_parameters = parameters;
+  ExternalPathJoinStats blocked_stats;
+  externalPathGraphExtend(blocked_graph, GIGABYTE, blocked_parameters, &blocked_stats);
+  require(readGraph(legacy) == readGraph(blocked_graph));
+  require(blocked_stats.blocked_key_groups > 0);
+  require(blocked_stats.blocked_key_blocks > 1);
+  require(blocked_stats.max_bytes_resident <= blocked_parameters.getMemoryLimitBytes());
 
   char workspace_root[] = "/tmp/gcsa-path-checkpoint-XXXXXX";
   require(mkdtemp(workspace_root) != nullptr);
@@ -227,12 +244,17 @@ int main(int argc, char** argv)
     process_parameters, &process_stats, &workspace, "step-process");
   omp_set_num_threads(1);
   require(readGraph(legacy) == readGraph(process_graph));
-  require(process_graph.files() > 1);
+  // Many worker partitions are compacted into one bounded label-sorted shard
+  // per logical input before the generation escapes to PathGraphMerger.
+  require(process_graph.files() == 1);
   for(size_type file = 0; file < process_graph.files(); file++)
   {
     require(process_graph.logicalFile(file) == logical_file_id_t(7));
   }
   require(process_stats.join_partitions > 1);
+  // The sampled planner must turn this single high-fanout semantic key into
+  // several deterministic range tasks rather than one worker monopoly.
+  require(process_stats.join_partitions >= 4);
   require(process_stats.worker_processes == process_stats.join_partitions);
   require(process_stats.recursive_splits > 0);
   require(process_stats.left_range_splits > 0);

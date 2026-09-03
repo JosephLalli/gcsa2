@@ -868,6 +868,9 @@ writeLabelRecord(const JoinRecord& record, ExternalPathSortSink& output,
   }
 }
 
+size_type checkedJoinAdd(size_type left, size_type right, const char* description);
+size_type checkedJoinMultiply(size_type left, size_type right, const char* description);
+
 void
 joinSortedRuns(const JoinRun& left_run, const JoinRun& right_run,
   logical_file_id_t logical, size_type byte_budget, ExternalPathSortSink& output,
@@ -884,6 +887,10 @@ joinSortedRuns(const JoinRun& left_run, const JoinRun& right_run,
   if(left_begin > left_end || right_begin > right_end)
   {
     throw joinError("invalid worker join range");
+  }
+  if(stats != nullptr)
+  {
+    stats->max_bytes_resident = std::max(stats->max_bytes_resident, JOIN_FIXED_BYTES);
   }
   size_type left_offset = left_begin, right_offset = right_begin;
   JoinRecord left_record, right_record;
@@ -933,16 +940,63 @@ joinSortedRuns(const JoinRun& left_run, const JoinRun& right_run,
     {
       stats->blocked_key_groups++;
     }
-    // This is the unsplittable heavy-key fallback. Replaying the right range
-    // for each left record is I/O-expensive, but resident path data is constant.
-    for(size_type i = left_offset; i < left_limit; i++)
+    // Do not materialize either side of a pathological key. Keep a bounded
+    // block from the smaller side and replay the other disk-backed range for
+    // each block. This reduces the former per-record replay to per-block I/O;
+    // the compact JoinRecord block retains all label data needed for extension.
+    size_type left_count = left_limit - left_offset;
+    size_type right_count = right_limit - right_offset;
+    size_type block_capacity = std::max(static_cast<size_type>(1),
+      (byte_budget - std::min(byte_budget, JOIN_FIXED_BYTES)) / sizeof(JoinRecord));
+    // A pathological key must never become a single in-memory side just
+    // because one side happens to fit the reservation. Keep at least two
+    // deterministic blocks whenever that side has multiple records.
+    size_type smaller_side = std::min(left_count, right_count);
+    if(smaller_side > 1) { block_capacity = std::min(block_capacity, smaller_side / 2); }
+    std::vector<JoinRecord> block;
+    block.reserve(block_capacity);
+    if(stats != nullptr)
     {
-      left.read(i, left_record);
-      for(size_type j = right_offset; j < right_limit; j++)
+      stats->max_records_resident = std::max(stats->max_records_resident, block_capacity);
+      stats->max_bytes_resident = std::max(stats->max_bytes_resident,
+        checkedJoinAdd(JOIN_FIXED_BYTES,
+          checkedJoinMultiply(block_capacity, sizeof(JoinRecord), "join block bytes"),
+          "join block reservation"));
+    }
+    if(left_count <= right_count)
+    {
+      for(size_type begin = left_offset; begin < left_limit; begin += block_capacity)
       {
-        right.read(j, right_record);
-        JoinRecord generated = extendRecord(left_record, right_record);
-        writeLabelRecord(generated, output, false, stats);
+        if(stats != nullptr) { stats->blocked_key_blocks++; }
+        size_type end = std::min(left_limit, begin + block_capacity);
+        block.clear();
+        for(size_type i = begin; i < end; i++) { left.read(i, left_record); block.push_back(left_record); }
+        for(const JoinRecord& cached_left : block)
+        {
+          for(size_type j = right_offset; j < right_limit; j++)
+          {
+            right.read(j, right_record);
+            writeLabelRecord(extendRecord(cached_left, right_record), output, false, stats);
+          }
+        }
+      }
+    }
+    else
+    {
+      for(size_type i = left_offset; i < left_limit; i++)
+      {
+        left.read(i, left_record);
+        for(size_type begin = right_offset; begin < right_limit; begin += block_capacity)
+        {
+          if(stats != nullptr) { stats->blocked_key_blocks++; }
+          size_type end = std::min(right_limit, begin + block_capacity);
+          block.clear();
+          for(size_type j = begin; j < end; j++) { right.read(j, right_record); block.push_back(right_record); }
+          for(const JoinRecord& cached_right : block)
+          {
+            writeLabelRecord(extendRecord(left_record, cached_right), output, false, stats);
+          }
+        }
       }
     }
     left_offset = left_limit; right_offset = right_limit;
@@ -982,6 +1036,75 @@ struct JoinGroupSummary
   JoinGroupSummary() : key(0), begin(0), end(0), count(0), order_sum(0),
     bypass_paths(0), bypass_ranks(0) { }
 };
+
+// Planning must not retain one entry per distinct key: a realistic graph can
+// have many more keys than fit in the join reservation.  This fixed-size,
+// deterministic systematic sample is only an admission hint.  The subsequent
+// exact group pass remains the authority for ranges and output counts.
+constexpr size_type JOIN_PLAN_SAMPLE_RECORDS = 4096;
+
+std::map<node_type, size_type>
+sampleJoinKeys(const JoinFileReader& reader)
+{
+  std::map<node_type, size_type> result;
+  size_type samples = std::min(reader.size(), JOIN_PLAN_SAMPLE_RECORDS);
+  if(samples == 0) { return result; }
+  JoinRecord record;
+  for(size_type sample = 0; sample < samples; sample++)
+  {
+    // Avoid overflowing sample * reader.size() for a multi-terabyte run.
+    size_type quotient = reader.size() / samples;
+    size_type remainder = reader.size() % samples;
+    size_type offset = sample * quotient + (sample * remainder) / samples;
+    reader.read(offset, record);
+    result[record.key]++;
+  }
+  return result;
+}
+
+size_type
+scaleSampleCount(size_type count, size_type total, size_type samples)
+{
+  if(count == 0 || total == 0) { return 0; }
+  // ceil(count * total / samples), without overflow.
+  size_type quotient = total / samples, remainder = total % samples;
+  size_type remainder_product = checkedJoinMultiply(count, remainder,
+    "sampled key remainder");
+  return checkedJoinAdd(checkedJoinMultiply(count, quotient,
+    "sampled key multiplicity"),
+    remainder_product / samples + (remainder_product % samples != 0),
+    "sampled key estimate");
+}
+
+std::map<node_type, bool>
+sampledPathologicalKeys(const JoinFileReader& left, const JoinFileReader& right,
+  size_type target_bytes)
+{
+  std::map<node_type, size_type> left_samples = sampleJoinKeys(left);
+  std::map<node_type, size_type> right_samples = sampleJoinKeys(right);
+  std::map<node_type, bool> result;
+  size_type left_count = std::min(left.size(), JOIN_PLAN_SAMPLE_RECORDS);
+  size_type right_count = std::min(right.size(), JOIN_PLAN_SAMPLE_RECORDS);
+  for(const auto& entry : left_samples)
+  {
+    auto found = right_samples.find(entry.first);
+    if(found == right_samples.end()) { continue; }
+    size_type estimated_left = scaleSampleCount(entry.second, left.size(), left_count);
+    size_type estimated_right = scaleSampleCount(found->second, right.size(), right_count);
+    size_type fanout = checkedJoinMultiply(estimated_left, estimated_right,
+      "sampled key fanout");
+    // Every generated path has its terminal rank plus at least one rank from
+    // each input. This is still a lower-bound estimate; the exact pass below
+    // catches anything the sample misses and validates all planned byte counts.
+    size_type minimum_output_bytes = sizeof(PathNode) +
+      3 * sizeof(PathNode::rank_type);
+    if(fanout > target_bytes / minimum_output_bytes)
+    {
+      result[entry.first] = true;
+    }
+  }
+  return result;
+}
 
 size_type
 checkedJoinAdd(size_type left, size_type right, const char* description)
@@ -1194,6 +1317,8 @@ planJoinPartitions(const JoinRun& left_run, const JoinRun& right_run,
   JoinFileReader right(right_run, logical, RIGHT_BY_FROM);
   if(verify_payloads) { left.validate(); right.validate(); }
   target_bytes = std::max(static_cast<size_type>(1), target_bytes);
+  const std::map<node_type, bool> sampled_heavy =
+    sampledPathologicalKeys(left, right, target_bytes);
 
   std::vector<JoinPartition> result;
   size_type left_offset = 0, right_offset = 0;
@@ -1252,7 +1377,12 @@ planJoinPartitions(const JoinRun& left_run, const JoinRun& right_run,
     bool oversized_group = (group_bytes > target_bytes ||
       group_input_bytes > target_bytes ||
       group_ranks > (static_cast<size_type>(1) << 40));
-    if(oversized_group && selected_right != nullptr &&
+    // The bounded histogram lets a repeated semantic key begin range tiling
+    // before it monopolizes an otherwise balanced worker task. Exact counts
+    // above still decide the output contract and retain logical-file identity.
+    bool sampled_heavy_group = (selected_left != nullptr && selected_right != nullptr &&
+      sampled_heavy.find(selected_left->key) != sampled_heavy.end());
+    if((oversized_group || sampled_heavy_group) && selected_right != nullptr &&
        (selected_left != nullptr || selected_right->bypass_paths > 0))
     {
       flush_current();
@@ -1325,7 +1455,7 @@ planJoinPartitions(const JoinRun& left_run, const JoinRun& right_run,
 
 constexpr std::uint64_t WORKER_TASK_MAGIC = 0x314b535441534347ULL;   // "GCSATSK1"
 constexpr std::uint64_t WORKER_RESULT_MAGIC = 0x3153455241534347ULL; // "GCSARES1"
-constexpr std::uint32_t WORKER_FORMAT_VERSION = 1;
+constexpr std::uint32_t WORKER_FORMAT_VERSION = 2;
 constexpr size_type WORKER_CONTROL_LIMIT = MEGABYTE;
 
 struct ExternalJoinWorkerTask
@@ -1334,7 +1464,7 @@ struct ExternalJoinWorkerTask
   JoinRun left, right;
   JoinPartition partition;
   std::string output_path, output_rank, temp_directory;
-  size_type sort_budget, fan_in, threads;
+  size_type sort_budget, join_block_budget, fan_in, threads;
   bool verify_payloads;
 };
 
@@ -1342,11 +1472,11 @@ struct ExternalJoinWorkerResult
 {
   size_type paths, ranks, bytes;
   size_type generated, bypassed, label_runs, label_merge_passes, label_parallel_sorts;
-  size_type max_records, max_bytes, bytes_read, bytes_written;
+  size_type max_records, max_bytes, blocks, bytes_read, bytes_written;
 
   ExternalJoinWorkerResult() : paths(0), ranks(0), bytes(0), generated(0),
     bypassed(0), label_runs(0), label_merge_passes(0), label_parallel_sorts(0),
-    max_records(0), max_bytes(0), bytes_read(0), bytes_written(0) { }
+    max_records(0), max_bytes(0), blocks(0), bytes_read(0), bytes_written(0) { }
 };
 
 template<class Value>
@@ -1455,6 +1585,7 @@ encodeWorkerTask(const ExternalJoinWorkerTask& task)
   appendWorkerValue<std::uint64_t>(data, task.partition.generated_paths);
   appendWorkerValue<std::uint64_t>(data, task.partition.bypass_paths);
   appendWorkerValue<std::uint64_t>(data, task.sort_budget);
+  appendWorkerValue<std::uint64_t>(data, task.join_block_budget);
   appendWorkerValue<std::uint64_t>(data, task.fan_in);
   appendWorkerValue<std::uint64_t>(data, task.threads);
   appendWorkerValue<std::uint8_t>(data, task.partition.emit_bypass ? 1 : 0);
@@ -1490,6 +1621,7 @@ decodeWorkerTask(const std::vector<std::uint8_t>& data)
   task.partition.generated_paths = readWorkerValue<std::uint64_t>(data, offset);
   task.partition.bypass_paths = readWorkerValue<std::uint64_t>(data, offset);
   task.sort_budget = readWorkerValue<std::uint64_t>(data, offset);
+  task.join_block_budget = readWorkerValue<std::uint64_t>(data, offset);
   task.fan_in = readWorkerValue<std::uint64_t>(data, offset);
   task.threads = readWorkerValue<std::uint64_t>(data, offset);
   task.partition.emit_bypass = (readWorkerValue<std::uint8_t>(data, offset) != 0);
@@ -1519,6 +1651,7 @@ encodeWorkerResult(const ExternalJoinWorkerResult& result)
   appendWorkerValue<std::uint64_t>(data, result.label_parallel_sorts);
   appendWorkerValue<std::uint64_t>(data, result.max_records);
   appendWorkerValue<std::uint64_t>(data, result.max_bytes);
+  appendWorkerValue<std::uint64_t>(data, result.blocks);
   appendWorkerValue<std::uint64_t>(data, result.bytes_read);
   appendWorkerValue<std::uint64_t>(data, result.bytes_written);
   return data;
@@ -1544,6 +1677,7 @@ decodeWorkerResult(const std::vector<std::uint8_t>& data)
   result.label_parallel_sorts = readWorkerValue<std::uint64_t>(data, offset);
   result.max_records = readWorkerValue<std::uint64_t>(data, offset);
   result.max_bytes = readWorkerValue<std::uint64_t>(data, offset);
+  result.blocks = readWorkerValue<std::uint64_t>(data, offset);
   result.bytes_read = readWorkerValue<std::uint64_t>(data, offset);
   result.bytes_written = readWorkerValue<std::uint64_t>(data, offset);
   if(offset != data.size()) { throw joinError("worker result has trailing data"); }
@@ -1588,7 +1722,7 @@ externalPathJoinWorker(const std::string& task_file)
     ExternalPathJoinStats join_stats;
     ExternalPathSortSink sink(output, 0, task.sort_budget, task.fan_in,
       task.partition.expected_bytes, committed_bytes, &sort_stats);
-    joinSortedRuns(task.left, task.right, task.logical, task.sort_budget,
+    joinSortedRuns(task.left, task.right, task.logical, task.join_block_budget,
       sink, task.verify_payloads, &join_stats,
       task.partition.left_begin, task.partition.left_end,
       task.partition.right_begin, task.partition.right_end,
@@ -1610,8 +1744,9 @@ externalPathJoinWorker(const std::string& task_file)
     result.label_merge_passes = sort_stats.merge_passes;
     result.label_parallel_sorts = sort_stats.parallel_sorts;
     result.max_records = sort_stats.max_records_resident;
-    result.max_bytes = sort_stats.max_bytes_resident +
-      2 * (JOIN_IO_BUFFER_BYTES + sizeof(JoinRecord) + 256);
+    result.max_bytes = checkedJoinAdd(sort_stats.max_bytes_resident,
+      join_stats.max_bytes_resident, "worker combined resident bytes");
+    result.blocks = join_stats.blocked_key_blocks;
     result.bytes_read = DiskIO::read_volume.load() - read_start;
     result.bytes_written = DiskIO::write_volume.load() - write_start;
     // The parent owns these completed files and will either admit them into the
@@ -1641,6 +1776,99 @@ appendOutputShard(PathGraph& graph, logical_file_id_t logical,
   graph.logical_file_ids.push_back(logical);
   graph.physical_shard_ids.push_back(physical);
   return file;
+}
+
+// Workers deliberately produce independent physical shards. Before exposing a
+// generation, collapse those shards per logical input so downstream mergers do
+// not allocate one pair of buffered readers (and FDs) for every partition.
+void
+compactLogicalJoinShards(PathGraph& source, size_type size_limit,
+  const ConstructionParameters& parameters, size_type label_fan_in,
+  size_type memory_budget, size_type& committed_bytes,
+  ExternalPathJoinStats* stats)
+{
+  std::map<logical_file_id_t, std::vector<size_type>> groups;
+  for(size_type file = 0; file < source.files(); file++)
+  {
+    groups[source.logicalFile(file)].push_back(file);
+  }
+  bool needs_compaction = false;
+  for(auto& group : groups)
+  {
+    std::sort(group.second.begin(), group.second.end(), [&source](size_type left, size_type right)
+    {
+      if(source.physicalShard(left) != source.physicalShard(right))
+      {
+        return source.physicalShard(left) < source.physicalShard(right);
+      }
+      return left < right;
+    });
+    needs_compaction = needs_compaction || group.second.size() > 1;
+  }
+  if(!needs_compaction) { return; }
+
+  const size_type reader_bytes = 2 * JOIN_IO_BUFFER_BYTES + sizeof(JoinRecord);
+  if(memory_budget < reader_bytes ||
+     memory_budget - reader_bytes < externalPathGraphSortMinimumBudget())
+  {
+    throw joinError("memory limit cannot admit one shard reader and label compaction");
+  }
+  const size_type sort_budget = std::min(parameters.getSortRunSize(),
+    memory_budget - reader_bytes);
+  PathGraph compacted(0, source.k(), source.step());
+  size_type next_physical = 0;
+  std::vector<size_type> obsolete;
+  for(const auto& group : groups)
+  {
+    logical_file_id_t logical = group.first;
+    const std::vector<size_type>& shards = group.second;
+    if(shards.size() == 1)
+    {
+      size_type file = shards.front();
+      compacted.path_names.push_back(source.path_names[file]);
+      compacted.rank_names.push_back(source.rank_names[file]);
+      compacted.path_counts.push_back(source.path_counts[file]);
+      compacted.rank_counts.push_back(source.rank_counts[file]);
+      compacted.logical_file_ids.push_back(logical);
+      compacted.physical_shard_ids.push_back(physical_shard_id_t(next_physical++));
+      compacted.path_count += source.path_counts[file];
+      compacted.rank_count += source.rank_counts[file];
+      continue;
+    }
+
+    size_type output_file = appendOutputShard(compacted, logical,
+      physical_shard_id_t(next_physical++));
+    ExternalPathSortStats sort_stats;
+    ExternalPathSortSink sink(compacted, output_file, sort_budget, label_fan_in,
+      size_limit, committed_bytes, (stats == nullptr ? nullptr : &sort_stats));
+    for(size_type file : shards)
+    {
+      PathShardReader reader(source, file);
+      JoinRecord record;
+      while(reader.read(record)) { sink.write(record.node, record.labels); }
+    }
+    sink.finish();
+    obsolete.insert(obsolete.end(), shards.begin(), shards.end());
+    if(stats != nullptr)
+    {
+      stats->label_sort_runs += sort_stats.runs;
+      stats->label_merge_passes = std::max(stats->label_merge_passes,
+        sort_stats.merge_passes);
+      stats->label_parallel_sorts += sort_stats.parallel_sorts;
+      stats->max_records_resident = std::max(stats->max_records_resident,
+        sort_stats.max_records_resident);
+      stats->max_bytes_resident = std::max(stats->max_bytes_resident,
+        checkedJoinAdd(reader_bytes, sort_stats.max_bytes_resident,
+          "logical shard compaction bytes"));
+    }
+  }
+  // Only installed successors make their predecessors obsolete.
+  for(size_type file : obsolete)
+  {
+    TempFile::remove(source.path_names[file]); TempFile::remove(source.rank_names[file]);
+  }
+  source.delete_files = false;
+  source.clear(); source.swap(compacted);
 }
 
 std::string
@@ -1797,8 +2025,8 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
     throw joinError("process workers require a worker executable");
   }
   size_type requested = std::min(parameters.getProcessWorkers(), partitions.size());
-  size_type minimum_worker = externalPathGraphSortMinimumBudget() +
-    2 * (JOIN_IO_BUFFER_BYTES + sizeof(JoinRecord) + 256);
+  size_type minimum_worker = checkedJoinAdd(externalPathGraphSortMinimumBudget(),
+    externalPathJoinMinimumBudget(), "minimum worker reservation");
   // Leave room for the coordinator, allocator metadata, dynamic-library state,
   // and the checkpoint copy buffer. Tiny test budgets retain the same fraction
   // instead of relying on a fixed margin that would make them unusable.
@@ -1812,10 +2040,16 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
   }
   size_type worker_reservation = usable_memory / concurrency;
   size_type sort_budget = std::min(parameters.getSortRunSize(),
-    worker_reservation - 2 * (JOIN_IO_BUFFER_BYTES + sizeof(JoinRecord) + 256));
+    worker_reservation - externalPathJoinMinimumBudget());
   if(sort_budget < externalPathGraphSortMinimumBudget())
   {
     throw joinError("per-worker label-sort budget is below the implementation minimum");
+  }
+  size_type join_block_budget = std::min(parameters.getJoinPartitionSize(),
+    worker_reservation - sort_budget);
+  if(join_block_budget < externalPathJoinMinimumBudget())
+  {
+    throw joinError("per-worker join block budget is below the implementation minimum");
   }
   size_type worker_threads = std::max(static_cast<size_type>(1),
     static_cast<size_type>(omp_get_max_threads()) / concurrency);
@@ -1858,6 +2092,10 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
     worker.reservation = MemoryBudget::Reservation();
     std::string result_file = worker.task_file + ".result";
     ExternalJoinWorkerResult result = decodeWorkerResult(readWorkerControl(result_file));
+    if(result.max_bytes > worker_reservation)
+    {
+      throw joinError("worker exceeded its combined join/sort reservation", result_file);
+    }
     if(result.paths != worker.partition.expected_paths ||
        result.ranks != worker.partition.expected_ranks ||
        result.bytes != worker.partition.expected_bytes)
@@ -1894,6 +2132,8 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
       stats->max_records_resident = std::max(stats->max_records_resident,
         checkedJoinMultiply(result.max_records, concurrency,
           "concurrent worker resident records"));
+      stats->blocked_key_blocks = checkedJoinAdd(stats->blocked_key_blocks,
+        result.blocks, "worker join blocks");
       stats->worker_processes++;
     }
     std::remove(result_file.c_str());
@@ -1943,7 +2183,8 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
       task.output_path = next.path_names[shard];
       task.output_rank = next.rank_names[shard];
       task.temp_directory = TempFile::temp_dir;
-      task.sort_budget = sort_budget; task.fan_in = label_fan_in;
+      task.sort_budget = sort_budget; task.join_block_budget = join_block_budget;
+      task.fan_in = label_fan_in;
       task.threads = worker_threads;
       task.verify_payloads = parameters.getVerifyWorkspace();
       std::string task_file = TempFile::getName("gcsa_join_worker_task");
@@ -2025,6 +2266,15 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
   {
     throw joinError("join partition or sort run budget is below the implementation minimum");
   }
+  size_type direct_sort_budget = std::min(sort_budget,
+    memory_budget - externalPathJoinMinimumBudget());
+  size_type direct_join_budget = std::min(join_budget,
+    memory_budget - direct_sort_budget);
+  if(direct_sort_budget < externalPathGraphSortMinimumBudget() ||
+     direct_join_budget < externalPathJoinMinimumBudget())
+  {
+    throw joinError("memory limit cannot admit concurrent label sorting and join blocking");
+  }
   if(parameters.getMaxOpenFiles() < 6)
   {
     throw joinError("max-open-files must be at least 6 for the external join");
@@ -2086,11 +2336,12 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
       // working set for label run generation and feed expansion records
       // directly into it, avoiding a complete unsorted pair and reread.
       ExternalPathSortStats sort_stats;
-      ExternalPathSortSink output(next, output_file, sort_budget,
+      ExternalPathJoinStats direct_join_stats;
+      ExternalPathSortSink output(next, output_file, direct_sort_budget,
         label_fan_in, size_limit, committed_bytes,
         (stats == nullptr ? nullptr : &sort_stats));
-      joinSortedRuns(left, right, logical, join_budget, output,
-        parameters.getVerifyWorkspace(), stats);
+      joinSortedRuns(left, right, logical, direct_join_budget, output,
+        parameters.getVerifyWorkspace(), (stats == nullptr ? nullptr : &direct_join_stats));
       output.finish();
       if(stats != nullptr)
       {
@@ -2099,22 +2350,28 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
         stats->label_merge_passes = std::max(stats->label_merge_passes,
           sort_stats.merge_passes);
         stats->label_parallel_sorts += sort_stats.parallel_sorts;
+        stats->generated_records += direct_join_stats.generated_records;
+        stats->sorted_bypass += direct_join_stats.sorted_bypass;
+        stats->direct_label_records += direct_join_stats.direct_label_records;
+        stats->intermediate_path_bytes_avoided += direct_join_stats.intermediate_path_bytes_avoided;
+        stats->blocked_key_groups += direct_join_stats.blocked_key_groups;
+        stats->blocked_key_blocks += direct_join_stats.blocked_key_blocks;
         stats->max_records_resident = std::max(stats->max_records_resident,
-          sort_stats.max_records_resident);
+          checkedJoinAdd(sort_stats.max_records_resident,
+            direct_join_stats.max_records_resident, "direct join resident records"));
         stats->max_bytes_resident = std::max(stats->max_bytes_resident,
-          sort_stats.max_bytes_resident);
+          checkedJoinAdd(sort_stats.max_bytes_resident,
+            direct_join_stats.max_bytes_resident, "direct join resident bytes"));
         // Label run generation overlaps with exactly two bounded join readers.
         // Include them in the reported peak instead of treating the sequential
         // sort and join budgets as independent maxima.
-        size_type direct_pipeline_bytes = sort_stats.max_bytes_resident +
-          2 * (JOIN_IO_BUFFER_BYTES + sizeof(JoinRecord) + 256);
-        stats->max_bytes_resident = std::max(stats->max_bytes_resident,
-          direct_pipeline_bytes);
       }
     }
     TempFile::remove(left.name); TempFile::remove(right.name);
   }
 
+  compactLogicalJoinShards(next, size_limit, parameters, label_fan_in,
+    memory_budget, committed_bytes, stats);
   graph.clear(); graph.swap(next);
 }
 
