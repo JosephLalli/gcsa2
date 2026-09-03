@@ -661,6 +661,7 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
   ExternalFinalScanStats* stats)
 {
   FinalEventMetadata metadata;
+  FinalEventChecksums event_checksums(graph.alpha.sigma);
   if(restoreFinalEvents(workspace, files, metadata, merged_graph.size(),
     graph.alpha.sigma, checkpoint_buffer, parameters.getVerifyWorkspace()))
   {
@@ -935,6 +936,7 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
         stats->suffix_tree_stack = stack.stats();
       }
       metadata = output.finish();
+      event_checksums = output.checksums();
     }
 
     TempFile::remove(previous_name); TempFile::remove(stack_name);
@@ -945,7 +947,8 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
     }
     sortFinalRedundancy(files, parameters);
     writeFinalEventMetadata(files, metadata);
-    checkpointFinalEvents(workspace, files, metadata, checkpoint_buffer);
+    checkpointFinalEvents(workspace, files, metadata, checkpoint_buffer,
+      &event_checksums);
   }
   catch(...)
   {

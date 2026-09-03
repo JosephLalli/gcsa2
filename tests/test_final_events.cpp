@@ -55,6 +55,24 @@ void appendInteger(std::ostream& out, std::uint64_t value)
   out.write(reinterpret_cast<const char*>(encoded.data()), encoded.size());
 }
 
+std::uint64_t checksumFile(const std::string& filename)
+{
+  std::ifstream input(filename.c_str(), std::ios_base::binary);
+  require(static_cast<bool>(input));
+  std::array<char, 257> buffer = {};
+  std::uint64_t result = 1469598103934665603ULL;
+  while(input)
+  {
+    input.read(buffer.data(), buffer.size());
+    if(input.gcount() > 0)
+    {
+      result = BuildWorkspace::checksum(buffer.data(),
+        static_cast<size_type>(input.gcount()), result);
+    }
+  }
+  require(input.eof()); return result;
+}
+
 void initSupports(GCSA& index)
 {
   for(size_type comp = 0; comp < index.alpha.sigma; comp++)
@@ -407,6 +425,7 @@ int main()
   Alphabet alphabet;
   FinalEventFiles files(alphabet.sigma);
   FinalEventMetadata metadata;
+  FinalEventChecksums event_checksums(alphabet.sigma);
   {
     MemoryBudget budget(4096);
     FinalEventWriter writer(files, alphabet.sigma, 32, budget);
@@ -428,7 +447,18 @@ int main()
     // counts [1, 0, 2] for the three suffix-tree slots.
     writer.redundancy(2); writer.redundancy(0); writer.redundancy(2);
     metadata = writer.finish();
+    event_checksums = writer.checksums();
   }
+  require(event_checksums.bwt_masks == checksumFile(files.bwt_masks));
+  for(size_type comp = 0; comp < alphabet.sigma; comp++)
+  {
+    require(event_checksums.edge_destinations[comp] ==
+      checksumFile(files.edge_destinations[comp]));
+  }
+  require(event_checksums.sample_positions == checksumFile(files.sample_positions));
+  require(event_checksums.sample_ids == checksumFile(files.sample_ids));
+  require(event_checksums.sample_ends == checksumFile(files.sample_ends));
+  require(event_checksums.occurrences == checksumFile(files.occurrences));
   metadata.fast_chars = alphabet.fast_chars;
   sortFinalRedundancy(files, parameters);
   writeFinalEventMetadata(files, metadata);
@@ -437,7 +467,7 @@ int main()
   semantic["fixture"] = "final-events";
   BuildWorkspace workspace(root, semantic, BuildWorkspace::Settings(),
     BuildWorkspace::NEW_WORKSPACE);
-  checkpointFinalEvents(workspace, files, metadata, 64);
+  checkpointFinalEvents(workspace, files, metadata, 64, &event_checksums);
   require(workspace.task_completed("final", "events"));
 
   // Same-filesystem checkpointing adopts the immutable payload inode. This is
@@ -455,7 +485,7 @@ int main()
   FinalEventFiles restored(alphabet.sigma);
   FinalEventMetadata restored_metadata;
   require(restoreFinalEvents(workspace, restored, restored_metadata, 4,
-    alphabet.sigma, 64));
+    alphabet.sigma, 64, true));
   require(restored_metadata.total_edges == 6);
   require(restored_metadata.occurrence_extra == 22);
   require(restored_metadata.redundant == 3);

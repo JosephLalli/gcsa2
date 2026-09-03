@@ -377,11 +377,18 @@ count, and byte length and then hard-links the committed inode into the next
 `PathGraph`; `--verify-workspace` additionally rereads the complete checksum.
 Join-range worker outputs and final-event streams use the same immutable raw
 payload protocol, avoiding both the checkpoint rewrite and normal resume copy.
+The final-event writer incrementally hashes BWT masks, edge destinations,
+samples, and occurrence events while producing them; same-filesystem adoption
+reuses those digests instead of rereading each closed stream. The externally
+sorted redundancy stream retains a full checksum pass, and cross-filesystem
+fallback always validates the writer digest while copying.
 Final events retain a checked header/footer compatibility restore for older
 workspaces. Cross-filesystem restore copies and checksum-validates in one pass.
-A task with a missing, truncated, or corrupt output is invalidated and rerun
-along with its dependants. Cleanup is itself idempotent and never removes the
-newest committed predecessor of an incomplete task.
+A task with a missing or truncated output is invalidated and rerun along with
+its dependants. `--verify-workspace` additionally discovers same-length payload
+corruption by replaying the committed checksum; ordinary resume deliberately
+trusts the checksum recorded by the closed writer. Cleanup is itself idempotent
+and never removes the newest committed predecessor of an incomplete task.
 
 Crash tests use deterministic process termination, without stack unwinding,
 immediately before and after artifact rename, immediately before and after task

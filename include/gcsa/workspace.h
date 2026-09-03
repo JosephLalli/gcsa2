@@ -66,9 +66,13 @@ public:
     logical_file_id_t,physical_shard_id_t,size_t maximum_bytes) const;
   void restore_artifact(const ArtifactIdentity&,logical_file_id_t,
     physical_shard_id_t,const std::string& output_path,size_t buffer_bytes) const;
+  // known_checksum may be supplied only by a closed immutable writer that
+  // hashed exactly the raw payload while writing it. Same-filesystem adoption
+  // can then avoid rereading the payload; copy fallback still verifies it.
   ArtifactRef adopt_raw_payload(const ArtifactIdentity&,logical_file_id_t,
     physical_shard_id_t,const std::string& source_path,uint64_t records,
-    uint64_t expected_bytes,size_t buffer_bytes);
+    uint64_t expected_bytes,size_t buffer_bytes,
+    const uint64_t* known_checksum=nullptr);
   void restore_adopted_payload(const ArtifactIdentity&,logical_file_id_t,
     physical_shard_id_t,const std::string& output_path,uint64_t records,
     uint64_t expected_bytes,size_t buffer_bytes,bool verify_checksum=false) const;

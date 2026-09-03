@@ -73,9 +73,12 @@ int main() {
     std::ofstream out(raw_source.c_str(), std::ios::binary);
     out.write(reinterpret_cast<const char*>(payload.data()), payload.size());
   }
+  const uint64_t raw_checksum = BuildWorkspace::checksum(payload.data(),
+    payload.size());
   BuildWorkspace::ArtifactRef raw_ref = resumed.adopt_raw_payload(raw_id,
     logical_file_id_t(8), physical_shard_id_t(10), raw_source, 5,
-    payload.size(), 7777);
+    payload.size(), 7777, &raw_checksum);
+  require(raw_ref.checksum == raw_checksum);
   std::vector<BuildWorkspace::ArtifactRef> raw_refs(1, raw_ref);
   resumed.commit_task(raw_id.task, raw_id.phase, raw_refs);
   std::string raw_stored = resumed.artifact_path(raw_id,
@@ -95,6 +98,59 @@ int main() {
     physical_shard_id_t(10), raw_source, 5, payload.size(), 7777);
   require(stat(raw_source.c_str(), &source_stat) == 0 &&
     source_stat.st_ino == stored_stat.st_ino);
+
+  // If a writable second filesystem is available, force the bounded-copy
+  // fallback and verify that a writer-provided checksum is checked during the
+  // copy. Keep the test portable by skipping this block when /dev/shm is absent
+  // or backed by the same device as the workspace.
+  char cross_root[] = "/dev/shm/gcsa-workspace-cross-XXXXXX";
+  struct stat workspace_device, shared_memory_device;
+  if(stat(root, &workspace_device) == 0 &&
+     stat("/dev/shm", &shared_memory_device) == 0 &&
+     workspace_device.st_dev != shared_memory_device.st_dev &&
+     mkdtemp(cross_root) != nullptr)
+  {
+    const std::string cross_source = std::string(cross_root) + "/payload";
+    {
+      std::ofstream output(cross_source.c_str(), std::ios::binary);
+      output.write(reinterpret_cast<const char*>(payload.data()), payload.size());
+    }
+    ArtifactIdentity cross_id("raw-cross", "checkpoint", "payload", "raw-v1");
+    const uint64_t wrong_checksum = raw_checksum ^ 1ULL;
+    bool rejected_writer_checksum = false;
+    try
+    {
+      resumed_raw.adopt_raw_payload(cross_id, logical_file_id_t(9),
+        physical_shard_id_t(11), cross_source, 6, payload.size(), 7777,
+        &wrong_checksum);
+    }
+    catch(const std::runtime_error&) { rejected_writer_checksum = true; }
+    require(rejected_writer_checksum);
+    BuildWorkspace::ArtifactRef cross_ref = resumed_raw.adopt_raw_payload(
+      cross_id, logical_file_id_t(9), physical_shard_id_t(11), cross_source,
+      6, payload.size(), 7777, &raw_checksum);
+    require(cross_ref.checksum == raw_checksum);
+    resumed_raw.commit_task(cross_id.task, cross_id.phase,
+      std::vector<BuildWorkspace::ArtifactRef>(1, cross_ref));
+    const std::string cross_stored = resumed_raw.artifact_path(cross_id,
+      logical_file_id_t(9), physical_shard_id_t(11));
+    struct stat cross_source_stat, cross_stored_stat;
+    require(stat(cross_source.c_str(), &cross_source_stat) == 0 &&
+      stat(cross_stored.c_str(), &cross_stored_stat) == 0 &&
+      cross_source_stat.st_dev != cross_stored_stat.st_dev);
+    const std::string cross_restored = std::string(root) + "/cross-restored";
+    resumed_raw.restore_adopted_payload(cross_id, logical_file_id_t(9),
+      physical_shard_id_t(11), cross_restored, 6, payload.size(), 7777, true);
+    {
+      std::ifstream input(cross_restored.c_str(), std::ios::binary);
+      std::vector<uint8_t> copy((std::istreambuf_iterator<char>(input)),
+        std::istreambuf_iterator<char>());
+      require(copy == payload);
+    }
+    require(unlink(cross_restored.c_str()) == 0);
+    require(unlink(cross_source.c_str()) == 0);
+    require(rmdir(cross_root) == 0);
+  }
   {
     std::fstream file(raw_stored.c_str(), std::ios::in | std::ios::out | std::ios::binary);
     file.seekp(0); char bad = 127; file.write(&bad, 1);
