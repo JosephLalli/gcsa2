@@ -1519,6 +1519,27 @@ GCSA::locate(range_type range, std::vector<node_type>& results, bool append, boo
 }
 
 void
+GCSA::locate(range_type range, const OccurrenceCallback& report) const
+{
+  if(!report) { throw std::invalid_argument("GCSA::locate(): missing occurrence callback"); }
+  if(Range::empty(range) || range.second >= this->size()) { return; }
+  for(size_type path_node = range.first; path_node <= range.second; path_node++)
+  {
+    size_type steps = 0, sample_path = path_node;
+    while(!(this->sampled(sample_path)))
+    {
+      sample_path = this->LF(sample_path); steps++;
+    }
+    size_type sample = this->firstSample(sample_path);
+    do
+    {
+      report(this->sample(sample) + steps); sample++;
+    }
+    while(!(this->lastSample(sample - 1)));
+  }
+}
+
+void
 GCSA::locate(range_type range, size_type max_positions, std::vector<node_type>& results) const
 {
   results.clear();

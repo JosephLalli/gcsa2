@@ -23,6 +23,7 @@
   SOFTWARE.
 */
 
+#include <algorithm>
 #include <cerrno>
 #include <filesystem>
 #include <fcntl.h>
@@ -337,7 +338,18 @@ main(int argc, char** argv)
 
   printStatistics(index, lcp);
 
-  if(verify) { verifyIndex(index, &lcp, graph); }
+  if(verify)
+  {
+    if(parameters.externalMemory())
+    {
+      const size_type verification_budget = std::max(
+        verifyIndexMinimumBudget(),
+        std::min(parameters.getMemoryLimitBytes(), static_cast<size_type>(64 * MEGABYTE)));
+      verifyIndex(index, &lcp, graph, verification_budget,
+        parameters.getMergeFanIn());
+    }
+    else { verifyIndex(index, &lcp, graph); }
+  }
 
   std::cout << "Final memory usage: " << inGigabytes(memoryUsage()) << " GB" << std::endl;
   std::cout << std::endl;

@@ -28,6 +28,7 @@
 
 #include <gcsa/gcsa.h>
 #include <gcsa/lcp.h>
+#include <gcsa/external_sort.h>
 
 namespace gcsa
 {
@@ -53,6 +54,17 @@ namespace gcsa
 */
 bool verifyIndex(const GCSA& index, const LCPArray* lcp, std::vector<KMer>& kmers, size_type kmer_length, const NodeMapping& mapping = NodeMapping());
 bool verifyIndex(const GCSA& index, const LCPArray* lcp, const InputGraph& graph);
+// Minimum byte budget for the external InputGraph verification route.
+size_type verifyIndexMinimumBudget();
+/*
+  As above, but stream the input through a fixed-record external sort. The
+  byte budget bounds the sorter working set; the input is never materialized.
+  statistics, when non-null, aggregates the external passes and records the
+  peak byte-accounted working set across all verification phases.
+*/
+bool verifyIndex(const GCSA& index, const LCPArray* lcp, const InputGraph& graph,
+  size_type byte_budget, size_type merge_fan_in,
+  ExternalFixedRecordSortStats* statistics = nullptr);
 
 //------------------------------------------------------------------------------
 

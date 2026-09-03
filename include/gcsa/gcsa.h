@@ -3,6 +3,8 @@
 
 #include <gcsa/files.h>
 
+#include <functional>
+
 namespace gcsa
 {
 
@@ -101,6 +103,9 @@ public:
   void locate(size_type path, std::vector<node_type>& results, bool append = false, bool sort = true) const;
   void locate(range_type range, std::vector<node_type>& results, bool append = false, bool sort = true) const;
   void locate(range_type range, size_type max_positions, std::vector<node_type>& results) const;
+  typedef std::function<void(node_type)> OccurrenceCallback;
+  // Report raw occurrences without collecting or deduplicating them.
+  void locate(range_type range, const OccurrenceCallback& report) const;
 
 //------------------------------------------------------------------------------
 
