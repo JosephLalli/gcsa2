@@ -17,6 +17,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <queue>
 #include <stdexcept>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -472,6 +473,96 @@ validateMetadata(const FinalEventMetadata& metadata)
   }
 }
 
+/*
+  Serialize sdsl::bit_vector_il<512> from a sequential bit source. The SDSL
+  constructor interleaves one cumulative count with each eight 64-bit data
+  words and retains at most 1024 cumulative samples in breadth-first midpoint
+  order. Reproducing that layout here avoids its dense source and destination
+  allocations while preserving the public index format byte for byte.
+*/
+template<class NextBit>
+size_type
+serializeFastVector(std::ostream& out, size_type bits, NextBit next_bit)
+{
+  constexpr size_type BLOCK_BITS = 512;
+  constexpr size_type WORDS_PER_BLOCK = BLOCK_BITS / 64;
+  if(bits > std::numeric_limits<size_type>::max() - BLOCK_BITS)
+  {
+    throw eventError("fast bitvector length overflows");
+  }
+  const size_type superblocks = (bits + BLOCK_BITS) / BLOCK_BITS;
+  const size_type data_words = (bits + 64) / 64;
+  if(data_words > std::numeric_limits<size_type>::max() - superblocks - 1)
+  {
+    throw eventError("fast bitvector size overflows");
+  }
+  const size_type stored_words = data_words + superblocks + 1;
+
+  sdsl::write_member(bits, out);
+  sdsl::write_member(stored_words, out);
+  sdsl::write_member(superblocks, out);
+  sdsl::write_member(static_cast<size_type>(9), out);
+  sdsl::int_vector<64>::write_header(checkedBytes(stored_words, 64,
+    "fast bitvector"), 64, out);
+
+  size_type sample_count = 0;
+  if(stored_words > 1024 * 64)
+  {
+    sample_count = std::min<size_type>(1024,
+      static_cast<size_type>(1) << sdsl::bits::hi(superblocks));
+  }
+  std::vector<std::pair<size_type, size_type>> targets;
+  targets.reserve(sample_count);
+  std::queue<std::pair<size_type, size_type>> ranges;
+  ranges.push(std::make_pair(0, superblocks));
+  for(size_type order = 0; order < sample_count; order++)
+  {
+    const std::pair<size_type, size_type> range = ranges.front();
+    ranges.pop();
+    const size_type middle = range.first + (range.second - range.first) / 2;
+    targets.push_back(std::make_pair(middle, order));
+    ranges.push(std::make_pair(range.first, middle));
+    ranges.push(std::make_pair(middle + 1, range.second));
+  }
+  std::sort(targets.begin(), targets.end());
+  sdsl::int_vector<64> rank_samples(sample_count, 0);
+
+  const auto write_word = [&out](std::uint64_t word)
+  {
+    out.write(reinterpret_cast<const char*>(&word), sizeof(word));
+    if(!out) { throw eventError("cannot serialize fast bitvector"); }
+  };
+  size_type target = 0, cumulative = 0, position = 0;
+  for(size_type word_index = 0; word_index < data_words; word_index++)
+  {
+    if(word_index % WORDS_PER_BLOCK == 0)
+    {
+      const size_type block = word_index / WORDS_PER_BLOCK;
+      write_word(cumulative);
+      if(target < targets.size() && targets[target].first == block)
+      {
+        rank_samples[targets[target].second] = cumulative;
+        target++;
+      }
+    }
+    std::uint64_t word = 0;
+    for(size_type offset = 0; offset < 64 && position < bits;
+        offset++, position++)
+    {
+      if(next_bit()) { word |= static_cast<std::uint64_t>(1) << offset; }
+    }
+    write_word(word); cumulative += sdsl::bits::cnt(word);
+  }
+  write_word(cumulative);
+  if(position != bits || target != targets.size())
+  {
+    throw eventError("fast bitvector stream length mismatch");
+  }
+  rank_samples.serialize(out);
+  if(!out) { throw eventError("cannot finish fast bitvector serialization"); }
+  return cumulative;
+}
+
 void
 validatePayloads(const FinalEventFiles& files, const FinalEventMetadata& metadata)
 {
@@ -785,6 +876,32 @@ FinalEventMetadata::FinalEventMetadata() :
   redundant(0), bwt_counts()
 {
   bwt_counts.fill(0);
+}
+
+void
+serializeFastBWTComponent(std::ostream& out, const std::string& mask_file,
+  size_type paths, size_type expected_ones, comp_type comp,
+  const ConstructionParameters& parameters)
+{
+  if(comp >= FinalEventMetadata::MAX_SIGMA)
+  {
+    throw eventError("fast BWT component is outside the mask width");
+  }
+  MemoryBudget budget(parameters.getMemoryLimitBytes(),
+    parameters.getMemoryLimitBytes() / 8);
+  BufferedEventReader masks(mask_file, 1, paths,
+    componentBufferBytes(parameters, 1), budget, "final-bwt-mask-reader");
+  size_type observed = serializeFastVector(out, paths, [&]()
+  {
+    std::uint8_t mask = 0;
+    masks.nextByte(mask);
+    return (mask & (static_cast<size_type>(1) << comp)) != 0;
+  });
+  masks.finish();
+  if(observed != expected_ones)
+  {
+    throw eventError("BWT mask count does not match metadata");
+  }
 }
 
 FinalEventFiles::FinalEventFiles(size_type sigma) :
@@ -1466,22 +1583,6 @@ storeFinalComponents(const GCSAHeader& header,
     value.serialize(out);
     if(!out) { throw eventError("cannot write partial final index", partial); }
   };
-  const auto make_fast_bwt = [&](size_type comp)
-  {
-    MemoryBudget budget(parameters.getMemoryLimitBytes(),
-      parameters.getMemoryLimitBytes() / 8);
-    BufferedEventReader masks(files.bwt_masks, 1, metadata.paths,
-      componentBufferBytes(parameters, 1), budget, "final-bwt-mask-reader");
-    GCSA::bit_vector dense(metadata.paths, 0);
-    for(size_type path = 0; path < metadata.paths; path++)
-    {
-      std::uint8_t mask = 0;
-      masks.nextByte(mask);
-      if(mask & (static_cast<size_type>(1) << comp)) { dense[path] = 1; }
-    }
-    masks.finish();
-    return GCSA::fast_vector(dense);
-  };
   try
   {
     sdsl::int_vector<64> counts(metadata.sigma, 0);
@@ -1500,7 +1601,9 @@ storeFinalComponents(const GCSAHeader& header,
     {
       if(comp > 0 && comp <= metadata.fast_chars)
       {
-        write(make_fast_bwt(comp));
+        serializeFastBWTComponent(out, files.bwt_masks, metadata.paths,
+          metadata.bwt_counts[comp], static_cast<comp_type>(comp), parameters);
+        if(!out) { throw eventError("cannot write partial final index", partial); }
       }
       else
       {
@@ -1508,20 +1611,14 @@ storeFinalComponents(const GCSAHeader& header,
         write(empty);
       }
     }
+    // rank_support_il serializes no payload; load() simply binds it to the BWT
+    // already read above. Rebuilding each fast BWT solely to initialize an
+    // empty serialization performed a full mask scan and allocation for no
+    // output bytes.
     for(size_type comp = 0; comp < metadata.sigma; comp++)
     {
-      if(comp > 0 && comp <= metadata.fast_chars)
-      {
-        GCSA::fast_vector bwt = make_fast_bwt(comp);
-        GCSA::fast_vector::rank_1_type rank;
-        sdsl::util::init_support(rank, &bwt);
-        write(rank);
-      }
-      else
-      {
-        GCSA::fast_vector::rank_1_type empty;
-        write(empty);
-      }
+      GCSA::fast_vector::rank_1_type empty;
+      write(empty);
     }
     for(size_type comp = 0; comp < metadata.sigma; comp++)
     {
@@ -1603,31 +1700,40 @@ storeFinalComponents(const GCSAHeader& header,
           8, metadata.bwt_counts[comp], buffer_bytes, budget, "final-edge-reader"));
         available[comp] = readers.back()->nextInteger(current[comp]);
       }
-      GCSA::bit_vector edge_bits(metadata.total_edges, 0);
-      size_type tail = 0;
-      for(size_type path = 0; path < metadata.paths; path++)
+      size_type path = 0, remaining_degree = 0, consumed_edges = 0;
+      size_type observed_paths = serializeFastVector(out, metadata.total_edges, [&]()
       {
-        size_type degree = 0;
-        for(size_type comp = 0; comp < metadata.sigma; comp++)
+        if(remaining_degree == 0)
         {
-          if(available[comp] && current[comp] < path)
+          if(path >= metadata.paths)
           {
-            throw eventError("edge stream is not nondecreasing");
+            throw eventError("edge stream exceeds path universe");
           }
-          while(available[comp] && current[comp] == path)
+          size_type degree = 0;
+          for(size_type comp = 0; comp < metadata.sigma; comp++)
           {
-            degree++;
-            available[comp] = readers[comp]->nextInteger(current[comp]);
+            if(available[comp] && current[comp] < path)
+            {
+              throw eventError("edge stream is not nondecreasing");
+            }
+            while(available[comp] && current[comp] == path)
+            {
+              degree++;
+              available[comp] = readers[comp]->nextInteger(current[comp]);
+            }
           }
+          if(degree == 0 || degree > metadata.total_edges ||
+             consumed_edges > metadata.total_edges - degree)
+          {
+            throw eventError("invalid edge stream");
+          }
+          consumed_edges += degree;
+          remaining_degree = degree;
+          path++;
         }
-        if(degree == 0 || degree > metadata.total_edges ||
-           tail > metadata.total_edges - degree)
-        {
-          throw eventError("invalid edge stream");
-        }
-        tail += degree;
-        edge_bits[tail - 1] = 1;
-      }
+        remaining_degree--;
+        return (remaining_degree == 0);
+      });
       for(size_type comp = 0; comp < metadata.sigma; comp++)
       {
         if(available[comp])
@@ -1636,15 +1742,13 @@ storeFinalComponents(const GCSAHeader& header,
         }
         readers[comp]->finish();
       }
-      if(tail != metadata.total_edges)
+      if(path != metadata.paths || remaining_degree != 0 ||
+         consumed_edges != metadata.total_edges || observed_paths != metadata.paths)
       {
         throw eventError("edge total mismatch");
       }
-      GCSA::fast_vector edges(edge_bits);
-      write(edges);
-      GCSA::fast_vector::rank_1_type rank;
-      sdsl::util::init_support(rank, &edges);
-      write(rank);
+      GCSA::fast_vector::rank_1_type empty_rank;
+      write(empty_rank);
     }
 
     {
@@ -1653,25 +1757,35 @@ storeFinalComponents(const GCSAHeader& header,
       size_type buffer_bytes = componentBufferBytes(parameters, 1);
       BufferedEventReader positions(files.sample_positions, 8,
         metadata.sampled_paths, buffer_bytes, budget, "final-sample-path-reader");
-      GCSA::bit_vector sampled_bits(metadata.paths, 0);
-      std::uint64_t previous = 0;
-      for(size_type i = 0; i < metadata.sampled_paths; i++)
+      std::uint64_t next_sample = 0, previous = 0;
+      bool sample_available = positions.nextInteger(next_sample);
+      size_type path = 0;
+      size_type observed_samples = serializeFastVector(out, metadata.paths, [&]()
       {
-        std::uint64_t path = 0;
-        positions.nextInteger(path);
-        if(path >= metadata.paths || (i > 0 && path <= previous))
+        if(sample_available && next_sample < path)
         {
           throw eventError("sampled path stream is not strictly increasing");
         }
-        sampled_bits[path] = 1;
-        previous = path;
-      }
+        bool result = (sample_available && next_sample == path);
+        if(result)
+        {
+          previous = next_sample;
+          sample_available = positions.nextInteger(next_sample);
+          if(sample_available && next_sample <= previous)
+          {
+            throw eventError("sampled path stream is not strictly increasing");
+          }
+        }
+        path++;
+        return result;
+      });
       positions.finish();
-      GCSA::fast_vector sampled(sampled_bits);
-      write(sampled);
-      GCSA::fast_vector::rank_1_type rank;
-      sdsl::util::init_support(rank, &sampled);
-      write(rank);
+      if(sample_available || observed_samples != metadata.sampled_paths)
+      {
+        throw eventError("sampled path stream does not match metadata");
+      }
+      GCSA::fast_vector::rank_1_type empty_rank;
+      write(empty_rank);
 
       sdsl::int_vector<0> ids_vector(metadata.sample_ids, 0,
         metadata.sample_bits);

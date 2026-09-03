@@ -174,6 +174,39 @@ int main()
   parameters.setIOBufferSize(128);
   parameters.setMergeFanIn(2);
 
+  // Cross the bit_vector_il threshold where SDSL stores its auxiliary
+  // breadth-first rank samples. Exact byte equality here covers both the
+  // interleaved block layout and the bounded 1024-sample construction.
+  const size_type large_paths = 4 * MEGABYTE;
+  const std::string large_masks = std::string(root) + "/large-masks";
+  GCSA::bit_vector expected_dense(large_paths, 0);
+  size_type expected_ones = 0;
+  {
+    std::ofstream output(large_masks.c_str(), std::ios_base::binary);
+    require(static_cast<bool>(output));
+    std::array<std::uint8_t, 4096> block = {};
+    for(size_type first = 0; first < large_paths; first += block.size())
+    {
+      size_type count = std::min<size_type>(block.size(), large_paths - first);
+      for(size_type offset = 0; offset < count; offset++)
+      {
+        size_type path = first + offset;
+        bool set = (path % 7 == 0 || path % 1021 == 0);
+        block[offset] = (set ? static_cast<std::uint8_t>(1U << 1) : 0);
+        if(set) { expected_dense[path] = 1; expected_ones++; }
+      }
+      output.write(reinterpret_cast<const char*>(block.data()), count);
+      require(static_cast<bool>(output));
+    }
+  }
+  std::ostringstream streamed_fast, expected_fast;
+  serializeFastBWTComponent(streamed_fast, large_masks, large_paths,
+    expected_ones, 1, parameters);
+  GCSA::fast_vector expected_interleaved(expected_dense);
+  expected_interleaved.serialize(expected_fast);
+  require(streamed_fast.str() == expected_fast.str());
+  require(std::filesystem::remove(large_masks));
+
   // A path may represent more mapped start nodes than fit in RAM. Exercise
   // both reusable in-memory sets and the forced external sort/dedup path with
   // the minimum legal byte reservation.

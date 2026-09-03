@@ -12,6 +12,7 @@
 #include <gcsa/workspace.h>
 
 #include <array>
+#include <iosfwd>
 #include <memory>
 #include <string>
 #include <vector>
@@ -148,6 +149,15 @@ bool restoreFinalEvents(const BuildWorkspace& workspace,
   FinalEventFiles& files, FinalEventMetadata& metadata,
   size_type expected_paths, size_type expected_sigma, size_type buffer_bytes,
   bool verify_checksum = false);
+
+/*
+  Stream one fast BWT component directly in the existing bit_vector_il<512>
+  serialization. This avoids materializing both a dense bitvector and its
+  interleaved replacement. Public only for exact-format regression tests.
+*/
+void serializeFastBWTComponent(std::ostream& out,
+  const std::string& mask_file, size_type paths, size_type expected_ones,
+  comp_type comp, const ConstructionParameters& parameters);
 
 /*
   Build the existing GCSA members serially from event streams. This preserves
