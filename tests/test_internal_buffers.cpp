@@ -26,11 +26,36 @@ int main()
 
   {
     ReadBuffer<size_type> input;
-    input.open(name, 33);
+    input.open(name, 33, true);
     require(input.buffer_elements == 33 / sizeof(size_type));
     require(input.minimum_elements == 2);
     require(input.size() == 17);
     for(size_type i = 0; i < input.size(); i++) { require(input[i] == i * i); }
+    // pread()-based seeking remains correct after the cache-retirement path is
+    // enabled, including a backward seek that invalidates both read windows.
+    input.seek(3);
+    require(input[3] == 9 && input[16] == 256);
+    input.close();
+  }
+
+  // A sparse extension reaches the rolling-cache threshold without writing a
+  // large fixture. Seeking forward retires the skipped/consumed prefix, while
+  // a later backward seek remains semantically correct through pread().
+  require(::truncate(name.c_str(), 48 * MEGABYTE) == 0);
+  {
+    ReadBuffer<size_type> input;
+    input.open(name, MEGABYTE, true);
+    const size_type far = 40 * MEGABYTE / sizeof(size_type);
+    input.seek(far);
+    require(input[far] == 0);
+#if defined(POSIX_FADV_DONTNEED)
+    require(input.cache_released >= 32 * MEGABYTE);
+#endif
+    input.seek(3);
+#if defined(POSIX_FADV_DONTNEED)
+    require(input.cache_released == 0);
+#endif
+    require(input[3] == 9);
     input.close();
   }
 
