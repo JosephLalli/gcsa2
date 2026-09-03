@@ -506,13 +506,15 @@ Fast BWT, edge-boundary, and sampled-path `bit_vector_il<512>` members are
 serialized directly from their event streams, including SDSL's interleaved
 cumulative counts and bounded select samples. They never materialize the dense
 source bitvector or the full interleaved destination; empty `rank_support_il`
-payloads are emitted without rebuilding the corresponding vector.
+payloads are emitted without rebuilding the corresponding vector. Packed
+sample IDs are likewise serialized word by word in the existing
+`sdsl::int_vector<0>` layout instead of allocating one entry per sample.
 The partial file is synced and atomically published. Standalone `build_gcsa`,
 `vg index`, and `vg autoindex` use this direct packer whenever a workspace is
 configured; they reload the index only for explicit verification. This removes
-the cumulative completed-index peak, but sparse SDSL builders, packed sample
-IDs and boundaries, occurrence/redundancy members, and their conversion scratch
-can still allocate outside `MemoryBudget`.
+the cumulative completed-index peak, but sparse SDSL builders, sample-boundary,
+occurrence/redundancy members, and their conversion scratch can still allocate
+outside `MemoryBudget`.
 
 LCP level `i+1` is produced by streaming groups of the configured branching
 factor from level `i`; each raw internal level is independently checkpointed
@@ -545,7 +547,7 @@ when its production call path and forced-spill/recovery tests pass.
 | Process worker scheduler and partition resume | implemented with fork-free spawn, global byte admission, immutable-payload semantic range checkpoints, same-filesystem zero-copy restore, and one-/multi-partition tests |
 | External keys/start nodes/initial paths | implemented with bounded fixed-record runs, global duplicate reduction, streaming support construction, durable key/start checkpoints, and physical initial shards preserving logical IDs |
 | Spillable pruning groups | implemented and forced-spill tested for equal-label priority groups, extended ranges, external same-from sets, and bounded input/output descriptor caches |
-| Final event/component passes | implemented with one-task immutable-payload event checkpoint, same-filesystem zero-copy restore, spillable mapped start-node sets, disk-backed `prev_occ` and suffix-tree stack, external redundancy sort, streaming fast-vector serialization, and direct component-at-a-time packing in standalone/vg/autoindex; mid-scan assignment logs and remaining SDSL token admission pending |
+| Final event/component passes | implemented with one-task immutable-payload event checkpoint, same-filesystem zero-copy restore, spillable mapped start-node sets, disk-backed `prev_occ` and suffix-tree stack, external redundancy sort, streaming fast-vector and packed-sample-ID serialization, and direct component-at-a-time packing in standalone/vg/autoindex; mid-scan assignment logs and remaining SDSL token admission pending |
 | Streaming LCP levels | implemented and resume-tested with one raw level resident at a time and byte-identical legacy serialization; final packed hierarchy remains resident |
 | External verification | implemented and forced-spill tested with bounded input blocks, external expected/actual occurrence sorts, callback-based locate, and sequential set comparison; resumable runs and parallel label ranges pending |
 | Standalone and `vg index` / `vg autoindex` CLI integration | implemented; forced-spill/resume integration tested |
@@ -554,9 +556,9 @@ when its production call path and forced-spill/recovery tests pass.
 Current limitations are intentionally explicit. The external route is selected
 only when `ConstructionParameters::work_directory` is nonempty. The production
 file-building routes no longer retain all completed GCSA components or retain a
-completed GCSA while constructing LCP. Fast BWT/edge/sample vectors stream in
-bounded memory, but individual sparse SDSL builders, packed sample data,
-occurrence/redundancy structures, and their conversion scratch still allocate
+completed GCSA while constructing LCP. Fast BWT/edge/sample vectors and packed
+sample IDs stream in bounded memory, but individual sparse SDSL builders,
+sample-boundary, occurrence/redundancy structures, and their conversion scratch still allocate
 outside the token budget, and the final packed LCP remains resident. These are
 bounded by one final component rather than total intermediate path volume, but
 they keep the in-process budget from being a strict whole-process RSS ceiling;
