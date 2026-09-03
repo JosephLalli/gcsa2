@@ -70,11 +70,14 @@ main()
 
   char legacy_root[] = "/tmp/gcsa-resume-legacy-XXXXXX";
   char workspace_root[] = "/tmp/gcsa-resume-work-XXXXXX";
+  char empty_root[] = "/tmp/gcsa-resume-empty-XXXXXX";
   require(mkdtemp(legacy_root) != nullptr);
   require(mkdtemp(workspace_root) != nullptr);
+  require(mkdtemp(empty_root) != nullptr);
   const std::string input_name = "tests/cycle.gcsa2";
   const std::string legacy_prefix = std::string(legacy_root) + "/index";
   const std::string external_prefix = std::string(workspace_root) + "/index";
+  const std::string staged_prefix = std::string(workspace_root) + "/staged";
   const std::string mapping_name = std::string(legacy_root) + "/mapping";
   // Exercise mapping-before-deduplication in the final start-node set: the
   // mapping is deliberately non-monotone and collapses two input node ids.
@@ -161,6 +164,24 @@ main()
   require(readFile(legacy_prefix + LCPArray::EXTENSION) ==
     readFile(external_prefix + LCPArray::EXTENSION));
 
+  // Reuse the same completed event frontier through the production direct
+  // packer. This exercises the constructor-to-file lifecycle, not just the
+  // lower-level component helper, and proves ordinary GCSA::load()/queries
+  // remain compatible.
+  {
+    ConstructionParameters parameters = externalParameters(workspace_root,
+      external_minimum + 64 * KILOBYTE);
+    parameters.setResume();
+    InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
+    GCSA::buildAndStore(graph, parameters, staged_prefix + GCSA::EXTENSION);
+    LCPArray lcp(graph, parameters);
+    GCSA staged;
+    require(sdsl::load_from_file(staged, staged_prefix + GCSA::EXTENSION));
+    require(verifyIndex(staged, &lcp, graph));
+  }
+  require(readFile(legacy_prefix + GCSA::EXTENSION) ==
+    readFile(staged_prefix + GCSA::EXTENSION));
+
   // A semantic change must refuse reuse even though operational parameters are
   // deliberately allowed to change between invocations.
   bool semantic_change_refused = false;
@@ -179,7 +200,35 @@ main()
   }
   require(semantic_change_refused);
 
+  // Direct construction must publish a valid empty index as well. Previously
+  // the constructor returned before the staged packer ran, leaving no output
+  // (or, worse, leaving a stale destination from an earlier build).
+  {
+    const std::string empty_input = std::string(empty_root) + "/empty.graph";
+    const std::string legacy_empty = std::string(empty_root) + "/legacy.gcsa";
+    const std::string staged_empty = std::string(empty_root) + "/staged.gcsa";
+    std::vector<KMer> kmers;
+    std::ofstream output(empty_input.c_str(), std::ios_base::binary);
+    writeBinary(output, kmers, 4); output.close();
+    require(static_cast<bool>(output));
+
+    ConstructionParameters legacy_parameters;
+    InputGraph legacy_graph({ empty_input }, true, legacy_parameters);
+    GCSA legacy_empty_index(legacy_graph, legacy_parameters);
+    require(sdsl::store_to_file(legacy_empty_index, legacy_empty));
+
+    ConstructionParameters external_parameters = externalParameters(empty_root,
+      external_minimum + 64 * KILOBYTE);
+    InputGraph external_graph({ empty_input }, true, external_parameters);
+    GCSA::buildAndStore(external_graph, external_parameters, staged_empty);
+    GCSA loaded;
+    require(sdsl::load_from_file(loaded, staged_empty));
+    require(loaded.size() == 0);
+    require(readFile(legacy_empty) == readFile(staged_empty));
+  }
+
   std::filesystem::remove_all(legacy_root);
   std::filesystem::remove_all(workspace_root);
+  std::filesystem::remove_all(empty_root);
   return 0;
 }

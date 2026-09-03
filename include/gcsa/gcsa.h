@@ -74,6 +74,15 @@ public:
   */
   GCSA(InputGraph& graph, const ConstructionParameters& parameters = ConstructionParameters());
 
+  /*
+    Disk-first construction directly into the normal serialized .gcsa format.
+    Final succinct components are written and released one at a time instead
+    of accumulating in a resident GCSA object. This route requires an external
+    workspace; the resulting file loads through the ordinary GCSA::load().
+  */
+  static void buildAndStore(InputGraph& graph,
+    const ConstructionParameters& parameters, const std::string& filename);
+
 //------------------------------------------------------------------------------
 
   /*
@@ -247,6 +256,8 @@ public:
 //------------------------------------------------------------------------------
 
 private:
+  GCSA(InputGraph& graph, const ConstructionParameters& parameters,
+    const std::string* direct_output);
   void copy(const GCSA& source);
   void setVectors();
   void initSupport();
