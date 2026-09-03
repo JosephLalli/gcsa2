@@ -843,12 +843,18 @@ recordPathSortRun(ExternalPathSortStats* stats, const PathSortRunWriter& writer)
 {
   if(stats == nullptr) { return; }
   if(stats->run_uncompressed_bytes > std::numeric_limits<size_type>::max() - writer.uncompressedBytes() ||
-     stats->run_compressed_bytes > std::numeric_limits<size_type>::max() - writer.bytes())
+     stats->run_compressed_bytes > std::numeric_limits<size_type>::max() - writer.bytes() ||
+     stats->grouped_records > std::numeric_limits<size_type>::max() - writer.groupReferences() ||
+     stats->group_headers > std::numeric_limits<size_type>::max() - writer.groupHeaders() ||
+     stats->context_bytes_saved > std::numeric_limits<size_type>::max() - writer.contextBytesSaved())
   {
-    externalSortFailure("path-sort run byte counter overflow");
+    externalSortFailure("path-sort run statistics overflow");
   }
   stats->run_uncompressed_bytes += writer.uncompressedBytes();
   stats->run_compressed_bytes += writer.bytes();
+  stats->grouped_records += writer.groupReferences();
+  stats->group_headers += writer.groupHeaders();
+  stats->context_bytes_saved += writer.contextBytesSaved();
 }
 
 inline off_t

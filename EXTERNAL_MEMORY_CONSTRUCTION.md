@@ -252,11 +252,14 @@ semantic range is committed independently, so a resumed generation restores
 valid ranges and only respawns missing work. Cgroup-charged filesystem cache
 still needs a deployment-level ceiling in addition to allocator byte tokens.
 
-The largest remaining I/O opportunity is record compaction, not extra writer
-processes. Current fixed-width join runs repeat complete path labels and may be
-larger than the variable-width source path/rank pair. Versioned blocked records
-that store one left context followed by a sequence of right references would
-reduce both bytes and comparison work for high-fanout keys. Asynchronous
+The largest remaining I/O opportunity is further record compaction, not extra
+writer processes. Current fixed-width join runs repeat complete path labels and
+may be larger than the variable-width source path/rank pair. A versioned grouped
+codec now writes one left context for consecutive expansions in each label-sort
+run, followed by compact right-dependent records that reference it. This removes
+14 bytes of repeated `PathNode` context per grouped reference in addition to
+label-prefix compression. A future join-run reference format could also avoid
+repeating the complete rank payload before label sorting. Asynchronous
 writeback (`sync_file_range` where available, followed by `fdatasync` only at a
 commit boundary) may later overlap compute and flushing, but is not yet used:
 the portable implementation currently syncs every 512 MiB before evicting that
@@ -279,10 +282,11 @@ Generated paths and sorted bypass paths now feed the label-run builder directly
 during the final join scan. The previous route materialized an approximately
 61.5 GB step-4 path/rank pair and then decoded it into 67.1 GiB of fixed-width
 sort records. The fused route removes one complete write/read cycle and reports
-the exact avoided bytes for each generation. A blocked
-left-context-plus-right-references format can still reduce the larger
-fixed-record traffic. That compaction remains more valuable than running two
-encoders against the same disk.
+the exact avoided bytes for each generation. The v2 label-run codec additionally
+groups adjacent expansions that share `from`, predecessor mask, and order; its
+counters report both grouped references and payload bytes avoided. Rank payloads
+in the earlier join runs remain the next compaction target. That compaction
+remains more valuable than running two encoders against the same disk.
 
 The current disk guard is exact for generated path/label sinks and deterministic
 join-partition output: it counts committed and pending generation bytes against
@@ -332,10 +336,12 @@ Durable phase artifacts have explicit little-endian headers and footers with
 magic, format version, artifact kind, logical ID, physical shard ID, record and
 payload byte counts, checksum, sort order, and key range. Join runs also use an
 explicit versioned encoding. Transient label-sort runs use an explicit
-little-endian, versioned prefix-compressed format: the first label is complete
-and following labels store LCP length plus suffix. They remain transient rather
-than workspace tasks, but no longer dump an unstable C++ object layout. The
-final public index keeps its unchanged legacy format.
+little-endian, versioned grouped and prefix-compressed format. A group header
+stores the left-path context once; following records store a reference flag and
+only right-dependent node fields. The first label is complete and following
+labels store LCP length plus suffix. They remain transient rather than workspace
+tasks, but no longer dump an unstable C++ object layout. The final public index
+keeps its unchanged legacy format.
 
 ### Commit and recovery protocol
 
@@ -410,12 +416,21 @@ left key  = (logical_file, path.to)
 right key = (logical_file, path.from)
 ```
 
-The complete target design samples key/range and leading-label distributions,
-then commits an MSD radix partition plan backed by pack files. The implemented
-planner currently takes a deterministic systematic sample of at most 4096
-records from each side to identify likely pathological keys. An exact streaming
-group pass remains authoritative for every boundary, count, and byte estimate;
-full sampled quantile/MSD pack planning is not implemented yet.
+The planner takes a deterministic systematic sample of at most 4096 records
+from each side, estimates both input bytes and matching-key fanout, and
+recursively refines oversized ranges by four most-significant key bits. The
+result is a canonical set of explicit prefix packs with estimated input/output
+bytes plus suspected heavy keys. Pack memory is capped from the configured RAM
+budget; if that cap is reached, a coarser pack is retained and the exact pass
+continues splitting it. The plan is bound to both join-run payload checksums,
+committed as a checksummed workspace artifact, and restored independently of
+partition outputs. Completed partition task names carry the same run checksums,
+so equal-length replacement runs cannot reuse stale output. The already-sorted
+left/right join files act as shared pack files:
+thousands of logical radix bins are half-open offsets in two files instead of
+thousands of open descriptors. An exact streaming group pass remains
+authoritative for every range, count, and byte estimate, so a sampling miss can
+change task balance but cannot change join semantics.
 
 For each partition, the scheduler reserves a declared working set. If one side
 fits, it is indexed and the other is streamed. Otherwise the partition is
@@ -425,9 +440,12 @@ immediately sent to label-run construction. This uses
 `O(|L_key| * |R_key|)` generation work, as required by the output, but only
 `O(block_L + block_R + output_buffer)` RAM.
 
-Sorted paths bypass the join and enter label-run generation unchanged. A later
-optimization may encode one left reference followed by many right references,
-delaying repeated-label materialization.
+Sorted paths bypass the join and enter label-run generation unchanged. After a
+bounded chunk is label-sorted, consecutive records with the same left context
+are encoded as one group header followed by compact references. The reader
+reconstructs full `PathNode` values only as the merge consumes them. Complete
+rank payloads are still generated before label sorting, preserving the exact
+legacy comparator and keeping this optimization local to the transient format.
 
 The production route uses an external sort-merge implementation. For every
 logical input it writes explicit, versioned left-by-`to` and right-by-`from`
@@ -436,10 +454,10 @@ run records. Run creation uses leveled compaction, so file-name metadata is
 processed without materializing either key group: it loads bounded blocks from
 the smaller side and replays disk-backed blocks/ranges from the other side.
 This already handles an individual key larger than RAM and preserves joins
-across physical shards. Generated records flow directly to prefix-compressed
-bounded label-sort runs. The expansion record itself still repeats the complete
-generated label; true left-context-plus-right-reference encoding remains an
-I/O optimization.
+across physical shards. Generated records flow directly to grouped,
+prefix-compressed bounded label-sort runs. The run format avoids repeated left
+`PathNode` context; the complete generated rank label remains present as a
+prefix-compressed sequence because it is the primary external-sort key.
 
 ### Pruning
 
@@ -485,9 +503,9 @@ when its production call path and forced-spill/recovery tests pass.
 | Shared byte-token `MemoryBudget` and statvfs-aware `DiskBudget` | memory primitives and major external-phase byte caps implemented; pruning/merged-graph buffers are byte-bounded but not globally admitted; SDSL/library allocations remain outside the shared budget; disk guard covers generated path/join volume but not every final/LCP/checkpoint writer |
 | Versioned workspace artifacts, atomic publication, manifest compatibility, recovery tests | phase and join-range checkpoints plus abrupt-exit commit-boundary tests implemented; transient distribution-run task records pending |
 | Human-readable operational construction parameters | core budget/run controls implemented and parser-tested; cleanup/cadence controls are not all wired |
-| Bounded external path-label runs and leveled multi-pass merge | versioned prefix-compressed runs, parallel in-place run sorting, rolling cache windows, one-run bypass, and forced multi-pass spilling implemented and tested |
+| Bounded external path-label runs and leveled multi-pass merge | versioned grouped/prefix-compressed runs, shared-left-context references, parallel in-place run sorting, rolling cache windows, one-run bypass, and forced multi-pass spilling implemented and tested |
 | Logical/physical `PathGraph` identity in pruning and joining | implemented; pruning coalesces only by logical ID and never treats a physical shard as a semantic input; durable run-set manifest pending |
-| External prefix-doubling join | bounded sort-merge, rolling page-cache windows, deterministic 4096-record heavy-key sampling, exact range partitioning, recursive two-dimensional heavy-key splitting, blocked nested-loop expansion, and selectable checksum scans implemented; full sampled MSD/radix pack planning pending |
+| External prefix-doubling join | bounded sort-merge, rolling page-cache windows, RAM-capped persisted 4096-record MSD radix range-pack planning bound to run checksums, exact range contracts, recursive two-dimensional heavy-key splitting, blocked nested-loop expansion, and selectable checksum scans implemented and forced-spill tested |
 | Direct join-to-label pipeline | implemented and forced-spill tested; the unsorted generated path/rank pair is no longer materialized |
 | Process worker scheduler and partition resume | implemented with fork-free spawn, global byte admission, semantic range checkpoints, and one-/multi-partition tests |
 | External keys/start nodes/initial paths | implemented with bounded fixed-record runs, global duplicate reduction, streaming support construction, durable key/start checkpoints, and physical initial shards preserving logical IDs |
@@ -507,11 +525,13 @@ on closing or directly bounding them.
 
 Join distribution runs are checksummed immutable files but are not yet
 registered as resumable workspace tasks, so an incomplete generation rebuilds
-them before restoring completed join ranges. Recursive range planning is exact
-but performs an additional sequential group-summary pass and does not yet use
-sampled MSD/radix boundaries. Initial records and generated expansion records
-repeat full payloads; label-sort runs prefix-compress adjacent labels, but
-grouped expansion/super-k-mer-like reference encoding is not implemented.
+them before restoring the persisted MSD plan and completed join ranges. The
+exact group-summary pass still scans both shared pack files after sampling; this
+extra sequential I/O makes sampled boundaries safe rather than speculative.
+Initial records and join distribution records still repeat full rank payloads.
+Label-sort runs group shared left contexts and prefix-compress labels, but a
+deeper reference representation spanning the pre-sort join stream remains an
+optional compaction rather than a feasibility dependency.
 Final component construction is serial and the ordered event scan resumes only
 at its task boundary. Process workers currently accelerate independent join
 ranges only. Even with these limitations, preprocessing and prefix doubling no

@@ -261,6 +261,10 @@ int main(int argc, char** argv)
   require(process_stats.right_range_splits > 0);
   require(process_stats.generated_records == left.size() * right.size());
   require(process_stats.sorted_bypass == 1);
+  require(process_stats.sampled_plan_records > 0);
+  require(process_stats.radix_plan_bins >= 1);
+  require(process_stats.grouped_expansion_records > 0);
+  require(process_stats.expansion_context_bytes_saved > 0);
   require(process_stats.max_bytes_resident <= process_parameters.getMemoryLimitBytes());
 
   PathGraph resumed_process(left_path, left_rank);
@@ -275,6 +279,99 @@ int main(int argc, char** argv)
   require(readGraph(process_graph) == readGraph(resumed_process));
   require(resumed_stats.worker_processes == 0);
   require(resumed_stats.restored_partitions == resumed_stats.join_partitions);
+  require(resumed_stats.restored_radix_plans == 1);
+
+  // Spread exact join keys across the most-significant nibble of node_type.
+  // The 4 KiB target cannot admit their combined output, but each key fits by
+  // itself. This forces a sampled MSD split and proves that the exact scan
+  // flushes at the persisted range-pack boundaries without changing results.
+  std::vector<TestRecord> radix_left, radix_right, radix_combined;
+  for(size_type digit = 1; digit <= 8; digit++)
+  {
+    node_type key = (static_cast<node_type>(digit) << 60) | 0x1234;
+    for(size_type i = 0; i < 8; i++)
+    {
+      radix_left.push_back({ 10000 + 100 * digit + i, key,
+        static_cast<byte_type>(1U << (i % 4)),
+        static_cast<PathNode::rank_type>(100 * digit + i), false });
+      radix_right.push_back({ key, 20000 + 100 * digit + i,
+        static_cast<byte_type>(1),
+        static_cast<PathNode::rank_type>(1000 + 100 * digit + i), false });
+    }
+  }
+  radix_combined = radix_left;
+  radix_combined.insert(radix_combined.end(), radix_right.begin(), radix_right.end());
+  std::string radix_combined_path = base + ".radix-combined.path";
+  std::string radix_combined_rank = base + ".radix-combined.rank";
+  std::string radix_left_path = base + ".radix-left.path";
+  std::string radix_left_rank = base + ".radix-left.rank";
+  std::string radix_right_path = base + ".radix-right.path";
+  std::string radix_right_rank = base + ".radix-right.rank";
+  writePathPair(radix_combined_path, radix_combined_rank, radix_combined);
+  writePathPair(radix_left_path, radix_left_rank, radix_left);
+  writePathPair(radix_right_path, radix_right_rank, radix_right);
+
+  PathGraph radix_legacy(radix_combined_path, radix_combined_rank);
+  radix_legacy.order = 1;
+  radix_legacy.extend(GIGABYTE, 64 * MEGABYTE);
+  PathGraph radix_external(radix_left_path, radix_left_rank);
+  radix_external.order = 1;
+  radix_external.logical_file_ids[0] = logical_file_id_t(11);
+  radix_external.physical_shard_ids[0] = physical_shard_id_t(301);
+  appendShard(radix_external, radix_right_path, radix_right_rank,
+    logical_file_id_t(11), physical_shard_id_t(302));
+  ConstructionParameters radix_parameters = process_parameters;
+  radix_parameters.setCheckpointBytes(4 * KILOBYTE);
+  ExternalPathJoinStats radix_stats;
+  externalPathGraphExtend(radix_external, GIGABYTE, radix_parameters,
+    &radix_stats, &workspace, "step-msd");
+  require(readGraph(radix_legacy) == readGraph(radix_external));
+  require(radix_stats.radix_plan_splits > 0);
+  require(radix_stats.radix_plan_bins > 1);
+  require(radix_stats.radix_plan_max_bits >= 4);
+  require(radix_stats.radix_boundary_flushes > 0);
+
+  PathGraph radix_resumed(radix_left_path, radix_left_rank);
+  radix_resumed.order = 1;
+  radix_resumed.logical_file_ids[0] = logical_file_id_t(11);
+  radix_resumed.physical_shard_ids[0] = physical_shard_id_t(301);
+  appendShard(radix_resumed, radix_right_path, radix_right_rank,
+    logical_file_id_t(11), physical_shard_id_t(302));
+  ExternalPathJoinStats radix_resumed_stats;
+  externalPathGraphExtend(radix_resumed, GIGABYTE, radix_parameters,
+    &radix_resumed_stats, &workspace, "step-msd");
+  require(readGraph(radix_external) == readGraph(radix_resumed));
+  require(radix_resumed_stats.restored_radix_plans == 1);
+  require(radix_resumed_stats.worker_processes == 0);
+
+  // A same-length run with different payload must not inherit either the plan
+  // or completed worker ranges. Run checksums are part of both task identities.
+  std::vector<TestRecord> changed_left = radix_left;
+  changed_left.front().label += 50000;
+  std::vector<TestRecord> changed_combined = changed_left;
+  changed_combined.insert(changed_combined.end(), radix_right.begin(), radix_right.end());
+  std::string changed_combined_path = base + ".changed-combined.path";
+  std::string changed_combined_rank = base + ".changed-combined.rank";
+  std::string changed_left_path = base + ".changed-left.path";
+  std::string changed_left_rank = base + ".changed-left.rank";
+  writePathPair(changed_combined_path, changed_combined_rank, changed_combined);
+  writePathPair(changed_left_path, changed_left_rank, changed_left);
+  PathGraph changed_legacy(changed_combined_path, changed_combined_rank);
+  changed_legacy.order = 1;
+  changed_legacy.extend(GIGABYTE, 64 * MEGABYTE);
+  PathGraph changed_external(changed_left_path, changed_left_rank);
+  changed_external.order = 1;
+  changed_external.logical_file_ids[0] = logical_file_id_t(11);
+  changed_external.physical_shard_ids[0] = physical_shard_id_t(301);
+  appendShard(changed_external, radix_right_path, radix_right_rank,
+    logical_file_id_t(11), physical_shard_id_t(302));
+  ExternalPathJoinStats changed_stats;
+  externalPathGraphExtend(changed_external, GIGABYTE, radix_parameters,
+    &changed_stats, &workspace, "step-msd");
+  require(readGraph(changed_legacy) == readGraph(changed_external));
+  require(changed_stats.restored_radix_plans == 0);
+  require(changed_stats.restored_partitions == 0);
+  require(changed_stats.worker_processes == changed_stats.join_partitions);
 
   // Requesting multiple workers must remain valid when the deterministic plan
   // contains only one task. This is common for small logical inputs.
@@ -317,6 +414,11 @@ int main(int argc, char** argv)
   std::remove(combined_path.c_str()); std::remove(combined_rank.c_str());
   std::remove(left_path.c_str()); std::remove(left_rank.c_str());
   std::remove(right_path.c_str()); std::remove(right_rank.c_str());
+  std::remove(radix_combined_path.c_str()); std::remove(radix_combined_rank.c_str());
+  std::remove(radix_left_path.c_str()); std::remove(radix_left_rank.c_str());
+  std::remove(radix_right_path.c_str()); std::remove(radix_right_rank.c_str());
+  std::remove(changed_combined_path.c_str()); std::remove(changed_combined_rank.c_str());
+  std::remove(changed_left_path.c_str()); std::remove(changed_left_rank.c_str());
   std::filesystem::remove_all(workspace_root);
   return 0;
 }

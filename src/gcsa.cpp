@@ -91,6 +91,10 @@ constructionSemanticSettings(const InputGraph& graph,
   // old initial/path checkpoints with the v1 reduced key/start artifacts.
   settings["external_preprocessing"] = "v1";
   settings["external_final_events"] = "v1";
+  // Both formats affect deterministic transient ordering and therefore the
+  // semantic range names used by resumable join-partition tasks.
+  settings["external_join_planner"] = "v2-msd-range-pack";
+  settings["path_sort_run_codec"] = "v2-left-context-groups";
   settings["kmer_length"] = std::to_string(graph.k());
   settings["doubling_steps"] = std::to_string(parameters.getSteps());
   settings["sample_period"] = std::to_string(parameters.getSamplePeriod());
@@ -1104,10 +1108,22 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
         std::cerr << "externalPathGraphExtend(): "
                   << join_stats.join_parallel_sorts << " parallel join sorts, "
                   << join_stats.label_parallel_sorts << " parallel label sorts" << std::endl;
+        std::cerr << "externalPathGraphExtend(): sampled "
+                  << join_stats.sampled_plan_records << " join keys into "
+                  << join_stats.radix_plan_bins << " MSD range packs ("
+                  << join_stats.radix_plan_splits << " radix splits, "
+                  << join_stats.radix_plan_capped << " budget-capped plans, "
+                  << join_stats.radix_boundary_flushes << " exact boundary flushes, "
+                  << join_stats.restored_radix_plans << " restored plans)" << std::endl;
         std::cerr << "externalPathGraphExtend(): streamed "
                   << join_stats.direct_label_records << " records directly to label runs; avoided "
                   << formatBytes(join_stats.intermediate_path_bytes_avoided)
                   << " of intermediate path/rank I/O per direction" << std::endl;
+        std::cerr << "externalPathGraphExtend(): emitted "
+                  << join_stats.grouped_expansion_records
+                  << " compact left-context references across transient run passes; avoided "
+                  << formatBytes(join_stats.expansion_context_bytes_saved)
+                  << " of transient run payload" << std::endl;
         std::cerr << "externalPathGraphExtend(): maximum bounded workspace "
                   << formatBytes(join_stats.max_bytes_resident) << " ("
                   << join_stats.max_records_resident << " records)" << std::endl;
