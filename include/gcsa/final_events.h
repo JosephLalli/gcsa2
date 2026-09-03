@@ -159,6 +159,15 @@ void serializeFastBWTComponent(std::ostream& out,
   const std::string& mask_file, size_type paths, size_type expected_ones,
   comp_type comp, const ConstructionParameters& parameters);
 
+/*
+  Stream one sparse BWT component directly in the existing sd_vector<>
+  serialization. The mask file is replayed for each Elias--Fano member so no
+  builder or completed component is proportional to the path count.
+*/
+void serializeSparseBWTComponent(std::ostream& out,
+  const std::string& mask_file, size_type paths, size_type expected_ones,
+  comp_type comp, const ConstructionParameters& parameters);
+
 // Stream the stored-sample int_vector<0> in its existing packed format.
 void serializeSampleIds(std::ostream& out, const std::string& sample_file,
   size_type samples, size_type sample_bits,

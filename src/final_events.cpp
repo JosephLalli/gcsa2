@@ -624,6 +624,10 @@ template<class NextPosition>
 void
 serializePlainBitVector(std::ostream& out, size_type bits, NextPosition next_position)
 {
+  if(bits > std::numeric_limits<size_type>::max() - 63)
+  {
+    throw eventError("bitvector universe overflows");
+  }
   sdsl::int_vector<1>::write_header(bits, 1, out);
   const size_type words = (bits + 63) / 64;
   size_type next = 0;
@@ -1380,6 +1384,54 @@ serializeFastBWTComponent(std::ostream& out, const std::string& mask_file,
   {
     throw eventError("BWT mask count does not match metadata");
   }
+}
+
+void
+serializeSparseBWTComponent(std::ostream& out, const std::string& mask_file,
+  size_type paths, size_type expected_ones, comp_type comp,
+  const ConstructionParameters& parameters)
+{
+  if(comp >= FinalEventMetadata::MAX_SIGMA || expected_ones > paths)
+  {
+    throw eventError("invalid sparse BWT component metadata");
+  }
+
+  const auto replay = [&](const auto& consume)
+  {
+    MemoryBudget budget(parameters.getMemoryLimitBytes(),
+      parameters.getMemoryLimitBytes() / 8);
+    BufferedEventReader masks(mask_file, 1, paths,
+      componentBufferBytes(parameters, 1), budget, "final-bwt-mask-reader");
+    size_type path = 0, observed = 0;
+    const auto next = [&](size_type& position)
+    {
+      while(path < paths)
+      {
+        std::uint8_t mask = 0;
+        masks.nextByte(mask);
+        const size_type current = path++;
+        if(mask & (static_cast<size_type>(1) << comp))
+        {
+          position = current; observed++; return true;
+        }
+      }
+      return false;
+    };
+
+    consume(next);
+    // Packed low parts request exactly expected_ones positions instead of
+    // reading to EOF. Drain the remaining mask bytes so extra set bits and
+    // truncated streams are still detected in every replay.
+    size_type ignored = 0;
+    while(next(ignored)) { }
+    masks.finish();
+    if(observed != expected_ones)
+    {
+      throw eventError("BWT mask count does not match metadata");
+    }
+  };
+
+  serializeSparseVector(out, paths, expected_ones, replay);
 }
 
 void
@@ -2274,62 +2326,16 @@ storeFinalComponents(const GCSAHeader& header,
         write(empty);
         continue;
       }
-      MemoryBudget budget(parameters.getMemoryLimitBytes(),
-        parameters.getMemoryLimitBytes() / 8);
-      BufferedEventReader masks(files.bwt_masks, 1, metadata.paths,
-        componentBufferBytes(parameters, 1), budget, "final-bwt-mask-reader");
-      sdsl::sd_vector_builder builder(metadata.paths, metadata.bwt_counts[comp]);
-      size_type observed = 0;
-      for(size_type path = 0; path < metadata.paths; path++)
-      {
-        std::uint8_t mask = 0;
-        masks.nextByte(mask);
-        if(mask & (static_cast<size_type>(1) << comp))
-        {
-          builder.set(path);
-          observed++;
-        }
-      }
-      masks.finish();
-      if(observed != metadata.bwt_counts[comp])
-      {
-        throw eventError("BWT mask count does not match metadata");
-      }
-      GCSA::sparse_vector bwt(builder);
-      write(bwt);
+      serializeSparseBWTComponent(out, files.bwt_masks, metadata.paths,
+        metadata.bwt_counts[comp], static_cast<comp_type>(comp), parameters);
+      if(!out) { throw eventError("cannot write partial final index", partial); }
     }
+    // rank_support_sd serializes no payload and load() binds it to the sparse
+    // BWT already read above. Rebuilding every sparse vector solely to
+    // initialize this empty object doubled both scan I/O and peak memory.
     for(size_type comp = 0; comp < metadata.sigma; comp++)
     {
-      if(comp > 0 && comp <= metadata.fast_chars)
-      {
-        GCSA::sparse_vector::rank_1_type empty;
-        write(empty);
-        continue;
-      }
-      MemoryBudget budget(parameters.getMemoryLimitBytes(),
-        parameters.getMemoryLimitBytes() / 8);
-      BufferedEventReader masks(files.bwt_masks, 1, metadata.paths,
-        componentBufferBytes(parameters, 1), budget, "final-bwt-mask-reader");
-      sdsl::sd_vector_builder builder(metadata.paths, metadata.bwt_counts[comp]);
-      size_type observed = 0;
-      for(size_type path = 0; path < metadata.paths; path++)
-      {
-        std::uint8_t mask = 0;
-        masks.nextByte(mask);
-        if(mask & (static_cast<size_type>(1) << comp))
-        {
-          builder.set(path);
-          observed++;
-        }
-      }
-      masks.finish();
-      if(observed != metadata.bwt_counts[comp])
-      {
-        throw eventError("BWT mask count does not match metadata");
-      }
-      GCSA::sparse_vector bwt(builder);
       GCSA::sparse_vector::rank_1_type rank;
-      sdsl::util::init_support(rank, &bwt);
       write(rank);
     }
 
