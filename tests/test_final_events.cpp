@@ -111,6 +111,65 @@ int main()
   parameters.setIOBufferSize(128);
   parameters.setMergeFanIn(2);
 
+  // A path may represent more mapped start nodes than fit in RAM. Exercise
+  // both reusable in-memory sets and the forced external sort/dedup path with
+  // the minimum legal byte reservation.
+  const size_type node_set_budget = SpillableNodeSet::minimumBudget();
+  MemoryBudget node_memory(2 * node_set_budget);
+  {
+    SpillableNodeSet current(node_set_budget, 2, node_memory);
+    SpillableNodeSet predecessor(node_set_budget, 2, node_memory);
+    for(node_type value = 2048; value > 0; value--)
+    {
+      current.push_back(value + 100);
+      current.push_back(value + 100); // Deduplicate across spilled runs.
+      predecessor.push_back(value + 99);
+    }
+    current.finish(); predecessor.finish();
+    require(current.spilled() && predecessor.spilled());
+    require(current.size() == 2048 && predecessor.size() == 2048);
+
+    current.rewind(); predecessor.rewind();
+    node_type curr = 0, pred = 0;
+    for(node_type expected = 101; expected <= 2148; expected++)
+    {
+      require(current.next(curr) && predecessor.next(pred));
+      require(curr == expected && curr == pred + 1);
+    }
+    require(!current.next(curr) && !predecessor.next(pred));
+
+    // Reuse releases spill artifacts but retains the same admitted workspace.
+    current.clear();
+    current.push_back(9); current.push_back(3); current.push_back(9);
+    current.finish();
+    require(!current.spilled() && current.size() == 2);
+    current.rewind();
+    require(current.next(curr) && curr == 3);
+    require(current.next(curr) && curr == 9);
+    require(!current.next(curr));
+
+    // A rewind must reproduce the complete sorted stream; the final scan may
+    // make three current-set passes before emitting samples.
+    current.rewind();
+    require(current.next(curr) && curr == 3);
+    require(current.next(curr) && curr == 9);
+    require(!current.next(curr));
+
+    MemoryBudget::Stats node_stats = node_memory.stats();
+    require(node_stats.current == 2 * node_set_budget);
+    require(node_stats.maximum == 2 * node_set_budget);
+  }
+  require(node_memory.stats().current == 0);
+
+  bool tiny_node_budget_rejected = false;
+  try
+  {
+    MemoryBudget tiny_memory(node_set_budget);
+    SpillableNodeSet invalid(node_set_budget - 1, 2, tiny_memory);
+  }
+  catch(const std::runtime_error&) { tiny_node_budget_rejected = true; }
+  require(tiny_node_budget_rejected);
+
   // Components 1..4 use the fast representation in the default alphabet;
   // components 0, 5, and 6 exercise the sparse sides of the split.
   Alphabet alphabet;

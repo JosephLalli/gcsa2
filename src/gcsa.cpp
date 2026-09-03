@@ -409,6 +409,7 @@ struct MergedGraphReader
   bool intersect(const PathLabel& first, const PathLabel& last, size_type offset);
 
   void fromNodes(std::vector<node_type>& results, const NodeMapping& mapping);
+  void fromNodes(SpillableNodeSet& results, const NodeMapping& mapping);
 };
 
 void
@@ -560,6 +561,25 @@ MergedGraphReader::fromNodes(std::vector<node_type>& results, const NodeMapping&
   removeDuplicates(results, false);
 }
 
+void
+MergedGraphReader::fromNodes(SpillableNodeSet& results, const NodeMapping& mapping)
+{
+  results.clear();
+  const auto mapped = [&mapping](node_type node) {
+    return (mapping.empty() ? node :
+      Node::encode(mapping(Node::id(node)), Node::offset(node), Node::rc(node)));
+  };
+  results.push_back(mapped(this->paths[this->path].from));
+
+  size_type old_pointer = this->from;
+  while(this->from < this->from_nodes.size() && this->from_nodes[this->from].first == this->path)
+  {
+    results.push_back(mapped(this->from_nodes[this->from].second)); this->from++;
+  }
+  this->from = old_pointer;
+  results.finish();
+}
+
 //------------------------------------------------------------------------------
 
 namespace
@@ -568,10 +588,11 @@ namespace
 struct ExternalFinalScanStats
 {
   DiskBackedArray64::Stats previous_occurrences, suffix_tree_stack;
+  size_type from_node_spills, maximum_from_nodes;
   bool restored;
 
   ExternalFinalScanStats() : previous_occurrences(), suffix_tree_stack(),
-    restored(false) { }
+    from_node_spills(0), maximum_from_nodes(0), restored(false) { }
 };
 
 size_type
@@ -618,35 +639,83 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
   const size_type safety_margin = memory_limit / 8;
   MemoryBudget memory(memory_limit, safety_margin);
 
-  // Every ReadBuffer may simultaneously own its foreground window and its
-  // asynchronous refill vector. Reserve both for all three streams in each
-  // MergedGraphReader and for the leaf-LCP reader.
   const size_type reader_streams = 3 * (graph.alpha.sigma + 1) + 1;
   const size_type minimum_reader = std::max(sizeof(PathNode),
     std::max(sizeof(PathNode::rank_type), sizeof(range_type)));
-  size_type reader_buffer = std::max(minimum_reader,
-    std::min(parameters.getIOBufferSize(),
-      memory.available() / std::max(static_cast<size_type>(1), 4 * reader_streams)));
-  size_type reader_reservation_bytes = checkedProduct(2 * reader_streams,
-    reader_buffer, "final reader reservation");
-  MemoryBudget::Reservation reader_reservation = memory.reserve(
-    reader_reservation_bytes, "final-merged-graph-readers");
-
   const size_type writer_streams = graph.alpha.sigma + 6;
-  size_type writer_buffer = std::max(static_cast<size_type>(16),
-    std::min(parameters.getIOBufferSize(),
-      memory.available() / std::max(static_cast<size_type>(1), 2 * writer_streams)));
-  if(checkedProduct(writer_streams, writer_buffer,
-      "final writer reservation") > memory.available())
+  const size_type reader_minimum = checkedProduct(2 * reader_streams,
+    minimum_reader, "minimum final reader reservation");
+  const size_type writer_minimum = checkedProduct(writer_streams,
+    static_cast<size_type>(16), "minimum final writer reservation");
+  const size_type array_minimum =
+    (unique_from_nodes > 0 ? DiskBackedArray64::minimumCacheBytes() : 0) +
+    (merged_graph.size() > 0 ? DiskBackedArray64::minimumCacheBytes() : 0);
+
+  // One merged path can represent an arbitrarily large set of original start
+  // nodes. Reserve two reusable external sets before sizing the reader/writer
+  // caches, because current and predecessor sets must coexist for the
+  // continuation test. Their in-memory collection buffers are small for the
+  // common case; an oversized set becomes a sorted, deduplicated disk stream.
+  const size_type minimum_node_set = SpillableNodeSet::minimumBudget();
+  const size_type non_set_minimum = reader_minimum + writer_minimum + array_minimum;
+  if(memory.available() < non_set_minimum + 2 * minimum_node_set)
   {
-    throw std::runtime_error("GCSA::GCSA(): memory limit cannot hold final event buffers");
+    throw std::runtime_error("GCSA::GCSA(): memory limit cannot hold the minimum final-scan workspace");
   }
+  size_type desired_node_set = std::max(minimum_node_set,
+    std::min(parameters.getIOBufferSize(), parameters.getSortRunSize()));
+  size_type node_set_cap = (memory.available() - non_set_minimum) / 2;
+  size_type node_set_budget = std::min(node_set_cap,
+    std::max(minimum_node_set,
+      std::min(desired_node_set, memory.available() / 16)));
+
+  // ExternalFixedRecordSorter owns two descriptors per merge input and four
+  // fixed descriptors. The predecessor set may be sorted while the current
+  // set has one read descriptor open. Account those on top of every final scan
+  // reader, writer, and mutable disk array; this turns --max-open-files into a
+  // real ceiling rather than an advisory fan-in value.
+  const size_type fixed_descriptors = reader_streams + writer_streams + 2;
+  const size_type sorter_fixed_descriptors = 5;
+  if(parameters.getMaxOpenFiles() < fixed_descriptors +
+     sorter_fixed_descriptors + 2 * 2)
+  {
+    throw std::runtime_error("GCSA::GCSA(): max-open-files cannot hold the final-scan streams");
+  }
+  size_type node_set_fan_in = std::min(parameters.getMergeFanIn(),
+    (parameters.getMaxOpenFiles() - fixed_descriptors -
+      sorter_fixed_descriptors) / 2);
+  node_set_fan_in = std::max(static_cast<size_type>(2), node_set_fan_in);
 
   std::string previous_name = TempFile::getName("gcsa_final_prev_occ");
   std::string stack_name = TempFile::getName("gcsa_final_lcp_stack");
   try
   {
     {
+      SpillableNodeSet curr_from(node_set_budget, node_set_fan_in, memory);
+      SpillableNodeSet pred_from(node_set_budget, node_set_fan_in, memory);
+
+      // Every ReadBuffer may simultaneously own its foreground window and its
+      // asynchronous refill vector. Admit both windows only after the two
+      // persistent start-node workspaces, so later writer reservations cannot
+      // wait on memory that this single-threaded phase will never release.
+      size_type reader_buffer = std::max(minimum_reader,
+        std::min(parameters.getIOBufferSize(),
+          memory.available() /
+          std::max(static_cast<size_type>(1), 4 * reader_streams)));
+      size_type reader_reservation_bytes = checkedProduct(2 * reader_streams,
+        reader_buffer, "final reader reservation");
+      MemoryBudget::Reservation reader_reservation = memory.reserve(
+        reader_reservation_bytes, "final-merged-graph-readers");
+
+      size_type writer_buffer = std::max(static_cast<size_type>(16),
+        std::min(parameters.getIOBufferSize(),
+          memory.available() /
+          std::max(static_cast<size_type>(1), 2 * writer_streams)));
+      if(checkedProduct(writer_streams, writer_buffer,
+          "final writer reservation") > memory.available())
+      {
+        throw std::runtime_error("GCSA::GCSA(): memory limit cannot hold final event buffers");
+      }
       FinalEventWriter output(files, graph.alpha.sigma, writer_buffer, memory);
       size_type cache_bytes = memory.available();
       size_type previous_cache = cache_bytes / 2;
@@ -675,10 +744,12 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
       lcp_array.open(merged_graph.lcp_name, reader_buffer);
 
       PathLabel first, last;
-      std::vector<node_type> pred_from, curr_from;
       size_type stack_size = 0;
       for(size_type i = 0; i < merged_graph.size(); i++, reader[0].advance())
       {
+        // Close any predecessor spill reader retained by the preceding path
+        // before current-set collection can invoke the external sorter.
+        pred_from.clear();
         size_type indegree = 0, pred_comp = 0;
         byte_type predecessor_mask = 0;
         bool sample_this = false;
@@ -701,9 +772,15 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
         output.path(predecessor_mask);
 
         reader[0].fromNodes(curr_from, graph.mapping);
-        if(curr_from.empty())
+        if(curr_from.size() == 0)
         {
           throw std::runtime_error("GCSA::GCSA(): merged path has no start node");
+        }
+        if(stats != nullptr)
+        {
+          stats->from_node_spills += curr_from.spilled();
+          stats->maximum_from_nodes = std::max(stats->maximum_from_nodes,
+            curr_from.size());
         }
         output.occurrence(i, curr_from.size() - 1);
 
@@ -725,7 +802,9 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
           stack_size++;
         }
 
-        for(node_type node : curr_from)
+        node_type node;
+        curr_from.rewind();
+        while(curr_from.next(node))
         {
           if(node >= from_nodes.size() || !from_nodes[node])
           {
@@ -761,7 +840,8 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
         {
           sample_this = true;
         }
-        for(node_type node : curr_from)
+        curr_from.rewind();
+        while(curr_from.next(node))
         {
           if(node % parameters.getSamplePeriod() == 0)
           {
@@ -776,12 +856,20 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
             throw std::runtime_error("GCSA::GCSA(): unsampled path has no predecessor");
           }
           reader[pred_comp + 1].fromNodes(pred_from, graph.mapping);
+          if(stats != nullptr)
+          {
+            stats->from_node_spills += pred_from.spilled();
+            stats->maximum_from_nodes = std::max(stats->maximum_from_nodes,
+              pred_from.size());
+          }
           if(pred_from.size() != curr_from.size()) { sample_this = true; }
           else
           {
-            for(size_type j = 0; j < curr_from.size(); j++)
+            node_type curr_node, pred_node;
+            curr_from.rewind(); pred_from.rewind();
+            while(curr_from.next(curr_node))
             {
-              if(curr_from[j] != pred_from[j] + 1)
+              if(!pred_from.next(pred_node) || curr_node != pred_node + 1)
               {
                 sample_this = true; break;
               }
@@ -792,7 +880,8 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
         if(sample_this)
         {
           output.sampledPath(i);
-          for(node_type node : curr_from) { output.sample(node); }
+          curr_from.rewind();
+          while(curr_from.next(node)) { output.sample(node); }
           output.sampleEnd();
         }
       }
@@ -1122,6 +1211,9 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
                   << event_stats.previous_occurrences.block_writes << " writes; ST stack "
                   << event_stats.suffix_tree_stack.block_reads << " reads / "
                   << event_stats.suffix_tree_stack.block_writes << " writes" << std::endl;
+        std::cerr << "GCSA::GCSA(): final start-node sets: "
+                  << event_stats.from_node_spills << " spills, maximum "
+                  << event_stats.maximum_from_nodes << " unique nodes" << std::endl;
       }
     }
   }

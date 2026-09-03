@@ -46,6 +46,7 @@ constexpr size_type ConstructionParameters::SORT_RUN_SIZE;
 constexpr size_type ConstructionParameters::JOIN_PARTITION_SIZE;
 constexpr size_type ConstructionParameters::MERGE_FAN_IN;
 constexpr size_type ConstructionParameters::MAX_OPEN_FILES;
+constexpr size_type ConstructionParameters::MIN_OPEN_FILES;
 constexpr size_type ConstructionParameters::CHECKPOINT_RECORDS;
 constexpr size_type ConstructionParameters::CHECKPOINT_BYTES;
 
@@ -205,10 +206,9 @@ ConstructionParameters::setMergeFanIn(size_type fan_in)
 void
 ConstructionParameters::setMaxOpenFiles(size_type files)
 {
-  // Final merged-graph construction owns four output streams, up to eight
-  // descriptors in its two-way external from-set sorter, two spill files, and
-  // at least one two-file PathGraph input pair.
-  this->max_open_files = std::max((size_type)16, files);
+  // The final event scan has more fixed streams than PathGraph pruning and
+  // merging. Keep enough headroom for its bounded two-way sorter as well.
+  this->max_open_files = std::max(MIN_OPEN_FILES, files);
 }
 
 void

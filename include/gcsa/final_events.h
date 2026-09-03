@@ -20,6 +20,44 @@ namespace gcsa
 {
 
 /*
+  A mapped start-node set used by the final merged-graph scan.
+
+  Most paths have only a few start nodes, so the set remains an in-memory
+  sorted vector. If a single path has more nodes than the reserved workspace,
+  records are streamed to disk, externally sorted and deduplicated, and then
+  exposed through the same rewind()/next() interface. The reservation covers
+  mutually exclusive collection, external-sort, and readback phases.
+
+  This class is public only so the forced-spill behavior can be unit tested;
+  it is a construction helper and is not part of the query interface.
+*/
+class SpillableNodeSet
+{
+public:
+  SpillableNodeSet(size_type byte_budget, size_type merge_fan_in,
+    MemoryBudget& memory);
+  ~SpillableNodeSet();
+
+  void clear();
+  void push_back(node_type value);
+  void finish();
+
+  size_type size() const;
+  bool spilled() const;
+  void rewind();
+  bool next(node_type& value);
+
+  static size_type minimumBudget();
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+
+  SpillableNodeSet(const SpillableNodeSet&) = delete;
+  SpillableNodeSet& operator=(const SpillableNodeSet&) = delete;
+};
+
+/*
   The final merged-graph scan is globally ordered and therefore deliberately
   remains a single atomic task. It writes these immutable streams and commits
   them together. Component construction can then restart without repeating the

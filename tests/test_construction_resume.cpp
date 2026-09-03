@@ -56,7 +56,7 @@ externalParameters(const std::string& workspace, size_type memory_limit)
   parameters.setSortRunSize(externalPathGraphSortMinimumBudget());
   parameters.setJoinPartitionSize(externalPathJoinMinimumBudget());
   parameters.setMergeFanIn(2);
-  parameters.setMaxOpenFiles(16);
+  parameters.setMaxOpenFiles(ConstructionParameters::MIN_OPEN_FILES);
   return parameters;
 }
 
@@ -75,6 +75,12 @@ main()
   const std::string input_name = "tests/cycle.gcsa2";
   const std::string legacy_prefix = std::string(legacy_root) + "/index";
   const std::string external_prefix = std::string(workspace_root) + "/index";
+  const std::string mapping_name = std::string(legacy_root) + "/mapping";
+  // Exercise mapping-before-deduplication in the final start-node set: the
+  // mapping is deliberately non-monotone and collapses two input node ids.
+  NodeMapping mapping(1);
+  mapping.insert(2); mapping.insert(2); mapping.insert(1);
+  require(sdsl::store_to_file(mapping, mapping_name));
   // Prefix doubling streams join results directly into label sorting, so the
   // configured ceiling must admit both independently byte-bounded stages.
   const size_type external_minimum = externalPathJoinMinimumBudget() +
@@ -87,7 +93,7 @@ main()
     ConstructionParameters parameters;
     parameters.setSteps(2);
     parameters.setMemoryLimitBytes(MEGABYTE);
-    InputGraph graph({ input_name }, false, parameters);
+    InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
     GCSA index(graph, parameters);
     LCPArray lcp(graph, parameters);
     require(verifyIndex(index, &lcp, graph));
@@ -103,7 +109,7 @@ main()
     bool stopped = false;
     try
     {
-      InputGraph graph({ input_name }, false, parameters);
+      InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
       GCSA index(graph, parameters);
     }
     catch(const ConstructionStopped& event)
@@ -125,7 +131,7 @@ main()
     bool stopped = false;
     try
     {
-      InputGraph graph({ input_name }, false, parameters);
+      InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
       GCSA index(graph, parameters);
     }
     catch(const ConstructionStopped& event)
@@ -143,7 +149,7 @@ main()
     ConstructionParameters parameters = externalParameters(workspace_root,
       external_minimum + 64 * KILOBYTE);
     parameters.setResume();
-    InputGraph graph({ input_name }, false, parameters);
+    InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
     GCSA index(graph, parameters);
     LCPArray lcp(graph, parameters);
     require(verifyIndex(index, &lcp, graph));
@@ -164,7 +170,7 @@ main()
       external_minimum + 128 * KILOBYTE);
     parameters.setSteps(1);
     parameters.setResume();
-    InputGraph graph({ input_name }, false, parameters);
+    InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
     GCSA index(graph, parameters);
   }
   catch(const std::runtime_error&)

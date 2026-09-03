@@ -22,7 +22,7 @@ int main()
 
   ConstructionParameters parameters;
   parameters.setMaxOpenFiles(1);
-  require(parameters.getMaxOpenFiles() == 16);
+  require(parameters.getMaxOpenFiles() == ConstructionParameters::MIN_OPEN_FILES);
   parameters.setWorkDirectory("/tmp/example.gcsa-work/");
   parameters.setResume(); parameters.setKeepWork();
   parameters.setMemoryLimitBytes(parseBytes("96G"));
