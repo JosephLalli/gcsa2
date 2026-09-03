@@ -37,12 +37,29 @@ namespace
 constexpr std::uint64_t JOIN_HEADER_MAGIC = 0x314e494f4a534347ULL; // "GCSJOIN1"
 constexpr std::uint64_t JOIN_FOOTER_MAGIC = 0x31444e454a534347ULL; // "GCSJEND1"
 constexpr std::uint32_t JOIN_FORMAT_VERSION = 1;
+// Every sorted join run has an immutable companion that carries exact key
+// groups and a one-byte per-record aggregate for range tiling.  Planning can
+// consequently stream compact summaries instead of reopening every wide
+// JoinRecord after the bounded radix sample.
+constexpr std::uint64_t JOIN_GROUP_HEADER_MAGIC = 0x3150555247534347ULL; // "GCSGRUP1"
+constexpr std::uint64_t JOIN_GROUP_FOOTER_MAGIC = 0x31444e4547534347ULL; // "GCSGEND1"
+constexpr std::uint64_t JOIN_DETAIL_HEADER_MAGIC = 0x314c544447534347ULL; // "GCSGDTL1"
+constexpr std::uint64_t JOIN_DETAIL_FOOTER_MAGIC = 0x3154454447534347ULL; // "GCSGDET1"
+constexpr std::uint32_t JOIN_GROUP_FORMAT_VERSION = 1;
 constexpr size_type JOIN_BASE_FIXED_BYTES = 32 * KILOBYTE;
 constexpr size_type JOIN_LABEL_COUNT = PathLabel::LABEL_LENGTH + 1;
 constexpr size_type JOIN_HEADER_BYTES = 8 + 4 + 4 + 4 + 8;
 constexpr size_type JOIN_FOOTER_BYTES = 8 + 8 + 8;
 constexpr size_type JOIN_RECORD_BYTES =
   4 + 3 * sizeof(node_type) + 4 + 8 + JOIN_LABEL_COUNT * sizeof(PathNode::rank_type);
+constexpr size_type JOIN_GROUP_HEADER_BYTES = 8 + 4 + 4 + 4 + 4 + 3 * sizeof(std::uint64_t);
+constexpr size_type JOIN_GROUP_FOOTER_BYTES = 8 + 4 * sizeof(std::uint64_t);
+constexpr size_type JOIN_DETAIL_HEADER_BYTES = 8 + 4 + 4 + 4 + 4 + 2 * sizeof(std::uint64_t);
+constexpr size_type JOIN_DETAIL_FOOTER_BYTES = 8 + 3 * sizeof(std::uint64_t);
+constexpr size_type JOIN_GROUP_SUMMARY_BYTES = sizeof(node_type) + 5 * sizeof(std::uint64_t);
+constexpr std::uint8_t JOIN_DETAIL_ORDER_MASK = 0x1F;
+constexpr std::uint8_t JOIN_DETAIL_SORTED = 0x80;
+constexpr std::uint8_t JOIN_DETAIL_RESERVED = 0x60;
 // Join records are compact on disk, so issuing one system call per record can
 // turn a sequential spill into syscall-bound I/O. Keep all phase-local I/O
 // caches byte-sized and account for them in the same join reservation.
@@ -52,8 +69,12 @@ constexpr size_type JOIN_PARALLEL_SORT_MIN_RECORDS = 64 * 1024;
 // Run generation may simultaneously have a join writer, path/rank source
 // caches, and path/rank output caches. Merge reader caches are accounted per
 // input when selecting fan-in below.
-constexpr size_type JOIN_FIXED_BYTES = JOIN_BASE_FIXED_BYTES + 5 * JOIN_IO_BUFFER_BYTES;
+// The output run has a payload cache plus summary and compact-detail sidecar
+// caches. Account for all of them in the same reservation as merge readers.
+constexpr size_type JOIN_FIXED_BYTES = JOIN_BASE_FIXED_BYTES + 7 * JOIN_IO_BUFFER_BYTES;
 static_assert(JOIN_IO_BUFFER_RECORDS > 0, "join record exceeds the I/O buffer");
+static_assert(PathLabel::LABEL_LENGTH <= JOIN_DETAIL_ORDER_MASK,
+  "join group detail cannot encode PathNode order");
 // Clean page cache is charged to a cgroup's MemoryMax. Keep a small rolling
 // tail and evict completed sequential prefixes so disk, not cache, remains the
 // authoritative working set. The larger flush interval amortizes fdatasync().
@@ -75,16 +96,54 @@ struct JoinRecord
   PathNode::rank_type labels[JOIN_LABEL_COUNT];
 };
 
+struct JoinGroupSummary
+{
+  node_type key;
+  size_type begin, end, count, order_sum;
+  size_type bypass_paths, bypass_ranks;
+
+  JoinGroupSummary() : key(0), begin(0), end(0), count(0), order_sum(0),
+    bypass_paths(0), bypass_ranks(0) { }
+};
+
+struct JoinGroupSidecar
+{
+  std::string summary_name, detail_name;
+  size_type groups;
+  std::uint64_t summary_checksum, detail_checksum;
+
+  JoinGroupSidecar(const std::string& summaries = std::string(),
+    const std::string& details = std::string(), size_type group_count = 0,
+    std::uint64_t summaries_checksum = 0, std::uint64_t details_checksum = 0) :
+    summary_name(summaries), detail_name(details), groups(group_count),
+    summary_checksum(summaries_checksum), detail_checksum(details_checksum) { }
+
+  bool complete() const
+  {
+    return !this->summary_name.empty() && !this->detail_name.empty();
+  }
+};
+
 struct JoinRun
 {
   std::string name;
   size_type records;
   std::uint64_t checksum;
+  JoinGroupSidecar sidecar;
 
   JoinRun(const std::string& path = std::string(), size_type count = 0,
-    std::uint64_t payload_checksum = 0) :
-    name(path), records(count), checksum(payload_checksum) { }
+    std::uint64_t payload_checksum = 0,
+    const JoinGroupSidecar& group_sidecar = JoinGroupSidecar()) :
+    name(path), records(count), checksum(payload_checksum), sidecar(group_sidecar) { }
 };
+
+void
+removeJoinRun(JoinRun& run)
+{
+  TempFile::remove(run.name);
+  TempFile::remove(run.sidecar.summary_name);
+  TempFile::remove(run.sidecar.detail_name);
+}
 
 std::runtime_error
 joinError(const std::string& message, const std::string& path = std::string())
@@ -92,6 +151,9 @@ joinError(const std::string& message, const std::string& path = std::string())
   return std::runtime_error("externalPathGraphExtend(): " + message +
     (path.empty() ? std::string() : ": " + path));
 }
+
+size_type checkedJoinAdd(size_type left, size_type right, const char* description);
+size_type checkedJoinMultiply(size_type left, size_type right, const char* description);
 
 void
 adviseSequential(int descriptor)
@@ -275,6 +337,315 @@ decodeJoinRecord(const std::array<std::uint8_t, JOIN_RECORD_BYTES>& buffer,
   }
 }
 
+void
+encodeJoinGroupSummary(const JoinGroupSummary& source,
+  std::array<std::uint8_t, JOIN_GROUP_SUMMARY_BYTES>& buffer)
+{
+  if(source.end < source.begin || source.count != source.end - source.begin)
+  {
+    throw joinError("invalid join-key group half-open range");
+  }
+  std::uint8_t* out = buffer.data();
+  encodeLittle<node_type>(out, source.key);
+  encodeLittle<std::uint64_t>(out, source.begin);
+  encodeLittle<std::uint64_t>(out, source.end);
+  encodeLittle<std::uint64_t>(out, source.order_sum);
+  encodeLittle<std::uint64_t>(out, source.bypass_paths);
+  encodeLittle<std::uint64_t>(out, source.bypass_ranks);
+}
+
+void
+decodeJoinGroupSummary(const std::array<std::uint8_t, JOIN_GROUP_SUMMARY_BYTES>& buffer,
+  JoinGroupSummary& target)
+{
+  const std::uint8_t* in = buffer.data();
+  target.key = decodeLittle<node_type>(in);
+  target.begin = decodeLittle<std::uint64_t>(in);
+  target.end = decodeLittle<std::uint64_t>(in);
+  target.order_sum = decodeLittle<std::uint64_t>(in);
+  target.bypass_paths = decodeLittle<std::uint64_t>(in);
+  target.bypass_ranks = decodeLittle<std::uint64_t>(in);
+  if(target.end < target.begin)
+  {
+    throw joinError("invalid join-key group half-open range");
+  }
+  target.count = target.end - target.begin;
+  if(target.bypass_paths > target.count || target.bypass_ranks < target.bypass_paths)
+  {
+    throw joinError("invalid join-key group aggregate");
+  }
+}
+
+class JoinGroupSidecarWriter
+{
+public:
+  JoinGroupSidecarWriter(logical_file_id_t logical, JoinKeyKind kind) :
+    logical_id(logical), key_kind(kind), summary_name(TempFile::getName("gcsa_join_groups")),
+    detail_name(TempFile::getName("gcsa_join_group_detail")),
+    summary_descriptor(-1), detail_descriptor(-1), group_count(0), detail_records(0),
+    summary_checksum(1469598103934665603ULL),
+    detail_checksum(1469598103934665603ULL), summary_released(0), detail_released(0),
+    active(), have_active(false), finished(false), summary_buffer(), detail_buffer()
+  {
+    this->summary_descriptor = ::open(this->summary_name.c_str(),
+      O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if(this->summary_descriptor < 0)
+    {
+      throw joinError("cannot create join group sidecar", this->summary_name);
+    }
+    this->detail_descriptor = ::open(this->detail_name.c_str(),
+      O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if(this->detail_descriptor < 0)
+    {
+      int saved_errno = errno; ::close(this->summary_descriptor);
+      this->summary_descriptor = -1;
+      errno = saved_errno;
+      throw joinError("cannot create join group detail sidecar", this->detail_name);
+    }
+    adviseSequential(this->summary_descriptor); adviseSequential(this->detail_descriptor);
+    this->writeHeaders();
+    this->summary_buffer.reserve(std::max(static_cast<size_type>(1),
+      JOIN_IO_BUFFER_BYTES / JOIN_GROUP_SUMMARY_BYTES));
+    this->detail_buffer.reserve(JOIN_IO_BUFFER_BYTES);
+  }
+
+  ~JoinGroupSidecarWriter()
+  {
+    if(this->summary_descriptor >= 0) { ::close(this->summary_descriptor); }
+    if(this->detail_descriptor >= 0) { ::close(this->detail_descriptor); }
+    if(!this->finished)
+    {
+      TempFile::remove(this->summary_name); TempFile::remove(this->detail_name);
+    }
+  }
+
+  void writeRecord(const JoinRecord& record, size_type offset)
+  {
+    if(offset != this->detail_records)
+    {
+      throw joinError("join group sidecar record offset mismatch", this->summary_name);
+    }
+    if(!this->have_active)
+    {
+      this->startGroup(record.key, offset);
+    }
+    else if(record.key != this->active.key)
+    {
+      if(record.key < this->active.key)
+      {
+        throw joinError("join run is not ordered by join key", this->summary_name);
+      }
+      this->finishGroup(offset); this->startGroup(record.key, offset);
+    }
+
+    size_type order = record.node.order();
+    if(order > PathLabel::LABEL_LENGTH || order > JOIN_DETAIL_ORDER_MASK)
+    {
+      throw joinError("join group detail has invalid path order", this->detail_name);
+    }
+    std::uint8_t detail = static_cast<std::uint8_t>(order);
+    if(record.node.sorted()) { detail |= JOIN_DETAIL_SORTED; }
+    this->detail_buffer.push_back(detail);
+    this->detail_checksum = joinChecksum(&detail, sizeof(detail), this->detail_checksum);
+    this->detail_records++;
+    this->active.count++;
+    this->active.order_sum = checkedJoinAdd(this->active.order_sum, order,
+      "group order sum");
+    if(record.node.sorted())
+    {
+      this->active.bypass_paths++;
+      this->active.bypass_ranks = checkedJoinAdd(this->active.bypass_ranks,
+        order + 1, "group bypass ranks");
+    }
+    if(this->detail_buffer.size() >= JOIN_IO_BUFFER_BYTES) { this->flushDetails(); }
+  }
+
+  JoinGroupSidecar finish(size_type records, std::uint64_t run_checksum)
+  {
+    if(this->finished)
+    {
+      throw joinError("join group sidecar already finished", this->summary_name);
+    }
+    if(this->detail_records != records)
+    {
+      throw joinError("join group sidecar record count mismatch", this->summary_name);
+    }
+    if(this->have_active) { this->finishGroup(records); }
+    this->flushSummaries(); this->flushDetails();
+    this->writeFinalMetadata(records, run_checksum);
+    this->writeFooters(records, run_checksum);
+    trimWrittenCache(this->summary_descriptor, this->summary_released, true,
+      this->summary_name);
+    trimWrittenCache(this->detail_descriptor, this->detail_released, true,
+      this->detail_name);
+    if(::close(this->summary_descriptor) != 0)
+    {
+      throw joinError("cannot close join group sidecar", this->summary_name);
+    }
+    this->summary_descriptor = -1;
+    if(::close(this->detail_descriptor) != 0)
+    {
+      throw joinError("cannot close join group detail sidecar", this->detail_name);
+    }
+    this->detail_descriptor = -1; this->finished = true;
+    return JoinGroupSidecar(this->summary_name, this->detail_name, this->group_count,
+      this->summary_checksum, this->detail_checksum);
+  }
+
+  void discard()
+  {
+    if(this->summary_descriptor >= 0)
+    {
+      ::close(this->summary_descriptor); this->summary_descriptor = -1;
+    }
+    if(this->detail_descriptor >= 0)
+    {
+      ::close(this->detail_descriptor); this->detail_descriptor = -1;
+    }
+    TempFile::remove(this->summary_name); TempFile::remove(this->detail_name);
+    this->finished = true;
+  }
+
+private:
+  void writeHeaders()
+  {
+    std::array<std::uint8_t, JOIN_GROUP_HEADER_BYTES> summary_header;
+    std::uint8_t* summary = summary_header.data();
+    encodeLittle<std::uint64_t>(summary, JOIN_GROUP_HEADER_MAGIC);
+    encodeLittle<std::uint32_t>(summary, JOIN_GROUP_FORMAT_VERSION);
+    encodeLittle<std::uint32_t>(summary, static_cast<std::uint32_t>(this->key_kind));
+    encodeLittle<std::uint32_t>(summary, this->logical_id.value);
+    encodeLittle<std::uint32_t>(summary, 0);
+    encodeLittle<std::uint64_t>(summary, 0);
+    encodeLittle<std::uint64_t>(summary, 0);
+    encodeLittle<std::uint64_t>(summary, 0);
+    writeAll(this->summary_descriptor, summary_header.data(), summary_header.size(),
+      this->summary_name);
+
+    std::array<std::uint8_t, JOIN_DETAIL_HEADER_BYTES> detail_header;
+    std::uint8_t* details = detail_header.data();
+    encodeLittle<std::uint64_t>(details, JOIN_DETAIL_HEADER_MAGIC);
+    encodeLittle<std::uint32_t>(details, JOIN_GROUP_FORMAT_VERSION);
+    encodeLittle<std::uint32_t>(details, static_cast<std::uint32_t>(this->key_kind));
+    encodeLittle<std::uint32_t>(details, this->logical_id.value);
+    encodeLittle<std::uint32_t>(details, 0);
+    encodeLittle<std::uint64_t>(details, 0);
+    encodeLittle<std::uint64_t>(details, 0);
+    writeAll(this->detail_descriptor, detail_header.data(), detail_header.size(),
+      this->detail_name);
+  }
+
+  void startGroup(node_type key, size_type begin)
+  {
+    this->active = JoinGroupSummary();
+    this->active.key = key; this->active.begin = begin; this->active.end = begin;
+    this->have_active = true;
+  }
+
+  void finishGroup(size_type end)
+  {
+    if(!this->have_active || end < this->active.begin ||
+       this->active.count != end - this->active.begin)
+    {
+      throw joinError("invalid join group sidecar range", this->summary_name);
+    }
+    this->active.end = end;
+    std::array<std::uint8_t, JOIN_GROUP_SUMMARY_BYTES> encoded;
+    encodeJoinGroupSummary(this->active, encoded);
+    this->summary_checksum = joinChecksum(encoded.data(), encoded.size(),
+      this->summary_checksum);
+    this->summary_buffer.push_back(encoded); this->group_count++;
+    this->have_active = false;
+    if(this->summary_buffer.size() * JOIN_GROUP_SUMMARY_BYTES >= JOIN_IO_BUFFER_BYTES)
+    {
+      this->flushSummaries();
+    }
+  }
+
+  void flushSummaries()
+  {
+    if(this->summary_buffer.empty()) { return; }
+    writeAll(this->summary_descriptor, this->summary_buffer.data(),
+      this->summary_buffer.size() * JOIN_GROUP_SUMMARY_BYTES, this->summary_name);
+    this->summary_buffer.clear();
+    if(::lseek(this->summary_descriptor, 0, SEEK_CUR) - this->summary_released >=
+       JOIN_CACHE_FLUSH_BYTES)
+    {
+      trimWrittenCache(this->summary_descriptor, this->summary_released, false,
+        this->summary_name);
+    }
+  }
+
+  void flushDetails()
+  {
+    if(this->detail_buffer.empty()) { return; }
+    writeAll(this->detail_descriptor, this->detail_buffer.data(),
+      this->detail_buffer.size(), this->detail_name);
+    this->detail_buffer.clear();
+    if(::lseek(this->detail_descriptor, 0, SEEK_CUR) - this->detail_released >=
+       JOIN_CACHE_FLUSH_BYTES)
+    {
+      trimWrittenCache(this->detail_descriptor, this->detail_released, false,
+        this->detail_name);
+    }
+  }
+
+  void writeFinalMetadata(size_type records, std::uint64_t run_checksum)
+  {
+    std::array<std::uint8_t, 3 * sizeof(std::uint64_t)> summary_metadata;
+    std::uint8_t* summary = summary_metadata.data();
+    encodeLittle<std::uint64_t>(summary, records);
+    encodeLittle<std::uint64_t>(summary, run_checksum);
+    encodeLittle<std::uint64_t>(summary, this->group_count);
+    pwriteAll(this->summary_descriptor, summary_metadata.data(), summary_metadata.size(),
+      24, this->summary_name);
+
+    std::array<std::uint8_t, 2 * sizeof(std::uint64_t)> detail_metadata;
+    std::uint8_t* details = detail_metadata.data();
+    encodeLittle<std::uint64_t>(details, records);
+    encodeLittle<std::uint64_t>(details, run_checksum);
+    pwriteAll(this->detail_descriptor, detail_metadata.data(), detail_metadata.size(),
+      24, this->detail_name);
+  }
+
+  void writeFooters(size_type records, std::uint64_t run_checksum)
+  {
+    std::array<std::uint8_t, JOIN_GROUP_FOOTER_BYTES> summary_footer;
+    std::uint8_t* summary = summary_footer.data();
+    encodeLittle<std::uint64_t>(summary, JOIN_GROUP_FOOTER_MAGIC);
+    encodeLittle<std::uint64_t>(summary, records);
+    encodeLittle<std::uint64_t>(summary, run_checksum);
+    encodeLittle<std::uint64_t>(summary, this->group_count);
+    encodeLittle<std::uint64_t>(summary, this->summary_checksum);
+    writeAll(this->summary_descriptor, summary_footer.data(), summary_footer.size(),
+      this->summary_name);
+
+    std::array<std::uint8_t, JOIN_DETAIL_FOOTER_BYTES> detail_footer;
+    std::uint8_t* details = detail_footer.data();
+    encodeLittle<std::uint64_t>(details, JOIN_DETAIL_FOOTER_MAGIC);
+    encodeLittle<std::uint64_t>(details, records);
+    encodeLittle<std::uint64_t>(details, run_checksum);
+    encodeLittle<std::uint64_t>(details, this->detail_checksum);
+    writeAll(this->detail_descriptor, detail_footer.data(), detail_footer.size(),
+      this->detail_name);
+  }
+
+  JoinGroupSidecarWriter(const JoinGroupSidecarWriter&);
+  JoinGroupSidecarWriter& operator=(const JoinGroupSidecarWriter&);
+
+  logical_file_id_t logical_id;
+  JoinKeyKind key_kind;
+  std::string summary_name, detail_name;
+  int summary_descriptor, detail_descriptor;
+  size_type group_count, detail_records;
+  std::uint64_t summary_checksum, detail_checksum;
+  off_t summary_released, detail_released;
+  JoinGroupSummary active;
+  bool have_active, finished;
+  std::vector<std::array<std::uint8_t, JOIN_GROUP_SUMMARY_BYTES>> summary_buffer;
+  std::vector<std::uint8_t> detail_buffer;
+};
+
 bool
 joinRecordLess(const JoinRecord& left, const JoinRecord& right)
 {
@@ -305,7 +676,8 @@ class JoinFileWriter
 public:
   JoinFileWriter(const std::string& path, logical_file_id_t logical, JoinKeyKind kind) :
     name(path), logical_id(logical), key_kind(kind), descriptor(-1), count(0),
-    checksum(1469598103934665603ULL), cache_released(0), finished(false), buffer()
+    checksum(1469598103934665603ULL), cache_released(0), finished(false),
+    sidecar(logical, kind), buffer()
   {
     this->descriptor = ::open(this->name.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
     if(this->descriptor < 0) { throw joinError("cannot create join run", this->name); }
@@ -329,6 +701,7 @@ public:
 
   void writeRecord(const JoinRecord& record)
   {
+    this->sidecar.writeRecord(record, this->count);
     std::array<std::uint8_t, JOIN_RECORD_BYTES> encoded;
     encodeJoinRecord(record, encoded);
     this->checksum = joinChecksum(encoded.data(), encoded.size(), this->checksum);
@@ -340,21 +713,35 @@ public:
   JoinRun finish()
   {
     if(this->finished) { throw joinError("join run already finished", this->name); }
-    this->flushRecords();
-    std::array<std::uint8_t, 8> encoded_count;
-    std::uint8_t* count_out = encoded_count.data();
-    encodeLittle<std::uint64_t>(count_out, this->count);
-    pwriteAll(this->descriptor, encoded_count.data(), encoded_count.size(), 20, this->name);
-    std::array<std::uint8_t, JOIN_FOOTER_BYTES> footer;
-    std::uint8_t* out = footer.data();
-    encodeLittle<std::uint64_t>(out, JOIN_FOOTER_MAGIC);
-    encodeLittle<std::uint64_t>(out, this->count);
-    encodeLittle<std::uint64_t>(out, this->checksum);
-    writeAll(this->descriptor, footer.data(), footer.size(), this->name);
-    trimWrittenCache(this->descriptor, this->cache_released, true, this->name);
-    if(::close(this->descriptor) != 0) { throw joinError("cannot close join run", this->name); }
-    this->descriptor = -1; this->finished = true;
-    return JoinRun(this->name, this->count, this->checksum);
+    try
+    {
+      this->flushRecords();
+      std::array<std::uint8_t, 8> encoded_count;
+      std::uint8_t* count_out = encoded_count.data();
+      encodeLittle<std::uint64_t>(count_out, this->count);
+      pwriteAll(this->descriptor, encoded_count.data(), encoded_count.size(), 20, this->name);
+      std::array<std::uint8_t, JOIN_FOOTER_BYTES> footer;
+      std::uint8_t* out = footer.data();
+      encodeLittle<std::uint64_t>(out, JOIN_FOOTER_MAGIC);
+      encodeLittle<std::uint64_t>(out, this->count);
+      encodeLittle<std::uint64_t>(out, this->checksum);
+      writeAll(this->descriptor, footer.data(), footer.size(), this->name);
+      trimWrittenCache(this->descriptor, this->cache_released, true, this->name);
+      if(::close(this->descriptor) != 0)
+      {
+        this->descriptor = -1;
+        throw joinError("cannot close join run", this->name);
+      }
+      this->descriptor = -1;
+      JoinGroupSidecar group_sidecar = this->sidecar.finish(this->count,
+        this->checksum);
+      this->finished = true;
+      return JoinRun(this->name, this->count, this->checksum, group_sidecar);
+    }
+    catch(...)
+    {
+      this->sidecar.discard(); throw;
+    }
   }
 
 private:
@@ -382,6 +769,7 @@ private:
   std::uint64_t checksum;
   off_t cache_released;
   bool finished;
+  JoinGroupSidecarWriter sidecar;
   std::vector<std::array<std::uint8_t, JOIN_RECORD_BYTES>> buffer;
 };
 
@@ -502,6 +890,291 @@ private:
   mutable off_t cache_released;
   mutable std::vector<std::array<std::uint8_t, JOIN_RECORD_BYTES>> buffer;
   mutable size_type buffer_first, buffer_records;
+};
+
+class JoinGroupSidecarReader
+{
+public:
+  JoinGroupSidecarReader(const JoinRun& run, logical_file_id_t logical,
+    JoinKeyKind kind) :
+    summary_name(run.sidecar.summary_name), detail_name(run.sidecar.detail_name),
+    summary_descriptor(-1), detail_descriptor(-1), record_count(run.records),
+    group_count(0), expected_summary_checksum(0), expected_detail_checksum(0),
+    summary_cache_released(0), detail_cache_released(0),
+    summary_buffer(std::max(static_cast<size_type>(1),
+      JOIN_IO_BUFFER_BYTES / JOIN_GROUP_SUMMARY_BYTES)),
+    summary_buffer_first(0), summary_buffer_records(0),
+    detail_buffer(JOIN_IO_BUFFER_BYTES)
+  {
+    if(!run.sidecar.complete())
+    {
+      throw joinError("join run has no group sidecar", run.name);
+    }
+    this->summary_descriptor = ::open(this->summary_name.c_str(), O_RDONLY);
+    this->detail_descriptor = ::open(this->detail_name.c_str(), O_RDONLY);
+    if(this->summary_descriptor < 0 || this->detail_descriptor < 0)
+    {
+      throw joinError("cannot open join group sidecar", this->summary_name);
+    }
+    adviseSequential(this->summary_descriptor); adviseSequential(this->detail_descriptor);
+
+    std::array<std::uint8_t, JOIN_GROUP_HEADER_BYTES> summary_header;
+    preadAll(this->summary_descriptor, summary_header.data(), summary_header.size(), 0,
+      this->summary_name);
+    const std::uint8_t* input = summary_header.data();
+    std::uint64_t summary_magic = decodeLittle<std::uint64_t>(input);
+    std::uint32_t summary_version = decodeLittle<std::uint32_t>(input);
+    std::uint32_t summary_kind = decodeLittle<std::uint32_t>(input);
+    std::uint32_t summary_logical = decodeLittle<std::uint32_t>(input);
+    std::uint32_t summary_reserved = decodeLittle<std::uint32_t>(input);
+    size_type summary_records = decodeLittle<std::uint64_t>(input);
+    std::uint64_t summary_run_checksum = decodeLittle<std::uint64_t>(input);
+    this->group_count = decodeLittle<std::uint64_t>(input);
+    if(summary_magic != JOIN_GROUP_HEADER_MAGIC ||
+       summary_version != JOIN_GROUP_FORMAT_VERSION ||
+       summary_kind != static_cast<std::uint32_t>(kind) ||
+       summary_logical != logical.value || summary_reserved != 0 ||
+       summary_records != run.records || summary_run_checksum != run.checksum ||
+       this->group_count != run.sidecar.groups ||
+       this->group_count > (std::numeric_limits<size_type>::max() -
+         JOIN_GROUP_HEADER_BYTES - JOIN_GROUP_FOOTER_BYTES) / JOIN_GROUP_SUMMARY_BYTES)
+    {
+      throw joinError("join group sidecar header mismatch", this->summary_name);
+    }
+    struct stat summary_info;
+    size_type summary_bytes = JOIN_GROUP_HEADER_BYTES +
+      this->group_count * JOIN_GROUP_SUMMARY_BYTES + JOIN_GROUP_FOOTER_BYTES;
+    if(::fstat(this->summary_descriptor, &summary_info) != 0 ||
+       summary_info.st_size < 0 || static_cast<size_type>(summary_info.st_size) != summary_bytes)
+    {
+      throw joinError("join group sidecar length mismatch", this->summary_name);
+    }
+    std::array<std::uint8_t, JOIN_GROUP_FOOTER_BYTES> summary_footer;
+    preadAll(this->summary_descriptor, summary_footer.data(), summary_footer.size(),
+      JOIN_GROUP_HEADER_BYTES + this->group_count * JOIN_GROUP_SUMMARY_BYTES,
+      this->summary_name);
+    input = summary_footer.data();
+    if(decodeLittle<std::uint64_t>(input) != JOIN_GROUP_FOOTER_MAGIC ||
+       decodeLittle<std::uint64_t>(input) != run.records ||
+       decodeLittle<std::uint64_t>(input) != run.checksum ||
+       decodeLittle<std::uint64_t>(input) != this->group_count)
+    {
+      throw joinError("join group sidecar footer mismatch", this->summary_name);
+    }
+    this->expected_summary_checksum = decodeLittle<std::uint64_t>(input);
+    if(this->expected_summary_checksum != run.sidecar.summary_checksum)
+    {
+      throw joinError("join group sidecar checksum identity mismatch", this->summary_name);
+    }
+
+    std::array<std::uint8_t, JOIN_DETAIL_HEADER_BYTES> detail_header;
+    preadAll(this->detail_descriptor, detail_header.data(), detail_header.size(), 0,
+      this->detail_name);
+    input = detail_header.data();
+    std::uint64_t detail_magic = decodeLittle<std::uint64_t>(input);
+    std::uint32_t detail_version = decodeLittle<std::uint32_t>(input);
+    std::uint32_t detail_kind = decodeLittle<std::uint32_t>(input);
+    std::uint32_t detail_logical = decodeLittle<std::uint32_t>(input);
+    std::uint32_t detail_reserved = decodeLittle<std::uint32_t>(input);
+    size_type detail_records = decodeLittle<std::uint64_t>(input);
+    std::uint64_t detail_run_checksum = decodeLittle<std::uint64_t>(input);
+    if(detail_magic != JOIN_DETAIL_HEADER_MAGIC ||
+       detail_version != JOIN_GROUP_FORMAT_VERSION ||
+       detail_kind != static_cast<std::uint32_t>(kind) ||
+       detail_logical != logical.value || detail_reserved != 0 ||
+       detail_records != run.records || detail_run_checksum != run.checksum ||
+       detail_records > std::numeric_limits<size_type>::max() -
+         JOIN_DETAIL_HEADER_BYTES - JOIN_DETAIL_FOOTER_BYTES)
+    {
+      throw joinError("join group detail header mismatch", this->detail_name);
+    }
+    struct stat detail_info;
+    size_type detail_bytes = JOIN_DETAIL_HEADER_BYTES + detail_records +
+      JOIN_DETAIL_FOOTER_BYTES;
+    if(::fstat(this->detail_descriptor, &detail_info) != 0 ||
+       detail_info.st_size < 0 || static_cast<size_type>(detail_info.st_size) != detail_bytes)
+    {
+      throw joinError("join group detail length mismatch", this->detail_name);
+    }
+    std::array<std::uint8_t, JOIN_DETAIL_FOOTER_BYTES> detail_footer;
+    preadAll(this->detail_descriptor, detail_footer.data(), detail_footer.size(),
+      JOIN_DETAIL_HEADER_BYTES + detail_records, this->detail_name);
+    input = detail_footer.data();
+    if(decodeLittle<std::uint64_t>(input) != JOIN_DETAIL_FOOTER_MAGIC ||
+       decodeLittle<std::uint64_t>(input) != run.records ||
+       decodeLittle<std::uint64_t>(input) != run.checksum)
+    {
+      throw joinError("join group detail footer mismatch", this->detail_name);
+    }
+    this->expected_detail_checksum = decodeLittle<std::uint64_t>(input);
+    if(this->expected_detail_checksum != run.sidecar.detail_checksum)
+    {
+      throw joinError("join group detail checksum identity mismatch", this->detail_name);
+    }
+  }
+
+  ~JoinGroupSidecarReader()
+  {
+    if(this->summary_descriptor >= 0)
+    {
+      discardCachedRange(this->summary_descriptor, 0, 0);
+      ::close(this->summary_descriptor);
+    }
+    if(this->detail_descriptor >= 0)
+    {
+      discardCachedRange(this->detail_descriptor, 0, 0);
+      ::close(this->detail_descriptor);
+    }
+  }
+
+  size_type size() const { return this->group_count; }
+  size_type records() const { return this->record_count; }
+  std::uint64_t summaryChecksum() const { return this->expected_summary_checksum; }
+  std::uint64_t detailChecksum() const { return this->expected_detail_checksum; }
+
+  void read(size_type index, JoinGroupSummary& summary) const
+  {
+    if(index >= this->group_count)
+    {
+      throw joinError("join group sidecar index out of range", this->summary_name);
+    }
+    if(this->summary_buffer_records == 0 || index < this->summary_buffer_first ||
+       index >= this->summary_buffer_first + this->summary_buffer_records)
+    {
+      this->refillSummaries(index);
+    }
+    decodeJoinGroupSummary(this->summary_buffer[index - this->summary_buffer_first],
+      summary);
+    if(summary.end > this->record_count)
+    {
+      throw joinError("join group sidecar range exceeds join run", this->summary_name);
+    }
+  }
+
+  JoinGroupSummary summarize(const JoinGroupSummary& parent, size_type begin,
+    size_type end) const
+  {
+    if(begin >= end || begin < parent.begin || end > parent.end)
+    {
+      throw joinError("invalid join-key subgroup sidecar range", this->detail_name);
+    }
+    if(begin == parent.begin && end == parent.end) { return parent; }
+    JoinGroupSummary result;
+    result.key = parent.key; result.begin = begin; result.end = end;
+    result.count = end - begin;
+    for(size_type offset = begin; offset < end; )
+    {
+      size_type bytes = std::min(this->detail_buffer.size(), end - offset);
+      preadAll(this->detail_descriptor, this->detail_buffer.data(), bytes,
+        JOIN_DETAIL_HEADER_BYTES + offset, this->detail_name);
+      trimReadCache(this->detail_descriptor, JOIN_DETAIL_HEADER_BYTES + offset + bytes,
+        this->detail_cache_released);
+      for(size_type i = 0; i < bytes; i++)
+      {
+        std::uint8_t detail = this->detail_buffer[i];
+        size_type order = detail & JOIN_DETAIL_ORDER_MASK;
+        if((detail & JOIN_DETAIL_RESERVED) != 0 || order > PathLabel::LABEL_LENGTH)
+        {
+          throw joinError("invalid join group detail record", this->detail_name);
+        }
+        result.order_sum = checkedJoinAdd(result.order_sum, order,
+          "subgroup order sum");
+        if((detail & JOIN_DETAIL_SORTED) != 0)
+        {
+          result.bypass_paths++;
+          result.bypass_ranks = checkedJoinAdd(result.bypass_ranks, order + 1,
+            "subgroup bypass ranks");
+        }
+      }
+      offset += bytes;
+    }
+    return result;
+  }
+
+  void validate() const
+  {
+    std::uint64_t summary_checksum = 1469598103934665603ULL;
+    size_type cursor = 0;
+    node_type previous_key = 0;
+    bool have_previous = false;
+    std::array<std::uint8_t, JOIN_GROUP_SUMMARY_BYTES> encoded;
+    for(size_type group = 0; group < this->group_count; group++)
+    {
+      preadAll(this->summary_descriptor, encoded.data(), encoded.size(),
+        JOIN_GROUP_HEADER_BYTES + group * JOIN_GROUP_SUMMARY_BYTES,
+        this->summary_name);
+      summary_checksum = joinChecksum(encoded.data(), encoded.size(), summary_checksum);
+      trimReadCache(this->summary_descriptor, JOIN_GROUP_HEADER_BYTES +
+        (group + 1) * JOIN_GROUP_SUMMARY_BYTES, this->summary_cache_released);
+      JoinGroupSummary summary;
+      decodeJoinGroupSummary(encoded, summary);
+      if(summary.begin != cursor || summary.end > this->record_count ||
+         (have_previous && summary.key <= previous_key))
+      {
+        throw joinError("join group sidecar is not canonical", this->summary_name);
+      }
+      cursor = summary.end; previous_key = summary.key; have_previous = true;
+    }
+    if(cursor != this->record_count || summary_checksum != this->expected_summary_checksum)
+    {
+      throw joinError("join group sidecar checksum mismatch", this->summary_name);
+    }
+    std::uint64_t detail_checksum = 1469598103934665603ULL;
+    for(size_type offset = 0; offset < this->record_count; )
+    {
+      size_type bytes = std::min(this->detail_buffer.size(), this->record_count - offset);
+      preadAll(this->detail_descriptor, this->detail_buffer.data(), bytes,
+        JOIN_DETAIL_HEADER_BYTES + offset, this->detail_name);
+      detail_checksum = joinChecksum(this->detail_buffer.data(), bytes, detail_checksum);
+      trimReadCache(this->detail_descriptor, JOIN_DETAIL_HEADER_BYTES + offset + bytes,
+        this->detail_cache_released);
+      for(size_type i = 0; i < bytes; i++)
+      {
+        size_type order = this->detail_buffer[i] & JOIN_DETAIL_ORDER_MASK;
+        if((this->detail_buffer[i] & JOIN_DETAIL_RESERVED) != 0 ||
+           order > PathLabel::LABEL_LENGTH)
+        {
+          throw joinError("invalid join group detail record", this->detail_name);
+        }
+      }
+      offset += bytes;
+    }
+    if(detail_checksum != this->expected_detail_checksum)
+    {
+      throw joinError("join group detail checksum mismatch", this->detail_name);
+    }
+    discardCachedRange(this->summary_descriptor, 0, 0);
+    discardCachedRange(this->detail_descriptor, 0, 0);
+    this->summary_cache_released = 0; this->detail_cache_released = 0;
+    this->summary_buffer_records = 0;
+  }
+
+private:
+  void refillSummaries(size_type first) const
+  {
+    this->summary_buffer_first = first;
+    this->summary_buffer_records = std::min(this->summary_buffer.size(),
+      this->group_count - first);
+    preadAll(this->summary_descriptor, this->summary_buffer.data(),
+      this->summary_buffer_records * JOIN_GROUP_SUMMARY_BYTES,
+      JOIN_GROUP_HEADER_BYTES + first * JOIN_GROUP_SUMMARY_BYTES,
+      this->summary_name);
+    trimReadCache(this->summary_descriptor, JOIN_GROUP_HEADER_BYTES +
+      (first + this->summary_buffer_records) * JOIN_GROUP_SUMMARY_BYTES,
+      this->summary_cache_released);
+  }
+
+  JoinGroupSidecarReader(const JoinGroupSidecarReader&);
+  JoinGroupSidecarReader& operator=(const JoinGroupSidecarReader&);
+
+  std::string summary_name, detail_name;
+  int summary_descriptor, detail_descriptor;
+  size_type record_count, group_count;
+  std::uint64_t expected_summary_checksum, expected_detail_checksum;
+  mutable off_t summary_cache_released, detail_cache_released;
+  mutable std::vector<std::array<std::uint8_t, JOIN_GROUP_SUMMARY_BYTES>> summary_buffer;
+  mutable size_type summary_buffer_first, summary_buffer_records;
+  mutable std::vector<std::uint8_t> detail_buffer;
 };
 
 struct JoinHeapComparator
@@ -627,7 +1300,7 @@ public:
         std::vector<JoinRun> group(remaining.begin() + first, remaining.begin() + last);
         JoinRun merged = mergeJoinRuns(group, this->logical_id, this->key_kind,
           this->verify_runs, this->statistics);
-        for(size_type i = 0; i < group.size(); i++) { TempFile::remove(group[i].name); }
+        for(size_type i = 0; i < group.size(); i++) { removeJoinRun(group[i]); }
         next.push_back(merged);
       }
       remaining.swap(next);
@@ -671,7 +1344,7 @@ private:
     std::vector<JoinRun> inputs; inputs.swap(this->levels[level]);
     JoinRun merged = mergeJoinRuns(inputs, this->logical_id, this->key_kind,
       this->verify_runs, this->statistics);
-    for(size_type i = 0; i < inputs.size(); i++) { TempFile::remove(inputs[i].name); }
+    for(size_type i = 0; i < inputs.size(); i++) { removeJoinRun(inputs[i]); }
     this->addRun(merged, level + 1);
   }
 
@@ -881,9 +1554,6 @@ writeLabelRecord(const JoinRecord& record, ExternalPathSortSink& output,
   }
 }
 
-size_type checkedJoinAdd(size_type left, size_type right, const char* description);
-size_type checkedJoinMultiply(size_type left, size_type right, const char* description);
-
 void
 joinSortedRuns(const JoinRun& left_run, const JoinRun& right_run,
   logical_file_id_t logical, size_type byte_budget, ExternalPathSortSink& output,
@@ -1040,16 +1710,6 @@ struct JoinPartition
     emit_bypass(true) { }
 };
 
-struct JoinGroupSummary
-{
-  node_type key;
-  size_type begin, end, count, order_sum;
-  size_type bypass_paths, bypass_ranks;
-
-  JoinGroupSummary() : key(0), begin(0), end(0), count(0), order_sum(0),
-    bypass_paths(0), bypass_ranks(0) { }
-};
-
 // Planning must not retain one entry per distinct key: a realistic graph can
 // have many more keys than fit in the join reservation. This fixed-size,
 // deterministic systematic sample builds a bounded MSD radix range-pack tree.
@@ -1059,11 +1719,11 @@ constexpr size_type JOIN_PLAN_SAMPLE_RECORDS = 4096;
 constexpr size_type JOIN_PLAN_RADIX_BITS = 4;
 constexpr size_type JOIN_PLAN_MAX_BYTES = 4 * MEGABYTE;
 constexpr size_type JOIN_PLAN_PACK_BYTES = 4 * sizeof(std::uint64_t);
-constexpr size_type JOIN_PLAN_FIXED_BYTES = 8 + 4 + 4 + 12 * sizeof(std::uint64_t);
-constexpr size_type JOIN_PLAN_RUNTIME_OVERHEAD = 2 * JOIN_IO_BUFFER_BYTES +
+constexpr size_type JOIN_PLAN_FIXED_BYTES = 8 + 4 + 4 + 18 * sizeof(std::uint64_t);
+constexpr size_type JOIN_PLAN_RUNTIME_OVERHEAD = 6 * JOIN_IO_BUFFER_BYTES +
   2 * JOIN_PLAN_SAMPLE_RECORDS * sizeof(node_type) + 64 * KILOBYTE;
-constexpr std::uint64_t JOIN_PLAN_MAGIC = 0x324e4c5044534347ULL; // "GCSDPLN2"
-constexpr std::uint32_t JOIN_PLAN_VERSION = 2;
+constexpr std::uint64_t JOIN_PLAN_MAGIC = 0x334e4c5044534347ULL; // "GCSDPLN3"
+constexpr std::uint32_t JOIN_PLAN_VERSION = 3;
 
 struct JoinKeySample
 {
@@ -1091,11 +1751,44 @@ struct JoinRadixPlan
   std::vector<node_type> boundaries;
   std::vector<node_type> heavy_keys;
   size_type sampled_records, splits, max_bits, serialized_limit;
+  size_type left_groups, right_groups;
+  std::uint64_t left_summary_checksum, right_summary_checksum;
+  std::uint64_t left_detail_checksum, right_detail_checksum;
   bool capped;
 
   JoinRadixPlan() : sampled_records(0), splits(0), max_bits(0),
-    serialized_limit(0), capped(false) { }
+    serialized_limit(0), left_groups(0), right_groups(0),
+    left_summary_checksum(0), right_summary_checksum(0),
+    left_detail_checksum(0), right_detail_checksum(0), capped(false) { }
 };
+
+void
+bindJoinRadixPlanSidecars(JoinRadixPlan& plan, const JoinRun& left,
+  const JoinRun& right)
+{
+  if(!left.sidecar.complete() || !right.sidecar.complete())
+  {
+    throw joinError("cannot bind a radix plan without join group sidecars");
+  }
+  plan.left_groups = left.sidecar.groups; plan.right_groups = right.sidecar.groups;
+  plan.left_summary_checksum = left.sidecar.summary_checksum;
+  plan.right_summary_checksum = right.sidecar.summary_checksum;
+  plan.left_detail_checksum = left.sidecar.detail_checksum;
+  plan.right_detail_checksum = right.sidecar.detail_checksum;
+}
+
+bool
+joinRadixPlanSidecarsMatch(const JoinRadixPlan& plan, const JoinRun& left,
+  const JoinRun& right)
+{
+  return left.sidecar.complete() && right.sidecar.complete() &&
+    plan.left_groups == left.sidecar.groups &&
+    plan.right_groups == right.sidecar.groups &&
+    plan.left_summary_checksum == left.sidecar.summary_checksum &&
+    plan.right_summary_checksum == right.sidecar.summary_checksum &&
+    plan.left_detail_checksum == left.sidecar.detail_checksum &&
+    plan.right_detail_checksum == right.sidecar.detail_checksum;
+}
 
 JoinKeySample
 sampleJoinKeys(const JoinFileReader& reader)
@@ -1381,6 +2074,7 @@ joinRadixPlanTaskName(const std::string& generation,
   std::uint64_t left_checksum, std::uint64_t right_checksum)
 {
   return generation + "-msd-plan-l" + std::to_string(logical.value) +
+    "-v3" +
     "-t" + std::to_string(target_bytes) +
     "-m" + std::to_string(serialized_limit) +
     "-lc" + std::to_string(left_checksum) +
@@ -1391,7 +2085,7 @@ ArtifactIdentity
 joinRadixPlanArtifact(const std::string& task)
 {
   return ArtifactIdentity(task, "join-plan", "msd-range-packs",
-    "join-msd-plan-v2");
+    "join-msd-plan-v3");
 }
 
 void
@@ -1446,6 +2140,12 @@ encodeJoinRadixPlan(const JoinRadixPlan& plan, logical_file_id_t logical,
   appendPlanValue<std::uint64_t>(result, right_records);
   appendPlanValue<std::uint64_t>(result, left_checksum);
   appendPlanValue<std::uint64_t>(result, right_checksum);
+  appendPlanValue<std::uint64_t>(result, plan.left_groups);
+  appendPlanValue<std::uint64_t>(result, plan.right_groups);
+  appendPlanValue<std::uint64_t>(result, plan.left_summary_checksum);
+  appendPlanValue<std::uint64_t>(result, plan.right_summary_checksum);
+  appendPlanValue<std::uint64_t>(result, plan.left_detail_checksum);
+  appendPlanValue<std::uint64_t>(result, plan.right_detail_checksum);
   appendPlanValue<std::uint64_t>(result, plan.serialized_limit);
   appendPlanValue<std::uint64_t>(result, plan.sampled_records);
   appendPlanValue<std::uint64_t>(result, plan.splits);
@@ -1476,7 +2176,7 @@ decodeJoinRadixPlan(const std::vector<std::uint8_t>& payload,
   logical_file_id_t logical, size_type target_bytes,
   size_type left_records, size_type right_records,
   std::uint64_t left_checksum, std::uint64_t right_checksum,
-  size_type serialized_limit)
+  size_type serialized_limit, const JoinRun& left_run, const JoinRun& right_run)
 {
   size_type offset = 0;
   if(readPlanValue<std::uint64_t>(payload, offset) != JOIN_PLAN_MAGIC ||
@@ -1486,12 +2186,22 @@ decodeJoinRadixPlan(const std::vector<std::uint8_t>& payload,
      readPlanValue<std::uint64_t>(payload, offset) != left_records ||
      readPlanValue<std::uint64_t>(payload, offset) != right_records ||
      readPlanValue<std::uint64_t>(payload, offset) != left_checksum ||
-     readPlanValue<std::uint64_t>(payload, offset) != right_checksum ||
-     readPlanValue<std::uint64_t>(payload, offset) != serialized_limit)
+     readPlanValue<std::uint64_t>(payload, offset) != right_checksum)
   {
     throw joinError("MSD range-pack plan does not match its join inputs");
   }
   JoinRadixPlan result;
+  result.left_groups = readPlanValue<std::uint64_t>(payload, offset);
+  result.right_groups = readPlanValue<std::uint64_t>(payload, offset);
+  result.left_summary_checksum = readPlanValue<std::uint64_t>(payload, offset);
+  result.right_summary_checksum = readPlanValue<std::uint64_t>(payload, offset);
+  result.left_detail_checksum = readPlanValue<std::uint64_t>(payload, offset);
+  result.right_detail_checksum = readPlanValue<std::uint64_t>(payload, offset);
+  if(!joinRadixPlanSidecarsMatch(result, left_run, right_run) ||
+     readPlanValue<std::uint64_t>(payload, offset) != serialized_limit)
+  {
+    throw joinError("MSD range-pack plan does not match its join sidecars");
+  }
   result.sampled_records = readPlanValue<std::uint64_t>(payload, offset);
   result.splits = readPlanValue<std::uint64_t>(payload, offset);
   result.max_bits = readPlanValue<std::uint64_t>(payload, offset);
@@ -1537,7 +2247,8 @@ decodeJoinRadixPlan(const std::vector<std::uint8_t>& payload,
 
 JoinRadixPlan
 loadOrCreateJoinRadixPlan(const JoinFileReader& left,
-  const JoinFileReader& right, logical_file_id_t logical,
+  const JoinFileReader& right, const JoinRun& left_run, const JoinRun& right_run,
+  logical_file_id_t logical,
   size_type target_bytes, size_type memory_budget, BuildWorkspace* workspace,
   const std::string& checkpoint_task, ExternalPathJoinStats* stats)
 {
@@ -1554,13 +2265,14 @@ loadOrCreateJoinRadixPlan(const JoinFileReader& left,
       result = decodeJoinRadixPlan(workspace->read_artifact_payload(
         joinRadixPlanArtifact(task), logical, physical_shard_id_t(0),
         serialized_limit), logical, target_bytes, left.size(), right.size(),
-        left.checksum(), right.checksum(), serialized_limit);
+        left.checksum(), right.checksum(), serialized_limit, left_run, right_run);
       restored = true;
     }
   }
   if(!restored)
   {
     result = sampleJoinRadixPlan(left, right, target_bytes, serialized_limit);
+    bindJoinRadixPlanSidecars(result, left_run, right_run);
     if(workspace != nullptr && !task.empty())
     {
       std::vector<std::uint8_t> payload = encodeJoinRadixPlan(result, logical,
@@ -1587,7 +2299,11 @@ loadOrCreateJoinRadixPlan(const JoinFileReader& left,
       saturatingPlanMultiply(4, serialized_limit));
     stats->max_bytes_resident = std::max(stats->max_bytes_resident,
       std::min(memory_budget, planner_bound));
-    if(restored) { stats->restored_radix_plans++; }
+    if(restored)
+    {
+      stats->restored_radix_plans++;
+      stats->restored_sidecar_metadata += 2;
+    }
   }
   return result;
 }
@@ -1613,30 +2329,16 @@ checkedJoinMultiply(size_type left, size_type right, const char* description)
 }
 
 JoinGroupSummary
-readJoinGroup(const JoinFileReader& reader, size_type begin, size_type limit)
+readJoinGroup(const JoinGroupSidecarReader& reader, size_type group,
+  ExternalPathJoinStats* stats)
 {
-  if(begin >= limit) { throw joinError("cannot inspect an empty join-key group"); }
   JoinGroupSummary result;
-  result.begin = begin;
-  JoinRecord record;
-  reader.read(begin, record); result.key = record.key;
-  size_type offset = begin;
-  while(offset < limit)
+  reader.read(group, result);
+  if(result.count == 0)
   {
-    reader.read(offset, record);
-    if(record.key != result.key) { break; }
-    result.count++;
-    result.order_sum = checkedJoinAdd(result.order_sum, record.node.order(),
-      "group order sum");
-    if(record.node.sorted())
-    {
-      result.bypass_paths++;
-      result.bypass_ranks = checkedJoinAdd(result.bypass_ranks,
-        record.node.ranks(), "bypass ranks");
-    }
-    offset++;
+    throw joinError("join group sidecar contains an empty group");
   }
-  result.end = offset;
+  if(stats != nullptr) { stats->sidecar_plan_groups++; }
   return result;
 }
 
@@ -1670,34 +2372,17 @@ joinGroupOutput(const JoinGroupSummary* left, const JoinGroupSummary* right,
 }
 
 JoinGroupSummary
-readJoinSubgroup(const JoinFileReader& reader, const JoinGroupSummary& parent,
-  size_type begin, size_type end)
+readJoinSubgroup(const JoinGroupSidecarReader& reader,
+  const JoinGroupSummary& parent, size_type begin, size_type end,
+  ExternalPathJoinStats* stats)
 {
-  if(begin >= end || begin < parent.begin || end > parent.end)
+  if(stats != nullptr)
   {
-    throw joinError("invalid join-key subgroup range");
+    stats->sidecar_plan_detail_records = checkedJoinAdd(
+      stats->sidecar_plan_detail_records, end - begin,
+      "sidecar detail planning records");
   }
-  JoinGroupSummary result;
-  result.key = parent.key; result.begin = begin; result.end = end;
-  JoinRecord record;
-  for(size_type offset = begin; offset < end; offset++)
-  {
-    reader.read(offset, record);
-    if(record.key != parent.key)
-    {
-      throw joinError("join-key subgroup crosses a key boundary");
-    }
-    result.count++;
-    result.order_sum = checkedJoinAdd(result.order_sum, record.node.order(),
-      "subgroup order sum");
-    if(record.node.sorted())
-    {
-      result.bypass_paths++;
-      result.bypass_ranks = checkedJoinAdd(result.bypass_ranks,
-        record.node.ranks(), "subgroup bypass ranks");
-    }
-  }
-  return result;
+  return reader.summarize(parent, begin, end);
 }
 
 JoinGroupSummary
@@ -1721,8 +2406,8 @@ remainingJoinSubgroup(const JoinGroupSummary& parent,
 }
 
 void
-planJoinGroupRecursive(const JoinFileReader& left_reader,
-  const JoinFileReader& right_reader, const JoinGroupSummary& left,
+planJoinGroupRecursive(const JoinGroupSidecarReader& left_reader,
+  const JoinGroupSidecarReader& right_reader, const JoinGroupSummary& left,
   const JoinGroupSummary& right, size_type target_bytes, bool emit_bypass,
   std::vector<JoinPartition>& result, ExternalPathJoinStats* stats)
 {
@@ -1770,7 +2455,7 @@ planJoinGroupRecursive(const JoinFileReader& left_reader,
   {
     size_type middle = left.begin + left.count / 2;
     JoinGroupSummary first = readJoinSubgroup(left_reader, left,
-      left.begin, middle);
+      left.begin, middle, stats);
     JoinGroupSummary second = remainingJoinSubgroup(left, first);
     planJoinGroupRecursive(left_reader, right_reader, first, right,
       target_bytes, emit_bypass, result, stats);
@@ -1785,7 +2470,7 @@ planJoinGroupRecursive(const JoinFileReader& left_reader,
     }
     size_type middle = right.begin + right.count / 2;
     JoinGroupSummary first = readJoinSubgroup(right_reader, right,
-      right.begin, middle);
+      right.begin, middle, stats);
     JoinGroupSummary second = remainingJoinSubgroup(right, first);
     planJoinGroupRecursive(left_reader, right_reader, left, first,
       target_bytes, emit_bypass, result, stats);
@@ -1803,14 +2488,20 @@ planJoinPartitions(const JoinRun& left_run, const JoinRun& right_run,
 {
   JoinFileReader left(left_run, logical, LEFT_BY_TO);
   JoinFileReader right(right_run, logical, RIGHT_BY_FROM);
-  if(verify_payloads) { left.validate(); right.validate(); }
+  JoinGroupSidecarReader left_groups(left_run, logical, LEFT_BY_TO);
+  JoinGroupSidecarReader right_groups(right_run, logical, RIGHT_BY_FROM);
+  if(verify_payloads)
+  {
+    left.validate(); right.validate(); left_groups.validate(); right_groups.validate();
+  }
   target_bytes = std::max(static_cast<size_type>(1), target_bytes);
-  JoinRadixPlan radix_plan = loadOrCreateJoinRadixPlan(left, right, logical,
-    target_bytes, memory_budget, workspace, checkpoint_task, stats);
+  JoinRadixPlan radix_plan = loadOrCreateJoinRadixPlan(left, right, left_run,
+    right_run, logical, target_bytes, memory_budget, workspace, checkpoint_task, stats);
   size_type radix_boundary = 0;
 
   std::vector<JoinPartition> result;
   size_type left_offset = 0, right_offset = 0;
+  size_type left_group_index = 0, right_group_index = 0;
   JoinPartition current;
   current.left_begin = 0; current.right_begin = 0;
   size_type current_input_bytes = 0;
@@ -1824,15 +2515,26 @@ planJoinPartitions(const JoinRun& left_run, const JoinRun& right_run,
   };
   JoinGroupSummary left_group, right_group;
   bool have_left = false, have_right = false;
-  while(left_offset < left.size() || right_offset < right.size())
+  while(have_left || have_right || left_group_index < left_groups.size() ||
+    right_group_index < right_groups.size())
   {
-    if(!have_left && left_offset < left.size())
+    if(!have_left && left_group_index < left_groups.size())
     {
-      left_group = readJoinGroup(left, left_offset, left.size()); have_left = true;
+      left_group = readJoinGroup(left_groups, left_group_index++, stats);
+      if(left_group.begin != left_offset)
+      {
+        throw joinError("left join group sidecar is not contiguous");
+      }
+      have_left = true;
     }
-    if(!have_right && right_offset < right.size())
+    if(!have_right && right_group_index < right_groups.size())
     {
-      right_group = readJoinGroup(right, right_offset, right.size()); have_right = true;
+      right_group = readJoinGroup(right_groups, right_group_index++, stats);
+      if(right_group.begin != right_offset)
+      {
+        throw joinError("right join group sidecar is not contiguous");
+      }
+      have_right = true;
     }
     const JoinGroupSummary* selected_left = nullptr;
     const JoinGroupSummary* selected_right = nullptr;
@@ -1894,7 +2596,7 @@ planJoinPartitions(const JoinRun& left_run, const JoinRun& right_run,
       JoinGroupSummary empty_left;
       empty_left.key = selected_right->key;
       empty_left.begin = left_offset; empty_left.end = left_offset;
-      planJoinGroupRecursive(left, right,
+      planJoinGroupRecursive(left_groups, right_groups,
         (selected_left == nullptr ? empty_left : *selected_left),
         *selected_right, target_bytes, true, result, stats);
       if(selected_left != nullptr) { left_offset = selected_left->end; }
@@ -1949,6 +2651,10 @@ planJoinPartitions(const JoinRun& left_run, const JoinRun& right_run,
     }
   }
   flush_current();
+  if(left_offset != left.size() || right_offset != right.size())
+  {
+    throw joinError("join group sidecar did not cover its join run");
+  }
   if(result.empty())
   {
     current.left_begin = 0; current.left_end = left.size();
@@ -3154,7 +3860,7 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
         // sort and join budgets as independent maxima.
       }
     }
-    TempFile::remove(left.name); TempFile::remove(right.name);
+    removeJoinRun(left); removeJoinRun(right);
   }
 
   MemoryBudget compaction_memory(memory_budget, memory_budget / 16);
