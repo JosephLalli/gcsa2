@@ -216,6 +216,16 @@ int main()
   GCSA::fast_vector expected_interleaved(expected_dense);
   expected_interleaved.serialize(expected_fast);
   require(streamed_fast.str() == expected_fast.str());
+
+  // The same immutable mask stream can be replayed to encode all Elias--Fano
+  // members directly. Compare bytes above the SDSL fast-select threshold so
+  // the test covers multiple select blocks and both high-bit supports.
+  std::ostringstream streamed_sparse_bwt, expected_sparse_bwt;
+  serializeSparseBWTComponent(streamed_sparse_bwt, large_masks, large_paths,
+    expected_ones, 1, parameters);
+  GCSA::sparse_vector expected_sparse(expected_dense);
+  expected_sparse.serialize(expected_sparse_bwt);
+  require(streamed_sparse_bwt.str() == expected_sparse_bwt.str());
   require(std::filesystem::remove(large_masks));
 
   // Exercise packed sample values crossing 64-bit word boundaries.
