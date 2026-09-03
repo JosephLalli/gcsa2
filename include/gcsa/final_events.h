@@ -164,6 +164,13 @@ void serializeSampleIds(std::ostream& out, const std::string& sample_file,
   size_type samples, size_type sample_bits,
   const ConstructionParameters& parameters);
 
+// Stream SadaCount's ordinary bit_vector and select_support_mcl payload from
+// sorted redundancy events without materializing the dense unary vector.
+// Public only for exact-format regression tests.
+void serializeRedundantPointers(std::ostream& out,
+  const std::string& redundancy_file, size_type paths, size_type redundant,
+  const ConstructionParameters& parameters);
+
 /*
   Build the existing GCSA members serially from event streams. This preserves
   the public .gcsa format and the historical fast/sparse BWT asymmetry. Final
