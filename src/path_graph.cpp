@@ -2057,28 +2057,71 @@ private:
 */
 struct PathGraphInputCache
 {
+  struct Window
+  {
+    std::vector<char> data;
+    off_t start;
+    size_type valid;
+
+    explicit Window(size_type bytes = 0) : data(bytes), start(0), valid(0) { }
+
+    void reset() { this->start = 0; this->valid = 0; }
+
+    bool contains(off_t offset, size_type bytes) const
+    {
+      if(offset < this->start) { return false; }
+      size_type relative = static_cast<size_type>(offset - this->start);
+      return (relative <= this->valid && bytes <= this->valid - relative);
+    }
+  };
+
   struct Entry
   {
     size_type file, stamp;
     int path, rank;
     off_t path_high, rank_high, path_released, rank_released;
+    Window path_window, rank_window;
 
-    Entry() : file(PathGraph::UNKNOWN), stamp(0), path(-1), rank(-1),
-      path_high(0), rank_high(0), path_released(0), rank_released(0) { }
+    explicit Entry(size_type window_bytes = 0) :
+      file(PathGraph::UNKNOWN), stamp(0), path(-1), rank(-1),
+      path_high(0), rank_high(0), path_released(0), rank_released(0),
+      path_window(window_bytes), rank_window(window_bytes) { }
+
+    void reset(size_type new_file, size_type new_stamp)
+    {
+      this->file = new_file; this->stamp = new_stamp;
+      this->path = -1; this->rank = -1;
+      this->path_high = 0; this->rank_high = 0;
+      this->path_released = 0; this->rank_released = 0;
+      this->path_window.reset(); this->rank_window.reset();
+    }
   };
 
   const PathGraph& graph;
   std::vector<Entry> entries;
-  size_type clock, max_pairs;
+  size_type clock, max_pairs, window_bytes;
   PathGraphMergeStats* stats;
 
   constexpr static off_t CACHE_TAIL = 64 * KILOBYTE;
+  constexpr static size_type MIN_WINDOW = 4 * KILOBYTE;
+  constexpr static size_type MAX_WINDOW = 64 * KILOBYTE;
 
   PathGraphInputCache(const PathGraph& source, PathGraphMergeStats* merge_stats,
-    size_type requested_pairs) :
+    size_type requested_pairs, size_type byte_budget) :
     graph(source), entries(), clock(0),
-    max_pairs(std::max(static_cast<size_type>(1), requested_pairs)), stats(merge_stats)
+    max_pairs(std::max(static_cast<size_type>(1),
+      std::min(requested_pairs, std::max(static_cast<size_type>(1), source.files())))),
+    window_bytes(0), stats(merge_stats)
   {
+    // At most 2 * max_pairs windows can coexist. Reserve at most one quarter
+    // of the caller's merge workspace for them, leaving the rest for equal-
+    // label groups, range metadata, and phase-specific state.
+    size_type candidate = byte_budget / this->max_pairs / 8;
+    if(candidate >= MIN_WINDOW)
+    {
+      this->window_bytes = std::min(MAX_WINDOW,
+        candidate - (candidate % MIN_WINDOW));
+    }
     this->entries.reserve(this->max_pairs);
   }
 
@@ -2089,7 +2132,11 @@ struct PathGraphInputCache
   {
     Entry& entry = this->get(file);
     off_t path_offset = this->checkedOffset(offset, sizeof(PathNode));
-    this->preadAll(entry.path, &node, sizeof(node), path_offset);
+    off_t path_limit = this->checkedOffset(this->graph.path_counts[file],
+      sizeof(PathNode));
+    this->readWindow(entry.path, entry.path_window, &node, sizeof(node),
+      path_offset, path_limit, true);
+    if(this->stats != nullptr) { this->stats->path_input_reads++; }
     entry.path_high = std::max(entry.path_high,
       path_offset + static_cast<off_t>(sizeof(node)));
     this->trim(entry.path, entry.path_high, entry.path_released);
@@ -2099,8 +2146,17 @@ struct PathGraphInputCache
       throw std::runtime_error("PathGraphMerger: invalid path rank count");
     }
     size_type rank_bytes = node.ranks() * sizeof(PathNode::rank_type);
+    if(node.pointer() > this->graph.rank_counts[file] ||
+       node.ranks() > this->graph.rank_counts[file] - node.pointer())
+    {
+      throw std::runtime_error("PathGraphMerger: path rank range is outside its sidecar");
+    }
     off_t rank_offset = this->checkedOffset(node.pointer(), sizeof(PathNode::rank_type));
-    this->preadAll(entry.rank, labels, rank_bytes, rank_offset);
+    off_t rank_limit = this->checkedOffset(this->graph.rank_counts[file],
+      sizeof(PathNode::rank_type));
+    this->readWindow(entry.rank, entry.rank_window, labels, rank_bytes,
+      rank_offset, rank_limit, false);
+    if(this->stats != nullptr) { this->stats->rank_input_reads++; }
     entry.rank_high = std::max(entry.rank_high,
       rank_offset + static_cast<off_t>(rank_bytes));
     this->trim(entry.rank, entry.rank_high, entry.rank_released);
@@ -2124,21 +2180,24 @@ private:
     Entry* target = nullptr;
     if(this->entries.size() < this->max_pairs)
     {
-      this->entries.push_back(Entry()); target = &(this->entries.back());
+      this->entries.emplace_back(this->window_bytes); target = &(this->entries.back());
       if(this->stats != nullptr)
       {
         this->stats->max_open_input_pairs = std::max(
           this->stats->max_open_input_pairs, static_cast<size_type>(this->entries.size()));
+        this->stats->max_input_buffer_bytes = std::max(
+          this->stats->max_input_buffer_bytes,
+          2 * this->window_bytes * static_cast<size_type>(this->entries.size()));
       }
     }
     else
     {
       target = &(*std::min_element(this->entries.begin(), this->entries.end(),
         [](const Entry& left, const Entry& right) { return left.stamp < right.stamp; }));
-      this->close(*target); *target = Entry();
+      this->close(*target);
     }
 
-    target->file = file; target->stamp = this->clock;
+    target->reset(file, this->clock);
     target->path = ::open(this->graph.path_names[file].c_str(), O_RDONLY);
     if(target->path < 0) { throw std::runtime_error("PathGraphMerger: cannot open path input"); }
     target->rank = ::open(this->graph.rank_names[file].c_str(), O_RDONLY);
@@ -2191,6 +2250,38 @@ private:
     }
   }
 
+  void readWindow(int descriptor, Window& window, void* target, size_type bytes,
+    off_t offset, off_t limit, bool path_stream)
+  {
+    if(offset < 0 || limit < offset ||
+       bytes > static_cast<size_type>(limit - offset))
+    {
+      throw std::runtime_error("PathGraphMerger: input range is outside its file");
+    }
+    if(bytes == 0) { return; }
+
+    if(window.data.empty() || bytes > window.data.size())
+    {
+      this->preadAll(descriptor, target, bytes, offset);
+      if(this->stats != nullptr) { this->stats->direct_input_reads++; }
+      return;
+    }
+    if(!(window.contains(offset, bytes)))
+    {
+      size_type available = static_cast<size_type>(limit - offset);
+      size_type refill = std::min(static_cast<size_type>(window.data.size()), available);
+      this->preadAll(descriptor, window.data.data(), refill, offset);
+      window.start = offset; window.valid = refill;
+      if(this->stats != nullptr)
+      {
+        if(path_stream) { this->stats->path_input_refills++; }
+        else { this->stats->rank_input_refills++; }
+      }
+    }
+    size_type relative = static_cast<size_type>(offset - window.start);
+    std::memcpy(target, window.data.data() + relative, bytes);
+  }
+
   static void trim(int descriptor, off_t high, off_t& released)
   {
     if(high <= released + 2 * CACHE_TAIL) { return; }
@@ -2213,6 +2304,8 @@ private:
 };
 
 constexpr off_t PathGraphInputCache::CACHE_TAIL;
+constexpr size_type PathGraphInputCache::MIN_WINDOW;
+constexpr size_type PathGraphInputCache::MAX_WINDOW;
 
 /*
   This structure reads a buffered stream of PriorityNodes in sorted order and outputs a
@@ -2290,7 +2383,7 @@ PathGraphMerger::PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lc
   graph(path_graph), lcp(kmer_lcp),
   ranges(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->range_spills))),
   buffer(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->priority_spills))),
-  input_files(path_graph, stats, max_input_pairs),
+  input_files(path_graph, stats, max_input_pairs, group_buffer_bytes),
   offsets(path_graph.files()), inputs(path_graph.files())
 {
   if(stats != nullptr) { *stats = PathGraphMergeStats(); }

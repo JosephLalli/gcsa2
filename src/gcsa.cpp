@@ -1170,7 +1170,12 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
                   << merge_stats.priority_spills << " path-group spills, "
                   << merge_stats.range_spills << " range spills, "
                   << merge_stats.max_open_input_pairs << " input pairs and "
-                  << merge_stats.max_open_output_pairs << " output pairs open at peak"
+                  << merge_stats.max_open_output_pairs << " output pairs open at peak; "
+                  << merge_stats.path_input_refills << "/"
+                  << merge_stats.rank_input_refills << " path/rank window refills for "
+                  << merge_stats.path_input_reads << " paths using "
+                  << formatBytes(merge_stats.max_input_buffer_bytes)
+                  << " of bounded input windows"
                   << std::endl;
       }
       if(workspace)
@@ -1264,7 +1269,13 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
               << final_merge_stats.priority_spills << " path-group spills, "
               << final_merge_stats.range_spills << " range spills, "
               << final_merge_stats.from_set_sorts << " external from-set sorts and "
-              << final_merge_stats.max_open_input_pairs << " input pairs open at peak"
+              << final_merge_stats.max_open_input_pairs << " input pairs open at peak; "
+              << final_merge_stats.path_input_refills << "/"
+              << final_merge_stats.rank_input_refills
+              << " path/rank window refills for "
+              << final_merge_stats.path_input_reads << " paths using "
+              << formatBytes(final_merge_stats.max_input_buffer_bytes)
+              << " of bounded input windows"
               << std::endl;
   }
   this->header.path_nodes = merged_graph.size();
