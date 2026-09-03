@@ -47,13 +47,13 @@ endif
 CXX_FLAGS=$(MY_CXX_FLAGS) $(VERIFY_FLAGS) $(PARALLEL_FLAGS) $(MY_CXX_OPT_FLAGS) -Iinclude -I$(INC_DIR)
 
 HEADERS=$(wildcard include/gcsa/*.h)
-LIBOBJS=$(addprefix $(BUILD_OBJ)/,algorithms.o checkpoint.o dbg.o disk_array.o external_join.o external_preprocessing.o external_sort.o files.o final_events.o gcsa.o internal.o lcp.o path_graph.o support.o utils.o resources.o workspace.o)
+LIBOBJS=$(addprefix $(BUILD_OBJ)/,algorithms.o checkpoint.o dbg.o disk_array.o external_join.o external_preprocessing.o external_sort.o files.o final_events.o gcsa.o internal.o lcp.o path_graph.o path_sort_run.o support.o utils.o resources.o workspace.o)
 LIBRARY=$(BUILD_LIB)/libgcsa2.a
 
 PROGRAMS=$(addprefix $(BUILD_BIN)/,build_gcsa convert_graph gcsa_format try_extend)
 OBSOLETE=build_gcsa convert_graph gcsa_format try_extend
 
-.PHONY: all clean directories test workspace-test external-path-sort-test external-join-test external-sort-test external-preprocessing-test final-events-test lcp-streaming-test disk-array-test internal-buffer-test parameter-test construction-resume-test
+.PHONY: all clean directories test workspace-test external-path-sort-test path-sort-run-test external-join-test external-sort-test external-preprocessing-test final-events-test lcp-streaming-test disk-array-test internal-buffer-test parameter-test construction-resume-test path-graph-prune-test
 all: directories $(LIBRARY) $(PROGRAMS)
 
 directories: $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)
@@ -89,6 +89,13 @@ $(BUILD_OBJ)/test_external_path_sort.o:tests/test_external_path_sort.cpp include
 external-path-sort-test: directories $(BUILD_OBJ)/test_external_path_sort.o $(LIBRARY)
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_external_path_sort $(BUILD_OBJ)/test_external_path_sort.o $(LIBRARY) $(LIBS)
 	$(BUILD_BIN)/test_external_path_sort
+
+$(BUILD_OBJ)/test_path_sort_run.o:tests/test_path_sort_run.cpp include/gcsa/path_sort_run.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+path-sort-run-test: directories $(BUILD_OBJ)/test_path_sort_run.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_path_sort_run $(BUILD_OBJ)/test_path_sort_run.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_path_sort_run
 
 $(BUILD_OBJ)/test_external_sort.o:tests/test_external_sort.cpp include/gcsa/external_sort.h
 	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
@@ -153,7 +160,14 @@ construction-resume-test: directories $(BUILD_OBJ)/test_construction_resume.o $(
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_construction_resume $(BUILD_OBJ)/test_construction_resume.o $(LIBRARY) $(LIBS)
 	$(BUILD_BIN)/test_construction_resume
 
-test: workspace-test external-path-sort-test external-join-test external-sort-test external-preprocessing-test final-events-test lcp-streaming-test disk-array-test internal-buffer-test parameter-test construction-resume-test
+$(BUILD_OBJ)/test_path_graph_prune.o:tests/test_path_graph_prune.cpp include/gcsa/path_graph.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+path-graph-prune-test: directories $(BUILD_OBJ)/test_path_graph_prune.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_path_graph_prune $(BUILD_OBJ)/test_path_graph_prune.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_path_graph_prune
+
+test: workspace-test external-path-sort-test path-sort-run-test external-join-test external-sort-test external-preprocessing-test final-events-test lcp-streaming-test disk-array-test internal-buffer-test parameter-test construction-resume-test path-graph-prune-test
 
 clean:
 	rm -rf $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)

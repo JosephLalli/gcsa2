@@ -267,6 +267,22 @@ struct LCP
 //------------------------------------------------------------------------------
 
 /*
+  Diagnostics for the bounded merge used by prune() and MergedGraph. The
+  counters are optional and do not affect construction semantics.
+*/
+struct PathGraphMergeStats
+{
+  size_type priority_spills, range_spills, from_set_sorts;
+  size_type max_open_input_pairs;
+
+  PathGraphMergeStats() :
+    priority_spills(0), range_spills(0), from_set_sorts(0),
+    max_open_input_pairs(0) { }
+};
+
+//------------------------------------------------------------------------------
+
+/*
   A path graph is a set of files. Each file in the input graph becomes two temporary
   files: one for the paths and another for the rank sequences corresponding to path
   labels. The PathNodes in each file are sorted by their labels, and the read() member
@@ -325,7 +341,12 @@ struct PathGraph
 
       path_graph.prune(lcp, total_size_limit - path_graph.bytes())
   */
-  void prune(const LCP& lcp, size_type size_limit);
+  // Keep a bounded resident window while pruning one potentially very large
+  // equal-label range. The default is deliberately small enough that the
+  // external route cannot retain an adversarial range in RAM.
+  void prune(const LCP& lcp, size_type size_limit,
+    size_type group_buffer_bytes = MEGABYTE,
+    PathGraphMergeStats* stats = nullptr);
   void extend(size_type size_limit, size_type memory_limit);
 
   void debugExtend();
@@ -340,10 +361,12 @@ struct ExternalPathSortStats
 {
   size_type runs, merge_operations, merge_passes, parallel_sorts;
   size_type max_records_resident, max_bytes_resident;
+  size_type run_uncompressed_bytes, run_compressed_bytes;
 
   ExternalPathSortStats() :
     runs(0), merge_operations(0), merge_passes(0), parallel_sorts(0),
-    max_records_resident(0), max_bytes_resident(0) { }
+    max_records_resident(0), max_bytes_resident(0),
+    run_uncompressed_bytes(0), run_compressed_bytes(0) { }
 };
 
 // Sort one physical PathGraph file without materializing it in memory.
@@ -387,7 +410,7 @@ private:
 struct ExternalPathJoinStats
 {
   size_type left_records, right_records, sorted_bypass, generated_records;
-  size_type initial_runs, merge_operations, blocked_key_groups;
+  size_type initial_runs, merge_operations, blocked_key_groups, blocked_key_blocks;
   size_type join_parallel_sorts, label_sort_runs, label_merge_passes, label_parallel_sorts;
   size_type direct_label_records, intermediate_path_bytes_avoided;
   size_type join_partitions, worker_processes, restored_partitions;
@@ -396,7 +419,7 @@ struct ExternalPathJoinStats
 
   ExternalPathJoinStats() :
     left_records(0), right_records(0), sorted_bypass(0), generated_records(0),
-    initial_runs(0), merge_operations(0), blocked_key_groups(0),
+    initial_runs(0), merge_operations(0), blocked_key_groups(0), blocked_key_blocks(0),
     join_parallel_sorts(0), label_sort_runs(0), label_merge_passes(0), label_parallel_sorts(0),
     direct_label_records(0), intermediate_path_bytes_avoided(0),
     join_partitions(0), worker_processes(0), restored_partitions(0),
@@ -442,7 +465,10 @@ struct MergedGraph
 
       MergedGraph merged_graph(source, mapper, kmer_lcp, total_size_limit - source.bytes())
   */
-  MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper, const LCP& kmer_lcp, size_type size_limit);
+  MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper,
+    const LCP& kmer_lcp, size_type size_limit,
+    size_type group_buffer_bytes = MEGABYTE,
+    PathGraphMergeStats* stats = nullptr);
   ~MergedGraph();
 
   void clear();

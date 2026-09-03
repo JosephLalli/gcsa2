@@ -75,6 +75,10 @@ main()
   const std::string input_name = "tests/cycle.gcsa2";
   const std::string legacy_prefix = std::string(legacy_root) + "/index";
   const std::string external_prefix = std::string(workspace_root) + "/index";
+  // Prefix doubling streams join results directly into label sorting, so the
+  // configured ceiling must admit both independently byte-bounded stages.
+  const size_type external_minimum = externalPathJoinMinimumBudget() +
+    externalPathGraphSortMinimumBudget();
 
   // Establish the byte-for-byte reference through the original in-memory
   // extend route. The common external label sorter is still exercised.
@@ -93,7 +97,8 @@ main()
   // Stop after a durable, fine-grained prefix-doubling checkpoint.
   TempFile::setDirectory(workspace_root);
   {
-    ConstructionParameters parameters = externalParameters(workspace_root, 768 * KILOBYTE);
+    ConstructionParameters parameters = externalParameters(workspace_root,
+      external_minimum + 256 * KILOBYTE);
     parameters.setStopAfter("step-01-prune");
     bool stopped = false;
     try
@@ -113,7 +118,8 @@ main()
   // Resume through the final ordered scan, but stop before component assembly.
   // This verifies that a completed event set is independently durable.
   {
-    ConstructionParameters parameters = externalParameters(workspace_root, 640 * KILOBYTE);
+    ConstructionParameters parameters = externalParameters(workspace_root,
+      external_minimum + 128 * KILOBYTE);
     parameters.setResume();
     parameters.setStopAfter("final-events");
     bool stopped = false;
@@ -134,7 +140,8 @@ main()
   // A second resume changes the operational RAM ceiling again, restores the
   // immutable events, and assembles byte-identical final components.
   {
-    ConstructionParameters parameters = externalParameters(workspace_root, 576 * KILOBYTE);
+    ConstructionParameters parameters = externalParameters(workspace_root,
+      external_minimum + 64 * KILOBYTE);
     parameters.setResume();
     InputGraph graph({ input_name }, false, parameters);
     GCSA index(graph, parameters);
@@ -153,7 +160,8 @@ main()
   bool semantic_change_refused = false;
   try
   {
-    ConstructionParameters parameters = externalParameters(workspace_root, 640 * KILOBYTE);
+    ConstructionParameters parameters = externalParameters(workspace_root,
+      external_minimum + 128 * KILOBYTE);
     parameters.setSteps(1);
     parameters.setResume();
     InputGraph graph({ input_name }, false, parameters);

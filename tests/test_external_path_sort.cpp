@@ -149,9 +149,9 @@ int main()
     { 1, 25, 1, 2, 1, { 1, 5, 70 } }
   };
   std::vector<TestRecord> records;
-  // Keep enough records to force multiple merge levels even when the sorter
-  // uses the intended two-thirds of a minimum-sized budget for run records.
-  for(size_type copy = 0; copy < 12; copy++)
+  // Keep enough records to force multiple merge levels even though the
+  // versioned run codec reserves useful 64 KiB sequential I/O windows.
+  for(size_type copy = 0; copy < 600; copy++)
   {
     for(size_type i = 0; i < pattern.size(); i++)
     {
@@ -195,6 +195,7 @@ int main()
   require(first_stats.merge_passes >= 2);
   require(first_stats.max_records_resident < records.size());
   require(first_stats.max_bytes_resident <= budget);
+  require(first_stats.run_compressed_bytes < first_stats.run_uncompressed_bytes);
   require(first.logicalFile(0) == logical_file_id_t(17));
   require(first.physicalShard(0) == physical_shard_id_t(9001));
   std::vector<PathNode::rank_type> first_ranks = read_ranks(first.rank_names[0]);
