@@ -371,10 +371,13 @@ and otherwise performs one bounded copy. The payload is checksummed once while
 it is committed. Normal same-filesystem restore validates task identity, record
 count, and byte length and then hard-links the committed inode into the next
 `PathGraph`; `--verify-workspace` additionally rereads the complete checksum.
-Cross-filesystem restore copies and checksum-validates in one pass. A task
-with a missing, truncated, or corrupt output is invalidated and rerun along with
-its dependants. Cleanup is itself idempotent and never removes the newest
-committed predecessor of an incomplete task.
+Join-range worker outputs and final-event streams use the same immutable raw
+payload protocol, avoiding both the checkpoint rewrite and normal resume copy.
+Final events retain a checked header/footer compatibility restore for older
+workspaces. Cross-filesystem restore copies and checksum-validates in one pass.
+A task with a missing, truncated, or corrupt output is invalidated and rerun
+along with its dependants. Cleanup is itself idempotent and never removes the
+newest committed predecessor of an incomplete task.
 
 Crash tests use deterministic process termination, without stack unwinding,
 immediately before and after artifact rename, immediately before and after task
@@ -533,10 +536,10 @@ when its production call path and forced-spill/recovery tests pass.
 | Logical/physical `PathGraph` identity in pruning and joining | implemented; pruning coalesces only by logical ID and never treats a physical shard as a semantic input; durable run-set manifest pending |
 | External prefix-doubling join | bounded sort-merge, rolling page-cache windows, RAM-capped persisted 4096-record MSD radix range-pack planning bound to run checksums, exact range contracts, recursive two-dimensional heavy-key splitting, blocked nested-loop expansion, and selectable checksum scans implemented and forced-spill tested |
 | Direct join-to-label pipeline | implemented and forced-spill tested; the unsorted generated path/rank pair is no longer materialized |
-| Process worker scheduler and partition resume | implemented with fork-free spawn, global byte admission, semantic range checkpoints, and one-/multi-partition tests |
+| Process worker scheduler and partition resume | implemented with fork-free spawn, global byte admission, immutable-payload semantic range checkpoints, same-filesystem zero-copy restore, and one-/multi-partition tests |
 | External keys/start nodes/initial paths | implemented with bounded fixed-record runs, global duplicate reduction, streaming support construction, durable key/start checkpoints, and physical initial shards preserving logical IDs |
 | Spillable pruning groups | implemented and forced-spill tested for equal-label priority groups, extended ranges, external same-from sets, and bounded input/output descriptor caches |
-| Final event/component passes | implemented with one-task event checkpoint, spillable mapped start-node sets, disk-backed `prev_occ` and suffix-tree stack, external redundancy sort, and direct component-at-a-time packing in standalone/vg/autoindex; mid-scan assignment logs and per-component token admission pending |
+| Final event/component passes | implemented with one-task immutable-payload event checkpoint, same-filesystem zero-copy restore, spillable mapped start-node sets, disk-backed `prev_occ` and suffix-tree stack, external redundancy sort, and direct component-at-a-time packing in standalone/vg/autoindex; mid-scan assignment logs and per-component token admission pending |
 | Streaming LCP levels | implemented and resume-tested with one raw level resident at a time and byte-identical legacy serialization; final packed hierarchy remains resident |
 | External verification | implemented and forced-spill tested with bounded input blocks, external expected/actual occurrence sorts, callback-based locate, and sequential set comparison; resumable runs and parallel label ranges pending |
 | Standalone and `vg index` / `vg autoindex` CLI integration | implemented; forced-spill/resume integration tested |

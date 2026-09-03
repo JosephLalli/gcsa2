@@ -8,6 +8,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 #include <unistd.h>
 
 using namespace gcsa;
@@ -53,6 +54,68 @@ void initSupports(GCSA& index)
   sdsl::util::init_support(index.edge_rank, &(index.edges));
   sdsl::util::init_support(index.sampled_path_rank, &(index.sampled_paths));
   sdsl::util::init_support(index.sample_select, &(index.samples));
+}
+
+BuildWorkspace::ArtifactRef checkpointWrapped(BuildWorkspace& workspace,
+  const ArtifactIdentity& identity, physical_shard_id_t shard,
+  const std::string& source, size_type records, const std::string& order)
+{
+  std::ifstream input(source.c_str(), std::ios_base::binary);
+  require(static_cast<bool>(input));
+  BuildWorkspace::ArtifactWriter writer = workspace.open_artifact(identity,
+    logical_file_id_t(0), shard, order, "all");
+  std::array<char, 64> buffer = {};
+  while(input)
+  {
+    input.read(buffer.data(), buffer.size());
+    if(input.gcount() > 0)
+    {
+      writer.write(buffer.data(), static_cast<size_type>(input.gcount()));
+    }
+  }
+  require(input.eof());
+  return writer.finish(records);
+}
+
+void checkpointLegacyWrappedFinalEvents(BuildWorkspace& workspace,
+  const FinalEventFiles& files, const FinalEventMetadata& metadata)
+{
+  std::vector<BuildWorkspace::ArtifactRef> artifacts;
+  artifacts.push_back(checkpointWrapped(workspace,
+    ArtifactIdentity("final", "events", "metadata", "final-events-meta-v1"),
+    physical_shard_id_t(0), files.metadata, 1, "metadata"));
+  artifacts.push_back(checkpointWrapped(workspace,
+    ArtifactIdentity("final", "events", "bwt-masks", "bwt-mask-u8-v1"),
+    physical_shard_id_t(1), files.bwt_masks, metadata.paths, "path-rank"));
+  for(size_type comp = 0; comp < metadata.sigma; comp++)
+  {
+    artifacts.push_back(checkpointWrapped(workspace,
+      ArtifactIdentity("final", "events", "edge-destinations-" +
+        std::to_string(comp), "path-rank-u64le-v1"),
+      physical_shard_id_t(100 + comp), files.edge_destinations[comp],
+      metadata.bwt_counts[comp], "source-path-rank"));
+  }
+  artifacts.push_back(checkpointWrapped(workspace,
+    ArtifactIdentity("final", "events", "sampled-paths", "path-rank-u64le-v1"),
+    physical_shard_id_t(2), files.sample_positions, metadata.sampled_paths,
+    "path-rank"));
+  artifacts.push_back(checkpointWrapped(workspace,
+    ArtifactIdentity("final", "events", "sample-ids", "node-id-u64le-v1"),
+    physical_shard_id_t(3), files.sample_ids, metadata.sample_ids,
+    "sample-order"));
+  artifacts.push_back(checkpointWrapped(workspace,
+    ArtifactIdentity("final", "events", "sample-ends", "sample-rank-u64le-v1"),
+    physical_shard_id_t(4), files.sample_ends, metadata.sampled_paths,
+    "sample-order"));
+  artifacts.push_back(checkpointWrapped(workspace,
+    ArtifactIdentity("final", "events", "occurrences", "path-value-u64le-v1"),
+    physical_shard_id_t(5), files.occurrences, metadata.occurrence_items,
+    "path-rank"));
+  artifacts.push_back(checkpointWrapped(workspace,
+    ArtifactIdentity("final", "events", "redundancy", "path-rank-u64le-v1"),
+    physical_shard_id_t(6), files.redundant, metadata.redundant,
+    "path-rank"));
+  workspace.commit_task("final", "events", artifacts);
 }
 
 GCSA legacyEquivalent(const Alphabet& alphabet)
@@ -208,6 +271,18 @@ int main()
   checkpointFinalEvents(workspace, files, metadata, 64);
   require(workspace.task_completed("final", "events"));
 
+  // Same-filesystem checkpointing adopts the immutable payload inode. This is
+  // the property that removes a complete event-stream rewrite.
+  struct stat source_status, artifact_status;
+  require(::stat(files.bwt_masks.c_str(), &source_status) == 0);
+  const std::string mask_artifact = workspace.artifact_path(
+    ArtifactIdentity("final", "events", "bwt-masks", "bwt-mask-u8-v1"),
+    logical_file_id_t(0), physical_shard_id_t(1));
+  require(::stat(mask_artifact.c_str(), &artifact_status) == 0);
+  require(source_status.st_dev == artifact_status.st_dev);
+  require(source_status.st_ino == artifact_status.st_ino);
+  require(artifact_status.st_nlink >= 2);
+
   FinalEventFiles restored(alphabet.sigma);
   FinalEventMetadata restored_metadata;
   require(restoreFinalEvents(workspace, restored, restored_metadata, 4,
@@ -215,6 +290,26 @@ int main()
   require(restored_metadata.total_edges == 6);
   require(restored_metadata.occurrence_extra == 22);
   require(restored_metadata.redundant == 3);
+
+  struct stat restored_status;
+  require(::stat(restored.bwt_masks.c_str(), &restored_status) == 0);
+  require(restored_status.st_dev == artifact_status.st_dev);
+  require(restored_status.st_ino == artifact_status.st_ino);
+
+  // Workspaces produced before raw-payload adoption remain resumable. Their
+  // generic artifact header/footer makes the committed file larger than the
+  // expected raw stream, selecting the checked compatibility restore path.
+  const std::string legacy_root = std::string(root) + "/legacy-workspace";
+  BuildWorkspace legacy_workspace(legacy_root, semantic,
+    BuildWorkspace::Settings(), BuildWorkspace::NEW_WORKSPACE);
+  checkpointLegacyWrappedFinalEvents(legacy_workspace, files, metadata);
+  FinalEventFiles legacy_restored(alphabet.sigma);
+  FinalEventMetadata legacy_metadata;
+  require(restoreFinalEvents(legacy_workspace, legacy_restored, legacy_metadata,
+    4, alphabet.sigma, 64));
+  require(legacy_metadata.total_edges == metadata.total_edges);
+  require(legacy_metadata.sample_ids == metadata.sample_ids);
+  legacy_restored.clear();
 
   GCSA observed;
   observed.header.path_nodes = 4; observed.header.edges = 6; observed.header.order = 8;

@@ -379,29 +379,47 @@ checkpointFile(BuildWorkspace& workspace, const ArtifactIdentity& identity,
   physical_shard_id_t shard, const std::string& path, size_type records,
   size_type buffer_bytes, const std::string& sort_order)
 {
-  std::ifstream input;
-  input.rdbuf()->pubsetbuf(nullptr, 0);
-  input.open(path.c_str(), std::ios_base::binary);
-  if(!input) { throw eventError("cannot checkpoint event stream", path); }
-  BuildWorkspace::ArtifactWriter writer = workspace.open_artifact(identity,
-    logical_file_id_t(0), shard, sort_order, "all");
-  std::vector<std::uint8_t> buffer(std::max(static_cast<size_type>(1), buffer_bytes));
-  while(input)
-  {
-    input.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
-    std::streamsize bytes = input.gcount();
-    if(bytes > 0) { writer.write(buffer.data(), static_cast<size_type>(bytes)); }
-  }
-  if(!input.eof()) { throw eventError("failed while checkpointing", path); }
-  return writer.finish(records);
+  // Event streams are closed and immutable at this point. Give the raw inode
+  // its semantic workspace name instead of writing a second full copy. The
+  // workspace helper retains a bounded-copy fallback for another filesystem
+  // and computes the committed checksum in either case.
+  static_cast<void>(sort_order);
+  return workspace.adopt_raw_payload(identity, logical_file_id_t(0), shard,
+    path, records, rawFileBytes(path),
+    std::max(static_cast<size_type>(1), buffer_bytes));
 }
 
 void
 restoreFile(const BuildWorkspace& workspace, const ArtifactIdentity& identity,
-  physical_shard_id_t shard, const std::string& path, size_type buffer_bytes)
+  physical_shard_id_t shard, const std::string& path, size_type records,
+  size_type width, size_type buffer_bytes, bool verify_checksum)
 {
-  workspace.restore_artifact(identity, logical_file_id_t(0), shard, path,
-    std::max(static_cast<size_type>(1), buffer_bytes));
+  const size_type expected_bytes = checkedBytes(records, width, path);
+  const std::string source = workspace.artifact_path(identity,
+    logical_file_id_t(0), shard);
+  struct stat status;
+  if(::stat(source.c_str(), &status) != 0 || status.st_size < 0)
+  {
+    throw eventError("cannot stat committed event stream", source);
+  }
+
+  if(static_cast<std::uintmax_t>(status.st_size) == expected_bytes)
+  {
+    // New workspaces store the raw immutable payload. A normal resume validates
+    // task identity and exact length in O(metadata); --verify-workspace asks
+    // restore_adopted_payload() for the full checksum scan.
+    workspace.restore_adopted_payload(identity, logical_file_id_t(0), shard,
+      path, records, expected_bytes,
+      std::max(static_cast<size_type>(1), buffer_bytes), verify_checksum);
+  }
+  else
+  {
+    // Backward compatibility for v1 workspaces whose event payloads were
+    // wrapped in a generic artifact header/footer. This also lets an active
+    // construction upgrade without discarding a completed final-event scan.
+    workspace.restore_artifact(identity, logical_file_id_t(0), shard, path,
+      std::max(static_cast<size_type>(1), buffer_bytes));
+  }
 }
 
 void
@@ -1121,11 +1139,13 @@ checkpointFinalEvents(BuildWorkspace& workspace,
 bool
 restoreFinalEvents(const BuildWorkspace& workspace,
   FinalEventFiles& files, FinalEventMetadata& metadata,
-  size_type expected_paths, size_type expected_sigma, size_type buffer_bytes)
+  size_type expected_paths, size_type expected_sigma, size_type buffer_bytes,
+  bool verify_checksum)
 {
   if(!workspace.task_completed(FINAL_TASK, FINAL_PHASE)) { return false; }
   restoreFile(workspace, metadataArtifact(), physical_shard_id_t(0),
-    files.metadata, buffer_bytes);
+    files.metadata, 1, 8 + EVENT_METADATA_WORDS * 8, buffer_bytes,
+    verify_checksum);
   metadata = readFinalEventMetadata(files);
   if(metadata.paths != expected_paths || metadata.sigma != expected_sigma ||
      files.edge_destinations.size() != metadata.sigma)
@@ -1133,22 +1153,28 @@ restoreFinalEvents(const BuildWorkspace& workspace,
     throw eventError("committed events do not match the merged graph");
   }
   restoreFile(workspace, maskArtifact(), physical_shard_id_t(1),
-    files.bwt_masks, buffer_bytes);
+    files.bwt_masks, metadata.paths, 1, buffer_bytes, verify_checksum);
   for(size_type comp = 0; comp < metadata.sigma; comp++)
   {
     restoreFile(workspace, edgeArtifact(comp), edgeShard(comp),
-      files.edge_destinations[comp], buffer_bytes);
+      files.edge_destinations[comp], metadata.bwt_counts[comp], 8,
+      buffer_bytes, verify_checksum);
   }
   restoreFile(workspace, streamArtifact("sampled-paths", "path-rank-u64le-v1"),
-    physical_shard_id_t(2), files.sample_positions, buffer_bytes);
+    physical_shard_id_t(2), files.sample_positions, metadata.sampled_paths, 8,
+    buffer_bytes, verify_checksum);
   restoreFile(workspace, streamArtifact("sample-ids", "node-id-u64le-v1"),
-    physical_shard_id_t(3), files.sample_ids, buffer_bytes);
+    physical_shard_id_t(3), files.sample_ids, metadata.sample_ids, 8,
+    buffer_bytes, verify_checksum);
   restoreFile(workspace, streamArtifact("sample-ends", "sample-rank-u64le-v1"),
-    physical_shard_id_t(4), files.sample_ends, buffer_bytes);
+    physical_shard_id_t(4), files.sample_ends, metadata.sampled_paths, 8,
+    buffer_bytes, verify_checksum);
   restoreFile(workspace, streamArtifact("occurrences", "path-value-u64le-v1"),
-    physical_shard_id_t(5), files.occurrences, buffer_bytes);
+    physical_shard_id_t(5), files.occurrences, metadata.occurrence_items, 16,
+    buffer_bytes, verify_checksum);
   restoreFile(workspace, streamArtifact("redundancy", "path-rank-u64le-v1"),
-    physical_shard_id_t(6), files.redundant, buffer_bytes);
+    physical_shard_id_t(6), files.redundant, metadata.redundant, 8,
+    buffer_bytes, verify_checksum);
   validatePayloads(files, metadata); return true;
 }
 

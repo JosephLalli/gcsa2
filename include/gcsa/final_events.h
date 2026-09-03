@@ -146,7 +146,8 @@ void checkpointFinalEvents(BuildWorkspace& workspace,
   size_type buffer_bytes);
 bool restoreFinalEvents(const BuildWorkspace& workspace,
   FinalEventFiles& files, FinalEventMetadata& metadata,
-  size_type expected_paths, size_type expected_sigma, size_type buffer_bytes);
+  size_type expected_paths, size_type expected_sigma, size_type buffer_bytes,
+  bool verify_checksum = false);
 
 /*
   Build the existing GCSA members serially from event streams. This preserves

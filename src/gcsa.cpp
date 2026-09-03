@@ -658,7 +658,7 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
 {
   FinalEventMetadata metadata;
   if(restoreFinalEvents(workspace, files, metadata, merged_graph.size(),
-    graph.alpha.sigma, checkpoint_buffer))
+    graph.alpha.sigma, checkpoint_buffer, parameters.getVerifyWorkspace()))
   {
     if(stats != nullptr) { stats->restored = true; }
     return metadata;
