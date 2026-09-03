@@ -73,11 +73,12 @@ and 105,438,580 KiB maximum RSS (100.55 GiB). This is the primary target for
 the requested approximately 25 GiB comparison once the host's other heavy
 `vg prune`/GCSA work and I/O contention are absent.
 
-Only preexisting pruned fixtures are eligible for acceptance runs. The active
-chr19 production job had not published a committed nonempty k32-pruned graph at
-the latest gate check, so no competing chr19 index build was launched. The
-remaining final-component memory gaps below must be closed or bounded before
-that race is considered ready.
+Only preexisting pruned fixtures are eligible for acceptance runs. The chr19
+production prune exited successfully after 49:45:06 at 154,737,660 KiB maximum
+RSS, but its wrapper did not publish the 748,778,080-byte `.partial` graph as a
+committed fixture. No competing chr19 index build was launched. The remaining
+final-component memory gaps below must be closed or bounded before that race is
+considered ready.
 
 The successful legacy command used `vg index -k 16 -X 4 -Z 700 -t 32 -V`.
 It produced a 682,869,673-byte GCSA and a 273,490,577-byte LCP in 1:55:35
@@ -176,8 +177,9 @@ I/O buffer settings are bytes. The element capacity is computed as
 scheduled separately, but both consume tokens from the same budget.
 
 Linux cgroups charge clean filesystem page cache to `MemoryMax`. The external
-preprocessor, join, label sorter, final-event streams, disk arrays, and durable
-checkpoint writer/validator/restorer therefore use bounded byte buffers and,
+preprocessor, join, label sorter, final-event streams, spillable per-path
+start-node sets, disk arrays, and durable checkpoint writer/validator/restorer
+therefore use bounded byte buffers and,
 where implemented, sequential access advice plus rolling cache eviction.
 Sequential join and final-event writers sync and evict completed prefixes every
 512 MiB while retaining a 64 MiB tail; readers evict consumed prefixes. A
@@ -190,12 +192,17 @@ all admitted through the process-wide `MemoryBudget`. The in-process token
 budget is therefore not yet an end-to-end RSS ceiling; a hard cgroup remains
 the acceptance boundary.
 
-`--max-open-files` is now enforced for the prune and final merge run sets.
+`--max-open-files` is now enforced for the prune, final merge, and final-scan
+run sets.
 Pruning reserves its two possible spill descriptors before dividing the
 remainder between two-descriptor input and output cache entries. Final merge
 reserves fourteen descriptors for four sequential outputs, two possible spill
 files, and the worst overlapping two-way `SameFromSet` external-sort state;
-each remaining input-cache entry consumes two. The supported minimum is 16.
+each remaining input-cache entry consumes two. The final scan additionally
+accounts for all merged-graph readers, event writers, two mutable disk arrays,
+one retained start-set reader, and the external sorter's `2 * fan-in + 4`
+descriptors. Its fan-in is reduced to fit the ceiling. The supported global
+minimum is 64; the isolated prune/merge algorithms can still operate with 16.
 This ceiling covers GCSA2 construction files, not descriptors already inherited
 from the embedding process.
 
@@ -450,7 +457,10 @@ The implemented final merged-graph scan emits immutable BWT masks,
 per-character source-path edge ranks, sampled path positions, sample IDs and
 boundaries, nonzero occurrence pairs, and redundancy positions. Redundancy
 positions are externally sorted. Dense previous-occurrence state and the
-suffix-tree traversal stack are block-cached disk arrays. All streams are
+suffix-tree traversal stack are block-cached disk arrays. Mapped start nodes for
+one path use two reusable `SpillableNodeSet` instances: small sets stay in RAM,
+while oversized sets are externally sorted/deduplicated and rewound from disk
+for occurrence, continuation, and sample passes. All streams are
 synced and committed together as one workspace task; a crash restarts only this
 ordered scan. Mid-scan resume and the assignment-log protocol remain future
 work.
@@ -482,17 +492,16 @@ when its production call path and forced-spill/recovery tests pass.
 | Process worker scheduler and partition resume | implemented with fork-free spawn, global byte admission, semantic range checkpoints, and one-/multi-partition tests |
 | External keys/start nodes/initial paths | implemented with bounded fixed-record runs, global duplicate reduction, streaming support construction, durable key/start checkpoints, and physical initial shards preserving logical IDs |
 | Spillable pruning groups | implemented and forced-spill tested for equal-label priority groups, extended ranges, external same-from sets, and bounded input/output descriptor caches |
-| Final event/component passes | implemented with one-task event checkpoint, disk-backed `prev_occ` and suffix-tree stack, external redundancy sort, and component-at-a-time construction; mid-scan assignment logs and direct component packer pending |
+| Final event/component passes | implemented with one-task event checkpoint, spillable mapped start-node sets, disk-backed `prev_occ` and suffix-tree stack, external redundancy sort, and component-at-a-time construction; mid-scan assignment logs and direct component packer pending |
 | Streaming LCP levels | implemented and resume-tested with one raw level resident at a time and byte-identical legacy serialization; final packed hierarchy remains resident |
 | Standalone and `vg index` / `vg autoindex` CLI integration | implemented; forced-spill/resume integration tested |
 | Chromosome-scale benchmark | preexisting chr20 k32-pruned fixture completed and verified at 32.36 GiB RSS under a 128 GiB cgroup; outputs are byte-identical to legacy; separate 25 GiB forced-spill/recovery path exercised |
 
 Current limitations are intentionally explicit. The external route is selected
-only when `ConstructionParameters::work_directory` is nonempty. Final-scan
-`curr_from` and `pred_from` vectors may grow with one path's start-node set.
-Final SDSL bitvectors and succinct components allocate outside the token budget
+only when `ConstructionParameters::work_directory` is nonempty. Final SDSL
+bitvectors and succinct components allocate outside the token budget
 and all completed components coexist in the returned object; callers may also
-retain the completed GCSA while constructing the LCP. These gaps prevent a
+retain the completed GCSA while constructing the LCP. This gap prevents a
 strict end-to-end RAM guarantee today, so chromosome-scale racing remains gated
 on closing or directly bounding them.
 
@@ -508,7 +517,8 @@ at its task boundary. Process workers currently accelerate independent join
 ranges only. Even with these limitations, preprocessing and prefix doubling no
 longer require a logical chromosome, physical shard, join key, equal-label prune
 group, same-from set, or generated label run to fit in RAM, and LCP no longer
-retains all raw hierarchy levels.
+retains all raw hierarchy levels. One final path's mapped start-node set is also
+no longer required to fit in RAM.
 
 ## Build, test, and usage
 

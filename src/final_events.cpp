@@ -491,6 +491,255 @@ compareEncoded64(const void* left, const void* right)
 
 } // namespace
 
+//------------------------------------------------------------------------------
+
+struct SpillableNodeSet::Impl
+{
+  size_type budget, fan_in, collection_capacity, count;
+  std::vector<node_type> values, read_buffer;
+  std::string raw_name, sorted_name;
+  int raw_descriptor, read_descriptor;
+  size_type raw_bytes, read_values, read_offset, values_seen;
+  off_t raw_cache_released, read_cache_released;
+  bool finished, on_disk;
+  MemoryBudget::Reservation reservation;
+
+  Impl(size_type byte_budget, size_type merge_fan_in, MemoryBudget& memory) :
+    budget(byte_budget), fan_in(std::max(static_cast<size_type>(2), merge_fan_in)),
+    collection_capacity(0), count(0), values(), read_buffer(), raw_name(),
+    sorted_name(), raw_descriptor(-1), read_descriptor(-1), raw_bytes(0),
+    read_values(0), read_offset(0), values_seen(0), raw_cache_released(0),
+    read_cache_released(0), finished(false), on_disk(false), reservation()
+  {
+    if(this->budget < SpillableNodeSet::minimumBudget())
+    {
+      throw eventError("start-node set budget is too small");
+    }
+    this->reservation = memory.reserve(this->budget, "final-start-node-set");
+
+    // Leave half the reservation unused during collection. It covers vector
+    // allocator slack and the small file/stream objects used when the vector
+    // is flushed. The external sorter receives the entire reservation only
+    // after this vector has released its storage.
+    this->collection_capacity = std::max(static_cast<size_type>(1),
+      this->budget / (2 * sizeof(node_type)));
+    this->values.reserve(this->collection_capacity);
+  }
+
+  ~Impl()
+  {
+    this->closeRaw(false);
+    this->closeRead();
+    if(!this->raw_name.empty()) { TempFile::remove(this->raw_name); }
+    if(!this->sorted_name.empty()) { TempFile::remove(this->sorted_name); }
+  }
+
+  void closeRaw(bool complete)
+  {
+    if(this->raw_descriptor < 0) { return; }
+    if(complete)
+    {
+      if(::fdatasync(this->raw_descriptor) != 0)
+      {
+        throw eventError("cannot sync spilled start-node set", this->raw_name);
+      }
+      discardCache(this->raw_descriptor, this->raw_cache_released,
+        static_cast<off_t>(this->raw_bytes) - this->raw_cache_released);
+    }
+    if(::close(this->raw_descriptor) != 0 && complete)
+    {
+      this->raw_descriptor = -1;
+      throw eventError("cannot close spilled start-node set", this->raw_name);
+    }
+    this->raw_descriptor = -1;
+  }
+
+  void closeRead()
+  {
+    if(this->read_descriptor >= 0)
+    {
+      discardCache(this->read_descriptor, this->read_cache_released,
+        static_cast<off_t>(this->values_seen * sizeof(node_type)) -
+        this->read_cache_released);
+      ::close(this->read_descriptor); this->read_descriptor = -1;
+    }
+    this->read_values = this->read_offset = this->values_seen = 0;
+    this->read_cache_released = 0;
+  }
+
+  void openRaw()
+  {
+    if(this->raw_descriptor >= 0) { return; }
+    this->raw_name = TempFile::getName("gcsa_final_from_nodes_raw");
+    this->raw_descriptor = ::open(this->raw_name.c_str(),
+      O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if(this->raw_descriptor < 0)
+    {
+      throw eventError("cannot create spilled start-node set", this->raw_name);
+    }
+    adviseSequential(this->raw_descriptor);
+  }
+
+  void flushValues()
+  {
+    if(this->values.empty()) { return; }
+    this->openRaw();
+    size_type bytes = checkedBytes(this->values.size(), sizeof(node_type),
+      this->raw_name);
+    writeAll(this->raw_descriptor, this->values.data(), bytes, this->raw_name);
+    this->raw_bytes += bytes; this->values.clear();
+    if(static_cast<off_t>(this->raw_bytes) - this->raw_cache_released >=
+       CACHE_FLUSH_BYTES)
+    {
+      if(::fdatasync(this->raw_descriptor) != 0)
+      {
+        throw eventError("cannot periodically sync spilled start-node set",
+          this->raw_name);
+      }
+      off_t discard_end = std::max(this->raw_cache_released,
+        static_cast<off_t>(this->raw_bytes) - CACHE_TAIL_BYTES);
+      discardCache(this->raw_descriptor, this->raw_cache_released,
+        discard_end - this->raw_cache_released);
+      this->raw_cache_released = discard_end;
+    }
+  }
+
+  void reset()
+  {
+    this->closeRaw(false); this->closeRead();
+    if(!this->raw_name.empty()) { TempFile::remove(this->raw_name); this->raw_name.clear(); }
+    if(!this->sorted_name.empty()) { TempFile::remove(this->sorted_name); this->sorted_name.clear(); }
+    std::vector<node_type>().swap(this->read_buffer);
+    this->values.clear();
+    if(this->values.capacity() < this->collection_capacity)
+    {
+      this->values.reserve(this->collection_capacity);
+    }
+    this->count = this->raw_bytes = 0;
+    this->raw_cache_released = 0;
+    this->finished = this->on_disk = false;
+  }
+
+  void push(node_type value)
+  {
+    if(this->finished) { throw eventError("append to completed start-node set"); }
+    if(this->values.size() == this->collection_capacity) { this->flushValues(); }
+    this->values.push_back(value);
+  }
+
+  void complete()
+  {
+    if(this->finished) { throw eventError("start-node set completed twice"); }
+    if(this->raw_descriptor < 0)
+    {
+      sequentialSort(this->values.begin(), this->values.end());
+      this->values.resize(std::unique(this->values.begin(), this->values.end()) -
+        this->values.begin());
+      this->count = this->values.size(); this->finished = true; return;
+    }
+
+    this->flushValues(); this->closeRaw(true);
+    std::vector<node_type>().swap(this->values);
+    this->sorted_name = TempFile::getName("gcsa_final_from_nodes_sorted");
+    size_type unique_values = 0;
+    try
+    {
+      ExternalFixedRecordSorter::sortAndReduce(this->raw_name,
+        this->sorted_name, sizeof(node_type), this->budget, this->fan_in,
+        [](const void* left, const void* right) {
+          node_type a, b;
+          std::memcpy(&a, left, sizeof(a)); std::memcpy(&b, right, sizeof(b));
+          return (a < b ? -1 : (a > b ? 1 : 0));
+        },
+        [&unique_values](const void* record, bool first, bool, std::ostream& output) {
+          if(first)
+          {
+            output.write(static_cast<const char*>(record), sizeof(node_type));
+            unique_values++;
+          }
+        });
+    }
+    catch(...)
+    {
+      TempFile::remove(this->sorted_name); this->sorted_name.clear(); throw;
+    }
+    TempFile::remove(this->raw_name); this->raw_name.clear();
+    this->count = unique_values; this->on_disk = true; this->finished = true;
+
+    size_type read_bytes = std::max(sizeof(node_type),
+      std::min(static_cast<size_type>(64 * KILOBYTE), this->budget / 4));
+    this->read_buffer.reserve(std::max(static_cast<size_type>(1),
+      read_bytes / sizeof(node_type)));
+  }
+
+  void startRead()
+  {
+    if(!this->finished) { throw eventError("read from incomplete start-node set"); }
+    if(!this->on_disk) { this->read_offset = 0; return; }
+    this->closeRead();
+    this->read_descriptor = ::open(this->sorted_name.c_str(), O_RDONLY);
+    if(this->read_descriptor < 0)
+    {
+      throw eventError("cannot open spilled start-node set", this->sorted_name);
+    }
+    adviseSequential(this->read_descriptor);
+  }
+
+  bool readNext(node_type& value)
+  {
+    if(!this->finished) { throw eventError("read from incomplete start-node set"); }
+    if(!this->on_disk)
+    {
+      if(this->read_offset == this->values.size()) { return false; }
+      value = this->values[this->read_offset++]; return true;
+    }
+    if(this->values_seen == this->count) { return false; }
+    if(this->read_offset == this->read_values)
+    {
+      size_type records = std::min(static_cast<size_type>(this->read_buffer.capacity()),
+        this->count - this->values_seen);
+      this->read_buffer.resize(records);
+      readAll(this->read_descriptor, this->read_buffer.data(),
+        checkedBytes(records, sizeof(node_type), this->sorted_name),
+        this->sorted_name);
+      this->read_values = records; this->read_offset = 0;
+    }
+    value = this->read_buffer[this->read_offset++]; this->values_seen++;
+    if(static_cast<off_t>(this->values_seen * sizeof(node_type)) -
+       this->read_cache_released >= CACHE_FLUSH_BYTES)
+    {
+      off_t discard_end = std::max(this->read_cache_released,
+        static_cast<off_t>(this->values_seen * sizeof(node_type)) - CACHE_TAIL_BYTES);
+      discardCache(this->read_descriptor, this->read_cache_released,
+        discard_end - this->read_cache_released);
+      this->read_cache_released = discard_end;
+    }
+    return true;
+  }
+};
+
+SpillableNodeSet::SpillableNodeSet(size_type byte_budget,
+  size_type merge_fan_in, MemoryBudget& memory) :
+  impl_(new Impl(byte_budget, merge_fan_in, memory))
+{
+}
+
+SpillableNodeSet::~SpillableNodeSet() = default;
+
+void SpillableNodeSet::clear() { this->impl_->reset(); }
+void SpillableNodeSet::push_back(node_type value) { this->impl_->push(value); }
+void SpillableNodeSet::finish() { this->impl_->complete(); }
+size_type SpillableNodeSet::size() const { return this->impl_->count; }
+bool SpillableNodeSet::spilled() const { return this->impl_->on_disk; }
+void SpillableNodeSet::rewind() { this->impl_->startRead(); }
+bool SpillableNodeSet::next(node_type& value) { return this->impl_->readNext(value); }
+
+size_type
+SpillableNodeSet::minimumBudget()
+{
+  return ExternalFixedRecordSorter::minimumBudget(sizeof(node_type));
+}
+
 FinalEventMetadata::FinalEventMetadata() :
   paths(0), sigma(0), fast_chars(0), total_edges(0), sampled_paths(0),
   sample_ids(0), sample_bits(0), occurrence_items(0), occurrence_extra(0),
@@ -712,10 +961,18 @@ sortFinalRedundancy(FinalEventFiles& files,
   std::string sorted = TempFile::getName("gcsa_final_redundant_sorted");
   try
   {
-    size_type budget = std::min(parameters.getMemoryLimitBytes(),
-      parameters.getSortRunSize());
+    size_type usable_memory = parameters.getMemoryLimitBytes() -
+      parameters.getMemoryLimitBytes() / 8;
+    size_type budget = std::min(usable_memory, parameters.getSortRunSize());
+    const size_type sorter_descriptors = 4;
+    if(parameters.getMaxOpenFiles() < sorter_descriptors + 2 * 2)
+    {
+      throw eventError("max-open-files cannot hold redundancy sort streams");
+    }
+    size_type fan_in = std::min(parameters.getMergeFanIn(),
+      (parameters.getMaxOpenFiles() - sorter_descriptors) / 2);
     ExternalFixedRecordSorter::sort(files.redundant, sorted, 8, budget,
-      parameters.getMergeFanIn(), compareEncoded64);
+      fan_in, compareEncoded64);
     TempFile::remove(files.redundant); files.redundant = sorted;
   }
   catch(...)

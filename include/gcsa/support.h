@@ -46,6 +46,10 @@ struct ConstructionParameters
   constexpr static size_type JOIN_PARTITION_SIZE   = 16 * GIGABYTE;
   constexpr static size_type MERGE_FAN_IN          = 64;
   constexpr static size_type MAX_OPEN_FILES        = 128;
+  // Final external construction owns fixed event/read streams in addition to
+  // temporary two-way sorter streams. Values below this cannot represent a
+  // global descriptor ceiling for the full supported alphabet.
+  constexpr static size_type MIN_OPEN_FILES        = 64;
   constexpr static size_type PROCESS_WORKERS       = 1;
   constexpr static size_type CHECKPOINT_RECORDS    = 16 * MILLION;
   constexpr static size_type CHECKPOINT_BYTES      = GIGABYTE;
