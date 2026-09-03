@@ -224,7 +224,12 @@ Merge emitters remain single-writer, while prefix-doubling joins can now use
 deterministic range partitions of `(logical_file_id, join_key)`. Worker tasks
 reserve byte tokens, consume disjoint immutable input ranges, and publish
 separate physical output shards. Those shards retain their shared logical ID
-and are compacted through the bounded label sorter before the next prune;
+and are compacted by a byte-budgeted, descriptor-bounded k-way merge before
+the next prune. Because every input already has the complete label order, the
+compactor never decodes the frontier into a new general sort. It performs as
+many merge levels as a small fan-in requires, publishes deterministic physical
+shard ids, and may retain several sorted streams when one monolith is neither
+needed nor desirable;
 pruning itself projects its globally label-sorted merge directly to one output
 shard per logical input. A heavy key is recursively split on both left and
 right record ranges; splitting the left range suppresses duplicate sorted
@@ -493,6 +498,15 @@ the configured branching factor from level `i`; each raw internal level is
 independently checkpointed and consumed. The final packed hierarchy necessarily
 resides in `LCPArray::data`, in legacy leaf-to-root serialization order.
 
+Index verification also has a disk-first route. It emits fixed-width
+`(label, mapped-from-node)` records from bounded input blocks, externally sorts
+and deduplicates the expected occurrences, streams raw `locate()` occurrences
+through a callback, externally reduces those records, and compares the two
+sorted streams. The verification workspace defaults to at most 64 MiB even
+when construction has a larger budget. It is currently serial and transient;
+checkpointing its sort runs and partitioning disjoint label ranges are
+throughput improvements rather than verification-correctness requirements.
+
 ## Implementation ledger
 
 The ledger is intentionally conservative: a feature moves to **complete** only
@@ -503,7 +517,7 @@ when its production call path and forced-spill/recovery tests pass.
 | Shared byte-token `MemoryBudget` and statvfs-aware `DiskBudget` | memory primitives and major external-phase byte caps implemented; pruning/merged-graph buffers are byte-bounded but not globally admitted; SDSL/library allocations remain outside the shared budget; disk guard covers generated path/join volume but not every final/LCP/checkpoint writer |
 | Versioned workspace artifacts, atomic publication, manifest compatibility, recovery tests | phase and join-range checkpoints plus abrupt-exit commit-boundary tests implemented; transient distribution-run task records pending |
 | Human-readable operational construction parameters | core budget/run controls implemented and parser-tested; cleanup/cadence controls are not all wired |
-| Bounded external path-label runs and leveled multi-pass merge | versioned grouped/prefix-compressed runs, shared-left-context references, parallel in-place run sorting, rolling cache windows, one-run bypass, and forced multi-pass spilling implemented and tested |
+| Bounded external path-label runs and leveled multi-pass merge | versioned grouped/prefix-compressed runs, shared-left-context references, parallel in-place run sorting, rolling cache windows, one-run bypass, direct leveled merge of already-sorted worker shards, and forced multi-pass spilling implemented and tested |
 | Logical/physical `PathGraph` identity in pruning and joining | implemented; pruning coalesces only by logical ID and never treats a physical shard as a semantic input; durable run-set manifest pending |
 | External prefix-doubling join | bounded sort-merge, rolling page-cache windows, RAM-capped persisted 4096-record MSD radix range-pack planning bound to run checksums, exact range contracts, recursive two-dimensional heavy-key splitting, blocked nested-loop expansion, and selectable checksum scans implemented and forced-spill tested |
 | Direct join-to-label pipeline | implemented and forced-spill tested; the unsorted generated path/rank pair is no longer materialized |
@@ -512,6 +526,7 @@ when its production call path and forced-spill/recovery tests pass.
 | Spillable pruning groups | implemented and forced-spill tested for equal-label priority groups, extended ranges, external same-from sets, and bounded input/output descriptor caches |
 | Final event/component passes | implemented with one-task event checkpoint, spillable mapped start-node sets, disk-backed `prev_occ` and suffix-tree stack, external redundancy sort, and component-at-a-time construction; mid-scan assignment logs and direct component packer pending |
 | Streaming LCP levels | implemented and resume-tested with one raw level resident at a time and byte-identical legacy serialization; final packed hierarchy remains resident |
+| External verification | implemented and forced-spill tested with bounded input blocks, external expected/actual occurrence sorts, callback-based locate, and sequential set comparison; resumable runs and parallel label ranges pending |
 | Standalone and `vg index` / `vg autoindex` CLI integration | implemented; forced-spill/resume integration tested |
 | Chromosome-scale benchmark | preexisting chr20 k32-pruned fixture completed and verified at 32.36 GiB RSS under a 128 GiB cgroup; outputs are byte-identical to legacy; separate 25 GiB forced-spill/recovery path exercised |
 
@@ -540,6 +555,50 @@ group, same-from set, or generated label run to fit in RAM, and LCP no longer
 retains all raw hierarchy levels. One final path's mapped start-node set is also
 no longer required to fit in RAM.
 
+### Whole-pangenome feasibility and throughput priorities
+
+`--memory-limit` in `build_gcsa` and `--gcsa-memory-limit` in `vg index` /
+`vg autoindex` are the external working-set goalpost. Sort, join, worker, and
+verification reservations are derived from this byte value; autoindex falls
+back to its `--target-mem` value when no GCSA-specific value is given. Until
+every library allocation is admitted, a deployment cgroup must remain the hard
+whole-process ceiling, with the GCSA goal below it for allocator, SDSL, and
+charged page-cache headroom.
+
+Before a whole-pangenome claim, the remaining work is ordered by the project's
+feasibility, RSS, then speed policy:
+
+1. Bound the `vg` input producer. `VGset::for_each()` currently loads one whole
+   physical graph and `SourceSinkOverlay` materializes weak-component sets
+   before GCSA2's budget exists. A sharded graph reader must preserve one
+   explicit logical GCSA2 input identity across all physical chunks.
+2. Bound or preflight the resident floor: `NodeMapping`, de Bruijn support,
+   completed succinct GCSA components, and the final packed LCP currently
+   coexist outside the shared token budget. Direct component-blob packing and
+   an external mapping lookup are the principal remaining greater-than-RAM
+   changes. Until then, their measured/projected bytes must be subtracted from
+   the phase budget and checked against the hard cap.
+3. Make `DiskBudget` global. Join/path generation is reserved today, but
+   checkpoint payloads, final events, verification runs, and LCP levels can
+   still discover ENOSPC only when a write fails.
+4. Remove checkpoint copy amplification. A phase currently copies raw
+   path/rank files into headered artifacts and copies them out again on resume.
+   Durable adoptable payloads (or offset-aware artifact readers) should let the
+   next phase consume committed immutable shards directly.
+5. Persist distribution and group-summary products as task artifacts, and emit
+   exact group summaries while creating join runs. This removes the full
+   post-sampling rescan and avoids rebuilding distributions after interruption.
+6. Compact the repeated rank payload in join distribution records before
+   increasing worker count. Only after per-path bytes and storage headroom are
+   measured should more encoders, merge groups, or verifier label ranges run in
+   parallel under combined memory and I/O admission.
+
+Acceptance should report the configured GCSA goal and cgroup cap separately,
+along with peak anonymous/cache/PSS memory, live disk, records and bytes per
+generated path, merge levels, worker count, filesystem throughput/PSI, and
+total `(bytes read + bytes written) / source byte`. Whole-genome runtime should
+not be extrapolated until the projected resident floor fits the selected cap.
+
 ## Build, test, and usage
 
 From the containing `vg` checkout, use its local toolchain wrapper. The GCSA2
@@ -547,7 +606,7 @@ library tests deliberately use tiny byte budgets so the same records create
 multiple runs and resume checkpoints:
 
 ```bash
-JOBS=8 ./build-local.sh -C deps/gcsa2 test
+JOBS=1 ./build-local.sh -C deps/gcsa2 test
 JOBS=8 ./build-local.sh -C deps/gcsa2 all
 ```
 
