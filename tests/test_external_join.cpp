@@ -51,10 +51,20 @@ struct SemanticRecord
   }
 };
 
-void require(bool condition)
+void
+requireAt(bool condition, const char* expression, int line)
 {
-  if(!condition) { std::abort(); }
+  if(!condition)
+  {
+    std::fprintf(stderr, "test_external_join:%d: requirement failed: %s\n",
+      line, expression);
+    std::abort();
+  }
 }
+
+// Keep assertions useful under the production -O3 test build, where adjacent
+// abort sites can otherwise collapse onto one misleading source line.
+#define require(value) requireAt((value), #value, __LINE__)
 
 void
 writePathPair(const std::string& path_name, const std::string& rank_name,
@@ -126,6 +136,74 @@ readGraph(const PathGraph& graph)
   return result;
 }
 
+void
+requireSameGraph(const PathGraph& expected_graph, const PathGraph& actual_graph,
+  const char* context)
+{
+  std::vector<SemanticRecord> expected = readGraph(expected_graph);
+  std::vector<SemanticRecord> actual = readGraph(actual_graph);
+  if(expected != actual)
+  {
+    size_type mismatch = 0;
+    while(mismatch < expected.size() && mismatch < actual.size() &&
+          expected[mismatch] == actual[mismatch]) { mismatch++; }
+    std::cerr << context << ": semantic graph mismatch at " << mismatch
+              << " (expected " << expected.size() << " records, got "
+              << actual.size() << ")" << std::endl;
+    if(mismatch < expected.size() && mismatch < actual.size())
+    {
+      std::cerr << "expected from/to/order/lcp/labels: " << expected[mismatch].from
+                << "/" << expected[mismatch].to << "/" << expected[mismatch].order
+                << "/" << expected[mismatch].lcp << "/" << expected[mismatch].labels.size()
+                << "; got " << actual[mismatch].from << "/" << actual[mismatch].to
+                << "/" << actual[mismatch].order << "/" << actual[mismatch].lcp
+                << "/" << actual[mismatch].labels.size() << std::endl;
+    }
+    std::abort();
+  }
+}
+
+bool
+labelSorted(const PathGraph& graph)
+{
+  for(size_type file = 0; file < graph.files(); file++)
+  {
+    std::vector<PathNode> paths;
+    std::vector<PathNode::rank_type> ranks;
+    graph.read(paths, ranks, file);
+    for(size_type i = 1; i < paths.size(); i++)
+    {
+      const PathNode& left = paths[i - 1]; const PathNode& right = paths[i];
+      auto less = [&](const PathNode& a, const PathNode& b)
+      {
+        size_type order = std::min(a.order(), b.order());
+        for(size_type j = 0; j < order; j++)
+        {
+          if(ranks[a.pointer() + j] != ranks[b.pointer() + j])
+          {
+            return ranks[a.pointer() + j] < ranks[b.pointer() + j];
+          }
+        }
+        if(a.order() != b.order()) { return a.order() < b.order(); }
+        if(a.from != b.from) { return a.from < b.from; }
+        if(a.to != b.to) { return a.to < b.to; }
+        if(a.predecessors() != b.predecessors()) { return a.predecessors() < b.predecessors(); }
+        if(a.lcp() != b.lcp()) { return a.lcp() < b.lcp(); }
+        for(size_type j = 0; j < a.ranks(); j++)
+        {
+          if(ranks[a.pointer() + j] != ranks[b.pointer() + j])
+          {
+            return ranks[a.pointer() + j] < ranks[b.pointer() + j];
+          }
+        }
+        return false;
+      };
+      if(less(right, left)) { return false; }
+    }
+  }
+  return true;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -192,7 +270,7 @@ int main(int argc, char** argv)
   ExternalPathJoinStats stats;
   externalPathGraphExtend(external, GIGABYTE, parameters, &stats);
 
-  require(readGraph(legacy) == readGraph(external));
+  requireSameGraph(legacy, external, "single-process external join");
   require(external.files() == 1);
   require(external.logicalFile(0) == logical_file_id_t(7));
   require(stats.generated_records == left.size() * right.size());
@@ -243,6 +321,9 @@ int main(int argc, char** argv)
   process_parameters.setSortRunSize(2 * MEGABYTE);
   process_parameters.setCheckpointBytes(32 * KILOBYTE);
   process_parameters.setProcessWorkers(2);
+  // The setter clamps to MIN_OPEN_FILES (64). Compaction retains a bounded
+  // multi-run frontier rather than pretending this request limits it to 8.
+  process_parameters.setMaxOpenFiles(8);
   process_parameters.setWorkerExecutable(argv[0]);
   omp_set_num_threads(4);
   ExternalPathJoinStats process_stats;
@@ -250,12 +331,15 @@ int main(int argc, char** argv)
     process_parameters, &process_stats, &workspace, "step-process");
   omp_set_num_threads(1);
   require(readGraph(legacy) == readGraph(process_graph));
-  // Many worker partitions are compacted into one bounded label-sorted shard
-  // per logical input before the generation escapes to PathGraphMerger.
-  require(process_graph.files() == 1);
+  // Many worker partitions remain a bounded set of individually LABEL-sorted
+  // streams for the downstream merger.
+  require(process_graph.files() > 1);
+  require(process_graph.files() <= (process_parameters.getMaxOpenFiles() - 4) / 2);
+  require(labelSorted(process_graph));
   for(size_type file = 0; file < process_graph.files(); file++)
   {
     require(process_graph.logicalFile(file) == logical_file_id_t(7));
+    require(process_graph.physicalShard(file) == physical_shard_id_t(file));
   }
   require(process_stats.join_partitions > 1);
   // The sampled planner must turn this single high-fanout semantic key into
@@ -283,6 +367,12 @@ int main(int argc, char** argv)
   externalPathGraphExtend(resumed_process, GIGABYTE,
     process_parameters, &resumed_stats, &workspace, "step-process");
   require(readGraph(process_graph) == readGraph(resumed_process));
+  require(resumed_process.files() == process_graph.files());
+  require(labelSorted(resumed_process));
+  for(size_type file = 0; file < resumed_process.files(); file++)
+  {
+    require(resumed_process.physicalShard(file) == physical_shard_id_t(file));
+  }
   require(resumed_stats.worker_processes == 0);
   require(resumed_stats.restored_partitions == resumed_stats.join_partitions);
   require(resumed_stats.restored_radix_plans == 1);
