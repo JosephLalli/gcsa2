@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <fstream>
 #include <limits>
+#include <set>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -76,9 +77,13 @@ static PathGraphMergeStats compare_prune(const std::string& base,
   initialize_graph(spilled, spilled_base, logical, records);
   reference.prune(lcp, MEGABYTE);
   PathGraphMergeStats stats;
-  spilled.prune(lcp, MEGABYTE, sizeof(PathNode), &stats);
+  const size_type one_record = sizeof(PathNode) +
+    (PathLabel::LABEL_LENGTH + 1) * sizeof(PathNode::rank_type);
+  spilled.prune(lcp, MEGABYTE, one_record, &stats, 8);
   require(stats.priority_spills > 0);
   require(reference.files() == spilled.files());
+  std::set<logical_file_id_t> distinct_logical(logical.begin(), logical.end());
+  require(reference.files() == distinct_logical.size());
   for(size_type file = 0; file < reference.files(); file++)
   {
     require(reference.logicalFile(file) == spilled.logicalFile(file));
@@ -130,7 +135,7 @@ static void compare_merged_graph(const std::string& base)
     PathGraphMergeStats reference_stats, spilled_stats;
     MergedGraph reference(paths, mapper, lcp, GIGABYTE, MEGABYTE,
       &reference_stats);
-    MergedGraph spilled(paths, mapper, lcp, GIGABYTE, 1, &spilled_stats);
+    MergedGraph spilled(paths, mapper, lcp, GIGABYTE, 1, &spilled_stats, 16);
 
     require(reference.size() == spilled.size());
     require(reference.ranks() == spilled.ranks());
@@ -147,6 +152,8 @@ static void compare_merged_graph(const std::string& base)
     require(spilled_stats.priority_spills > 0);
     require(spilled_stats.range_spills > 0);
     require(spilled_stats.from_set_sorts >= 4);
+    require(spilled_stats.max_open_input_pairs <= 1);
+    require(2 * spilled_stats.max_open_input_pairs + 14 <= 16);
 
     std::ifstream path_input(reference.path_name.c_str(), std::ios_base::binary);
     PathNode node; path_input.read(reinterpret_cast<char*>(&node), sizeof(node));
@@ -181,8 +188,12 @@ int main()
   std::vector<logical_file_id_t> shards(40, logical_file_id_t(7));
   PathGraphMergeStats shard_stats = compare_prune(std::string(root) + "/shards",
     shards, lcp, 4);
-  require(shard_stats.max_open_input_pairs <= 32);
+  require(shard_stats.max_open_input_pairs <= 2);
   require(shard_stats.max_open_input_pairs < shards.size());
+  require(shard_stats.max_open_output_pairs <= 2);
+  require(shard_stats.max_open_output_pairs < shards.size());
+  require(2 * shard_stats.max_open_input_pairs +
+    2 * shard_stats.max_open_output_pairs + 2 <= 8);
 
   // Use the real construction route so mapper ranks and LCP invariants are
   // validated rather than synthesized by the test.

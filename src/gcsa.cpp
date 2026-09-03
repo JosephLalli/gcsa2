@@ -967,7 +967,21 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
     std::string task = doublingTask(step);
     if(!(restored_prune && step == first_step))
     {
-      path_graph.prune(lcp, parameters.getLimitBytes() - path_graph.bytes());
+      size_type prune_buffer = std::max(static_cast<size_type>(1),
+        std::min(parameters.getIOBufferSize(),
+          parameters.getMemoryLimitBytes() / 16));
+      PathGraphMergeStats merge_stats;
+      path_graph.prune(lcp, parameters.getLimitBytes() - path_graph.bytes(),
+        prune_buffer, &merge_stats, parameters.getMaxOpenFiles());
+      if(Verbosity::level >= Verbosity::EXTENDED)
+      {
+        std::cerr << "PathGraph::prune(): "
+                  << merge_stats.priority_spills << " path-group spills, "
+                  << merge_stats.range_spills << " range spills, "
+                  << merge_stats.max_open_input_pairs << " input pairs and "
+                  << merge_stats.max_open_output_pairs << " output pairs open at peak"
+                  << std::endl;
+      }
       if(workspace)
       {
         checkpointPathGraph(*workspace, path_graph, task, "prune", checkpoint_buffer);
@@ -1034,7 +1048,22 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
   {
     std::cerr << "GCSA::GCSA(): Merging the paths" << std::endl;
   }
-  MergedGraph merged_graph(path_graph, mapper, lcp, parameters.getLimitBytes() - path_graph.bytes());
+  size_type merge_buffer = std::max(static_cast<size_type>(1),
+    std::min(parameters.getIOBufferSize(),
+      parameters.getMemoryLimitBytes() / 16));
+  PathGraphMergeStats final_merge_stats;
+  MergedGraph merged_graph(path_graph, mapper, lcp,
+    parameters.getLimitBytes() - path_graph.bytes(), merge_buffer,
+    &final_merge_stats, parameters.getMaxOpenFiles());
+  if(Verbosity::level >= Verbosity::EXTENDED)
+  {
+    std::cerr << "MergedGraph: "
+              << final_merge_stats.priority_spills << " path-group spills, "
+              << final_merge_stats.range_spills << " range spills, "
+              << final_merge_stats.from_set_sorts << " external from-set sorts and "
+              << final_merge_stats.max_open_input_pairs << " input pairs open at peak"
+              << std::endl;
+  }
   this->header.path_nodes = merged_graph.size();
   this->header.order = merged_graph.k();
   path_graph.clear();

@@ -56,7 +56,7 @@ externalParameters(const std::string& workspace, size_type memory_limit)
   parameters.setSortRunSize(externalPathGraphSortMinimumBudget());
   parameters.setJoinPartitionSize(externalPathJoinMinimumBudget());
   parameters.setMergeFanIn(2);
-  parameters.setMaxOpenFiles(8);
+  parameters.setMaxOpenFiles(16);
   return parameters;
 }
 

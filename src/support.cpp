@@ -205,7 +205,10 @@ ConstructionParameters::setMergeFanIn(size_type fan_in)
 void
 ConstructionParameters::setMaxOpenFiles(size_type files)
 {
-  this->max_open_files = std::max((size_type)6, files);
+  // Final merged-graph construction owns four output streams, up to eight
+  // descriptors in its two-way external from-set sorter, two spill files, and
+  // at least one two-file PathGraph input pair.
+  this->max_open_files = std::max((size_type)16, files);
 }
 
 void

@@ -32,6 +32,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fcntl.h>
 #include <limits>
 #include <memory>
@@ -356,16 +357,310 @@ constexpr PriorityNode::rank_type PriorityNode::NO_RANK;
   for a certain file have been written, call sort() for that file.
 */
 
+/*
+  Pruning may preserve thousands of physical shards. Keeping a WriteBuffer pair
+  open for every shard makes both resident buffers and descriptors proportional
+  to that physical layout. This cache bounds both resources while retaining one
+  append-only byte stream per shard. Counts in PathGraph remain authoritative,
+  so reopening a shard cannot change rank pointers or semantic file identity.
+*/
+struct PathGraphOutputCache
+{
+  struct Entry
+  {
+    size_type file, stamp;
+    int path, rank;
+    off_t path_high, rank_high, path_released, rank_released;
+    std::vector<PathNode> paths;
+    std::vector<PathNode::rank_type> ranks;
+
+    Entry() : file(PathGraph::UNKNOWN), stamp(0), path(-1), rank(-1),
+      path_high(0), rank_high(0), path_released(0), rank_released(0),
+      paths(), ranks() { }
+  };
+
+  PathGraph& graph;
+  std::vector<Entry> entries;
+  size_type clock, max_pairs, pair_buffer_bytes;
+  PathGraphMergeStats* stats;
+
+  constexpr static off_t CACHE_FLUSH_BYTES = 4 * MEGABYTE;
+
+  PathGraphOutputCache(PathGraph& target, size_type total_buffer_bytes,
+    size_type requested_pairs, PathGraphMergeStats* merge_stats) :
+    graph(target), entries(), clock(0),
+    max_pairs(std::max(static_cast<size_type>(1), std::min(requested_pairs,
+      total_buffer_bytes / minimumPairBytes()))),
+    pair_buffer_bytes(std::max(minimumPairBytes(),
+      total_buffer_bytes / this->max_pairs)), stats(merge_stats)
+  {
+    this->entries.reserve(this->max_pairs);
+  }
+
+  ~PathGraphOutputCache()
+  {
+    // Construction code calls close() on the success path. During exception
+    // unwinding, best-effort closure leaves the incomplete PathGraph temporary
+    // files owned by its normal cleanup machinery.
+    try { this->close(); } catch(...) { }
+  }
+
+  void append(PriorityNode& source)
+  {
+    const size_type file = source.file;
+    if(file >= this->graph.files())
+    {
+      throw std::out_of_range("PathGraphBuilder: invalid output shard");
+    }
+    Entry& entry = this->get(file);
+    this->makeRoom(entry, source.node.ranks());
+    source.node.setPointer(this->graph.rank_counts[file]);
+    entry.paths.push_back(source.node);
+    for(size_type i = 0; i < source.node.ranks(); i++)
+    {
+      entry.ranks.push_back(source.label[i]);
+    }
+    this->advanceCounts(file, source.node.ranks());
+    if(this->bufferedBytes(entry) >= this->pair_buffer_bytes) { this->flush(entry); }
+  }
+
+  void append(size_type file, PathNode& node,
+    const PathNode::rank_type* labels)
+  {
+    if(file >= this->graph.files() || (node.ranks() > 0 && labels == nullptr))
+    {
+      throw std::invalid_argument("PathGraphBuilder: invalid output record");
+    }
+    Entry& entry = this->get(file);
+    this->makeRoom(entry, node.ranks());
+    node.setPointer(this->graph.rank_counts[file]);
+    entry.paths.push_back(node);
+    if(node.ranks() > 0)
+    {
+      entry.ranks.insert(entry.ranks.end(), labels, labels + node.ranks());
+    }
+    this->advanceCounts(file, node.ranks());
+    if(this->bufferedBytes(entry) >= this->pair_buffer_bytes) { this->flush(entry); }
+  }
+
+  void closeFile(size_type file)
+  {
+    for(Entry& entry : this->entries)
+    {
+      if(entry.file == file) { this->close(entry); return; }
+    }
+  }
+
+  void close()
+  {
+    // A failed write/sync must not strand every descriptor after the first
+    // failing entry. Close all entries, then rethrow the first I/O error.
+    std::exception_ptr first_error;
+    for(Entry& entry : this->entries)
+    {
+      try { this->close(entry); }
+      catch(...) { if(first_error == nullptr) { first_error = std::current_exception(); } }
+    }
+    if(first_error != nullptr) { std::rethrow_exception(first_error); }
+  }
+
+private:
+  Entry& get(size_type file)
+  {
+    this->clock++;
+    Entry* target = nullptr;
+    for(Entry& entry : this->entries)
+    {
+      if(entry.file == file) { entry.stamp = this->clock; return entry; }
+      if(entry.file == PathGraph::UNKNOWN) { target = &entry; }
+    }
+    if(target == nullptr && this->entries.size() < this->max_pairs)
+    {
+      this->entries.push_back(Entry()); target = &(this->entries.back());
+      if(this->stats != nullptr)
+      {
+        this->stats->max_open_output_pairs = std::max(
+          this->stats->max_open_output_pairs, static_cast<size_type>(this->entries.size()));
+      }
+    }
+    if(target == nullptr)
+    {
+      target = &(*std::min_element(this->entries.begin(), this->entries.end(),
+        [](const Entry& left, const Entry& right) { return left.stamp < right.stamp; }));
+      this->close(*target);
+    }
+    this->open(*target, file); target->stamp = this->clock;
+    return *target;
+  }
+
+  void open(Entry& entry, size_type file)
+  {
+    entry.file = file;
+    entry.path = ::open(this->graph.path_names[file].c_str(),
+      O_CREAT | O_WRONLY | O_APPEND, 0600);
+    if(entry.path < 0)
+    {
+      entry.file = PathGraph::UNKNOWN;
+      throw std::runtime_error("PathGraphBuilder: cannot open path output");
+    }
+    entry.rank = ::open(this->graph.rank_names[file].c_str(),
+      O_CREAT | O_WRONLY | O_APPEND, 0600);
+    if(entry.rank < 0)
+    {
+      ::close(entry.path); entry.path = -1; entry.file = PathGraph::UNKNOWN;
+      throw std::runtime_error("PathGraphBuilder: cannot open rank output");
+    }
+    entry.path_high = ::lseek(entry.path, 0, SEEK_END);
+    entry.rank_high = ::lseek(entry.rank, 0, SEEK_END);
+    if(entry.path_high < 0 || entry.rank_high < 0)
+    {
+      this->close(entry);
+      throw std::runtime_error("PathGraphBuilder: cannot seek output shard");
+    }
+    entry.path_released = entry.path_high; entry.rank_released = entry.rank_high;
+#if defined(POSIX_FADV_SEQUENTIAL)
+    static_cast<void>(::posix_fadvise(entry.path, 0, 0, POSIX_FADV_SEQUENTIAL));
+    static_cast<void>(::posix_fadvise(entry.rank, 0, 0, POSIX_FADV_SEQUENTIAL));
+#endif
+    // Both arrays are preallocated for the largest individual PathNode before
+    // sharing the remaining allowance. makeRoom() flushes before either vector
+    // would grow, avoiding allocator doubling beyond the declared pool.
+    size_type extra_bytes = this->pair_buffer_bytes - minimumPairBytes();
+    size_type path_bytes = sizeof(PathNode) + extra_bytes / 2;
+    size_type rank_bytes = maximumRankBytes() + (extra_bytes - extra_bytes / 2);
+    entry.paths.reserve(std::max(static_cast<size_type>(1), path_bytes / sizeof(PathNode)));
+    entry.ranks.reserve(std::max(static_cast<size_type>(1), rank_bytes / sizeof(PathNode::rank_type)));
+  }
+
+  void makeRoom(Entry& entry, size_type ranks)
+  {
+    if(ranks > PathLabel::LABEL_LENGTH + 1)
+    {
+      throw std::runtime_error("PathGraphBuilder: path label exceeds disk-record limit");
+    }
+    if(entry.paths.size() + 1 > entry.paths.capacity() ||
+       entry.ranks.size() + ranks > entry.ranks.capacity())
+    {
+      this->flush(entry);
+    }
+    if(entry.paths.size() + 1 > entry.paths.capacity() ||
+       entry.ranks.size() + ranks > entry.ranks.capacity())
+    {
+      throw std::runtime_error("PathGraphBuilder: output buffer reservation is too small");
+    }
+  }
+
+  void close(Entry& entry)
+  {
+    if(entry.file == PathGraph::UNKNOWN) { return; }
+    std::exception_ptr first_error;
+    try
+    {
+      this->flush(entry);
+      this->syncAndTrim(entry.path, entry.path_high, entry.path_released, true);
+      this->syncAndTrim(entry.rank, entry.rank_high, entry.rank_released, true);
+    }
+    catch(...) { first_error = std::current_exception(); }
+    int path_result = (entry.path >= 0 ? ::close(entry.path) : 0);
+    int rank_result = (entry.rank >= 0 ? ::close(entry.rank) : 0);
+    entry.path = entry.rank = -1; entry.file = PathGraph::UNKNOWN; entry.stamp = 0;
+    if(first_error == nullptr && (path_result != 0 || rank_result != 0))
+    {
+      first_error = std::make_exception_ptr(
+        std::runtime_error("PathGraphBuilder: cannot close output shard"));
+    }
+    if(first_error != nullptr) { std::rethrow_exception(first_error); }
+  }
+
+  void flush(Entry& entry)
+  {
+    if(!(entry.paths.empty()))
+    {
+      this->writeAll(entry.path, entry.paths.data(),
+        entry.paths.size() * sizeof(PathNode));
+      entry.path_high += static_cast<off_t>(entry.paths.size() * sizeof(PathNode));
+      entry.paths.clear();
+    }
+    if(!(entry.ranks.empty()))
+    {
+      this->writeAll(entry.rank, entry.ranks.data(),
+        entry.ranks.size() * sizeof(PathNode::rank_type));
+      entry.rank_high += static_cast<off_t>(entry.ranks.size() * sizeof(PathNode::rank_type));
+      entry.ranks.clear();
+    }
+    this->syncAndTrim(entry.path, entry.path_high, entry.path_released, false);
+    this->syncAndTrim(entry.rank, entry.rank_high, entry.rank_released, false);
+  }
+
+  void advanceCounts(size_type file, size_type ranks)
+  {
+    this->graph.path_counts[file]++; this->graph.path_count++;
+    this->graph.rank_counts[file] += ranks; this->graph.rank_count += ranks;
+  }
+
+  static size_type bufferedBytes(const Entry& entry)
+  {
+    return entry.paths.size() * sizeof(PathNode) +
+      entry.ranks.size() * sizeof(PathNode::rank_type);
+  }
+
+  constexpr static size_type maximumRankBytes()
+  {
+    return (PathLabel::LABEL_LENGTH + 1) * sizeof(PathNode::rank_type);
+  }
+
+  constexpr static size_type minimumPairBytes()
+  {
+    return sizeof(PathNode) + maximumRankBytes();
+  }
+
+  static void writeAll(int descriptor, const void* source, size_type bytes)
+  {
+    const char* data = reinterpret_cast<const char*>(source); size_type done = 0;
+    while(done < bytes)
+    {
+      ssize_t result = ::write(descriptor, data + done, bytes - done);
+      if(result < 0 && errno == EINTR) { continue; }
+      if(result <= 0) { throw std::runtime_error("PathGraphBuilder: output write failed"); }
+      DiskIO::write_volume += static_cast<size_type>(result);
+      done += static_cast<size_type>(result);
+    }
+  }
+
+  void syncAndTrim(int descriptor, off_t high, off_t& released, bool complete)
+  {
+    if(!complete && high - released < CACHE_FLUSH_BYTES) { return; }
+    if(::fdatasync(descriptor) != 0)
+    {
+      throw std::runtime_error("PathGraphBuilder: output sync failed");
+    }
+    off_t tail = static_cast<off_t>(std::min(this->pair_buffer_bytes,
+      static_cast<size_type>(std::numeric_limits<off_t>::max())));
+    off_t discard_end = (complete ? high : std::max(released, high - tail));
+#if defined(POSIX_FADV_DONTNEED)
+    if(discard_end > released)
+    {
+      static_cast<void>(::posix_fadvise(descriptor, released,
+        discard_end - released, POSIX_FADV_DONTNEED));
+    }
+#endif
+    released = discard_end;
+  }
+};
+
+constexpr off_t PathGraphOutputCache::CACHE_FLUSH_BYTES;
+
 struct PathGraphBuilder
 {
   PathGraph graph;
-  std::vector<WriteBuffer<PathNode>> path_files;
-  std::vector<WriteBuffer<PathNode::rank_type>> rank_files;
+  PathGraphOutputCache output_files;
   size_type limit;  // Bytes of disk space.
 
   constexpr static size_type WRITE_BUFFER_SIZE = MEGABYTE;  // PathNodes per thread.
 
-  PathGraphBuilder(size_type file_count, size_type path_order, size_type step, size_type size_limit);
+  PathGraphBuilder(size_type file_count, size_type path_order, size_type step,
+    size_type size_limit, size_type writer_buffer_bytes = MEGABYTE,
+    size_type max_writer_pairs = 16, PathGraphMergeStats* stats = nullptr);
   void close();
 
   /*
@@ -380,26 +675,40 @@ struct PathGraphBuilder
 
 constexpr size_type PathGraphBuilder::WRITE_BUFFER_SIZE;
 
-PathGraphBuilder::PathGraphBuilder(size_type file_count, size_type path_order, size_type step, size_type size_limit) :
+PathGraphBuilder::PathGraphBuilder(size_type file_count, size_type path_order,
+  size_type step, size_type size_limit, size_type writer_buffer_bytes,
+  size_type max_writer_pairs, PathGraphMergeStats* stats) :
   graph(file_count, path_order, step),
-  path_files(file_count), rank_files(file_count),
+  output_files(this->graph, writer_buffer_bytes, max_writer_pairs, stats),
   limit(size_limit)
 {
-  for(size_type file = 0; file < file_count; file++)
+  // Materialize every empty shard without retaining a descriptor. Some input
+  // shards legitimately produce no paths, and later checkpoint/sort code must
+  // still observe a valid empty path/rank pair.
+  for(size_type file = 0; file < this->graph.files(); file++)
   {
-    this->path_files[file].open(this->graph.path_names[file]);
-    this->rank_files[file].open(this->graph.rank_names[file]);
+    int path = ::open(this->graph.path_names[file].c_str(),
+      O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    int rank = ::open(this->graph.rank_names[file].c_str(),
+      O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    if(path < 0 || rank < 0)
+    {
+      if(path >= 0) { ::close(path); }
+      if(rank >= 0) { ::close(rank); }
+      throw std::runtime_error("PathGraphBuilder: cannot create output shard");
+    }
+    int path_result = ::close(path), rank_result = ::close(rank);
+    if(path_result != 0 || rank_result != 0)
+    {
+      throw std::runtime_error("PathGraphBuilder: cannot close empty output shard");
+    }
   }
 }
 
 void
 PathGraphBuilder::close()
 {
-  for(size_type file = 0; file < this->path_files.size(); file++)
-  {
-    this->path_files[file].close();
-    this->rank_files[file].close();
-  }
+  this->output_files.close();
 }
 
 inline void
@@ -423,11 +732,7 @@ PathGraphBuilder::write(PriorityNode& path)
     std::cerr << "PathGraphBuilder::write(): Size limit exceeded, construction aborted" << std::endl;
     std::exit(EXIT_SIZE_LIMIT_EXCEEDED);
   }
-  writePath(path.node, path.label, this->path_files[path.file], this->rank_files[path.file]);
-
-  this->graph.path_counts[path.file]++; this->graph.path_count++;
-  this->graph.rank_counts[path.file] += path.node.ranks();
-  this->graph.rank_count += path.node.ranks();
+  this->output_files.append(path);
 }
 
 void
@@ -443,10 +748,13 @@ PathGraphBuilder::write(std::vector<PathNode>& paths, std::vector<PathNode::rank
     }
     for(size_type i = 0; i < paths.size(); i++)
     {
-      writePath(paths[i], labels.data(), this->path_files[file], this->rank_files[file]);
+      size_type pointer = paths[i].pointer();
+      if(pointer > labels.size() || paths[i].ranks() > labels.size() - pointer)
+      {
+        throw std::runtime_error("PathGraphBuilder::write(): invalid rank pointer");
+      }
+      this->output_files.append(file, paths[i], labels.data() + pointer);
     }
-    this->graph.path_counts[file] += paths.size(); this->graph.path_count += paths.size();
-    this->graph.rank_counts[file] += labels.size(); this->graph.rank_count += labels.size();
   }
   
   // Check if this file will violate the RAM limit parameter when it is loaded
@@ -463,8 +771,7 @@ PathGraphBuilder::write(std::vector<PathNode>& paths, std::vector<PathNode::rank
 void
 PathGraphBuilder::sort(size_type file, size_type byte_budget, size_type fan_in)
 {
-  this->path_files[file].close();
-  this->rank_files[file].close();
+  this->output_files.closeFile(file);
   externalPathGraphSort(this->graph, file, byte_budget, fan_in);
 
   if(Verbosity::level >= Verbosity::FULL)
@@ -1740,16 +2047,17 @@ struct PathGraphInputCache
 
   const PathGraph& graph;
   std::vector<Entry> entries;
-  size_type clock;
+  size_type clock, max_pairs;
   PathGraphMergeStats* stats;
 
-  constexpr static size_type MAX_PAIRS = 32;
   constexpr static off_t CACHE_TAIL = 64 * KILOBYTE;
 
-  PathGraphInputCache(const PathGraph& source, PathGraphMergeStats* merge_stats) :
-    graph(source), entries(), clock(0), stats(merge_stats)
+  PathGraphInputCache(const PathGraph& source, PathGraphMergeStats* merge_stats,
+    size_type requested_pairs) :
+    graph(source), entries(), clock(0),
+    max_pairs(std::max(static_cast<size_type>(1), requested_pairs)), stats(merge_stats)
   {
-    this->entries.reserve(MAX_PAIRS);
+    this->entries.reserve(this->max_pairs);
   }
 
   ~PathGraphInputCache() { this->close(); }
@@ -1792,7 +2100,7 @@ private:
     }
 
     Entry* target = nullptr;
-    if(this->entries.size() < MAX_PAIRS)
+    if(this->entries.size() < this->max_pairs)
     {
       this->entries.push_back(Entry()); target = &(this->entries.back());
       if(this->stats != nullptr)
@@ -1882,7 +2190,6 @@ private:
   }
 };
 
-constexpr size_type PathGraphInputCache::MAX_PAIRS;
 constexpr off_t PathGraphInputCache::CACHE_TAIL;
 
 /*
@@ -1906,7 +2213,8 @@ struct PathGraphMerger
 
   PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lcp,
     size_type group_buffer_bytes = MEGABYTE,
-    PathGraphMergeStats* stats = nullptr);
+    PathGraphMergeStats* stats = nullptr,
+    size_type max_input_pairs = 32);
   void close();
 
   inline size_type size() const { return this->graph.size(); }
@@ -1955,11 +2263,12 @@ struct PathGraphMerger
 };
 
 PathGraphMerger::PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lcp,
-  size_type group_buffer_bytes, PathGraphMergeStats* stats) :
+  size_type group_buffer_bytes, PathGraphMergeStats* stats,
+  size_type max_input_pairs) :
   graph(path_graph), lcp(kmer_lcp),
   ranges(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->range_spills))),
   buffer(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->priority_spills))),
-  input_files(path_graph, stats),
+  input_files(path_graph, stats, max_input_pairs),
   offsets(path_graph.files()), inputs(path_graph.files())
 {
   if(stats != nullptr) { *stats = PathGraphMergeStats(); }
@@ -2358,14 +2667,62 @@ struct SameFromLogicalFile
 
 void
 PathGraph::prune(const LCP& lcp, size_type size_limit,
-  size_type group_buffer_bytes, PathGraphMergeStats* stats)
+  size_type group_buffer_bytes, PathGraphMergeStats* stats,
+  size_type max_open_files)
 {
   size_type old_path_count = this->size();
 
-  PathGraphMerger merger(*this, lcp, group_buffer_bytes, stats);
-  PathGraphBuilder builder(this->files(), this->k(), this->step(), size_limit);
-  builder.graph.logical_file_ids = this->logical_file_ids;
-  builder.graph.physical_shard_ids = this->physical_shard_ids;
+  // Each live input or output pair consumes two descriptors. Split the global
+  // descriptor allowance evenly so neither side scales with shard count.
+  if(max_open_files < 6)
+  {
+    throw std::runtime_error("PathGraph::prune(): max-open-files must be at least 6");
+  }
+  // The priority group and range deque may each own one spill descriptor.
+  // The remaining allowance is shared by two caches with two descriptors per
+  // entry, so 4 * pair_limit + 2 never exceeds max_open_files.
+  size_type pair_limit = std::max(static_cast<size_type>(1),
+    (max_open_files - 2) / 4);
+
+  // The merger visits all input shards in global label order. We can therefore
+  // project that stream directly onto one output shard per semantic input: each
+  // projected subsequence remains label-sorted. This is deliberately keyed by
+  // logical_file_id_t, never by the physical shard number used for spill I/O.
+  // Besides avoiding a redundant compaction pass, this prevents a heavily
+  // sharded chromosome from causing tiny interleaved writes to thousands of
+  // output files during every subsequent prune.
+  std::map<logical_file_id_t, size_type> logical_outputs;
+  std::vector<size_type> output_file(this->files(), UNKNOWN);
+  std::vector<logical_file_id_t> output_logical;
+  std::vector<physical_shard_id_t> output_physical;
+  for(size_type file = 0; file < this->files(); file++)
+  {
+    logical_file_id_t logical = this->logicalFile(file);
+    auto result = logical_outputs.emplace(logical, output_logical.size());
+    if(result.second)
+    {
+      output_logical.push_back(logical);
+      // Preserve the first deterministic physical identity. The identity has
+      // no semantic role, but retaining it makes checkpoints easier to audit.
+      output_physical.push_back(this->physicalShard(file));
+    }
+    output_file[file] = result.first->second;
+  }
+
+  PathGraphMerger merger(*this, lcp, group_buffer_bytes, stats, pair_limit);
+  PathGraphBuilder builder(output_logical.size(), this->k(), this->step(), size_limit,
+    group_buffer_bytes, pair_limit, stats);
+  builder.graph.logical_file_ids.swap(output_logical);
+  builder.graph.physical_shard_ids.swap(output_physical);
+  auto write_output = [&](PriorityNode node)
+  {
+    if(node.file >= output_file.size() || output_file[node.file] == UNKNOWN)
+    {
+      throw std::runtime_error("PathGraph::prune(): invalid source shard identity");
+    }
+    node.file = output_file[node.file];
+    builder.write(node);
+  };
   for(range_type range = merger.first(); !(merger.atEnd(range)); range = merger.next())
   {
     SameFromLogicalFile same_from(merger, range);
@@ -2376,7 +2733,7 @@ PathGraph::prune(const LCP& lcp, size_type size_limit,
         range = merger.extendRange(same_from);
         merger.mergePathNodes();
         PriorityNode node = merger.buffer.get(range.second);
-        builder.write(node);
+        write_output(node);
         builder.graph.unique++;
       }
       else
@@ -2385,7 +2742,7 @@ PathGraph::prune(const LCP& lcp, size_type size_limit,
         for(size_type i = range.first; i <= range.second; i++)
         {
           PriorityNode node = merger.buffer.get(i);
-          node.node.makeSorted(); builder.write(node);
+          node.node.makeSorted(); write_output(node);
         }
         builder.graph.redundant += Range::length(range);
       }
@@ -2397,7 +2754,7 @@ PathGraph::prune(const LCP& lcp, size_type size_limit,
         PriorityNode node = merger.buffer.get(i);
         if(node.node.sorted()) { builder.graph.nondeterministic++; }
         else { builder.graph.unsorted++; }
-        builder.write(node);
+        write_output(node);
       }
     }
     builder.graph.range_count++;
@@ -2866,17 +3223,35 @@ struct SameFromSet
 
 MergedGraph::MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper,
   const LCP& kmer_lcp, size_type size_limit, size_type group_buffer_bytes,
-  PathGraphMergeStats* stats) :
+  PathGraphMergeStats* stats, size_type max_open_files) :
   path_name(TempFile::getName(PREFIX)), rank_name(TempFile::getName(PREFIX)),
   from_name(TempFile::getName(PREFIX)), lcp_name(TempFile::getName(PREFIX)),
   path_count(0), rank_count(0), from_count(0),
   order(source.k()),
   next(mapper.alpha.sigma + 1, 0), next_from(mapper.alpha.sigma + 1, 0)
 {
-  WriteBuffer<PathNode>            path_file(this->path_name);
-  WriteBuffer<PathNode::rank_type> rank_file(this->rank_name);
-  WriteBuffer<range_type>          from_file(this->from_name);
-  WriteBuffer<uint8_t>             lcp_file(this->lcp_name);
+  // Four sequential outputs coexist with at most eight descriptors in the
+  // two-way SameFromSet sorter (its source remains open during run merging)
+  // and two optional prune spill descriptors. A
+  // merger input pair needs two more. Account those fixed descriptors before
+  // sizing the LRU input cache instead of silently exceeding --max-open-files.
+  constexpr size_type fixed_descriptors = 14;
+  if(max_open_files < fixed_descriptors + 2)
+  {
+    throw std::runtime_error("MergedGraph: max-open-files must be at least 16");
+  }
+  size_type input_pairs = std::max(static_cast<size_type>(1),
+    (max_open_files - fixed_descriptors) / 2);
+
+  // WriteBuffer sizes its cache in elements, which made the PathNode stream
+  // much larger than the byte-sized scalar streams. These writers all derive
+  // their capacities from one byte allowance instead.
+  size_type output_buffer_bytes = std::max(static_cast<size_type>(1),
+    group_buffer_bytes / 8);
+  SequentialRecordWriter<PathNode> path_file(this->path_name, output_buffer_bytes);
+  SequentialRecordWriter<PathNode::rank_type> rank_file(this->rank_name, output_buffer_bytes);
+  SequentialRecordWriter<range_type> from_file(this->from_name, output_buffer_bytes);
+  SequentialRecordWriter<uint8_t> lcp_file(this->lcp_name, output_buffer_bytes);
 
   /*
      Initialize next[comp] to be the the rank of the first kmer starting with
@@ -2890,7 +3265,7 @@ MergedGraph::MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper,
   this->next[mapper.alpha.sigma] = ~(size_type)0;
   this->next_from[mapper.alpha.sigma] = ~(size_type)0;
 
-  PathGraphMerger merger(source, kmer_lcp, group_buffer_bytes, stats);
+  PathGraphMerger merger(source, kmer_lcp, group_buffer_bytes, stats, input_pairs);
   SameFromSet same_from_set(merger, group_buffer_bytes, stats);
   size_type curr_comp = 0;  // Used to transform next.
 
@@ -2911,9 +3286,11 @@ MergedGraph::MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper,
       std::exit(EXIT_SIZE_LIMIT_EXCEEDED);
     }
     curr.node.from = same_from_set.streamAfterFirst(
-      [&](node_type from) { from_file.push_back(range_type(this->path_count, from)); });
-    writePath(curr.node, curr.label, path_file, rank_file);
-    lcp_file.push_back(path_lcp.first * mapper.order() + path_lcp.second);
+      [&](node_type from) { from_file.pushBack(range_type(this->path_count, from)); });
+    curr.node.setPointer(this->rank_count);
+    path_file.pushBack(curr.node);
+    for(size_type i = 0; i < curr.node.ranks(); i++) { rank_file.pushBack(curr.label[i]); }
+    lcp_file.pushBack(path_lcp.first * mapper.order() + path_lcp.second);
 
     // Update the counts and the pointers to paths starting with each comp value.
     while(curr.firstLabel(0) >= this->next[curr_comp])
