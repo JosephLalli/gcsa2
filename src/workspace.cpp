@@ -355,7 +355,7 @@ BuildWorkspace::ArtifactRef
 BuildWorkspace::adopt_raw_payload(const ArtifactIdentity& identity,
   logical_file_id_t logical, physical_shard_id_t shard,
   const std::string& source, uint64_t records, uint64_t expected_bytes,
-  size_t buffer_bytes)
+  size_t buffer_bytes, const uint64_t* known_checksum)
 {
   if(buffer_bytes == 0)
   {
@@ -370,7 +370,11 @@ BuildWorkspace::adopt_raw_payload(const ArtifactIdentity& identity,
 
   const std::string target = artifact_path(identity, logical, shard);
   const std::string partial = target + partial_suffix();
-  std::vector<uint8_t> buffer(std::max<size_t>(1, buffer_bytes));
+  std::vector<uint8_t> buffer;
+  const auto allocate_buffer = [&]()
+  {
+    if(buffer.empty()) { buffer.resize(std::max<size_t>(1, buffer_bytes)); }
+  };
   int input = -1, output = -1;
   uint64_t sum = 1469598103934665603ULL;
   try
@@ -382,7 +386,15 @@ BuildWorkspace::adopt_raw_payload(const ArtifactIdentity& identity,
       input = open(partial.c_str(), O_RDONLY);
       if(input < 0) { throw err("cannot read linked raw payload", partial); }
       if(fdatasync(input) != 0) { throw err("fdatasync failed", partial); }
-      sum = checksum_raw_file(input, expected_bytes, buffer, partial);
+      // A writer that incrementally checksummed exactly the closed payload can
+      // make adoption metadata-only. Callers without such provenance retain
+      // the full validation scan used by the original API.
+      if(known_checksum == nullptr)
+      {
+        allocate_buffer();
+        sum = checksum_raw_file(input, expected_bytes, buffer, partial);
+      }
+      else { sum = *known_checksum; }
       if(close(input) != 0) { throw err("close failed", partial); }
       input = -1;
     }
@@ -397,6 +409,7 @@ BuildWorkspace::adopt_raw_payload(const ArtifactIdentity& identity,
         throw err("cannot create raw payload fallback", partial);
       }
       advise_sequential(input); advise_sequential(output);
+      allocate_buffer();
       off_t input_released = 0, output_released = 0;
       uint64_t left = expected_bytes;
       while(left > 0)
@@ -420,6 +433,10 @@ BuildWorkspace::adopt_raw_payload(const ArtifactIdentity& identity,
       do { got = read(input, &extra, 1); } while(got < 0 && errno == EINTR);
       if(got < 0) { throw err("read failed", source); }
       if(got > 0) { throw err("raw payload has trailing data", source); }
+      if(known_checksum != nullptr && sum != *known_checksum)
+      {
+        throw err("raw payload checksum differs from writer checksum", source);
+      }
       off_t consumed = lseek(input, 0, SEEK_CUR);
       if(consumed < 0) { throw err("cannot determine raw payload input position", source); }
       trim_read_cache(input, consumed, input_released, true);

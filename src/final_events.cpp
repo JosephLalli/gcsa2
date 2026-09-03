@@ -168,7 +168,8 @@ public:
   BufferedEventWriter(const std::string& path, size_type buffer_bytes,
     MemoryBudget& budget, const std::string& task) :
     path_(path), descriptor_(-1), buffer_(), used_(0), written_(0),
-    cache_released_(0), closed_(false), reservation_()
+    checksum_(1469598103934665603ULL), cache_released_(0), closed_(false),
+    reservation_()
   {
     buffer_bytes = std::max(static_cast<size_type>(16), buffer_bytes);
     reservation_ = budget.reserve(buffer_bytes, task);
@@ -199,6 +200,12 @@ public:
     append(record, sizeof(record));
   }
 
+  std::uint64_t checksum() const
+  {
+    if(!closed_) { throw eventError("checksum requested before event stream close", path_); }
+    return checksum_;
+  }
+
   void close()
   {
     if(closed_) { return; }
@@ -222,6 +229,7 @@ private:
   int descriptor_;
   std::vector<std::uint8_t> buffer_;
   size_type used_, written_;
+  std::uint64_t checksum_;
   off_t cache_released_;
   bool closed_;
   MemoryBudget::Reservation reservation_;
@@ -234,6 +242,7 @@ private:
     {
       size_type count = std::min(bytes, buffer_.size() - used_);
       std::memcpy(buffer_.data() + used_, data, count);
+      checksum_ = BuildWorkspace::checksum(data, count, checksum_);
       used_ += count; data += count; bytes -= count;
       if(used_ == buffer_.size()) { flush(); }
     }
@@ -379,7 +388,8 @@ physical_shard_id_t edgeShard(size_type comp)
 BuildWorkspace::ArtifactRef
 checkpointFile(BuildWorkspace& workspace, const ArtifactIdentity& identity,
   physical_shard_id_t shard, const std::string& path, size_type records,
-  size_type buffer_bytes, const std::string& sort_order)
+  size_type buffer_bytes, const std::string& sort_order,
+  const std::uint64_t* known_checksum = nullptr)
 {
   // Event streams are closed and immutable at this point. Give the raw inode
   // its semantic workspace name instead of writing a second full copy. The
@@ -388,7 +398,7 @@ checkpointFile(BuildWorkspace& workspace, const ArtifactIdentity& identity,
   static_cast<void>(sort_order);
   return workspace.adopt_raw_payload(identity, logical_file_id_t(0), shard,
     path, records, rawFileBytes(path),
-    std::max(static_cast<size_type>(1), buffer_bytes));
+    std::max(static_cast<size_type>(1), buffer_bytes), known_checksum);
 }
 
 void
@@ -1360,6 +1370,16 @@ FinalEventMetadata::FinalEventMetadata() :
   bwt_counts.fill(0);
 }
 
+FinalEventChecksums::FinalEventChecksums(size_type sigma) :
+  bwt_masks(1469598103934665603ULL),
+  edge_destinations(sigma, 1469598103934665603ULL),
+  sample_positions(1469598103934665603ULL),
+  sample_ids(1469598103934665603ULL),
+  sample_ends(1469598103934665603ULL),
+  occurrences(1469598103934665603ULL)
+{
+}
+
 void
 serializeFastBWTComponent(std::ostream& out, const std::string& mask_file,
   size_type paths, size_type expected_ones, comp_type comp,
@@ -1808,6 +1828,26 @@ FinalEventWriter::finish()
   return this->impl_->metadata;
 }
 
+FinalEventChecksums
+FinalEventWriter::checksums() const
+{
+  if(!this->impl_->finished)
+  {
+    throw eventError("event checksums requested before finish");
+  }
+  FinalEventChecksums result(this->impl_->sigma);
+  result.bwt_masks = this->impl_->masks->checksum();
+  for(size_type comp = 0; comp < this->impl_->sigma; comp++)
+  {
+    result.edge_destinations[comp] = this->impl_->edges[comp]->checksum();
+  }
+  result.sample_positions = this->impl_->sample_positions->checksum();
+  result.sample_ids = this->impl_->sample_ids->checksum();
+  result.sample_ends = this->impl_->sample_ends->checksum();
+  result.occurrences = this->impl_->occurrences->checksum();
+  return result;
+}
+
 void
 sortFinalRedundancy(FinalEventFiles& files,
   const ConstructionParameters& parameters)
@@ -1918,33 +1958,43 @@ readFinalEventMetadata(const FinalEventFiles& files)
 void
 checkpointFinalEvents(BuildWorkspace& workspace,
   const FinalEventFiles& files, const FinalEventMetadata& metadata,
-  size_type buffer_bytes)
+  size_type buffer_bytes, const FinalEventChecksums* checksums)
 {
   validatePayloads(files, metadata);
+  if(checksums != nullptr &&
+     checksums->edge_destinations.size() != metadata.sigma)
+  {
+    throw eventError("incremental edge checksum count does not match alphabet");
+  }
   std::vector<BuildWorkspace::ArtifactRef> artifacts;
   artifacts.push_back(checkpointFile(workspace, metadataArtifact(),
     physical_shard_id_t(0), files.metadata, 1, buffer_bytes, "metadata"));
   artifacts.push_back(checkpointFile(workspace, maskArtifact(),
     physical_shard_id_t(1), files.bwt_masks, metadata.paths, buffer_bytes,
-    "path-rank"));
+    "path-rank", checksums == nullptr ? nullptr : &(checksums->bwt_masks)));
   for(size_type comp = 0; comp < metadata.sigma; comp++)
   {
     artifacts.push_back(checkpointFile(workspace, edgeArtifact(comp), edgeShard(comp),
       files.edge_destinations[comp], metadata.bwt_counts[comp], buffer_bytes,
-      "source-path-rank"));
+      "source-path-rank", checksums == nullptr ? nullptr :
+        &(checksums->edge_destinations[comp])));
   }
   artifacts.push_back(checkpointFile(workspace,
     streamArtifact("sampled-paths", "path-rank-u64le-v1"), physical_shard_id_t(2),
-    files.sample_positions, metadata.sampled_paths, buffer_bytes, "path-rank"));
+    files.sample_positions, metadata.sampled_paths, buffer_bytes, "path-rank",
+    checksums == nullptr ? nullptr : &(checksums->sample_positions)));
   artifacts.push_back(checkpointFile(workspace,
     streamArtifact("sample-ids", "node-id-u64le-v1"), physical_shard_id_t(3),
-    files.sample_ids, metadata.sample_ids, buffer_bytes, "sample-order"));
+    files.sample_ids, metadata.sample_ids, buffer_bytes, "sample-order",
+    checksums == nullptr ? nullptr : &(checksums->sample_ids)));
   artifacts.push_back(checkpointFile(workspace,
     streamArtifact("sample-ends", "sample-rank-u64le-v1"), physical_shard_id_t(4),
-    files.sample_ends, metadata.sampled_paths, buffer_bytes, "sample-order"));
+    files.sample_ends, metadata.sampled_paths, buffer_bytes, "sample-order",
+    checksums == nullptr ? nullptr : &(checksums->sample_ends)));
   artifacts.push_back(checkpointFile(workspace,
     streamArtifact("occurrences", "path-value-u64le-v1"), physical_shard_id_t(5),
-    files.occurrences, metadata.occurrence_items, buffer_bytes, "path-rank"));
+    files.occurrences, metadata.occurrence_items, buffer_bytes, "path-rank",
+    checksums == nullptr ? nullptr : &(checksums->occurrences)));
   artifacts.push_back(checkpointFile(workspace,
     streamArtifact("redundancy", "path-rank-u64le-v1"), physical_shard_id_t(6),
     files.redundant, metadata.redundant, buffer_bytes, "path-rank"));

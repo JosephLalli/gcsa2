@@ -12,6 +12,7 @@
 #include <gcsa/workspace.h>
 
 #include <array>
+#include <cstdint>
 #include <iosfwd>
 #include <memory>
 #include <string>
@@ -100,6 +101,22 @@ struct FinalEventFiles
 };
 
 /*
+  Incremental checksums for streams written directly by FinalEventWriter.
+  Redundancy is omitted because its order changes in the subsequent external
+  sort, and metadata is small enough that avoiding its checksum scan is not
+  material. These digests allow same-filesystem workspace adoption without a
+  second full read of the immutable event payloads.
+*/
+struct FinalEventChecksums
+{
+  std::uint64_t bwt_masks;
+  std::vector<std::uint64_t> edge_destinations;
+  std::uint64_t sample_positions, sample_ids, sample_ends, occurrences;
+
+  explicit FinalEventChecksums(size_type sigma = 0);
+};
+
+/*
   A byte-budgeted writer set. buffer_bytes is the budget for each individual
   stream, and every buffer reserves from the shared MemoryBudget. The caller
   chooses buffer_bytes after accounting for the number of streams.
@@ -124,6 +141,10 @@ public:
   // by the merged-graph scan.
   FinalEventMetadata finish();
 
+  // Available only after finish(). The values cover the exact little-endian
+  // bytes delivered to each closed stream.
+  FinalEventChecksums checksums() const;
+
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
@@ -144,7 +165,7 @@ FinalEventMetadata readFinalEventMetadata(const FinalEventFiles& files);
 // Commit or restore the entire event scan as one atomic workspace task.
 void checkpointFinalEvents(BuildWorkspace& workspace,
   const FinalEventFiles& files, const FinalEventMetadata& metadata,
-  size_type buffer_bytes);
+  size_type buffer_bytes, const FinalEventChecksums* checksums = nullptr);
 bool restoreFinalEvents(const BuildWorkspace& workspace,
   FinalEventFiles& files, FinalEventMetadata& metadata,
   size_type expected_paths, size_type expected_sigma, size_type buffer_bytes,
