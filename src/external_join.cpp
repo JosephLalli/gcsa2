@@ -3491,6 +3491,75 @@ validateWorkerOutput(const std::string& path, size_type expected_bytes)
   }
 }
 
+struct ConcurrentPathBudgets
+{
+  size_type sort, join;
+
+  ConcurrentPathBudgets(size_type sort_bytes, size_type join_bytes) :
+    sort(sort_bytes), join(join_bytes) { }
+};
+
+ConcurrentPathBudgets
+allocateConcurrentPathBudgets(const ConstructionParameters& parameters,
+  size_type available_bytes, const std::string& context)
+{
+  const size_type minimum_sort = externalPathGraphSortMinimumBudget();
+  const size_type minimum_join = externalPathJoinMinimumBudget();
+  const size_type minimum_total = checkedJoinAdd(minimum_sort, minimum_join,
+    "minimum concurrent path workspace");
+  if(available_bytes < minimum_total)
+  {
+    throw joinError(context + " cannot admit concurrent label sorting and join blocking");
+  }
+
+  // Expert values are caps, while automatic values are preferred shares. An
+  // automatic 75/25 split may place one side below its irreducible stream
+  // buffers under tiny test budgets even though both phases fit together.
+  // Rebalance that case instead of rejecting a feasible aggregate goal.
+  const bool automatic_sort = parameters.sortRunSizeIsAutomatic();
+  const bool automatic_join = parameters.joinPartitionSizeIsAutomatic();
+  const size_type sort_cap = (automatic_sort ? available_bytes :
+    parameters.getSortRunSize(available_bytes));
+  const size_type join_cap = (automatic_join ? available_bytes :
+    parameters.getJoinPartitionSize(available_bytes));
+  if(sort_cap < minimum_sort)
+  {
+    throw joinError(context + " label-sort cap is below the implementation minimum");
+  }
+  if(join_cap < minimum_join)
+  {
+    throw joinError(context + " join cap is below the implementation minimum");
+  }
+
+  if(automatic_sort)
+  {
+    // Start from the nominal automatic join share. Clamp it to both phases'
+    // minima and, when explicitly bounded, to the user-provided join cap.
+    size_type join_bytes = available_bytes / 4;
+    join_bytes = std::max(minimum_join, join_bytes);
+    join_bytes = std::min(join_bytes, available_bytes - minimum_sort);
+    join_bytes = std::min(join_bytes, join_cap);
+    return ConcurrentPathBudgets(available_bytes - join_bytes, join_bytes);
+  }
+
+  if(automatic_join)
+  {
+    // Start from the nominal 75% sort share. A restrictive explicit sort cap
+    // hands the unused workspace to the automatic join.
+    size_type sort_bytes = available_bytes - available_bytes / 4;
+    sort_bytes = std::max(minimum_sort, sort_bytes);
+    sort_bytes = std::min(sort_bytes, available_bytes - minimum_join);
+    sort_bytes = std::min(sort_bytes, sort_cap);
+    return ConcurrentPathBudgets(sort_bytes, available_bytes - sort_bytes);
+  }
+
+  // Both expert caps are explicit. Preserve the historical sort-first policy
+  // and leave memory unused if the second cap is smaller than the remainder.
+  size_type sort_bytes = std::min(sort_cap, available_bytes - minimum_join);
+  size_type join_bytes = std::min(join_cap, available_bytes - sort_bytes);
+  return ConcurrentPathBudgets(sort_bytes, join_bytes);
+}
+
 void
 runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
   logical_file_id_t logical, const std::vector<JoinPartition>& partitions,
@@ -3518,18 +3587,10 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
     throw joinError("memory limit cannot admit one external join worker process");
   }
   size_type worker_reservation = usable_memory / concurrency;
-  size_type sort_budget = std::min(parameters.getSortRunSize(worker_reservation),
-    worker_reservation - externalPathJoinMinimumBudget());
-  if(sort_budget < externalPathGraphSortMinimumBudget())
-  {
-    throw joinError("per-worker label-sort budget is below the implementation minimum");
-  }
-  size_type join_block_budget = std::min(parameters.getJoinPartitionSize(worker_reservation),
-    worker_reservation - sort_budget);
-  if(join_block_budget < externalPathJoinMinimumBudget())
-  {
-    throw joinError("per-worker join block budget is below the implementation minimum");
-  }
+  ConcurrentPathBudgets worker_budgets = allocateConcurrentPathBudgets(parameters,
+    worker_reservation, "per-worker workspace");
+  size_type sort_budget = worker_budgets.sort;
+  size_type join_block_budget = worker_budgets.join;
   size_type worker_threads = std::max(static_cast<size_type>(1),
     static_cast<size_type>(omp_get_max_threads()) / concurrency);
   size_type checkpoint_buffer = std::min(parameters.getIOBufferSize(),
@@ -3740,27 +3801,11 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
     throw joinError("path graph shard identity metadata is incomplete");
   }
   size_type memory_budget = parameters.getMemoryLimitBytes();
-  if(memory_budget < externalPathJoinMinimumBudget() ||
-     memory_budget < externalPathGraphSortMinimumBudget())
-  {
-    throw joinError("configured memory limit is below the external path minimum");
-  }
-  size_type join_budget = std::min(memory_budget, parameters.getJoinPartitionSize());
-  size_type sort_budget = std::min(memory_budget, parameters.getSortRunSize());
-  if(join_budget < externalPathJoinMinimumBudget() ||
-     sort_budget < externalPathGraphSortMinimumBudget())
-  {
-    throw joinError("join partition or sort run budget is below the implementation minimum");
-  }
-  size_type direct_sort_budget = std::min(sort_budget,
-    memory_budget - externalPathJoinMinimumBudget());
-  size_type direct_join_budget = std::min(join_budget,
-    memory_budget - direct_sort_budget);
-  if(direct_sort_budget < externalPathGraphSortMinimumBudget() ||
-     direct_join_budget < externalPathJoinMinimumBudget())
-  {
-    throw joinError("memory limit cannot admit concurrent label sorting and join blocking");
-  }
+  ConcurrentPathBudgets direct_budgets = allocateConcurrentPathBudgets(parameters,
+    memory_budget, "configured memory limit");
+  size_type join_budget = direct_budgets.join;
+  size_type direct_sort_budget = direct_budgets.sort;
+  size_type direct_join_budget = direct_budgets.join;
   if(parameters.getMaxOpenFiles() < 6)
   {
     throw joinError("max-open-files must be at least 6 for the external join");

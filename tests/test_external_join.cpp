@@ -333,6 +333,29 @@ int main(int argc, char** argv)
   require(blocked_stats.blocked_key_blocks > 1);
   require(blocked_stats.max_bytes_resident <= blocked_parameters.getMemoryLimitBytes());
 
+  // The aggregate goal normally derives a 75/25 sort/join split. At 1 MiB,
+  // however, the nominal join quarter is smaller than its fixed stream
+  // buffers. The allocator must rebalance the still-feasible aggregate budget
+  // instead of treating the preferred ratio as an infeasible hard cap.
+  require(MEGABYTE >= externalPathJoinMinimumBudget() +
+    externalPathGraphSortMinimumBudget());
+  PathGraph automatic_graph(left_path, left_rank);
+  automatic_graph.order = 1;
+  automatic_graph.logical_file_ids[0] = logical_file_id_t(7);
+  automatic_graph.physical_shard_ids[0] = physical_shard_id_t(101);
+  appendShard(automatic_graph, right_path, right_rank,
+    logical_file_id_t(7), physical_shard_id_t(202));
+  ConstructionParameters automatic_parameters;
+  automatic_parameters.setMemoryLimitBytes(MEGABYTE);
+  automatic_parameters.setMergeFanIn(2);
+  automatic_parameters.setWorkDirectory(".");
+  ExternalPathJoinStats automatic_stats;
+  externalPathGraphExtend(automatic_graph, GIGABYTE,
+    automatic_parameters, &automatic_stats);
+  requireSameGraph(legacy, automatic_graph, "automatic aggregate budget");
+  require(automatic_stats.max_bytes_resident <=
+    automatic_parameters.getMemoryLimitBytes());
+
   char workspace_root[] = "/tmp/gcsa-path-checkpoint-XXXXXX";
   require(mkdtemp(workspace_root) != nullptr);
   BuildWorkspace::Settings semantic;
