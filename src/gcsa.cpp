@@ -117,6 +117,8 @@ constructionOperationalSettings(const ConstructionParameters& parameters)
   settings["io_buffer_size"] = std::to_string(parameters.getIOBufferSize());
   settings["sort_run_size"] = std::to_string(parameters.getSortRunSize());
   settings["join_partition_size"] = std::to_string(parameters.getJoinPartitionSize());
+  settings["sort_run_size_mode"] = (parameters.sortRunSizeIsAutomatic() ? "auto" : "explicit");
+  settings["join_partition_size_mode"] = (parameters.joinPartitionSizeIsAutomatic() ? "auto" : "explicit");
   settings["merge_fan_in"] = std::to_string(parameters.getMergeFanIn());
   settings["max_open_files"] = std::to_string(parameters.getMaxOpenFiles());
   settings["process_workers"] = std::to_string(parameters.getProcessWorkers());

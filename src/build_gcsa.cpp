@@ -106,8 +106,8 @@ main(int argc, char** argv)
     std::cerr << "                                 (default " << formatBytes(ConstructionParameters::MEMORY_LIMIT * GIGABYTE) << ")" << std::endl;
     std::cerr << "      --disk-limit SIZE          spill-generation disk budget" << std::endl;
     std::cerr << "      --io-buffer-size SIZE      byte size of sequential I/O buffers" << std::endl;
-    std::cerr << "      --sort-run-size SIZE       maximum label-sort working set" << std::endl;
-    std::cerr << "      --join-partition-size SIZE maximum join working set" << std::endl;
+    std::cerr << "      --sort-run-size SIZE       maximum label-sort working set (default 75% of memory goal)" << std::endl;
+    std::cerr << "      --join-partition-size SIZE maximum join working set (default 25% of memory goal)" << std::endl;
     std::cerr << "      --merge-fan-in N           maximum merge inputs" << std::endl;
     std::cerr << "      --max-open-files N         construction descriptor ceiling" << std::endl;
     std::cerr << "      --process-workers N        parallel external join worker processes" << std::endl;
@@ -287,9 +287,11 @@ main(int argc, char** argv)
       printHeader("Work directory", INDENT); std::cout << parameters.getWorkDirectory() << std::endl;
       printHeader("Resume", INDENT); std::cout << (parameters.getResume() ? "yes" : "no") << std::endl;
       printHeader("Sort run target", INDENT);
-      std::cout << formatBytes(parameters.getSortRunSize()) << std::endl;
+      std::cout << formatBytes(parameters.getSortRunSize())
+                << (parameters.sortRunSizeIsAutomatic() ? " (auto)" : " (explicit)") << std::endl;
       printHeader("Join partition target", INDENT);
-      std::cout << formatBytes(parameters.getJoinPartitionSize()) << std::endl;
+      std::cout << formatBytes(parameters.getJoinPartitionSize())
+                << (parameters.joinPartitionSizeIsAutomatic() ? " (auto)" : " (explicit)") << std::endl;
       printHeader("Join worker processes", INDENT);
       std::cout << parameters.getProcessWorkers() << std::endl;
     }

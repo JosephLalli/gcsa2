@@ -21,15 +21,25 @@ int main()
   require(invalid);
 
   ConstructionParameters parameters;
+  parameters.setMemoryLimitBytes(parseBytes("96G"));
+  require(parameters.sortRunSizeIsAutomatic());
+  require(parameters.joinPartitionSizeIsAutomatic());
+  require(parameters.getSortRunSize() == 72 * GIGABYTE);
+  require(parameters.getJoinPartitionSize() == 24 * GIGABYTE);
+  require(parameters.getSortRunSize(8 * GIGABYTE) == 6 * GIGABYTE);
+  require(parameters.getJoinPartitionSize(8 * GIGABYTE) == 2 * GIGABYTE);
   parameters.setMaxOpenFiles(1);
   require(parameters.getMaxOpenFiles() == ConstructionParameters::MIN_OPEN_FILES);
   parameters.setWorkDirectory("/tmp/example.gcsa-work/");
   parameters.setResume(); parameters.setKeepWork();
-  parameters.setMemoryLimitBytes(parseBytes("96G"));
   parameters.setLimitBytes(parseBytes("40T"));
   parameters.setIOBufferSize(parseBytes("64M"));
   parameters.setSortRunSize(parseBytes("4G"));
   parameters.setJoinPartitionSize(parseBytes("16G"));
+  require(!(parameters.sortRunSizeIsAutomatic()));
+  require(!(parameters.joinPartitionSizeIsAutomatic()));
+  require(parameters.getSortRunSize() == 4 * GIGABYTE);
+  require(parameters.getJoinPartitionSize() == 16 * GIGABYTE);
   parameters.setMergeFanIn(32); parameters.setMaxOpenFiles(96);
   parameters.setProcessWorkers(4);
   parameters.setWorkerExecutable("/tmp/build_gcsa");
