@@ -1026,6 +1026,17 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     BuildWorkspace::Settings operational = constructionOperationalSettings(parameters);
     workspace.reset(new BuildWorkspace(parameters.getWorkDirectory(), semantic, operational,
       parameters.getResume() ? BuildWorkspace::RESUME : BuildWorkspace::NEW_WORKSPACE));
+    if(Verbosity::level >= Verbosity::BASIC)
+    {
+      // This is the aggregate allocator/scheduler goal used to choose spill
+      // runs and admit join workers. Library allocations and the embedding
+      // application's graph remain outside it, so deployments should report
+      // their hard cgroup cap separately.
+      std::cerr << "GCSA::GCSA(): External working-set target "
+                << formatBytes(parameters.getMemoryLimitBytes())
+                << ", disk limit " << formatBytes(parameters.getLimitBytes())
+                << std::endl;
+    }
   }
 
   // Extract key and start-node facts. The legacy branch retains its historical

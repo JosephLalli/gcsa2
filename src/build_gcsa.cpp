@@ -103,6 +103,7 @@ main(int argc, char** argv)
     std::cerr << "      --keep-work                retain workspace after success" << std::endl;
     std::cerr << "      --memory-limit SIZE        aggregate external-construction working-set target" << std::endl;
     std::cerr << "                                 (RAM/HDD tradeoff; not a hard whole-process cap)" << std::endl;
+    std::cerr << "                                 (default " << formatBytes(ConstructionParameters::MEMORY_LIMIT * GIGABYTE) << ")" << std::endl;
     std::cerr << "      --disk-limit SIZE          spill-generation disk budget" << std::endl;
     std::cerr << "      --io-buffer-size SIZE      byte size of sequential I/O buffers" << std::endl;
     std::cerr << "      --sort-run-size SIZE       maximum label-sort working set" << std::endl;
