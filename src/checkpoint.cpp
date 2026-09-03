@@ -6,8 +6,6 @@
 
 #include <gcsa/checkpoint.h>
 
-#include <algorithm>
-#include <fstream>
 #include <limits>
 #include <stdexcept>
 
@@ -18,7 +16,7 @@ namespace
 {
 
 constexpr std::uint64_t PATH_GRAPH_CHECKPOINT_MAGIC = 0x3154504b434750ULL;
-constexpr std::uint32_t PATH_GRAPH_CHECKPOINT_VERSION = 1;
+constexpr std::uint32_t PATH_GRAPH_CHECKPOINT_VERSION = 2;
 constexpr size_type PATH_GRAPH_METADATA_FIXED = 8 + 4 + 10 * 8;
 constexpr size_type PATH_GRAPH_METADATA_PER_FILE = 4 + 8 + 8 + 8;
 constexpr size_type PATH_GRAPH_METADATA_LIMIT = 256 * MEGABYTE;
@@ -67,40 +65,6 @@ rankIdentity(const std::string& task, const std::string& phase, size_type file)
   return ArtifactIdentity(task, phase, "ranks-" + std::to_string(file), "path-ranks-v1");
 }
 
-BuildWorkspace::ArtifactRef
-copyIntoArtifact(BuildWorkspace& workspace, const ArtifactIdentity& identity,
-  logical_file_id_t logical, physical_shard_id_t shard, const std::string& source,
-  size_type records, size_type expected_bytes, size_type buffer_bytes,
-  const std::string& sort_order)
-{
-  std::ifstream input;
-  input.rdbuf()->pubsetbuf(nullptr, 0);
-  input.open(source.c_str(), std::ios_base::binary);
-  if(!input) { throw std::runtime_error("checkpointPathGraph(): cannot open " + source); }
-  input.seekg(0, std::ios_base::end);
-  size_type actual_bytes = static_cast<size_type>(input.tellg());
-  input.seekg(0, std::ios_base::beg);
-  if(actual_bytes != expected_bytes)
-  {
-    throw std::runtime_error("checkpointPathGraph(): file length does not match metadata: " + source);
-  }
-  BuildWorkspace::ArtifactWriter writer = workspace.open_artifact(
-    identity, logical, shard, sort_order, "all");
-  std::vector<std::uint8_t> buffer(std::max(static_cast<size_type>(1), buffer_bytes));
-  size_type remaining = actual_bytes;
-  while(remaining > 0)
-  {
-    size_type want = std::min(remaining, buffer.size());
-    input.read(reinterpret_cast<char*>(buffer.data()), want);
-    if(input.gcount() != static_cast<std::streamsize>(want))
-    {
-      throw std::runtime_error("checkpointPathGraph(): short read from " + source);
-    }
-    writer.write(buffer.data(), want); remaining -= want;
-  }
-  return writer.finish(records);
-}
-
 size_type
 checkedPayloadBytes(size_type records, size_type record_bytes,
   const std::string& source)
@@ -111,6 +75,17 @@ checkedPayloadBytes(size_type records, size_type record_bytes,
       "checkpointPathGraph(): record count overflows payload size: " + source);
   }
   return records * record_bytes;
+}
+
+BuildWorkspace::ArtifactRef
+checkpointPayload(BuildWorkspace& workspace, const ArtifactIdentity& identity,
+  logical_file_id_t logical, physical_shard_id_t shard, const std::string& source,
+  size_type records, size_type expected_bytes, size_type buffer_bytes,
+  const std::string& sort_order)
+{
+  static_cast<void>(sort_order);
+  return workspace.adopt_raw_payload(identity, logical, shard, source,
+    records, expected_bytes, buffer_bytes);
 }
 
 } // namespace
@@ -163,12 +138,12 @@ checkpointPathGraph(BuildWorkspace& workspace, const PathGraph& graph,
   artifacts.push_back(metadata_writer.finish(graph.files()));
   for(size_type file = 0; file < graph.files(); file++)
   {
-    artifacts.push_back(copyIntoArtifact(workspace, pathIdentity(task, phase, file),
+    artifacts.push_back(checkpointPayload(workspace, pathIdentity(task, phase, file),
       graph.logicalFile(file), graph.physicalShard(file), graph.path_names[file],
       graph.path_counts[file], checkedPayloadBytes(graph.path_counts[file],
         sizeof(PathNode), graph.path_names[file]),
       buffer_bytes, "label"));
-    artifacts.push_back(copyIntoArtifact(workspace, rankIdentity(task, phase, file),
+    artifacts.push_back(checkpointPayload(workspace, rankIdentity(task, phase, file),
       graph.logicalFile(file), graph.physicalShard(file), graph.rank_names[file],
       graph.rank_counts[file], checkedPayloadBytes(graph.rank_counts[file],
         sizeof(PathNode::rank_type), graph.rank_names[file]),
@@ -180,6 +155,14 @@ checkpointPathGraph(BuildWorkspace& workspace, const PathGraph& graph,
 void
 restorePathGraph(const BuildWorkspace& workspace, PathGraph& graph,
   const std::string& task, const std::string& phase, size_type buffer_bytes)
+{
+  restorePathGraph(workspace, graph, task, phase, buffer_bytes, false);
+}
+
+void
+restorePathGraph(const BuildWorkspace& workspace, PathGraph& graph,
+  const std::string& task, const std::string& phase, size_type buffer_bytes,
+  bool verify_checksum)
 {
   if(!workspace.task_completed(task, phase))
   {
@@ -224,17 +207,22 @@ restorePathGraph(const BuildWorkspace& workspace, PathGraph& graph,
     restored.rank_counts[file] = readLittle<std::uint64_t>(metadata, offset);
     restored.path_count += restored.path_counts[file];
     restored.rank_count += restored.rank_counts[file];
-    workspace.restore_artifact(pathIdentity(task, phase, file),
+    workspace.restore_adopted_payload(pathIdentity(task, phase, file),
       restored.logicalFile(file), restored.physicalShard(file),
-      restored.path_names[file], buffer_bytes);
-    workspace.restore_artifact(rankIdentity(task, phase, file),
+      restored.path_names[file], restored.path_counts[file],
+      checkedPayloadBytes(restored.path_counts[file], sizeof(PathNode),
+        restored.path_names[file]), buffer_bytes, verify_checksum);
+    workspace.restore_adopted_payload(rankIdentity(task, phase, file),
       restored.logicalFile(file), restored.physicalShard(file),
-      restored.rank_names[file], buffer_bytes);
+      restored.rank_names[file], restored.rank_counts[file],
+      checkedPayloadBytes(restored.rank_counts[file], sizeof(PathNode::rank_type),
+        restored.rank_names[file]), buffer_bytes, verify_checksum);
   }
   if(restored.path_count != total_paths || restored.rank_count != total_ranks)
   {
     throw std::runtime_error("restorePathGraph(): checkpoint totals do not match shards");
   }
+  restored.delete_files = false;
   graph.clear(); graph.swap(restored);
 }
 
