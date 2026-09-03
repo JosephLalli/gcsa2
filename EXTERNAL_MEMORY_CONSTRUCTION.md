@@ -531,8 +531,12 @@ outside `MemoryBudget`.
 
 LCP level `i+1` is produced by streaming groups of the configured branching
 factor from level `i`; each raw internal level is independently checkpointed
-and consumed. The final packed hierarchy necessarily resides in
-`LCPArray::data`, in legacy leaf-to-root serialization order.
+and consumed. `LCPArray::buildAndStore()` then writes the packed hierarchy
+directly in legacy leaf-to-root order, including SDSL's historical partial-word
+padding, and atomically publishes the final `.lcp`. The production standalone
+and `vg` routes therefore do not allocate `LCPArray::data`; they reload it only
+when explicit verification needs the query object. The resident constructor is
+retained for API compatibility and small callers.
 
 Index verification also has a disk-first route. It emits fixed-width
 `(label, mapped-from-node)` records from bounded input blocks, externally sorts
@@ -561,7 +565,7 @@ when its production call path and forced-spill/recovery tests pass.
 | External keys/start nodes/initial paths | implemented with bounded fixed-record runs, global duplicate reduction, streaming support construction, durable key/start checkpoints, and physical initial shards preserving logical IDs |
 | Spillable pruning groups | implemented and forced-spill tested for equal-label priority groups, extended ranges, external same-from sets, and bounded input/output descriptor caches |
 | Final event/component passes | implemented with one-task immutable-payload event checkpoint, same-filesystem zero-copy restore, spillable mapped start-node sets, disk-backed `prev_occ` and suffix-tree stack, external redundancy sort, streaming fast-vector, packed-sample-ID, and SadaCount serialization, and direct component-at-a-time packing in standalone/vg/autoindex; mid-scan assignment logs and remaining SDSL token admission pending |
-| Streaming LCP levels | implemented and resume-tested with one raw level resident at a time and byte-identical legacy serialization; final packed hierarchy remains resident |
+| Streaming LCP levels and direct packing | implemented and resume-tested with one raw level resident at a time, bounded direct final serialization, atomic publication, and byte-identical legacy output including padding edge cases |
 | External verification | implemented and forced-spill tested with bounded input blocks, external expected/actual occurrence sorts, callback-based locate, and sequential set comparison; resumable runs and parallel label ranges pending |
 | Standalone and `vg index` / `vg autoindex` CLI integration | implemented; forced-spill/resume integration tested |
 | Chromosome-scale benchmark | preexisting chr20 k32-pruned fixture completed and verified at 32.36 GiB RSS under a 128 GiB cgroup; outputs are byte-identical to legacy; separate 25 GiB forced-spill/recovery path exercised |
@@ -571,8 +575,8 @@ only when `ConstructionParameters::work_directory` is nonempty. The production
 file-building routes no longer retain all completed GCSA components or retain a
 completed GCSA while constructing LCP. Fast BWT/edge/sample vectors, packed
 sample IDs, and redundancy pointers stream in bounded memory, but individual
-sparse SDSL builders, sample-boundary and occurrence structures, and their conversion scratch still allocate
-outside the token budget, and the final packed LCP remains resident. These are
+sparse SDSL builders, sample-boundary and occurrence structures, and their
+conversion scratch still allocate outside the token budget. These are
 bounded by one final component rather than total intermediate path volume, but
 they keep the in-process budget from being a strict whole-process RSS ceiling;
 production runs retain a cgroup limit.
@@ -619,12 +623,12 @@ feasibility, RSS, then speed policy:
    whole physical graph before GCSA2's budget exists. A sharded graph reader
    must preserve one explicit logical GCSA2 input identity across all physical
    chunks.
-2. Bound the remaining resident floor: `NodeMapping`, de Bruijn support, one
-   SDSL final-component builder/conversion, and the final packed LCP allocate
-   outside the shared token budget. External mapping lookup, direct streaming
-   serialization for the largest SDSL component, and streamed final LCP packing
-   are the principal remaining greater-than-RAM changes. Until then, measured
-   component floors must be reserved below the deployment hard cap.
+2. Bound the remaining resident floor: `NodeMapping`, de Bruijn support, and
+   one sparse/sample-boundary/occurrence SDSL final-component builder or
+   conversion allocate outside the shared token budget. External mapping
+   lookup and direct serialization for those remaining component types are the
+   principal greater-than-RAM changes. Until then, measured component floors
+   must be reserved below the deployment hard cap.
 3. Make `DiskBudget` global. Join/path generation is reserved today, but
    checkpoint payloads, final events, verification runs, and LCP levels can
    still discover ENOSPC only when a write fails.

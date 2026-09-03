@@ -301,7 +301,7 @@ main(int argc, char** argv)
 
   GCSA index;
   LCPArray lcp;
-  bool stored_directly = false;
+  bool stored_directly = false, lcp_stored_directly = false;
   if(load_index)
   {
     if(!sdsl::load_from_file(index, index_file))
@@ -324,9 +324,14 @@ main(int argc, char** argv)
       {
         GCSA::buildAndStore(graph, parameters, index_file);
         stored_directly = true;
+        LCPArray::buildAndStore(graph, parameters, lcp_file);
+        lcp_stored_directly = true;
       }
-      else { index = GCSA(graph, parameters); }
-      lcp = LCPArray(graph, parameters);
+      else
+      {
+        index = GCSA(graph, parameters);
+        lcp = LCPArray(graph, parameters);
+      }
     }
     catch(const ConstructionStopped& stopped)
     {
@@ -344,7 +349,7 @@ main(int argc, char** argv)
       std::cerr << "build_gcsa: Cannot write the index to " << index_file << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    if(!atomicStore(lcp, lcp_file))
+    if(!lcp_stored_directly && !atomicStore(lcp, lcp_file))
     {
       std::cerr << "build_gcsa: Cannot write the LCP array to " << lcp_file << std::endl;
       std::exit(EXIT_FAILURE);
@@ -362,12 +367,19 @@ main(int argc, char** argv)
                 << index_file << std::endl;
       std::exit(EXIT_FAILURE);
     }
+    if(!sdsl::load_from_file(lcp, lcp_file))
+    {
+      std::cerr << "build_gcsa: Cannot reload the LCP array for verification from "
+                << lcp_file << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
   }
   if(!stored_directly || verify) { printStatistics(index, lcp); }
   else
   {
-    std::cout << "Index components stored directly in " << index_file
-              << " (not reloaded for statistics)" << std::endl << std::endl;
+    std::cout << "Index and LCP components stored directly in " << index_file
+              << " and " << lcp_file << " (not reloaded for statistics)"
+              << std::endl << std::endl;
   }
 
   if(verify)

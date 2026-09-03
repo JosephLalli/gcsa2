@@ -174,13 +174,17 @@ main()
     parameters.setResume();
     InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
     GCSA::buildAndStore(graph, parameters, staged_prefix + GCSA::EXTENSION);
-    LCPArray lcp(graph, parameters);
+    LCPArray::buildAndStore(graph, parameters, staged_prefix + LCPArray::EXTENSION);
     GCSA staged;
+    LCPArray lcp;
     require(sdsl::load_from_file(staged, staged_prefix + GCSA::EXTENSION));
+    require(sdsl::load_from_file(lcp, staged_prefix + LCPArray::EXTENSION));
     require(verifyIndex(staged, &lcp, graph));
   }
   require(readFile(legacy_prefix + GCSA::EXTENSION) ==
     readFile(staged_prefix + GCSA::EXTENSION));
+  require(readFile(legacy_prefix + LCPArray::EXTENSION) ==
+    readFile(staged_prefix + LCPArray::EXTENSION));
 
   // A semantic change must refuse reuse even though operational parameters are
   // deliberately allowed to change between invocations.
@@ -221,9 +225,14 @@ main()
       external_minimum + 64 * KILOBYTE);
     InputGraph external_graph({ empty_input }, true, external_parameters);
     GCSA::buildAndStore(external_graph, external_parameters, staged_empty);
+    LCPArray::buildAndStore(external_graph, external_parameters,
+      staged_empty + LCPArray::EXTENSION);
     GCSA loaded;
+    LCPArray loaded_lcp;
     require(sdsl::load_from_file(loaded, staged_empty));
+    require(sdsl::load_from_file(loaded_lcp, staged_empty + LCPArray::EXTENSION));
     require(loaded.size() == 0);
+    require(loaded_lcp.size() == 0);
     require(readFile(legacy_empty) == readFile(staged_empty));
   }
 
