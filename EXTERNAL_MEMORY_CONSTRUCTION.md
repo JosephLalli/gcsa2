@@ -671,6 +671,12 @@ blocking 25% of the current process reservation. Process workers recompute the
 same ratio after the aggregate goal has been divided among admitted workers;
 they do not each inherit the full global target. Explicit `--sort-run-size` and
 `--join-partition-size` values remain upper bounds and may change on resume.
+The automatic shares are preferences rather than independent caps: when a tiny
+reservation's 25% join share is below the fixed two-reader minimum, construction
+raises the join share and reduces the sort share while keeping their sum within
+the aggregate reservation. `build.json` records the nominal automatic shares;
+the phase allocator applies this minimum-aware rebalance to the top-level task
+and again inside every admitted process-worker reservation.
 
 The goal is operational, not semantic, and may change on resume. A larger value
 admits larger initial/sort runs, join blocks, and more worker reservations,
