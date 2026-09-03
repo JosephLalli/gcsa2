@@ -26,10 +26,14 @@ struct PathSortRunRecord
 };
 
 /*
-  Records are stored in a versioned little-endian stream. Each record contains
-  the PathNode fields, a one-byte common-prefix length against the previous
-  record, and only the remaining ranks. Both classes own fixed-size byte
-  buffers and periodically evict completed file-cache prefixes.
+  Records are stored in a versioned little-endian stream. A run groups adjacent
+  records with the same left-path context (from node, predecessor mask, and
+  order): the first record stores that context and following records reference
+  it. Each record then stores its right-dependent fields, a one-byte common-
+  prefix length against the previous label, and only the remaining ranks. This
+  is the on-disk analogue of an ExpansionGroup: repeated left context is
+  materialized only by the reader. Both classes own fixed-size byte buffers and
+  periodically evict completed file-cache prefixes.
 */
 class PathSortRunWriter
 {
@@ -45,6 +49,9 @@ public:
   size_type bytes() const { return this->total_bytes_; }
   size_type payloadBytes() const { return this->payload_bytes_; }
   size_type uncompressedBytes() const;
+  size_type groupHeaders() const { return this->group_headers_; }
+  size_type groupReferences() const { return this->group_references_; }
+  size_type contextBytesSaved() const { return this->context_bytes_saved_; }
 
 private:
   std::string filename_;
@@ -55,6 +62,11 @@ private:
   off_t cache_released_;
   PathNode::rank_type previous_[PathLabel::LABEL_LENGTH + 1];
   size_type previous_ranks_;
+  node_type context_from_;
+  byte_type context_predecessors_;
+  size_type context_order_;
+  size_type group_headers_, group_references_, context_bytes_saved_;
+  bool have_context_;
   bool finished_;
 
   void append(const void* data, size_type bytes, bool payload);
@@ -90,6 +102,10 @@ private:
   PathSortRunRecord current_;
   PathNode::rank_type previous_[PathLabel::LABEL_LENGTH + 1];
   size_type previous_ranks_;
+  node_type context_from_;
+  byte_type context_predecessors_;
+  size_type context_order_;
+  bool have_context_;
   bool at_end_, footer_checked_;
 
   void readExact(void* data, size_type bytes, bool payload);

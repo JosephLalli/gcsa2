@@ -24,7 +24,7 @@ namespace
 
 constexpr std::uint64_t RUN_HEADER_MAGIC = 0x32524f5350534347ULL; // "GCSPSOR2"
 constexpr std::uint64_t RUN_FOOTER_MAGIC = 0x32444e4550534347ULL; // "GCSPEND2"
-constexpr std::uint32_t RUN_FORMAT_VERSION = 1;
+constexpr std::uint32_t RUN_FORMAT_VERSION = 2;
 constexpr std::uint32_t RUN_ENDIAN_MARKER = 0x01020304U;
 constexpr size_type RUN_HEADER_BYTES = 8 + 4 + 4 + 8 + 8 + 8;
 constexpr size_type RUN_FOOTER_BYTES = 8 + 4 + 4 + 8 + 8 + 8;
@@ -33,6 +33,17 @@ constexpr off_t RUN_CACHE_TAIL_BYTES = 64 * MEGABYTE;
 constexpr off_t RUN_CACHE_FLUSH_BYTES = 512 * MEGABYTE;
 constexpr std::uint64_t FNV_OFFSET = 1469598103934665603ULL;
 constexpr std::uint64_t FNV_PRIME = 1099511628211ULL;
+constexpr std::uint8_t RUN_REUSE_LEFT_CONTEXT = 0x01;
+constexpr std::uint8_t RUN_KNOWN_FLAGS = RUN_REUSE_LEFT_CONTEXT;
+// The v1 codec wrote three uint64_t PathNode fields per record. A v2 group
+// header stores from + predecessor mask + order, while a reference stores none
+// of those values. Both forms store to + lcp and the label prefix byte.
+constexpr size_type RUN_V1_NODE_BYTES = 3 * sizeof(std::uint64_t);
+constexpr size_type RUN_V2_GROUP_HEADER_BYTES = sizeof(std::uint8_t) +
+  sizeof(node_type) + sizeof(byte_type) + sizeof(std::uint8_t) +
+  sizeof(node_type) + sizeof(std::uint8_t);
+constexpr size_type RUN_V2_GROUP_REFERENCE_BYTES = sizeof(std::uint8_t) +
+  sizeof(node_type) + sizeof(std::uint8_t);
 static_assert(sizeof(node_type) == sizeof(std::uint64_t),
   "path-sort run format requires 64-bit node identifiers");
 static_assert(sizeof(size_type) == sizeof(std::uint64_t),
@@ -204,7 +215,9 @@ PathSortRunWriter::PathSortRunWriter(const std::string& filename,
   buffer_(checkedBufferBytes(buffer_bytes, filename)), used_(0),
   expected_records_(expected_records), records_(0), payload_bytes_(0),
   total_bytes_(0), checksum_(FNV_OFFSET), cache_released_(0),
-  previous_ranks_(0), finished_(false)
+  previous_ranks_(0), context_from_(0), context_predecessors_(0),
+  context_order_(0), group_headers_(0), group_references_(0),
+  context_bytes_saved_(0), have_context_(false), finished_(false)
 {
   this->file_ = ::open(this->filename_.c_str(),
     O_CREAT | O_TRUNC | O_RDWR, 0600);
@@ -293,13 +306,40 @@ PathSortRunWriter::write(const PathSortRunRecord& source)
   }
 
   PathNode node = source.node; node.setPointer(0);
+  bool reuse_context = (this->have_context_ &&
+    node.from == this->context_from_ &&
+    node.predecessors() == this->context_predecessors_ &&
+    node.order() == this->context_order_);
+  std::uint8_t flags = (reuse_context ? RUN_REUSE_LEFT_CONTEXT : 0);
+  this->append(&flags, sizeof(flags), true);
   std::uint8_t encoded[sizeof(std::uint64_t)];
-  encodeLittle<std::uint64_t>(encoded, node.from);
-  this->append(encoded, sizeof(node.from), true);
+  if(!reuse_context)
+  {
+    encodeLittle<std::uint64_t>(encoded, node.from);
+    this->append(encoded, sizeof(node.from), true);
+    std::uint8_t predecessors = node.predecessors();
+    std::uint8_t order = static_cast<std::uint8_t>(node.order());
+    this->append(&predecessors, sizeof(predecessors), true);
+    this->append(&order, sizeof(order), true);
+    this->context_from_ = node.from;
+    this->context_predecessors_ = node.predecessors();
+    this->context_order_ = node.order();
+    this->have_context_ = true;
+    this->group_headers_ = checkedAdd(this->group_headers_, 1, this->filename_);
+    this->context_bytes_saved_ = checkedAdd(this->context_bytes_saved_,
+      RUN_V1_NODE_BYTES - RUN_V2_GROUP_HEADER_BYTES, this->filename_);
+  }
+  else
+  {
+    this->group_references_ = checkedAdd(this->group_references_, 1,
+      this->filename_);
+    this->context_bytes_saved_ = checkedAdd(this->context_bytes_saved_,
+      RUN_V1_NODE_BYTES - RUN_V2_GROUP_REFERENCE_BYTES, this->filename_);
+  }
   encodeLittle<std::uint64_t>(encoded, node.to);
   this->append(encoded, sizeof(node.to), true);
-  encodeLittle<std::uint64_t>(encoded, node.fields);
-  this->append(encoded, sizeof(node.fields), true);
+  std::uint8_t lcp = static_cast<std::uint8_t>(node.lcp());
+  this->append(&lcp, sizeof(lcp), true);
 
   size_type ranks = node.ranks(), common = 0;
   while(common < ranks && common < this->previous_ranks_ &&
@@ -362,7 +402,8 @@ PathSortRunReader::PathSortRunReader(const std::string& filename,
   begin_(0), end_(0), file_offset_(0), total_records_(0), records_read_(0),
   payload_bytes_(0), payload_read_(0), total_bytes_(0), expected_checksum_(0),
   checksum_(FNV_OFFSET), cache_released_(0), previous_ranks_(0),
-  at_end_(false), footer_checked_(false)
+  context_from_(0), context_predecessors_(0), context_order_(0),
+  have_context_(false), at_end_(false), footer_checked_(false)
 {
   this->file_ = ::open(this->filename_.c_str(), O_RDONLY);
   if(this->file_ < 0) { throw runError("cannot open run", this->filename_); }
@@ -472,13 +513,41 @@ PathSortRunReader::readRecord()
   {
     throw runError("too many run records", this->filename_);
   }
+  std::uint8_t flags = 0;
+  this->readExact(&flags, sizeof(flags), true);
+  if((flags & ~RUN_KNOWN_FLAGS) != 0)
+  {
+    throw runError("unknown record flags", this->filename_);
+  }
+  bool reuse_context = ((flags & RUN_REUSE_LEFT_CONTEXT) != 0);
   std::uint8_t encoded[sizeof(std::uint64_t)];
-  this->readExact(encoded, sizeof(node_type), true);
-  this->current_.node.from = decodeLittle<std::uint64_t>(encoded);
+  if(reuse_context)
+  {
+    if(!this->have_context_)
+    {
+      throw runError("left-context reference before group header", this->filename_);
+    }
+  }
+  else
+  {
+    this->readExact(encoded, sizeof(node_type), true);
+    this->context_from_ = decodeLittle<std::uint64_t>(encoded);
+    this->readExact(&(this->context_predecessors_),
+      sizeof(this->context_predecessors_), true);
+    std::uint8_t order = 0;
+    this->readExact(&order, sizeof(order), true);
+    this->context_order_ = order;
+    this->have_context_ = true;
+  }
+  this->current_.node.from = this->context_from_;
   this->readExact(encoded, sizeof(node_type), true);
   this->current_.node.to = decodeLittle<std::uint64_t>(encoded);
-  this->readExact(encoded, sizeof(size_type), true);
-  this->current_.node.fields = decodeLittle<std::uint64_t>(encoded);
+  std::uint8_t lcp = 0;
+  this->readExact(&lcp, sizeof(lcp), true);
+  this->current_.node.fields = 0;
+  this->current_.node.setPredecessors(this->context_predecessors_);
+  this->current_.node.setOrder(this->context_order_);
+  this->current_.node.setLCP(lcp);
   this->current_.node.setPointer(0);
   if(this->current_.node.ranks() > PathLabel::LABEL_LENGTH + 1 ||
      this->current_.node.lcp() > this->current_.node.order())
@@ -517,11 +586,11 @@ PathSortRunReader::readFooter()
   size_type offset = 0;
   std::uint64_t magic = decodeLittle<std::uint64_t>(footer + offset); offset += 8;
   std::uint32_t version = decodeLittle<std::uint32_t>(footer + offset); offset += 4;
-  offset += 4;
+  std::uint32_t reserved = decodeLittle<std::uint32_t>(footer + offset); offset += 4;
   size_type records = decodeLittle<std::uint64_t>(footer + offset); offset += 8;
   size_type payload = decodeLittle<std::uint64_t>(footer + offset); offset += 8;
   std::uint64_t checksum = decodeLittle<std::uint64_t>(footer + offset);
-  if(magic != RUN_FOOTER_MAGIC || version != RUN_FORMAT_VERSION ||
+  if(magic != RUN_FOOTER_MAGIC || version != RUN_FORMAT_VERSION || reserved != 0 ||
      records != this->total_records_ || payload != this->payload_bytes_ ||
      checksum != this->expected_checksum_)
   {

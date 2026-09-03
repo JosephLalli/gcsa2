@@ -363,11 +363,15 @@ struct ExternalPathSortStats
   size_type runs, merge_operations, merge_passes, parallel_sorts;
   size_type max_records_resident, max_bytes_resident;
   size_type run_uncompressed_bytes, run_compressed_bytes;
+  size_type grouped_records, group_headers, context_bytes_saved;
+  // Codec counters cover every immutable run written, including merge output;
+  // they measure transient I/O avoided, not distinct final graph records.
 
   ExternalPathSortStats() :
     runs(0), merge_operations(0), merge_passes(0), parallel_sorts(0),
     max_records_resident(0), max_bytes_resident(0),
-    run_uncompressed_bytes(0), run_compressed_bytes(0) { }
+    run_uncompressed_bytes(0), run_compressed_bytes(0),
+    grouped_records(0), group_headers(0), context_bytes_saved(0) { }
 };
 
 // Sort one physical PathGraph file without materializing it in memory.
@@ -416,6 +420,12 @@ struct ExternalPathJoinStats
   size_type direct_label_records, intermediate_path_bytes_avoided;
   size_type join_partitions, worker_processes, restored_partitions;
   size_type recursive_splits, left_range_splits, right_range_splits;
+  size_type sampled_plan_records, radix_plan_bins, radix_plan_splits;
+  size_type radix_plan_max_bits, radix_plan_capped;
+  size_type radix_boundary_flushes, restored_radix_plans;
+  size_type grouped_expansion_records, expansion_context_bytes_saved;
+  // These aggregate PathSortRun codec references across all label-run passes.
+  // A record rewritten by a merge may therefore contribute more than once.
   size_type max_records_resident, max_bytes_resident;
 
   ExternalPathJoinStats() :
@@ -425,6 +435,10 @@ struct ExternalPathJoinStats
     direct_label_records(0), intermediate_path_bytes_avoided(0),
     join_partitions(0), worker_processes(0), restored_partitions(0),
     recursive_splits(0), left_range_splits(0), right_range_splits(0),
+    sampled_plan_records(0), radix_plan_bins(0), radix_plan_splits(0),
+    radix_plan_max_bits(0), radix_plan_capped(0),
+    radix_boundary_flushes(0), restored_radix_plans(0),
+    grouped_expansion_records(0), expansion_context_bytes_saved(0),
     max_records_resident(0), max_bytes_resident(0) { }
 };
 

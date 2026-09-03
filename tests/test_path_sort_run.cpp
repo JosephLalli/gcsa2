@@ -51,6 +51,26 @@ void consume(const std::string& filename, const std::vector<PathSortRunRecord>& 
   require(offset == expected.size());
 }
 
+void drain(const std::string& filename)
+{
+  PathSortRunReader reader(filename, pathSortRunMinimumBuffer());
+  while(!(reader.atEnd())) { reader.advance(); }
+}
+
+void copyAndMutate(const std::string& source, const std::string& target,
+  off_t offset, std::uint8_t mask)
+{
+  std::ifstream input(source.c_str(), std::ios_base::binary);
+  std::ofstream output(target.c_str(), std::ios_base::binary);
+  output << input.rdbuf(); output.close();
+  int descriptor = ::open(target.c_str(), O_RDWR); require(descriptor >= 0);
+  std::uint8_t value = 0;
+  require(::pread(descriptor, &value, 1, offset) == 1);
+  value ^= mask;
+  require(::pwrite(descriptor, &value, 1, offset) == 1);
+  require(::close(descriptor) == 0);
+}
+
 } // namespace
 
 int main()
@@ -60,14 +80,23 @@ int main()
   TempFile::setDirectory(root);
   const std::string run = std::string(root) + "/labels.run";
   const std::string corrupt = std::string(root) + "/corrupt.run";
+  const std::string bad_flags = std::string(root) + "/bad-flags.run";
+  const std::string bad_reference = std::string(root) + "/bad-reference.run";
+  const std::string bad_prefix = std::string(root) + "/bad-prefix.run";
+  const std::string bad_reserved = std::string(root) + "/bad-reserved.run";
   const std::string truncated = std::string(root) + "/truncated.run";
+  const off_t header_bytes = 40, footer_bytes = 40;
 
   std::vector<PathSortRunRecord> records(1000);
   for(size_type i = 0; i < records.size(); i++)
   {
     PathSortRunRecord& record = records[i];
-    record.node.from = i + 1; record.node.to = i + 2; record.node.fields = 0;
-    record.node.setPredecessors(static_cast<byte_type>(1U << (i % 4)));
+    size_type group = i / 100;
+    // Each group models one left path expanding to many right paths. The run
+    // stores the immutable left context once and uses compact references for
+    // the remaining 99 records, while labels remain independently decodable.
+    record.node.from = group + 1; record.node.to = i + 2; record.node.fields = 0;
+    record.node.setPredecessors(static_cast<byte_type>(1U << (group % 4)));
     record.node.setOrder(16); record.node.setLCP(15);
     record.node.setPointer(i * 17); // The codec deliberately normalizes this.
     for(size_type rank = 0; rank < 17; rank++)
@@ -82,25 +111,48 @@ int main()
   writer.finish();
   require(writer.records() == records.size());
   require(writer.bytes() == bytes(run));
+  require(writer.groupHeaders() == 10);
+  require(writer.groupReferences() == records.size() - writer.groupHeaders());
+  require(writer.contextBytesSaved() ==
+    writer.groupHeaders() * 4 + writer.groupReferences() * 14);
   require(writer.bytes() < writer.uncompressedBytes() / 2);
   consume(run, records);
 
-  // Corruption is detected by the payload checksum even when every encoded
-  // field remains structurally readable.
-  {
-    std::ifstream input(run.c_str(), std::ios_base::binary);
-    std::ofstream output(corrupt.c_str(), std::ios_base::binary);
-    output << input.rdbuf(); output.close();
-    int descriptor = ::open(corrupt.c_str(), O_RDWR); require(descriptor >= 0);
-    std::uint8_t value = 0;
-    off_t checksum_byte = static_cast<off_t>(bytes(corrupt) - 1);
-    require(::pread(descriptor, &value, 1, checksum_byte) == 1);
-    value ^= 1;
-    require(::pwrite(descriptor, &value, 1, checksum_byte) == 1);
-    require(::close(descriptor) == 0);
-  }
+  // Corruption is detected by the payload checksum even when the modified
+  // from-node byte remains structurally readable.
+  copyAndMutate(run, corrupt, header_bytes + 1, 1);
   bool rejected = false;
-  try { consume(corrupt, records); }
+  try { drain(corrupt); }
+  catch(const std::runtime_error&) { rejected = true; }
+  require(rejected);
+
+  // Structural validation fails before a corrupt record can be admitted to a
+  // merge. These offsets are stable parts of the explicit v2 wire format.
+  copyAndMutate(run, bad_flags, header_bytes, 0x80);
+  rejected = false;
+  try { drain(bad_flags); }
+  catch(const std::runtime_error&) { rejected = true; }
+  require(rejected);
+
+  copyAndMutate(run, bad_reference, header_bytes, 0x01);
+  rejected = false;
+  try { drain(bad_reference); }
+  catch(const std::runtime_error&) { rejected = true; }
+  require(rejected);
+
+  // flags + from + predecessors + order + to + lcp precede label prefix.
+  copyAndMutate(run, bad_prefix, header_bytes + 1 + 8 + 1 + 1 + 8 + 1, 0xFF);
+  rejected = false;
+  try { drain(bad_prefix); }
+  catch(const std::runtime_error&) { rejected = true; }
+  require(rejected);
+
+  // The footer's reserved field must stay zero for forward-compatible format
+  // negotiation; silently accepting it would make corruption ambiguous.
+  copyAndMutate(run, bad_reserved,
+    static_cast<off_t>(bytes(run)) - footer_bytes + 12, 0x01);
+  rejected = false;
+  try { drain(bad_reserved); }
   catch(const std::runtime_error&) { rejected = true; }
   require(rejected);
 
@@ -118,6 +170,8 @@ int main()
   require(rejected);
 
   std::remove(run.c_str()); std::remove(corrupt.c_str());
+  std::remove(bad_flags.c_str()); std::remove(bad_reference.c_str());
+  std::remove(bad_prefix.c_str()); std::remove(bad_reserved.c_str());
   std::remove(truncated.c_str()); rmdir(root);
   return 0;
 }

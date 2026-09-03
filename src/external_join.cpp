@@ -79,9 +79,11 @@ struct JoinRun
 {
   std::string name;
   size_type records;
+  std::uint64_t checksum;
 
-  JoinRun(const std::string& path = std::string(), size_type count = 0) :
-    name(path), records(count) { }
+  JoinRun(const std::string& path = std::string(), size_type count = 0,
+    std::uint64_t payload_checksum = 0) :
+    name(path), records(count), checksum(payload_checksum) { }
 };
 
 std::runtime_error
@@ -351,7 +353,7 @@ public:
     trimWrittenCache(this->descriptor, this->cache_released, true, this->name);
     if(::close(this->descriptor) != 0) { throw joinError("cannot close join run", this->name); }
     this->descriptor = -1; this->finished = true;
-    return JoinRun(this->name, this->count);
+    return JoinRun(this->name, this->count, this->checksum);
   }
 
 private:
@@ -428,6 +430,10 @@ public:
       throw joinError("join run footer mismatch", this->name);
     }
     this->expected_checksum = decodeLittle<std::uint64_t>(in);
+    if(run.checksum != 0 && this->expected_checksum != run.checksum)
+    {
+      throw joinError("join run checksum identity mismatch", this->name);
+    }
   }
 
   ~JoinFileReader()
@@ -439,6 +445,9 @@ public:
   }
 
   size_type size() const { return this->record_count; }
+  // The checksum is part of the immutable run identity. Partition plans bind
+  // to it so a same-length replacement run can never inherit stale ranges.
+  std::uint64_t checksum() const { return this->expected_checksum; }
 
   void read(size_type index, JoinRecord& record) const
   {
@@ -1038,17 +1047,59 @@ struct JoinGroupSummary
 };
 
 // Planning must not retain one entry per distinct key: a realistic graph can
-// have many more keys than fit in the join reservation.  This fixed-size,
-// deterministic systematic sample is only an admission hint.  The subsequent
-// exact group pass remains the authority for ranges and output counts.
+// have many more keys than fit in the join reservation. This fixed-size,
+// deterministic systematic sample builds a bounded MSD radix range-pack tree.
+// The subsequent exact group pass remains the authority for ranges and output
+// counts, so a missed or underestimated key can only affect performance.
 constexpr size_type JOIN_PLAN_SAMPLE_RECORDS = 4096;
+constexpr size_type JOIN_PLAN_RADIX_BITS = 4;
+constexpr size_type JOIN_PLAN_MAX_BYTES = 4 * MEGABYTE;
+constexpr size_type JOIN_PLAN_PACK_BYTES = 4 * sizeof(std::uint64_t);
+constexpr size_type JOIN_PLAN_FIXED_BYTES = 8 + 4 + 4 + 12 * sizeof(std::uint64_t);
+constexpr size_type JOIN_PLAN_RUNTIME_OVERHEAD = 2 * JOIN_IO_BUFFER_BYTES +
+  2 * JOIN_PLAN_SAMPLE_RECORDS * sizeof(node_type) + 64 * KILOBYTE;
+constexpr std::uint64_t JOIN_PLAN_MAGIC = 0x324e4c5044534347ULL; // "GCSDPLN2"
+constexpr std::uint32_t JOIN_PLAN_VERSION = 2;
 
-std::map<node_type, size_type>
+struct JoinKeySample
+{
+  std::vector<node_type> keys;
+};
+
+// A pack is one leaf in a deterministic MSD radix tree. Prefix contains the
+// high `bits` bits of the join key; estimates are scheduling hints only. The
+// leaves tile the complete uint64_t key space in increasing order, including
+// empty sampled ranges, so an unsampled key still has an unambiguous pack.
+struct JoinRadixPack
+{
+  node_type prefix;
+  size_type bits, estimated_input_bytes, estimated_output_bytes;
+
+  JoinRadixPack(node_type prefix_value = 0, size_type prefix_bits = 0,
+    size_type input_bytes = 0, size_type output_bytes = 0) :
+    prefix(prefix_value), bits(prefix_bits),
+    estimated_input_bytes(input_bytes), estimated_output_bytes(output_bytes) { }
+};
+
+struct JoinRadixPlan
+{
+  std::vector<JoinRadixPack> packs;
+  std::vector<node_type> boundaries;
+  std::vector<node_type> heavy_keys;
+  size_type sampled_records, splits, max_bits, serialized_limit;
+  bool capped;
+
+  JoinRadixPlan() : sampled_records(0), splits(0), max_bits(0),
+    serialized_limit(0), capped(false) { }
+};
+
+JoinKeySample
 sampleJoinKeys(const JoinFileReader& reader)
 {
-  std::map<node_type, size_type> result;
+  JoinKeySample result;
   size_type samples = std::min(reader.size(), JOIN_PLAN_SAMPLE_RECORDS);
   if(samples == 0) { return result; }
+  result.keys.reserve(samples);
   JoinRecord record;
   for(size_type sample = 0; sample < samples; sample++)
   {
@@ -1057,9 +1108,16 @@ sampleJoinKeys(const JoinFileReader& reader)
     size_type remainder = reader.size() % samples;
     size_type offset = sample * quotient + (sample * remainder) / samples;
     reader.read(offset, record);
-    result[record.key]++;
+    result.keys.push_back(record.key);
   }
   return result;
+}
+
+size_type
+sampleKeyCount(const JoinKeySample& sample, node_type key)
+{
+  auto range = std::equal_range(sample.keys.begin(), sample.keys.end(), key);
+  return static_cast<size_type>(range.second - range.first);
 }
 
 size_type
@@ -1076,32 +1134,456 @@ scaleSampleCount(size_type count, size_type total, size_type samples)
     "sampled key estimate");
 }
 
-std::map<node_type, bool>
-sampledPathologicalKeys(const JoinFileReader& left, const JoinFileReader& right,
-  size_type target_bytes)
+size_type
+saturatingPlanAdd(size_type left, size_type right)
 {
-  std::map<node_type, size_type> left_samples = sampleJoinKeys(left);
-  std::map<node_type, size_type> right_samples = sampleJoinKeys(right);
-  std::map<node_type, bool> result;
-  size_type left_count = std::min(left.size(), JOIN_PLAN_SAMPLE_RECORDS);
-  size_type right_count = std::min(right.size(), JOIN_PLAN_SAMPLE_RECORDS);
-  for(const auto& entry : left_samples)
+  if(left > std::numeric_limits<size_type>::max() - right)
   {
-    auto found = right_samples.find(entry.first);
-    if(found == right_samples.end()) { continue; }
-    size_type estimated_left = scaleSampleCount(entry.second, left.size(), left_count);
-    size_type estimated_right = scaleSampleCount(found->second, right.size(), right_count);
-    size_type fanout = checkedJoinMultiply(estimated_left, estimated_right,
-      "sampled key fanout");
-    // Every generated path has its terminal rank plus at least one rank from
-    // each input. This is still a lower-bound estimate; the exact pass below
-    // catches anything the sample misses and validates all planned byte counts.
-    size_type minimum_output_bytes = sizeof(PathNode) +
-      3 * sizeof(PathNode::rank_type);
-    if(fanout > target_bytes / minimum_output_bytes)
+    return std::numeric_limits<size_type>::max();
+  }
+  return left + right;
+}
+
+size_type
+saturatingPlanMultiply(size_type left, size_type right)
+{
+  if(left != 0 && right > std::numeric_limits<size_type>::max() / left)
+  {
+    return std::numeric_limits<size_type>::max();
+  }
+  return left * right;
+}
+
+bool
+keyHasPrefix(node_type key, node_type prefix, size_type bits)
+{
+  return (bits == 0 || key >> (64 - bits) == prefix);
+}
+
+size_type
+estimatedPrefixOutput(const JoinKeySample& left_sample,
+  const JoinKeySample& right_sample, size_type left_total,
+  size_type right_total, node_type prefix, size_type bits)
+{
+  const size_type minimum_output_bytes = sizeof(PathNode) +
+    3 * sizeof(PathNode::rank_type);
+  size_type result = 0;
+  node_type lower = (bits == 0 ? node_type(0) : prefix << (64 - bits));
+  auto left = std::lower_bound(left_sample.keys.begin(), left_sample.keys.end(), lower);
+  while(left != left_sample.keys.end() && keyHasPrefix(*left, prefix, bits))
+  {
+    node_type key = *left;
+    auto left_end = std::upper_bound(left, left_sample.keys.end(), key);
+    size_type right_count = sampleKeyCount(right_sample, key);
+    if(right_count == 0) { left = left_end; continue; }
+    size_type estimated_left = scaleSampleCount(
+      static_cast<size_type>(left_end - left), left_total,
+      left_sample.keys.size());
+    size_type estimated_right = scaleSampleCount(right_count, right_total,
+      right_sample.keys.size());
+    size_type paths = saturatingPlanMultiply(estimated_left, estimated_right);
+    result = saturatingPlanAdd(result,
+      saturatingPlanMultiply(paths, minimum_output_bytes));
+    left = left_end;
+  }
+  return result;
+}
+
+size_type
+joinPlanBytes(size_type packs, size_type heavy_keys)
+{
+  size_type pack_bytes = saturatingPlanMultiply(packs, JOIN_PLAN_PACK_BYTES);
+  size_type heavy_bytes = saturatingPlanMultiply(heavy_keys, sizeof(node_type));
+  return saturatingPlanAdd(JOIN_PLAN_FIXED_BYTES,
+    saturatingPlanAdd(pack_bytes, heavy_bytes));
+}
+
+bool
+joinPlanCanFit(const JoinRadixPlan& plan, size_type extra_packs,
+  size_type extra_heavy_keys)
+{
+  return (joinPlanBytes(saturatingPlanAdd(plan.packs.size(), extra_packs),
+    saturatingPlanAdd(plan.heavy_keys.size(), extra_heavy_keys)) <=
+    plan.serialized_limit);
+}
+
+node_type
+radixPackLower(const JoinRadixPack& pack)
+{
+  return (pack.bits == 0 ? node_type(0) :
+    (pack.bits == 64 ? pack.prefix : pack.prefix << (64 - pack.bits)));
+}
+
+void
+finalizeJoinRadixPlan(JoinRadixPlan& plan)
+{
+  plan.boundaries.clear();
+  plan.boundaries.reserve(plan.packs.empty() ? 0 : plan.packs.size() - 1);
+  for(size_type i = 1; i < plan.packs.size(); i++)
+  {
+    plan.boundaries.push_back(radixPackLower(plan.packs[i]));
+  }
+  std::sort(plan.heavy_keys.begin(), plan.heavy_keys.end());
+  plan.heavy_keys.erase(std::unique(plan.heavy_keys.begin(), plan.heavy_keys.end()),
+    plan.heavy_keys.end());
+}
+
+void
+planRadixPrefix(const JoinKeySample& left_sample,
+  const JoinKeySample& right_sample, size_type left_total,
+  size_type right_total, node_type prefix, size_type bits,
+  size_type target_bytes, size_type reserved_packs, JoinRadixPlan& result)
+{
+  auto left_begin = std::lower_bound(left_sample.keys.begin(),
+    left_sample.keys.end(), (bits == 0 ? node_type(0) : prefix << (64 - bits)));
+  auto right_begin = std::lower_bound(right_sample.keys.begin(),
+    right_sample.keys.end(), (bits == 0 ? node_type(0) : prefix << (64 - bits)));
+  auto prefix_end = [prefix, bits](node_type key)
+  {
+    return !keyHasPrefix(key, prefix, bits);
+  };
+  auto left_end = std::find_if(left_begin, left_sample.keys.end(), prefix_end);
+  auto right_end = std::find_if(right_begin, right_sample.keys.end(), prefix_end);
+  size_type left_hits = static_cast<size_type>(left_end - left_begin);
+  size_type right_hits = static_cast<size_type>(right_end - right_begin);
+
+  size_type estimated_left = scaleSampleCount(left_hits, left_total,
+    left_sample.keys.size());
+  size_type estimated_right = scaleSampleCount(right_hits, right_total,
+    right_sample.keys.size());
+  size_type input_bytes = saturatingPlanMultiply(
+    saturatingPlanAdd(estimated_left, estimated_right), JOIN_RECORD_BYTES);
+  size_type output_bytes = estimatedPrefixOutput(left_sample, right_sample,
+    left_total, right_total, prefix, bits);
+  size_type estimated_bytes = std::max(input_bytes, output_bytes);
+
+  bool empty = (left_hits == 0 && right_hits == 0);
+  node_type minimum_key = std::numeric_limits<node_type>::max();
+  node_type maximum_key = 0;
+  if(left_hits > 0)
+  {
+    minimum_key = std::min(minimum_key, *left_begin);
+    maximum_key = std::max(maximum_key, *(left_end - 1));
+  }
+  if(right_hits > 0)
+  {
+    minimum_key = std::min(minimum_key, *right_begin);
+    maximum_key = std::max(maximum_key, *(right_end - 1));
+  }
+  bool terminal = (empty || estimated_bytes <= target_bytes || bits == 64 ||
+    minimum_key == maximum_key);
+  // A split replaces this prefix with at least 16 child packs. Keep enough
+  // space for every later sibling before allowing deeper recursion. When the
+  // byte cap is reached, the exact pass simply partitions the coarser pack.
+  if(!terminal && !joinPlanCanFit(result,
+      reserved_packs + (static_cast<size_type>(1) << JOIN_PLAN_RADIX_BITS), 0))
+  {
+    result.capped = true; terminal = true;
+  }
+  if(terminal)
+  {
+    if(!joinPlanCanFit(result, reserved_packs + 1, 0))
     {
-      result[entry.first] = true;
+      throw joinError("MSD range-pack planner violated its byte reservation");
     }
+    result.packs.emplace_back(prefix, bits, input_bytes, output_bytes);
+    if(!empty && output_bytes > target_bytes &&
+       sampleKeyCount(left_sample, minimum_key) > 0 &&
+       sampleKeyCount(right_sample, minimum_key) > 0)
+    {
+      if(joinPlanCanFit(result, reserved_packs, 1))
+      {
+        result.heavy_keys.push_back(minimum_key);
+      }
+      else { result.capped = true; }
+    }
+    result.max_bits = std::max(result.max_bits, bits);
+    return;
+  }
+
+  size_type next_bits = bits + JOIN_PLAN_RADIX_BITS;
+  result.splits++;
+  result.max_bits = std::max(result.max_bits, next_bits);
+  for(size_type digit = 0; digit < (static_cast<size_type>(1) << JOIN_PLAN_RADIX_BITS); digit++)
+  {
+    node_type child = (prefix << JOIN_PLAN_RADIX_BITS) | digit;
+    planRadixPrefix(left_sample, right_sample, left_total, right_total,
+      child, next_bits, target_bytes,
+      reserved_packs + ((static_cast<size_type>(1) << JOIN_PLAN_RADIX_BITS) -
+        digit - 1), result);
+  }
+}
+
+JoinRadixPlan
+sampleJoinRadixPlan(const JoinFileReader& left, const JoinFileReader& right,
+  size_type target_bytes, size_type serialized_limit)
+{
+  JoinKeySample left_sample = sampleJoinKeys(left);
+  JoinKeySample right_sample = sampleJoinKeys(right);
+  JoinRadixPlan result;
+  result.serialized_limit = serialized_limit;
+  result.sampled_records = left_sample.keys.size() + right_sample.keys.size();
+  planRadixPrefix(left_sample, right_sample, left.size(), right.size(),
+    0, 0, target_bytes, 0, result);
+  finalizeJoinRadixPlan(result);
+  return result;
+}
+
+size_type
+joinPlanSerializedLimit(size_type memory_budget)
+{
+  const size_type minimum = JOIN_PLAN_FIXED_BYTES + JOIN_PLAN_PACK_BYTES;
+  if(memory_budget <= JOIN_PLAN_RUNTIME_OVERHEAD + 4 * minimum)
+  {
+    return minimum;
+  }
+  // On fresh planning, vector capacity can approach twice the final pack
+  // count; on restore, the payload, decoded packs, and derived boundaries
+  // overlap. One quarter covers the worst of those representations.
+  return std::min(JOIN_PLAN_MAX_BYTES,
+    (memory_budget - JOIN_PLAN_RUNTIME_OVERHEAD) / 4);
+}
+
+template<class Value>
+void
+appendPlanValue(std::vector<std::uint8_t>& target, Value value)
+{
+  size_type offset = target.size();
+  if(offset > JOIN_PLAN_MAX_BYTES || sizeof(Value) > JOIN_PLAN_MAX_BYTES - offset)
+  {
+    throw joinError("MSD range-pack plan exceeds the format limit");
+  }
+  target.resize(offset + sizeof(Value));
+  std::uint8_t* output = target.data() + offset;
+  encodeLittle<Value>(output, value);
+}
+
+template<class Value>
+Value
+readPlanValue(const std::vector<std::uint8_t>& source, size_type& offset)
+{
+  if(offset > source.size() || sizeof(Value) > source.size() - offset)
+  {
+    throw joinError("truncated MSD range-pack plan");
+  }
+  const std::uint8_t* input = source.data() + offset;
+  Value result = decodeLittle<Value>(input); offset += sizeof(Value);
+  return result;
+}
+
+std::string
+joinRadixPlanTaskName(const std::string& generation,
+  logical_file_id_t logical, size_type target_bytes, size_type serialized_limit,
+  std::uint64_t left_checksum, std::uint64_t right_checksum)
+{
+  return generation + "-msd-plan-l" + std::to_string(logical.value) +
+    "-t" + std::to_string(target_bytes) +
+    "-m" + std::to_string(serialized_limit) +
+    "-lc" + std::to_string(left_checksum) +
+    "-rc" + std::to_string(right_checksum);
+}
+
+ArtifactIdentity
+joinRadixPlanArtifact(const std::string& task)
+{
+  return ArtifactIdentity(task, "join-plan", "msd-range-packs",
+    "join-msd-plan-v2");
+}
+
+void
+validateJoinRadixPacks(const JoinRadixPlan& plan)
+{
+  if(plan.packs.empty()) { throw joinError("MSD range-pack plan is empty"); }
+  typedef unsigned __int128 wide_type;
+  wide_type cursor = 0;
+  const wide_type universe = (static_cast<wide_type>(1) << 64);
+  for(const JoinRadixPack& pack : plan.packs)
+  {
+    if(pack.bits > 64 || (pack.bits == 0 && pack.prefix != 0) ||
+       (pack.bits < 64 && pack.bits > 0 &&
+        pack.prefix >= (static_cast<node_type>(1) << pack.bits)))
+    {
+      throw joinError("invalid MSD range-pack prefix");
+    }
+    wide_type lower = static_cast<wide_type>(radixPackLower(pack));
+    wide_type width = (static_cast<wide_type>(1) << (64 - pack.bits));
+    if(lower != cursor || lower + width > universe)
+    {
+      throw joinError("MSD range packs do not tile the join-key space");
+    }
+    cursor = lower + width;
+  }
+  if(cursor != universe)
+  {
+    throw joinError("MSD range packs do not cover the join-key space");
+  }
+}
+
+std::vector<std::uint8_t>
+encodeJoinRadixPlan(const JoinRadixPlan& plan, logical_file_id_t logical,
+  size_type target_bytes, size_type left_records, size_type right_records,
+  std::uint64_t left_checksum, std::uint64_t right_checksum)
+{
+  validateJoinRadixPacks(plan);
+  std::vector<std::uint8_t> result;
+  size_type serialized_bytes = joinPlanBytes(plan.packs.size(),
+    plan.heavy_keys.size());
+  if(serialized_bytes > plan.serialized_limit ||
+     serialized_bytes > JOIN_PLAN_MAX_BYTES)
+  {
+    throw joinError("MSD range-pack plan exceeds its memory reservation");
+  }
+  result.reserve(serialized_bytes);
+  appendPlanValue<std::uint64_t>(result, JOIN_PLAN_MAGIC);
+  appendPlanValue<std::uint32_t>(result, JOIN_PLAN_VERSION);
+  appendPlanValue<std::uint32_t>(result, logical.value);
+  appendPlanValue<std::uint64_t>(result, target_bytes);
+  appendPlanValue<std::uint64_t>(result, left_records);
+  appendPlanValue<std::uint64_t>(result, right_records);
+  appendPlanValue<std::uint64_t>(result, left_checksum);
+  appendPlanValue<std::uint64_t>(result, right_checksum);
+  appendPlanValue<std::uint64_t>(result, plan.serialized_limit);
+  appendPlanValue<std::uint64_t>(result, plan.sampled_records);
+  appendPlanValue<std::uint64_t>(result, plan.splits);
+  appendPlanValue<std::uint64_t>(result, plan.max_bits);
+  appendPlanValue<std::uint64_t>(result, plan.capped ? 1 : 0);
+  appendPlanValue<std::uint64_t>(result, plan.packs.size());
+  appendPlanValue<std::uint64_t>(result, plan.heavy_keys.size());
+  for(const JoinRadixPack& pack : plan.packs)
+  {
+    appendPlanValue<node_type>(result, pack.prefix);
+    appendPlanValue<std::uint64_t>(result, pack.bits);
+    appendPlanValue<std::uint64_t>(result, pack.estimated_input_bytes);
+    appendPlanValue<std::uint64_t>(result, pack.estimated_output_bytes);
+  }
+  for(node_type key : plan.heavy_keys)
+  {
+    appendPlanValue<node_type>(result, key);
+  }
+  if(result.size() != serialized_bytes)
+  {
+    throw joinError("MSD range-pack serialized length mismatch");
+  }
+  return result;
+}
+
+JoinRadixPlan
+decodeJoinRadixPlan(const std::vector<std::uint8_t>& payload,
+  logical_file_id_t logical, size_type target_bytes,
+  size_type left_records, size_type right_records,
+  std::uint64_t left_checksum, std::uint64_t right_checksum,
+  size_type serialized_limit)
+{
+  size_type offset = 0;
+  if(readPlanValue<std::uint64_t>(payload, offset) != JOIN_PLAN_MAGIC ||
+     readPlanValue<std::uint32_t>(payload, offset) != JOIN_PLAN_VERSION ||
+     readPlanValue<std::uint32_t>(payload, offset) != logical.value ||
+     readPlanValue<std::uint64_t>(payload, offset) != target_bytes ||
+     readPlanValue<std::uint64_t>(payload, offset) != left_records ||
+     readPlanValue<std::uint64_t>(payload, offset) != right_records ||
+     readPlanValue<std::uint64_t>(payload, offset) != left_checksum ||
+     readPlanValue<std::uint64_t>(payload, offset) != right_checksum ||
+     readPlanValue<std::uint64_t>(payload, offset) != serialized_limit)
+  {
+    throw joinError("MSD range-pack plan does not match its join inputs");
+  }
+  JoinRadixPlan result;
+  result.sampled_records = readPlanValue<std::uint64_t>(payload, offset);
+  result.splits = readPlanValue<std::uint64_t>(payload, offset);
+  result.max_bits = readPlanValue<std::uint64_t>(payload, offset);
+  result.capped = (readPlanValue<std::uint64_t>(payload, offset) != 0);
+  size_type packs = readPlanValue<std::uint64_t>(payload, offset);
+  size_type heavy_keys = readPlanValue<std::uint64_t>(payload, offset);
+  result.serialized_limit = serialized_limit;
+  if(packs == 0 || packs > (payload.size() - offset) / JOIN_PLAN_PACK_BYTES)
+  {
+    throw joinError("invalid MSD range-pack count");
+  }
+  result.packs.reserve(packs);
+  for(size_type i = 0; i < packs; i++)
+  {
+    node_type prefix = readPlanValue<node_type>(payload, offset);
+    size_type bits = readPlanValue<std::uint64_t>(payload, offset);
+    size_type input_bytes = readPlanValue<std::uint64_t>(payload, offset);
+    size_type output_bytes = readPlanValue<std::uint64_t>(payload, offset);
+    result.packs.emplace_back(prefix, bits, input_bytes, output_bytes);
+  }
+  if(heavy_keys > (payload.size() - offset) / sizeof(node_type) ||
+     offset + heavy_keys * sizeof(node_type) != payload.size())
+  {
+    throw joinError("invalid MSD range-pack heavy-key count");
+  }
+  result.heavy_keys.reserve(heavy_keys);
+  for(size_type i = 0; i < heavy_keys; i++)
+  {
+    result.heavy_keys.push_back(readPlanValue<node_type>(payload, offset));
+  }
+  if(joinPlanBytes(result.packs.size(), result.heavy_keys.size()) != payload.size() ||
+     payload.size() > serialized_limit ||
+     !std::is_sorted(result.heavy_keys.begin(), result.heavy_keys.end()) ||
+     std::adjacent_find(result.heavy_keys.begin(), result.heavy_keys.end()) !=
+       result.heavy_keys.end())
+  {
+    throw joinError("MSD range-pack plan is not canonical");
+  }
+  validateJoinRadixPacks(result);
+  finalizeJoinRadixPlan(result);
+  return result;
+}
+
+JoinRadixPlan
+loadOrCreateJoinRadixPlan(const JoinFileReader& left,
+  const JoinFileReader& right, logical_file_id_t logical,
+  size_type target_bytes, size_type memory_budget, BuildWorkspace* workspace,
+  const std::string& checkpoint_task, ExternalPathJoinStats* stats)
+{
+  JoinRadixPlan result;
+  size_type serialized_limit = joinPlanSerializedLimit(memory_budget);
+  bool restored = false;
+  std::string task;
+  if(workspace != nullptr && !checkpoint_task.empty())
+  {
+    task = joinRadixPlanTaskName(checkpoint_task, logical, target_bytes,
+      serialized_limit, left.checksum(), right.checksum());
+    if(workspace->task_completed(task, "join-plan"))
+    {
+      result = decodeJoinRadixPlan(workspace->read_artifact_payload(
+        joinRadixPlanArtifact(task), logical, physical_shard_id_t(0),
+        serialized_limit), logical, target_bytes, left.size(), right.size(),
+        left.checksum(), right.checksum(), serialized_limit);
+      restored = true;
+    }
+  }
+  if(!restored)
+  {
+    result = sampleJoinRadixPlan(left, right, target_bytes, serialized_limit);
+    if(workspace != nullptr && !task.empty())
+    {
+      std::vector<std::uint8_t> payload = encodeJoinRadixPlan(result, logical,
+        target_bytes, left.size(), right.size(), left.checksum(), right.checksum());
+      ArtifactIdentity identity = joinRadixPlanArtifact(task);
+      BuildWorkspace::ArtifactWriter writer = workspace->open_artifact(identity,
+        logical, physical_shard_id_t(0), "msd-key-prefix", "all");
+      writer.write(payload.data(), payload.size());
+      std::vector<BuildWorkspace::ArtifactRef> artifacts;
+      artifacts.push_back(writer.finish(result.packs.size() +
+        result.heavy_keys.size()));
+      workspace->commit_task(task, "join-plan", artifacts);
+    }
+  }
+  if(stats != nullptr)
+  {
+    stats->sampled_plan_records += result.sampled_records;
+    stats->radix_plan_bins += result.packs.size();
+    stats->radix_plan_splits += result.splits;
+    stats->radix_plan_max_bits = std::max(stats->radix_plan_max_bits,
+      result.max_bits);
+    stats->radix_plan_capped += (result.capped ? 1 : 0);
+    size_type planner_bound = saturatingPlanAdd(JOIN_PLAN_RUNTIME_OVERHEAD,
+      saturatingPlanMultiply(4, serialized_limit));
+    stats->max_bytes_resident = std::max(stats->max_bytes_resident,
+      std::min(memory_budget, planner_bound));
+    if(restored) { stats->restored_radix_plans++; }
   }
   return result;
 }
@@ -1310,15 +1792,18 @@ planJoinGroupRecursive(const JoinFileReader& left_reader,
 
 std::vector<JoinPartition>
 planJoinPartitions(const JoinRun& left_run, const JoinRun& right_run,
-  logical_file_id_t logical, size_type target_bytes, bool verify_payloads,
-  ExternalPathJoinStats* stats)
+  logical_file_id_t logical, size_type target_bytes, size_type memory_budget,
+  bool verify_payloads,
+  ExternalPathJoinStats* stats, BuildWorkspace* workspace = nullptr,
+  const std::string& checkpoint_task = std::string())
 {
   JoinFileReader left(left_run, logical, LEFT_BY_TO);
   JoinFileReader right(right_run, logical, RIGHT_BY_FROM);
   if(verify_payloads) { left.validate(); right.validate(); }
   target_bytes = std::max(static_cast<size_type>(1), target_bytes);
-  const std::map<node_type, bool> sampled_heavy =
-    sampledPathologicalKeys(left, right, target_bytes);
+  JoinRadixPlan radix_plan = loadOrCreateJoinRadixPlan(left, right, logical,
+    target_bytes, memory_budget, workspace, checkpoint_task, stats);
+  size_type radix_boundary = 0;
 
   std::vector<JoinPartition> result;
   size_type left_offset = 0, right_offset = 0;
@@ -1360,6 +1845,21 @@ planJoinPartitions(const JoinRun& left_run, const JoinRun& right_run,
       selected_left = &left_group; selected_right = &right_group;
     }
 
+    node_type selected_key = (selected_left == nullptr ?
+      selected_right->key : selected_left->key);
+    bool crossed_radix_boundary = false;
+    while(radix_boundary < radix_plan.boundaries.size() &&
+          radix_plan.boundaries[radix_boundary] <= selected_key)
+    {
+      crossed_radix_boundary = true; radix_boundary++;
+    }
+    if(crossed_radix_boundary &&
+       (current.expected_paths > 0 || current_input_bytes > 0))
+    {
+      flush_current();
+      if(stats != nullptr) { stats->radix_boundary_flushes++; }
+    }
+
     size_type group_paths = 0, group_ranks = 0, group_bytes = 0;
     joinGroupOutput(selected_left, selected_right, true,
       group_paths, group_ranks, group_bytes);
@@ -1381,7 +1881,8 @@ planJoinPartitions(const JoinRun& left_run, const JoinRun& right_run,
     // before it monopolizes an otherwise balanced worker task. Exact counts
     // above still decide the output contract and retain logical-file identity.
     bool sampled_heavy_group = (selected_left != nullptr && selected_right != nullptr &&
-      sampled_heavy.find(selected_left->key) != sampled_heavy.end());
+      std::binary_search(radix_plan.heavy_keys.begin(),
+        radix_plan.heavy_keys.end(), selected_left->key));
     if((oversized_group || sampled_heavy_group) && selected_right != nullptr &&
        (selected_left != nullptr || selected_right->bypass_paths > 0))
     {
@@ -1455,7 +1956,7 @@ planJoinPartitions(const JoinRun& left_run, const JoinRun& right_run,
 
 constexpr std::uint64_t WORKER_TASK_MAGIC = 0x314b535441534347ULL;   // "GCSATSK1"
 constexpr std::uint64_t WORKER_RESULT_MAGIC = 0x3153455241534347ULL; // "GCSARES1"
-constexpr std::uint32_t WORKER_FORMAT_VERSION = 2;
+constexpr std::uint32_t WORKER_FORMAT_VERSION = 3;
 constexpr size_type WORKER_CONTROL_LIMIT = MEGABYTE;
 
 struct ExternalJoinWorkerTask
@@ -1472,10 +1973,12 @@ struct ExternalJoinWorkerResult
 {
   size_type paths, ranks, bytes;
   size_type generated, bypassed, label_runs, label_merge_passes, label_parallel_sorts;
+  size_type grouped_records, group_headers, context_bytes_saved;
   size_type max_records, max_bytes, blocks, bytes_read, bytes_written;
 
   ExternalJoinWorkerResult() : paths(0), ranks(0), bytes(0), generated(0),
     bypassed(0), label_runs(0), label_merge_passes(0), label_parallel_sorts(0),
+    grouped_records(0), group_headers(0), context_bytes_saved(0),
     max_records(0), max_bytes(0), blocks(0), bytes_read(0), bytes_written(0) { }
 };
 
@@ -1575,6 +2078,8 @@ encodeWorkerTask(const ExternalJoinWorkerTask& task)
   appendWorkerValue<std::uint32_t>(data, task.logical.value);
   appendWorkerValue<std::uint64_t>(data, task.left.records);
   appendWorkerValue<std::uint64_t>(data, task.right.records);
+  appendWorkerValue<std::uint64_t>(data, task.left.checksum);
+  appendWorkerValue<std::uint64_t>(data, task.right.checksum);
   appendWorkerValue<std::uint64_t>(data, task.partition.left_begin);
   appendWorkerValue<std::uint64_t>(data, task.partition.left_end);
   appendWorkerValue<std::uint64_t>(data, task.partition.right_begin);
@@ -1611,6 +2116,8 @@ decodeWorkerTask(const std::vector<std::uint8_t>& data)
   task.logical = logical_file_id_t(readWorkerValue<std::uint32_t>(data, offset));
   task.left.records = readWorkerValue<std::uint64_t>(data, offset);
   task.right.records = readWorkerValue<std::uint64_t>(data, offset);
+  task.left.checksum = readWorkerValue<std::uint64_t>(data, offset);
+  task.right.checksum = readWorkerValue<std::uint64_t>(data, offset);
   task.partition.left_begin = readWorkerValue<std::uint64_t>(data, offset);
   task.partition.left_end = readWorkerValue<std::uint64_t>(data, offset);
   task.partition.right_begin = readWorkerValue<std::uint64_t>(data, offset);
@@ -1649,6 +2156,9 @@ encodeWorkerResult(const ExternalJoinWorkerResult& result)
   appendWorkerValue<std::uint64_t>(data, result.label_runs);
   appendWorkerValue<std::uint64_t>(data, result.label_merge_passes);
   appendWorkerValue<std::uint64_t>(data, result.label_parallel_sorts);
+  appendWorkerValue<std::uint64_t>(data, result.grouped_records);
+  appendWorkerValue<std::uint64_t>(data, result.group_headers);
+  appendWorkerValue<std::uint64_t>(data, result.context_bytes_saved);
   appendWorkerValue<std::uint64_t>(data, result.max_records);
   appendWorkerValue<std::uint64_t>(data, result.max_bytes);
   appendWorkerValue<std::uint64_t>(data, result.blocks);
@@ -1675,6 +2185,9 @@ decodeWorkerResult(const std::vector<std::uint8_t>& data)
   result.label_runs = readWorkerValue<std::uint64_t>(data, offset);
   result.label_merge_passes = readWorkerValue<std::uint64_t>(data, offset);
   result.label_parallel_sorts = readWorkerValue<std::uint64_t>(data, offset);
+  result.grouped_records = readWorkerValue<std::uint64_t>(data, offset);
+  result.group_headers = readWorkerValue<std::uint64_t>(data, offset);
+  result.context_bytes_saved = readWorkerValue<std::uint64_t>(data, offset);
   result.max_records = readWorkerValue<std::uint64_t>(data, offset);
   result.max_bytes = readWorkerValue<std::uint64_t>(data, offset);
   result.blocks = readWorkerValue<std::uint64_t>(data, offset);
@@ -1743,6 +2256,9 @@ externalPathJoinWorker(const std::string& task_file)
     result.bypassed = join_stats.sorted_bypass; result.label_runs = sort_stats.runs;
     result.label_merge_passes = sort_stats.merge_passes;
     result.label_parallel_sorts = sort_stats.parallel_sorts;
+    result.grouped_records = sort_stats.grouped_records;
+    result.group_headers = sort_stats.group_headers;
+    result.context_bytes_saved = sort_stats.context_bytes_saved;
     result.max_records = sort_stats.max_records_resident;
     result.max_bytes = checkedJoinAdd(sort_stats.max_bytes_resident,
       join_stats.max_bytes_resident, "worker combined resident bytes");
@@ -1873,14 +2389,17 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
 
 std::string
 joinPartitionTaskName(const std::string& generation,
-  logical_file_id_t logical, const JoinPartition& partition)
+  logical_file_id_t logical, const JoinPartition& partition,
+  std::uint64_t left_checksum, std::uint64_t right_checksum)
 {
   return generation + "-join-l" + std::to_string(logical.value) +
     "-lb" + std::to_string(partition.left_begin) +
     "-le" + std::to_string(partition.left_end) +
     "-rb" + std::to_string(partition.right_begin) +
     "-re" + std::to_string(partition.right_end) +
-    "-b" + std::to_string(partition.emit_bypass ? 1 : 0);
+    "-b" + std::to_string(partition.emit_bypass ? 1 : 0) +
+    "-lc" + std::to_string(left_checksum) +
+    "-rc" + std::to_string(right_checksum);
 }
 
 ArtifactIdentity
@@ -2129,6 +2648,12 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
         result.label_merge_passes);
       stats->label_parallel_sorts = checkedJoinAdd(stats->label_parallel_sorts,
         result.label_parallel_sorts, "worker parallel label sorts");
+      stats->grouped_expansion_records = checkedJoinAdd(
+        stats->grouped_expansion_records, result.grouped_records,
+        "worker grouped expansion records");
+      stats->expansion_context_bytes_saved = checkedJoinAdd(
+        stats->expansion_context_bytes_saved, result.context_bytes_saved,
+        "worker expansion context bytes saved");
       stats->max_records_resident = std::max(stats->max_records_resident,
         checkedJoinMultiply(result.max_records, concurrency,
           "concurrent worker resident records"));
@@ -2148,7 +2673,8 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
       size_type shard = appendOutputShard(next, logical,
         physical_shard_id_t(next_physical++));
       std::string partition_checkpoint = (checkpoint_task.empty() ? std::string() :
-        joinPartitionTaskName(checkpoint_task, logical, partition));
+        joinPartitionTaskName(checkpoint_task, logical, partition,
+          left.checksum, right.checksum));
       if(workspace != nullptr && !partition_checkpoint.empty() &&
          workspace->task_completed(partition_checkpoint, "join-partition"))
       {
@@ -2323,7 +2849,8 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
     if(parameters.getProcessWorkers() > 1)
     {
       std::vector<JoinPartition> partitions = planJoinPartitions(left, right,
-        logical, parameters.getCheckpointBytes(), parameters.getVerifyWorkspace(), stats);
+        logical, parameters.getCheckpointBytes(), memory_budget,
+        parameters.getVerifyWorkspace(), stats, workspace, checkpoint_task);
       runJoinWorkerPartitions(left, right, logical, partitions, size_limit,
         parameters, label_fan_in, next, next_physical, committed_bytes, stats,
         workspace, checkpoint_task);
@@ -2350,6 +2877,12 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
         stats->label_merge_passes = std::max(stats->label_merge_passes,
           sort_stats.merge_passes);
         stats->label_parallel_sorts += sort_stats.parallel_sorts;
+        stats->grouped_expansion_records = checkedJoinAdd(
+          stats->grouped_expansion_records, sort_stats.grouped_records,
+          "direct grouped expansion records");
+        stats->expansion_context_bytes_saved = checkedJoinAdd(
+          stats->expansion_context_bytes_saved, sort_stats.context_bytes_saved,
+          "direct expansion context bytes saved");
         stats->generated_records += direct_join_stats.generated_records;
         stats->sorted_bypass += direct_join_stats.sorted_bypass;
         stats->direct_label_records += direct_join_stats.direct_label_records;
