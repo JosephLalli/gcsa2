@@ -101,7 +101,8 @@ main(int argc, char** argv)
     std::cerr << "      --work-dir PATH            durable construction workspace" << std::endl;
     std::cerr << "      --resume                   resume compatible committed phases" << std::endl;
     std::cerr << "      --keep-work                retain workspace after success" << std::endl;
-    std::cerr << "      --memory-limit SIZE        external working-set goal (RAM/HDD tradeoff)" << std::endl;
+    std::cerr << "      --memory-limit SIZE        aggregate external-construction working-set target" << std::endl;
+    std::cerr << "                                 (RAM/HDD tradeoff; not a hard whole-process cap)" << std::endl;
     std::cerr << "      --disk-limit SIZE          spill-generation disk budget" << std::endl;
     std::cerr << "      --io-buffer-size SIZE      byte size of sequential I/O buffers" << std::endl;
     std::cerr << "      --sort-run-size SIZE       maximum label-sort working set" << std::endl;
@@ -277,11 +278,19 @@ main(int argc, char** argv)
     printHeader("Branching factor", INDENT); std::cout << parameters.lcp_branching << std::endl;
     printHeader("Temp directory", INDENT); std::cout << TempFile::temp_dir << std::endl;
     printHeader("Size limit", INDENT); std::cout << inGigabytes(parameters.size_limit) << " GB" << std::endl;
-    printHeader("Memory goal", INDENT); std::cout << formatBytes(parameters.memory_limit) << std::endl;
+    printHeader("External memory goal", INDENT);
+    std::cout << formatBytes(parameters.getMemoryLimitBytes())
+              << " aggregate (use an OS/cgroup limit for a hard process cap)" << std::endl;
     if(parameters.externalMemory())
     {
       printHeader("Work directory", INDENT); std::cout << parameters.getWorkDirectory() << std::endl;
       printHeader("Resume", INDENT); std::cout << (parameters.getResume() ? "yes" : "no") << std::endl;
+      printHeader("Sort run target", INDENT);
+      std::cout << formatBytes(parameters.getSortRunSize()) << std::endl;
+      printHeader("Join partition target", INDENT);
+      std::cout << formatBytes(parameters.getJoinPartitionSize()) << std::endl;
+      printHeader("Join worker processes", INDENT);
+      std::cout << parameters.getProcessWorkers() << std::endl;
     }
     printHeader("Threads", INDENT); std::cout << omp_get_max_threads() << std::endl;
     printHeader("Verbosity", INDENT); std::cout << Verbosity::levelName() << std::endl;
