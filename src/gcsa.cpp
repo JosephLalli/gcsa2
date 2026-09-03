@@ -1021,7 +1021,10 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   // Extract key and start-node facts. The legacy branch retains its historical
   // vectors exactly. With a workspace, ExternalInputPreprocessor instead
   // streams immutable record files through bounded sort/merge passes and
-  // checkpoints the reduced key/start streams for resume.
+  // checkpoints the reduced key/start streams for resume. Only the LCP support
+  // is needed during prefix doubling; mapper, last-character, and start-node
+  // supports are deliberately delayed so they do not inflate the longest and
+  // largest spill phase's resident set.
   DeBruijnGraph mapper;
   LCP lcp;
   sdsl::int_vector<0> last_char;
@@ -1033,9 +1036,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   {
     external_preprocessor.reset(new ExternalInputPreprocessor(graph, parameters,
       workspace.get()));
-    external_preprocessor->buildKeySupport(mapper, lcp, last_char);
-    external_preprocessor->buildStartNodes(from_nodes);
-    unique_from_nodes = external_preprocessor->startNodeCount();
+    external_preprocessor->buildLCP(lcp);
   }
   else
   {
@@ -1059,7 +1060,6 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     sdsl::util::clear(from_node_buffer);
   }
   sdsl::sd_vector<>::rank_1_type from_rank;
-  sdsl::util::init_support(from_rank, &(from_nodes));
 
   // Create or restore the initial PathGraph. Resumption still rebuilds the
   // compact key/LCP support above, but never repeats a committed doubling phase.
@@ -1246,6 +1246,13 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   {
     std::cerr << "GCSA::GCSA(): Merging the paths" << std::endl;
   }
+  if(parameters.externalMemory())
+  {
+    // The mapper is read-only and only participates in the final merge and
+    // event scan. Build it after doubling rather than carrying it through all
+    // generated path generations.
+    external_preprocessor->buildMapper(mapper);
+  }
   size_type merge_buffer = std::max(static_cast<size_type>(1),
     std::min(parameters.getIOBufferSize(),
       parameters.getMemoryLimitBytes() / 16));
@@ -1289,6 +1296,15 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   size_type final_sample_count = 0, final_sampled_positions = 0;
   if(parameters.externalMemory())
   {
+    // These supports are only used by the final event scan. Delaying them until
+    // after PathGraph/LCP release avoids retaining four key/start-proportional
+    // structures during prefix doubling. from_rank must be initialized after
+    // the sd_vector reaches its final address.
+    external_preprocessor->buildLastCharacters(last_char);
+    external_preprocessor->buildStartNodes(from_nodes);
+    unique_from_nodes = external_preprocessor->startNodeCount();
+    sdsl::util::init_support(from_rank, &(from_nodes));
+
     FinalEventFiles event_files(graph.alpha.sigma);
     ExternalFinalScanStats event_stats;
     FinalEventMetadata event_metadata = produceExternalFinalEvents(merged_graph,
@@ -1345,6 +1361,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   }
   else
   {
+  sdsl::util::init_support(from_rank, &(from_nodes));
   sdsl::int_vector<64> counts(graph.alpha.sigma, 0); // alpha
   std::vector<bit_vector> bwt(graph.alpha.sigma); // fast_bwt, sparse_bwt
   for(size_type comp = 0; comp < bwt.size(); comp++) { bwt[comp] = bit_vector(merged_graph.size(), 0); }

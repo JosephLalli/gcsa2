@@ -400,11 +400,33 @@ void
 ExternalInputPreprocessor::buildKeySupport(DeBruijnGraph& mapper, LCP& lcp,
   sdsl::int_vector<0>& last_char)
 {
+  this->buildMapper(mapper);
+  this->buildLCP(lcp);
+  this->buildLastCharacters(last_char);
+}
+
+void
+ExternalInputPreprocessor::buildMapper(DeBruijnGraph& mapper)
+{
   this->prepare();
   const size_type io_bytes = this->ioBufferBytes();
   mapper = DeBruijnGraph(this->key_name_, this->key_count_, this->graph_.k(),
     this->graph_.alpha, io_bytes);
+}
+
+void
+ExternalInputPreprocessor::buildLCP(LCP& lcp)
+{
+  this->prepare();
+  const size_type io_bytes = this->ioBufferBytes();
   lcp = LCP(this->key_name_, this->key_count_, this->graph_.k(), io_bytes);
+}
+
+void
+ExternalInputPreprocessor::buildLastCharacters(sdsl::int_vector<0>& last_char)
+{
+  this->prepare();
+  const size_type io_bytes = this->ioBufferBytes();
   last_char = sdsl::int_vector<0>(this->key_count_, 0, Key::GCSA_CHAR_WIDTH);
   RawReader keys(this->key_name_, sizeof(key_type), this->key_count_, io_bytes);
   key_type key = 0;

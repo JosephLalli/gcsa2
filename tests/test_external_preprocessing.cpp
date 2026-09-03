@@ -80,7 +80,14 @@ int main()
     DeBruijnGraph mapper;
     LCP lcp;
     sdsl::int_vector<0> last_char;
-    preprocessor.buildKeySupport(mapper, lcp, last_char);
+    // Production builds these supports at separate lifecycle boundaries. Keep
+    // the unit fixture on that route so delaying them cannot silently drift
+    // from the compatibility wrapper.
+    preprocessor.buildLCP(lcp);
+    require(lcp.total_keys == labels.size());
+    require(mapper.size() == 0);
+    preprocessor.buildMapper(mapper);
+    preprocessor.buildLastCharacters(last_char);
     require(mapper.size() == labels.size());
     require(last_char.size() == labels.size());
     sdsl::sd_vector<> starts;

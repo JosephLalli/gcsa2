@@ -582,7 +582,7 @@ when its production call path and forced-spill/recovery tests pass.
 | External prefix-doubling join | bounded sort-merge, rolling page-cache windows, compact exact key-group sidecars, RAM-capped persisted 4096-record MSD radix range-pack planning bound to run/sidecar checksums, exact range contracts, recursive two-dimensional heavy-key splitting, blocked nested-loop expansion, and selectable checksum scans implemented and forced-spill tested |
 | Direct join-to-label pipeline | implemented and forced-spill tested; the unsorted generated path/rank pair is no longer materialized |
 | Process worker scheduler and partition resume | implemented with fork-free spawn, global byte admission, immutable-payload semantic range checkpoints, same-filesystem zero-copy restore, and one-/multi-partition tests |
-| External keys/start nodes/initial paths | implemented with bounded fixed-record runs, global duplicate reduction, streaming support construction, durable key/start checkpoints, and physical initial shards preserving logical IDs |
+| External keys/start nodes/initial paths | implemented with bounded fixed-record runs, global duplicate reduction, streaming support construction, durable key/start checkpoints, and physical initial shards preserving logical IDs; only key LCP support remains resident during doubling, while mapper, last-character, and start-node supports are delayed to merge/final scan |
 | Spillable pruning groups | implemented and forced-spill tested for equal-label priority groups, extended ranges, external same-from sets, and bounded input/output descriptor caches |
 | Final event/component passes | implemented with one-task immutable-payload event checkpoint, same-filesystem zero-copy restore, spillable mapped start-node sets, disk-backed `prev_occ` and suffix-tree stack, external redundancy sort, streaming fast/sparse BWT, packed-sample-ID, sample-boundary, SadaSparse, and SadaCount serialization, and direct component-at-a-time packing in standalone/vg/autoindex; mid-scan assignment logs pending |
 | Streaming LCP levels and direct packing | implemented and resume-tested with one raw level resident at a time, bounded direct final serialization, atomic publication, and byte-identical legacy output including padding edge cases |
@@ -600,7 +600,10 @@ Elias--Fano packing. The resident-object compatibility constructor still uses
 SDSL component builders; production file-building routes do not. Input graph
 decoding, mapping support, allocator overhead, and charged page cache still
 keep the in-process budget from being a strict whole-process RSS ceiling, so
-production runs retain a cgroup limit.
+production runs retain a cgroup limit. The de Bruijn mapper is no longer kept
+alive throughout prefix doubling, and the last-character/from-node supports
+are not created until the final event scan, but those completed succinct
+objects are still resident rather than disk-cached while active.
 
 Join distribution runs and their exact group sidecars are checksummed immutable
 files but are not yet registered as resumable workspace tasks, so an incomplete
@@ -650,11 +653,13 @@ feasibility, RSS, then speed policy:
    whole physical graph before GCSA2's budget exists. A sharded graph reader
    must preserve one explicit logical GCSA2 input identity across all physical
    chunks.
-2. Bound the remaining resident floor: `NodeMapping`, de Bruijn support, input
-   graph decoding, and library/allocator scratch allocate outside the shared
-   token budget. External mapping lookup and a budget-aware `vg` input producer
-   are the principal greater-than-RAM changes. Until then, measured component
-   floors must be reserved below the deployment hard cap.
+2. Bound the remaining resident floor: `NodeMapping`, active de Bruijn support,
+   input graph decoding, and library/allocator scratch allocate outside the
+   shared token budget. Phase-lifetime scheduling now removes inactive key and
+   start supports from prefix doubling, but external mapper/mapping lookup and a
+   budget-aware `vg` input producer remain the principal greater-than-RAM
+   changes. Until then, measured component floors must be reserved below the
+   deployment hard cap.
 3. Make `DiskBudget` global. Join/path generation is reserved today, but
    checkpoint payloads, final events, verification runs, and LCP levels can
    still discover ENOSPC only when a write fails.
