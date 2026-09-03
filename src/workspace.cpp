@@ -196,7 +196,6 @@ BuildWorkspace::restore_artifact(const ArtifactIdentity& identity,
   logical_file_id_t logical,physical_shard_id_t shard,
   const std::string& output_path,size_t buffer_bytes) const
 {
-  this->validate_artifact(identity,logical,shard);
   if(buffer_bytes==0){throw std::invalid_argument("artifact restore buffer must be nonzero");}
   std::string source=this->artifact_path(identity,logical,shard);
   int input=open(source.c_str(),O_RDONLY);
@@ -208,11 +207,17 @@ BuildWorkspace::restore_artifact(const ArtifactIdentity& identity,
   off_t input_cache_released=0,output_cache_released=0;
   try
   {
-    if(readn(input,4,source)!=HEAD||readn(input,4,source)!=ArtifactHeader::VERSION)
+    if(readn(input,4,source)!=HEAD||readn(input,4,source)!=ArtifactHeader::VERSION||
+      get_string(input,source)!=identity.kind||readn(input,4,source)!=logical.value||
+      readn(input,8,source)!=shard.value)
     {throw err("artifact header mismatch",source);}
-    get_string(input,source);readn(input,4,source);readn(input,8,source);readn(input,8,source);
-    uint64_t remaining=readn(input,8,source);readn(input,8,source);
-    get_string(input,source);get_string(input,source);
+    uint64_t records=readn(input,8,source);
+    uint64_t bytes=readn(input,8,source);
+    uint64_t expected_checksum=readn(input,8,source);
+    std::string sort_order=get_string(input,source);
+    std::string key_range=get_string(input,source);
+    uint64_t remaining=bytes;
+    uint64_t actual_checksum=1469598103934665603ULL;
     std::vector<uint8_t> buffer(buffer_bytes);
     while(remaining>0)
     {
@@ -224,16 +229,32 @@ BuildWorkspace::restore_artifact(const ArtifactIdentity& identity,
         if(got<=0){throw err("truncated artifact payload",source);}
         offset+=got;
       }
+      actual_checksum=checksum(buffer.data(),want,actual_checksum);
       write_all(output,buffer.data(),want,partial);remaining-=want;
       off_t consumed=lseek(input,0,SEEK_CUR);
       if(consumed<0){throw err("cannot determine artifact input position",source);}
       trim_read_cache(input,consumed,input_cache_released);
       trim_written_cache(output,output_cache_released,false,partial);
     }
+    if(actual_checksum!=expected_checksum||
+      readn(input,4,source)!=FOOT||readn(input,4,source)!=ArtifactFooter::VERSION||
+      get_string(input,source)!=identity.kind||readn(input,4,source)!=logical.value||
+      readn(input,8,source)!=shard.value||readn(input,8,source)!=records||
+      readn(input,8,source)!=bytes||readn(input,8,source)!=expected_checksum||
+      get_string(input,source)!=sort_order||get_string(input,source)!=key_range)
+    {throw err("artifact checksum or footer mismatch",source);}
+    char extra;
+    ssize_t extra_bytes;
+    do { extra_bytes=read(input,&extra,1); } while(extra_bytes<0&&errno==EINTR);
+    if(extra_bytes<0){throw err("read failed",source);}
+    if(extra_bytes>0){throw err("artifact has trailing data",source);}
     off_t consumed=lseek(input,0,SEEK_CUR);
     if(consumed<0){throw err("cannot determine artifact input position",source);}
     trim_read_cache(input,consumed,input_cache_released,true);
     if(close(input)!=0){throw err("close failed",source);}input=-1;
+    // A valid header/footer is not sufficient: only an artifact named by the
+    // matching durable task marker may be restored and published.
+    this->ensure_completed(identity,base(source),expected_checksum);
     trim_written_cache(output,output_cache_released,true,partial);
     if(close(output)!=0){throw err("close failed",partial);}output=-1;
     if(rename(partial.c_str(),output_path.c_str())!=0)
