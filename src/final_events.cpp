@@ -12,8 +12,10 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
 #include <fcntl.h>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <sys/stat.h>
@@ -479,6 +481,25 @@ componentBufferBytes(const ConstructionParameters& parameters, size_type readers
   size_type share = parameters.getMemoryLimitBytes() / (4 * readers);
   return std::max(static_cast<size_type>(16),
     std::min(parameters.getIOBufferSize(), share));
+}
+
+size_type
+residentMemoryUsage()
+{
+#ifdef __linux__
+  std::ifstream input("/proc/self/statm");
+  size_type total = 0, resident = 0;
+  if(input >> total >> resident)
+  {
+    long page_size = ::sysconf(_SC_PAGESIZE);
+    if(page_size > 0 && resident <= std::numeric_limits<size_type>::max() /
+      static_cast<size_type>(page_size))
+    {
+      return resident * static_cast<size_type>(page_size);
+    }
+  }
+#endif
+  return 0;
 }
 
 int
@@ -1136,7 +1157,8 @@ buildFinalComponents(GCSA& index, const Alphabet& source_alphabet,
   const FinalEventFiles& files, const FinalEventMetadata& metadata,
   const ConstructionParameters& parameters)
 {
-  validateMetadata(metadata); validatePayloads(files, metadata);
+  validateMetadata(metadata);
+  validatePayloads(files, metadata);
   if(source_alphabet.sigma != metadata.sigma ||
      source_alphabet.fast_chars != metadata.fast_chars)
   {
@@ -1392,6 +1414,403 @@ buildFinalComponents(GCSA& index, const Alphabet& source_alphabet,
   sdsl::util::init_support(index.edge_rank, &(index.edges));
   sdsl::util::init_support(index.sampled_path_rank, &(index.sampled_paths));
   sdsl::util::init_support(index.sample_select, &(index.samples));
+}
+
+void
+storeFinalComponents(const GCSAHeader& header,
+  const Alphabet& source_alphabet, const FinalEventFiles& files,
+  const FinalEventMetadata& metadata,
+  const ConstructionParameters& parameters, const std::string& filename)
+{
+  validateMetadata(metadata); validatePayloads(files, metadata);
+  if(!header.check() || header.path_nodes != metadata.paths ||
+     header.edges != metadata.total_edges || source_alphabet.sigma != metadata.sigma ||
+     source_alphabet.fast_chars != metadata.fast_chars)
+  {
+    throw eventError("header or alphabet does not match final events");
+  }
+
+  std::string partial = filename + "." +
+    std::to_string(static_cast<unsigned long long>(::getpid())) + ".partial";
+  size_type peak_before = memoryUsage();
+  std::ofstream out(partial.c_str(), std::ios_base::binary | std::ios_base::trunc);
+  if(!out) { throw eventError("cannot open partial final index", partial); }
+  const auto write = [&](const auto& value)
+  {
+    value.serialize(out);
+    if(!out) { throw eventError("cannot write partial final index", partial); }
+  };
+  const auto make_fast_bwt = [&](size_type comp)
+  {
+    MemoryBudget budget(parameters.getMemoryLimitBytes(),
+      parameters.getMemoryLimitBytes() / 8);
+    BufferedEventReader masks(files.bwt_masks, 1, metadata.paths,
+      componentBufferBytes(parameters, 1), budget, "final-bwt-mask-reader");
+    GCSA::bit_vector dense(metadata.paths, 0);
+    for(size_type path = 0; path < metadata.paths; path++)
+    {
+      std::uint8_t mask = 0;
+      masks.nextByte(mask);
+      if(mask & (static_cast<size_type>(1) << comp)) { dense[path] = 1; }
+    }
+    masks.finish();
+    return GCSA::fast_vector(dense);
+  };
+  try
+  {
+    sdsl::int_vector<64> counts(metadata.sigma, 0);
+    for(size_type comp = 0; comp < metadata.sigma; comp++)
+    {
+      counts[comp] = metadata.bwt_counts[comp];
+    }
+    Alphabet alphabet(counts, source_alphabet.char2comp, source_alphabet.comp2char);
+    write(header);
+    write(alphabet);
+
+    // The on-disk order is all BWTs followed by all ranks. Reconstructing a
+    // component for its rank costs one bounded stream pass but avoids retaining
+    // all BWT members merely to reach that later section.
+    for(size_type comp = 0; comp < metadata.sigma; comp++)
+    {
+      if(comp > 0 && comp <= metadata.fast_chars)
+      {
+        write(make_fast_bwt(comp));
+      }
+      else
+      {
+        GCSA::fast_vector empty;
+        write(empty);
+      }
+    }
+    for(size_type comp = 0; comp < metadata.sigma; comp++)
+    {
+      if(comp > 0 && comp <= metadata.fast_chars)
+      {
+        GCSA::fast_vector bwt = make_fast_bwt(comp);
+        GCSA::fast_vector::rank_1_type rank;
+        sdsl::util::init_support(rank, &bwt);
+        write(rank);
+      }
+      else
+      {
+        GCSA::fast_vector::rank_1_type empty;
+        write(empty);
+      }
+    }
+    for(size_type comp = 0; comp < metadata.sigma; comp++)
+    {
+      if(comp > 0 && comp <= metadata.fast_chars)
+      {
+        GCSA::sparse_vector empty;
+        write(empty);
+        continue;
+      }
+      MemoryBudget budget(parameters.getMemoryLimitBytes(),
+        parameters.getMemoryLimitBytes() / 8);
+      BufferedEventReader masks(files.bwt_masks, 1, metadata.paths,
+        componentBufferBytes(parameters, 1), budget, "final-bwt-mask-reader");
+      sdsl::sd_vector_builder builder(metadata.paths, metadata.bwt_counts[comp]);
+      size_type observed = 0;
+      for(size_type path = 0; path < metadata.paths; path++)
+      {
+        std::uint8_t mask = 0;
+        masks.nextByte(mask);
+        if(mask & (static_cast<size_type>(1) << comp))
+        {
+          builder.set(path);
+          observed++;
+        }
+      }
+      masks.finish();
+      if(observed != metadata.bwt_counts[comp])
+      {
+        throw eventError("BWT mask count does not match metadata");
+      }
+      GCSA::sparse_vector bwt(builder);
+      write(bwt);
+    }
+    for(size_type comp = 0; comp < metadata.sigma; comp++)
+    {
+      if(comp > 0 && comp <= metadata.fast_chars)
+      {
+        GCSA::sparse_vector::rank_1_type empty;
+        write(empty);
+        continue;
+      }
+      MemoryBudget budget(parameters.getMemoryLimitBytes(),
+        parameters.getMemoryLimitBytes() / 8);
+      BufferedEventReader masks(files.bwt_masks, 1, metadata.paths,
+        componentBufferBytes(parameters, 1), budget, "final-bwt-mask-reader");
+      sdsl::sd_vector_builder builder(metadata.paths, metadata.bwt_counts[comp]);
+      size_type observed = 0;
+      for(size_type path = 0; path < metadata.paths; path++)
+      {
+        std::uint8_t mask = 0;
+        masks.nextByte(mask);
+        if(mask & (static_cast<size_type>(1) << comp))
+        {
+          builder.set(path);
+          observed++;
+        }
+      }
+      masks.finish();
+      if(observed != metadata.bwt_counts[comp])
+      {
+        throw eventError("BWT mask count does not match metadata");
+      }
+      GCSA::sparse_vector bwt(builder);
+      GCSA::sparse_vector::rank_1_type rank;
+      sdsl::util::init_support(rank, &bwt);
+      write(rank);
+    }
+
+    {
+      MemoryBudget budget(parameters.getMemoryLimitBytes(),
+        parameters.getMemoryLimitBytes() / 8);
+      size_type buffer_bytes = componentBufferBytes(parameters, metadata.sigma);
+      std::vector<std::unique_ptr<BufferedEventReader>> readers;
+      std::vector<std::uint64_t> current(metadata.sigma);
+      std::vector<bool> available(metadata.sigma, false);
+      for(size_type comp = 0; comp < metadata.sigma; comp++)
+      {
+        readers.emplace_back(new BufferedEventReader(files.edge_destinations[comp],
+          8, metadata.bwt_counts[comp], buffer_bytes, budget, "final-edge-reader"));
+        available[comp] = readers.back()->nextInteger(current[comp]);
+      }
+      GCSA::bit_vector edge_bits(metadata.total_edges, 0);
+      size_type tail = 0;
+      for(size_type path = 0; path < metadata.paths; path++)
+      {
+        size_type degree = 0;
+        for(size_type comp = 0; comp < metadata.sigma; comp++)
+        {
+          if(available[comp] && current[comp] < path)
+          {
+            throw eventError("edge stream is not nondecreasing");
+          }
+          while(available[comp] && current[comp] == path)
+          {
+            degree++;
+            available[comp] = readers[comp]->nextInteger(current[comp]);
+          }
+        }
+        if(degree == 0 || degree > metadata.total_edges ||
+           tail > metadata.total_edges - degree)
+        {
+          throw eventError("invalid edge stream");
+        }
+        tail += degree;
+        edge_bits[tail - 1] = 1;
+      }
+      for(size_type comp = 0; comp < metadata.sigma; comp++)
+      {
+        if(available[comp])
+        {
+          throw eventError("edge rank exceeds path universe");
+        }
+        readers[comp]->finish();
+      }
+      if(tail != metadata.total_edges)
+      {
+        throw eventError("edge total mismatch");
+      }
+      GCSA::fast_vector edges(edge_bits);
+      write(edges);
+      GCSA::fast_vector::rank_1_type rank;
+      sdsl::util::init_support(rank, &edges);
+      write(rank);
+    }
+
+    {
+      MemoryBudget budget(parameters.getMemoryLimitBytes(),
+        parameters.getMemoryLimitBytes() / 8);
+      size_type buffer_bytes = componentBufferBytes(parameters, 1);
+      BufferedEventReader positions(files.sample_positions, 8,
+        metadata.sampled_paths, buffer_bytes, budget, "final-sample-path-reader");
+      GCSA::bit_vector sampled_bits(metadata.paths, 0);
+      std::uint64_t previous = 0;
+      for(size_type i = 0; i < metadata.sampled_paths; i++)
+      {
+        std::uint64_t path = 0;
+        positions.nextInteger(path);
+        if(path >= metadata.paths || (i > 0 && path <= previous))
+        {
+          throw eventError("sampled path stream is not strictly increasing");
+        }
+        sampled_bits[path] = 1;
+        previous = path;
+      }
+      positions.finish();
+      GCSA::fast_vector sampled(sampled_bits);
+      write(sampled);
+      GCSA::fast_vector::rank_1_type rank;
+      sdsl::util::init_support(rank, &sampled);
+      write(rank);
+
+      sdsl::int_vector<0> ids_vector(metadata.sample_ids, 0,
+        metadata.sample_bits);
+      BufferedEventReader ids(files.sample_ids, 8, metadata.sample_ids,
+        buffer_bytes, budget, "final-sample-id-reader");
+      for(size_type i = 0; i < metadata.sample_ids; i++)
+      {
+        std::uint64_t node = 0;
+        ids.nextInteger(node);
+        if(metadata.sample_bits < 64 &&
+           node >= (static_cast<std::uint64_t>(1) << metadata.sample_bits))
+        {
+          throw eventError("sample identifier exceeds its declared width");
+        }
+        ids_vector[i] = node;
+      }
+      ids.finish();
+      write(ids_vector);
+
+      GCSA::bit_vector ends_vector(metadata.sample_ids, 0);
+      BufferedEventReader ends(files.sample_ends, 8, metadata.sampled_paths,
+        buffer_bytes, budget, "final-sample-end-reader");
+      previous = 0;
+      for(size_type i = 0; i < metadata.sampled_paths; i++)
+      {
+        std::uint64_t end = 0;
+        ends.nextInteger(end);
+        if(end >= metadata.sample_ids || (i > 0 && end <= previous))
+        {
+          throw eventError("sample endpoint stream is not strictly increasing");
+        }
+        ends_vector[end] = 1;
+        previous = end;
+      }
+      ends.finish();
+      if(metadata.sampled_paths > 0 && previous + 1 != metadata.sample_ids)
+      {
+        throw eventError("final sample endpoint does not cover all sample IDs");
+      }
+      write(ends_vector);
+      GCSA::bit_vector::select_1_type select;
+      sdsl::util::init_support(select, &ends_vector);
+      write(select);
+    }
+
+    {
+      MemoryBudget budget(parameters.getMemoryLimitBytes(),
+        parameters.getMemoryLimitBytes() / 8);
+      BufferedEventReader input(files.occurrences, 16, metadata.occurrence_items,
+        componentBufferBytes(parameters, 1), budget, "final-occurrence-reader");
+      sdsl::sd_vector_builder filter(metadata.paths, metadata.occurrence_items);
+      sdsl::sd_vector_builder values(metadata.occurrence_extra,
+        metadata.occurrence_items);
+      size_type tail = 0;
+      std::uint64_t previous = 0;
+      for(size_type i = 0; i < metadata.occurrence_items; i++)
+      {
+        std::uint64_t path = 0, extra = 0;
+        input.nextPair(path, extra);
+        if(path >= metadata.paths || extra == 0 ||
+           (i > 0 && path <= previous) || tail > metadata.occurrence_extra ||
+           extra > metadata.occurrence_extra - tail)
+        {
+          throw eventError("invalid occurrence event");
+        }
+        filter.set(path);
+        tail += extra;
+        values.set(tail - 1);
+        previous = path;
+      }
+      input.finish();
+      if(tail != metadata.occurrence_extra)
+      {
+        throw eventError("occurrence value total mismatch");
+      }
+      SadaSparse pointers;
+      pointers.filter = SadaSparse::sd_vector(filter);
+      pointers.values = SadaSparse::sd_vector(values);
+      sdsl::util::init_support(pointers.filter_rank, &(pointers.filter));
+      sdsl::util::init_support(pointers.value_select, &(pointers.values));
+      write(pointers);
+    }
+    {
+      if(metadata.paths == 0 && metadata.redundant != 0)
+      {
+        throw eventError("redundancy events exist for an empty graph");
+      }
+      size_type slots = (metadata.paths > 0 ? metadata.paths - 1 : 0);
+      if(metadata.redundant > std::numeric_limits<size_type>::max() - slots)
+      {
+        throw eventError("redundancy bitvector length overflows");
+      }
+      GCSA::bit_vector data(slots + metadata.redundant, 0);
+      MemoryBudget budget(parameters.getMemoryLimitBytes(),
+        parameters.getMemoryLimitBytes() / 8);
+      BufferedEventReader input(files.redundant, 8, metadata.redundant,
+        componentBufferBytes(parameters, 1), budget, "final-redundancy-reader");
+      std::uint64_t current = 0;
+      bool available = input.nextInteger(current);
+      size_type cumulative = 0;
+      for(size_type slot = 0; slot < slots; slot++)
+      {
+        if(available && current < slot)
+        {
+          throw eventError("redundancy stream is not nondecreasing");
+        }
+        while(available && current == slot)
+        {
+          cumulative++;
+          available = input.nextInteger(current);
+        }
+        data[slot + cumulative] = 1;
+      }
+      if(available || cumulative != metadata.redundant)
+      {
+        throw eventError("redundancy rank exceeds suffix-tree slot universe");
+      }
+      input.finish();
+      SadaCount pointers;
+      pointers.data = data;
+      sdsl::util::init_support(pointers.select, &(pointers.data));
+      write(pointers);
+    }
+    out.flush();
+    out.close();
+    if(!out) { throw eventError("cannot finish partial final index", partial); }
+    int descriptor = ::open(partial.c_str(), O_RDONLY);
+    if(descriptor < 0 || ::fdatasync(descriptor) != 0)
+    {
+      if(descriptor >= 0) { ::close(descriptor); }
+      throw eventError("cannot sync partial final index", partial);
+    }
+    if(::close(descriptor) != 0 ||
+       ::rename(partial.c_str(), filename.c_str()) != 0)
+    {
+      throw eventError("cannot publish final index", filename);
+    }
+    std::filesystem::path parent = std::filesystem::path(filename).parent_path();
+    if(parent.empty()) { parent = "."; }
+    descriptor = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY);
+    if(descriptor < 0 || ::fsync(descriptor) != 0)
+    {
+      if(descriptor >= 0) { ::close(descriptor); }
+      throw eventError("cannot sync final index directory", filename);
+    }
+    if(::close(descriptor) != 0)
+    {
+      throw eventError("cannot close final index directory", filename);
+    }
+    if(Verbosity::level >= Verbosity::EXTENDED)
+    {
+      size_type peak_after = memoryUsage();
+      std::cerr << "GCSA::storeFinalComponents(): RSS current "
+                << inGigabytes(residentMemoryUsage()) << " GB, peak increment "
+                << inGigabytes(peak_after >= peak_before ? peak_after - peak_before : 0)
+                << " GB, goal " << inGigabytes(parameters.getMemoryLimitBytes())
+                << " GB (SDSL allocations are outside the byte budget)" << std::endl;
+    }
+  }
+  catch(...)
+  {
+    out.close();
+    ::unlink(partial.c_str());
+    throw;
+  }
 }
 
 } // namespace gcsa

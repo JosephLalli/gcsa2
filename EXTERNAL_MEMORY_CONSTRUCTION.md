@@ -365,7 +365,13 @@ are replayed in dependency order. Headers, lengths, footers, and task metadata
 are always checked. Join-run payload checksums are selected by
 `--verify-workspace`; normal construction trusts the checksum computed while a
 newly synced run was written and avoids immediately rereading it. Phase
-checkpoint payloads are currently always checksummed on restore. A task
+path/rank checkpoints use immutable raw fixed-record payloads: the checkpoint
+hard-links them into the workspace when source and workspace share a filesystem
+and otherwise performs one bounded copy. The payload is checksummed once while
+it is committed. Normal same-filesystem restore validates task identity, record
+count, and byte length and then hard-links the committed inode into the next
+`PathGraph`; `--verify-workspace` additionally rereads the complete checksum.
+Cross-filesystem restore copies and checksum-validates in one pass. A task
 with a missing, truncated, or corrupt output is invalidated and rerun along with
 its dependants. Cleanup is itself idempotent and never removes the newest
 committed predecessor of an incomplete task.
@@ -489,14 +495,20 @@ ordered scan. Mid-scan resume and the assignment-log protocol remain future
 work.
 
 Final raw components are built serially, one at a time, from those streams.
-This preserves the fast/sparse BWT split and the unchanged public
-`GCSA::serialize()` format while eliminating the simultaneous raw BWT,
-outdegree, sample, occurrence, and redundancy arrays. The completed succinct
-members still coexist in the returned `GCSA` object, and direct component-blob
-packing is not implemented. LCP level `i+1` is produced by streaming groups of
-the configured branching factor from level `i`; each raw internal level is
-independently checkpointed and consumed. The final packed hierarchy necessarily
-resides in `LCPArray::data`, in legacy leaf-to-root serialization order.
+The library retains the resident-object constructor for compatibility, while
+`GCSA::buildAndStore()` writes each fast/sparse BWT, rank support, edge, sample,
+occurrence, and redundancy component immediately in the exact existing
+`GCSA::load()` order and releases it before constructing the next component.
+The partial file is synced and atomically published. Standalone `build_gcsa`,
+`vg index`, and `vg autoindex` use this direct packer whenever a workspace is
+configured; they reload the index only for explicit verification. This removes
+the cumulative completed-index peak, but one individual SDSL bitvector/builder
+and its conversion scratch can still allocate outside `MemoryBudget`.
+
+LCP level `i+1` is produced by streaming groups of the configured branching
+factor from level `i`; each raw internal level is independently checkpointed
+and consumed. The final packed hierarchy necessarily resides in
+`LCPArray::data`, in legacy leaf-to-root serialization order.
 
 Index verification also has a disk-first route. It emits fixed-width
 `(label, mapped-from-node)` records from bounded input blocks, externally sorts
@@ -524,19 +536,20 @@ when its production call path and forced-spill/recovery tests pass.
 | Process worker scheduler and partition resume | implemented with fork-free spawn, global byte admission, semantic range checkpoints, and one-/multi-partition tests |
 | External keys/start nodes/initial paths | implemented with bounded fixed-record runs, global duplicate reduction, streaming support construction, durable key/start checkpoints, and physical initial shards preserving logical IDs |
 | Spillable pruning groups | implemented and forced-spill tested for equal-label priority groups, extended ranges, external same-from sets, and bounded input/output descriptor caches |
-| Final event/component passes | implemented with one-task event checkpoint, spillable mapped start-node sets, disk-backed `prev_occ` and suffix-tree stack, external redundancy sort, and component-at-a-time construction; mid-scan assignment logs and direct component packer pending |
+| Final event/component passes | implemented with one-task event checkpoint, spillable mapped start-node sets, disk-backed `prev_occ` and suffix-tree stack, external redundancy sort, and direct component-at-a-time packing in standalone/vg/autoindex; mid-scan assignment logs and per-component token admission pending |
 | Streaming LCP levels | implemented and resume-tested with one raw level resident at a time and byte-identical legacy serialization; final packed hierarchy remains resident |
 | External verification | implemented and forced-spill tested with bounded input blocks, external expected/actual occurrence sorts, callback-based locate, and sequential set comparison; resumable runs and parallel label ranges pending |
 | Standalone and `vg index` / `vg autoindex` CLI integration | implemented; forced-spill/resume integration tested |
 | Chromosome-scale benchmark | preexisting chr20 k32-pruned fixture completed and verified at 32.36 GiB RSS under a 128 GiB cgroup; outputs are byte-identical to legacy; separate 25 GiB forced-spill/recovery path exercised |
 
 Current limitations are intentionally explicit. The external route is selected
-only when `ConstructionParameters::work_directory` is nonempty. Final SDSL
-bitvectors and succinct components allocate outside the token budget
-and all completed components coexist in the returned object; callers may also
-retain the completed GCSA while constructing the LCP. This gap prevents a
-strict end-to-end RAM guarantee today, so chromosome-scale racing remains gated
-on closing or directly bounding them.
+only when `ConstructionParameters::work_directory` is nonempty. The production
+file-building routes no longer retain all completed GCSA components or retain a
+completed GCSA while constructing LCP. Individual SDSL bitvectors/builders and
+their conversion scratch still allocate outside the token budget, and the final
+packed LCP remains resident. These are bounded by one final component rather
+than total intermediate path volume, but they keep the in-process budget from
+being a strict whole-process RSS ceiling; production runs retain a cgroup limit.
 
 Join distribution runs are checksummed immutable files but are not yet
 registered as resumable workspace tasks, so an incomplete generation rebuilds
@@ -565,26 +578,34 @@ every library allocation is admitted, a deployment cgroup must remain the hard
 whole-process ceiling, with the GCSA goal below it for allocator, SDSL, and
 charged page-cache headroom.
 
+The goal is operational, not semantic, and may change on resume. A larger value
+admits larger initial/sort runs, join blocks, and more worker reservations,
+usually reducing physical shards, merge passes, and HDD traffic. A smaller
+value deliberately produces more spill runs and I/O while preserving logical
+file identity and final-index semantics. Disk limit and free-space safety—not
+the RAM goal—decide whether a valid but very large generation may continue.
+
 Before a whole-pangenome claim, the remaining work is ordered by the project's
 feasibility, RSS, then speed policy:
 
-1. Bound the `vg` input producer. `VGset::for_each()` currently loads one whole
-   physical graph and `SourceSinkOverlay` materializes weak-component sets
-   before GCSA2's budget exists. A sharded graph reader must preserve one
-   explicit logical GCSA2 input identity across all physical chunks.
-2. Bound or preflight the resident floor: `NodeMapping`, de Bruijn support,
-   completed succinct GCSA components, and the final packed LCP currently
-   coexist outside the shared token budget. Direct component-blob packing and
-   an external mapping lookup are the principal remaining greater-than-RAM
-   changes. Until then, their measured/projected bytes must be subtracted from
-   the phase budget and checked against the hard cap.
+1. Bound the `vg` input producer. `SourceSinkOverlay` now discovers components
+   on the fly and retains only visited state, its traversal stack, and component
+   tips, including a sparse-ID fallback. `VGset::for_each()` still loads one
+   whole physical graph before GCSA2's budget exists. A sharded graph reader
+   must preserve one explicit logical GCSA2 input identity across all physical
+   chunks.
+2. Bound the remaining resident floor: `NodeMapping`, de Bruijn support, one
+   SDSL final-component builder/conversion, and the final packed LCP allocate
+   outside the shared token budget. External mapping lookup, direct streaming
+   serialization for the largest SDSL component, and streamed final LCP packing
+   are the principal remaining greater-than-RAM changes. Until then, measured
+   component floors must be reserved below the deployment hard cap.
 3. Make `DiskBudget` global. Join/path generation is reserved today, but
    checkpoint payloads, final events, verification runs, and LCP levels can
    still discover ENOSPC only when a write fails.
-4. Remove checkpoint copy amplification. A phase currently copies raw
-   path/rank files into headered artifacts and copies them out again on resume.
-   Durable adoptable payloads (or offset-aware artifact readers) should let the
-   next phase consume committed immutable shards directly.
+4. Add block-level final-event recovery. The event scan is bounded but a crash
+   currently restarts the complete scan; idempotent assignment logs and output
+   blocks would retain finer progress.
 5. Persist distribution and group-summary products as task artifacts, and emit
    exact group summaries while creating join runs. This removes the full
    post-sampling rescan and avoids rebuilding distributions after interruption.

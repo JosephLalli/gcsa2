@@ -158,6 +158,17 @@ void buildFinalComponents(GCSA& index, const Alphabet& source_alphabet,
   const FinalEventFiles& files, const FinalEventMetadata& metadata,
   const ConstructionParameters& parameters);
 
+/*
+  Serialize final components directly from immutable event streams. Members
+  are constructed and released in GCSA::load() order, so this avoids retaining
+  the completed index during final file publication. The result has the normal
+  public .gcsa format and is published with a synced atomic rename.
+*/
+void storeFinalComponents(const GCSAHeader& header,
+  const Alphabet& source_alphabet, const FinalEventFiles& files,
+  const FinalEventMetadata& metadata,
+  const ConstructionParameters& parameters, const std::string& filename);
+
 } // namespace gcsa
 
 #endif // GCSA_FINAL_EVENTS_H

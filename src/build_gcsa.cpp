@@ -101,7 +101,7 @@ main(int argc, char** argv)
     std::cerr << "      --work-dir PATH            durable construction workspace" << std::endl;
     std::cerr << "      --resume                   resume compatible committed phases" << std::endl;
     std::cerr << "      --keep-work                retain workspace after success" << std::endl;
-    std::cerr << "      --memory-limit SIZE        external working-set byte budget" << std::endl;
+    std::cerr << "      --memory-limit SIZE        external working-set goal (RAM/HDD tradeoff)" << std::endl;
     std::cerr << "      --disk-limit SIZE          spill-generation disk budget" << std::endl;
     std::cerr << "      --io-buffer-size SIZE      byte size of sequential I/O buffers" << std::endl;
     std::cerr << "      --sort-run-size SIZE       maximum label-sort working set" << std::endl;
@@ -277,7 +277,7 @@ main(int argc, char** argv)
     printHeader("Branching factor", INDENT); std::cout << parameters.lcp_branching << std::endl;
     printHeader("Temp directory", INDENT); std::cout << TempFile::temp_dir << std::endl;
     printHeader("Size limit", INDENT); std::cout << inGigabytes(parameters.size_limit) << " GB" << std::endl;
-    printHeader("Memory limit", INDENT); std::cout << formatBytes(parameters.memory_limit) << std::endl;
+    printHeader("Memory goal", INDENT); std::cout << formatBytes(parameters.memory_limit) << std::endl;
     if(parameters.externalMemory())
     {
       printHeader("Work directory", INDENT); std::cout << parameters.getWorkDirectory() << std::endl;
@@ -292,6 +292,7 @@ main(int argc, char** argv)
 
   GCSA index;
   LCPArray lcp;
+  bool stored_directly = false;
   if(load_index)
   {
     if(!sdsl::load_from_file(index, index_file))
@@ -310,7 +311,12 @@ main(int argc, char** argv)
     double start = readTimer();
     try
     {
-      index = GCSA(graph, parameters);
+      if(parameters.externalMemory())
+      {
+        GCSA::buildAndStore(graph, parameters, index_file);
+        stored_directly = true;
+      }
+      else { index = GCSA(graph, parameters); }
       lcp = LCPArray(graph, parameters);
     }
     catch(const ConstructionStopped& stopped)
@@ -324,7 +330,7 @@ main(int argc, char** argv)
     std::cout << "I/O volume: " << inGigabytes(readVolume()) << " GB read, "
               << inGigabytes(writeVolume()) << " GB write" << std::endl;
     std::cout << std::endl;
-    if(!atomicStore(index, index_file))
+    if(!stored_directly && !atomicStore(index, index_file))
     {
       std::cerr << "build_gcsa: Cannot write the index to " << index_file << std::endl;
       std::exit(EXIT_FAILURE);
@@ -336,7 +342,24 @@ main(int argc, char** argv)
     }
   }
 
-  printStatistics(index, lcp);
+  // Loading the just-written index solely for statistics would defeat the
+  // staged packer's resident-memory reduction. Verification necessarily needs
+  // the query index; otherwise report the durable output without reloading it.
+  if(stored_directly && verify)
+  {
+    if(!sdsl::load_from_file(index, index_file))
+    {
+      std::cerr << "build_gcsa: Cannot reload the index for verification from "
+                << index_file << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
+  if(!stored_directly || verify) { printStatistics(index, lcp); }
+  else
+  {
+    std::cout << "Index components stored directly in " << index_file
+              << " (not reloaded for statistics)" << std::endl << std::endl;
+  }
 
   if(verify)
   {

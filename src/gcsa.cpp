@@ -8,11 +8,14 @@
 #include <gcsa/workspace.h>
 
 #include <fstream>
+#include <filesystem>
+#include <fcntl.h>
 #include <iomanip>
 #include <memory>
 #include <random>
 #include <sstream>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <unordered_set>
 
 namespace gcsa
@@ -128,6 +131,56 @@ stopAfterCommittedPhase(const ConstructionParameters& parameters,
   if(parameters.getStopAfter() == completed_phase)
   {
     throw ConstructionStopped(completed_phase);
+  }
+}
+
+// The direct final-component path normally publishes through
+// storeFinalComponents(). An empty InputGraph has no event frontier, but it
+// must still replace the destination with the ordinary serialized empty GCSA.
+// Keep the same write/sync/rename/sync protocol used for nonempty indexes.
+void
+storeEmptyIndexAtomically(const GCSA& index, const std::string& filename)
+{
+  const std::string partial = filename + "." +
+    std::to_string(static_cast<unsigned long long>(::getpid())) + ".partial";
+  bool published = false;
+  try
+  {
+    std::ofstream output(partial.c_str(), std::ios_base::binary | std::ios_base::trunc);
+    if(!output) { throw std::runtime_error("cannot open partial empty index " + partial); }
+    index.serialize(output);
+    output.flush(); output.close();
+    if(!output) { throw std::runtime_error("cannot write partial empty index " + partial); }
+
+    int descriptor = ::open(partial.c_str(), O_RDONLY);
+    if(descriptor < 0 || ::fdatasync(descriptor) != 0)
+    {
+      if(descriptor >= 0) { ::close(descriptor); }
+      throw std::runtime_error("cannot sync partial empty index " + partial);
+    }
+    if(::close(descriptor) != 0 || ::rename(partial.c_str(), filename.c_str()) != 0)
+    {
+      throw std::runtime_error("cannot publish empty index " + filename);
+    }
+    published = true;
+
+    std::filesystem::path parent = std::filesystem::path(filename).parent_path();
+    if(parent.empty()) { parent = "."; }
+    descriptor = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY);
+    if(descriptor < 0 || ::fsync(descriptor) != 0)
+    {
+      if(descriptor >= 0) { ::close(descriptor); }
+      throw std::runtime_error("cannot sync empty index directory " + filename);
+    }
+    if(::close(descriptor) != 0)
+    {
+      throw std::runtime_error("cannot close empty index directory " + filename);
+    }
+  }
+  catch(...)
+  {
+    if(!published) { ::unlink(partial.c_str()); }
+    throw;
   }
 }
 
@@ -902,6 +955,29 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
 //------------------------------------------------------------------------------
 
 GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
+  GCSA(graph, parameters, nullptr)
+{
+}
+
+void
+GCSA::buildAndStore(InputGraph& graph, const ConstructionParameters& parameters,
+  const std::string& filename)
+{
+  if(!parameters.externalMemory())
+  {
+    throw std::invalid_argument("GCSA::buildAndStore() requires a durable external-memory workspace");
+  }
+  if(graph.size() == 0)
+  {
+    GCSA empty;
+    storeEmptyIndexAtomically(empty, filename);
+    return;
+  }
+  GCSA builder(graph, parameters, &filename);
+}
+
+GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
+  const std::string* direct_output) :
   GCSA()
 {
   double start = readTimer();
@@ -1184,6 +1260,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
     std::cerr << "GCSA::GCSA(): Building the index" << std::endl;
   }
   size_type occ_count = 0, red_count = 0;
+  size_type final_sample_count = 0, final_sampled_positions = 0;
   if(parameters.externalMemory())
   {
     FinalEventFiles event_files(graph.alpha.sigma);
@@ -1199,8 +1276,16 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
     sdsl::util::clear(last_char); sdsl::util::clear(from_nodes);
     sdsl::util::clear(mapper);
     this->header.edges = event_metadata.total_edges;
-    buildFinalComponents(*this, graph.alpha, event_files, event_metadata,
-      parameters);
+    if(direct_output != nullptr)
+    {
+      storeFinalComponents(this->header, graph.alpha, event_files,
+        event_metadata, parameters, *direct_output);
+    }
+    else
+    {
+      buildFinalComponents(*this, graph.alpha, event_files, event_metadata,
+        parameters);
+    }
     if(event_metadata.occurrence_extra >
        std::numeric_limits<size_type>::max() - event_metadata.paths)
     {
@@ -1208,6 +1293,8 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
     }
     occ_count = event_metadata.paths + event_metadata.occurrence_extra;
     red_count = event_metadata.redundant;
+    final_sample_count = event_metadata.sample_ids;
+    final_sampled_positions = event_metadata.sampled_paths;
 
     if(Verbosity::level >= Verbosity::EXTENDED)
     {
@@ -1396,6 +1483,8 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
   this->stored_samples = sdsl::int_vector<0>(sample_buffer.size(), 0, sample_bits);
   for(size_type i = 0; i < sample_buffer.size(); i++) { this->stored_samples[i] = sample_buffer[i]; }
   sdsl::util::clear(sample_buffer);
+  final_sample_count = this->sampleCount();
+  final_sampled_positions = this->sampledPositions();
   }
 
   // Transfer the LCP array from MergedGraph to InputGraph.
@@ -1413,8 +1502,8 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
   {
     std::cerr << "GCSA::GCSA(): " << this->size() << " paths, " << this->edgeCount() << " edges" << std::endl;
     std::cerr << "GCSA::GCSA(): " << occ_count << " pointers (" << red_count << " redundant)" << std::endl;
-    std::cerr << "GCSA::GCSA(): " << this->sampleCount() << " samples at "
-              << this->sampledPositions() << " positions" << std::endl;
+    std::cerr << "GCSA::GCSA(): " << final_sample_count << " samples at "
+              << final_sampled_positions << " positions" << std::endl;
   }
 }
 

@@ -234,6 +234,21 @@ int main()
   observed.serialize(observed_bytes); expected.serialize(expected_bytes);
   require(observed_bytes.str() == expected_bytes.str());
 
+  // Direct packing preserves the public serialization exactly while keeping
+  // component construction local to the writer. Loading proves that the
+  // stream order still matches GCSA::load().
+  const std::string packed_name = std::string(root) + "/packed.gcsa";
+  storeFinalComponents(observed.header, alphabet, restored, restored_metadata,
+    parameters, packed_name);
+  std::ifstream packed_input(packed_name.c_str(), std::ios_base::binary);
+  std::ostringstream packed_bytes; packed_bytes << packed_input.rdbuf();
+  require(packed_bytes.str() == expected_bytes.str());
+  std::istringstream packed_stream(packed_bytes.str());
+  GCSA packed; packed.load(packed_stream);
+  require(packed.extra_pointers.count(2, 2) == 20);
+  require(packed.redundant_pointers.count(2, 2) == 2);
+  require(packed.sampleCount() == 3 && packed.sample(2) == 100);
+
   const auto rejects = [&](const FinalEventMetadata& candidate_metadata)
   {
     GCSA candidate;
