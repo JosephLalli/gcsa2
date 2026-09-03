@@ -2304,7 +2304,7 @@ appendOutputShard(PathGraph& graph, logical_file_id_t logical,
 void
 compactLogicalJoinShards(PathGraph& source, size_type size_limit,
   const ConstructionParameters& parameters, size_type label_fan_in,
-  size_type memory_budget, size_type& committed_bytes,
+  MemoryBudget& memory, size_type& committed_bytes,
   ExternalPathJoinStats* stats)
 {
   std::map<logical_file_id_t, std::vector<size_type>> groups;
@@ -2327,68 +2327,332 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
   }
   if(!needs_compaction) { return; }
 
-  const size_type reader_bytes = 2 * JOIN_IO_BUFFER_BYTES + sizeof(JoinRecord);
-  if(memory_budget < reader_bytes ||
-     memory_budget - reader_bytes < externalPathGraphSortMinimumBudget())
+  // Each input is already in the complete path-label order used by
+  // pathSortLess().  Re-sorting the partition output would therefore turn a
+  // merge-only operation into a full extra external sort.  Keep two file
+  // descriptors per reader, two for the output pair, and two descriptors of
+  // reserve for the surrounding construction.
+  const size_type reader_bytes = 2 * JOIN_IO_BUFFER_BYTES + sizeof(JoinRecord) +
+    4 * sizeof(size_type);
+  const size_type writer_bytes = 2 * JOIN_IO_BUFFER_BYTES;
+  const size_type available_memory = static_cast<size_type>(memory.available());
+  size_type merge_fan_in = std::min(label_fan_in,
+    (parameters.getMaxOpenFiles() - 4) / 2);
+  if(merge_fan_in > 0)
   {
-    throw joinError("memory limit cannot admit one shard reader and label compaction");
+    merge_fan_in = std::min(merge_fan_in,
+      (available_memory > writer_bytes ? (available_memory - writer_bytes) / reader_bytes : 0));
   }
-  const size_type sort_budget = std::min(parameters.getSortRunSize(),
-    memory_budget - reader_bytes);
+  if(merge_fan_in < 2)
+  {
+    return; // Compaction is optional; the existing LABEL streams are valid.
+  }
+  bool needs_merge = false;
+  for(const auto& group : groups)
+  {
+    size_type target_pairs = std::max(static_cast<size_type>(1),
+      (parameters.getMaxOpenFiles() - 4) / (2 * groups.size()));
+    if(group.second.size() > target_pairs) { needs_merge = true; break; }
+  }
+  if(!needs_merge) { return; }
+  // Account for all reader state, heap entries, and both byte-bounded output
+  // buffers. The reservation is held for the entire compacting pass.
+  size_type merge_reservation = checkedJoinAdd(writer_bytes,
+    checkedJoinMultiply(merge_fan_in, reader_bytes, "logical merge reader bytes"),
+    "logical merge reservation");
+  MemoryBudget::Reservation merge_memory = memory.reserve(merge_reservation,
+    "logical-shard-merge");
+  size_type staged_committed = committed_bytes;
+  std::vector<std::string> new_outputs;
+  struct NewOutputCleanup
+  {
+    std::vector<std::string>& names; bool keep;
+    NewOutputCleanup(std::vector<std::string>& output_names) : names(output_names), keep(false) { }
+    ~NewOutputCleanup()
+    {
+      if(!this->keep) { for(std::string& name : this->names) { TempFile::remove(name); } }
+    }
+  } cleanup(new_outputs);
+
+  struct HeapLess
+  {
+    const std::vector<std::unique_ptr<PathShardReader>>* readers;
+    const std::vector<JoinRecord>* records;
+    bool operator()(size_type left, size_type right) const
+    {
+      const JoinRecord& a = records->at(left), &b = records->at(right);
+      size_type order = std::min(a.node.order(), b.node.order());
+      for(size_type i = 0; i < order; i++)
+      {
+        if(a.labels[i] != b.labels[i]) { return a.labels[i] > b.labels[i]; }
+      }
+      if(a.node.order() != b.node.order()) { return a.node.order() > b.node.order(); }
+      if(a.node.from != b.node.from) { return a.node.from > b.node.from; }
+      if(a.node.to != b.node.to) { return a.node.to > b.node.to; }
+      if(a.node.predecessors() != b.node.predecessors())
+      {
+        return a.node.predecessors() > b.node.predecessors();
+      }
+      if(a.node.lcp() != b.node.lcp()) { return a.node.lcp() > b.node.lcp(); }
+      for(size_type i = 0; i < a.node.ranks(); i++)
+      {
+        if(a.labels[i] != b.labels[i]) { return a.labels[i] > b.labels[i]; }
+      }
+      return false; // Equal records are byte-equivalent after pointer rewriting.
+    }
+  };
+
+  auto merge_batch = [&](const PathGraph& input, const std::vector<size_type>& shards,
+    PathGraph& output, logical_file_id_t logical, size_type& next_physical) -> bool
+  {
+    size_type paths = 0, ranks = 0, payload = 0;
+    for(size_type shard : shards)
+    {
+      paths = checkedJoinAdd(paths, input.path_counts[shard], "logical merge path count");
+      ranks = checkedJoinAdd(ranks, input.rank_counts[shard], "logical merge rank count");
+    }
+    payload = checkedJoinAdd(checkedJoinMultiply(paths, sizeof(PathNode), "logical merge path bytes"),
+      checkedJoinMultiply(ranks, sizeof(PathNode::rank_type), "logical merge rank bytes"),
+      "logical merge payload bytes");
+    if(payload > size_limit || staged_committed > size_limit - payload)
+    {
+      return false; // Preserve the original bounded streams when duplication will not fit.
+    }
+    const size_type pointer_limit = (static_cast<size_type>(1) << 40);
+    int path_fd = -1, rank_fd = -1;
+    std::string partial_path, partial_rank;
+    size_type file = 0, written_paths = 0, written_ranks = 0;
+    size_type emitted_paths = 0, emitted_ranks = 0;
+    off_t path_released = 0, rank_released = 0;
+    std::vector<std::uint8_t> path_buffer, rank_buffer;
+    auto close_output = [&]()
+    {
+      if(path_fd >= 0) { trimWrittenCache(path_fd, path_released, true, partial_path); }
+      if(rank_fd >= 0) { trimWrittenCache(rank_fd, rank_released, true, partial_rank); }
+      int path_error = (path_fd >= 0 ? ::close(path_fd) : 0); path_fd = -1;
+      int rank_error = (rank_fd >= 0 ? ::close(rank_fd) : 0); rank_fd = -1;
+      if(path_error != 0 || rank_error != 0) { throw joinError("cannot close logical merge output"); }
+      // Register both final names before either rename. If the second install
+      // fails after the first succeeds, generation rollback still owns the
+      // partially installed pair.
+      new_outputs.push_back(output.path_names[file]); new_outputs.push_back(output.rank_names[file]);
+      if(::rename(partial_path.c_str(), output.path_names[file].c_str()) != 0 ||
+         ::rename(partial_rank.c_str(), output.rank_names[file].c_str()) != 0)
+      {
+        throw joinError("cannot install logical merge output");
+      }
+      output.path_counts[file] = written_paths; output.rank_counts[file] = written_ranks;
+      output.path_count += written_paths; output.rank_count += written_ranks;
+      size_type output_bytes = checkedJoinAdd(
+        checkedJoinMultiply(written_paths, sizeof(PathNode), "logical output path bytes"),
+        checkedJoinMultiply(written_ranks, sizeof(PathNode::rank_type), "logical output rank bytes"),
+        "logical output bytes");
+      staged_committed = checkedJoinAdd(staged_committed, output_bytes,
+        "committed logical output bytes");
+    };
+    auto open_output = [&]()
+    {
+      file = appendOutputShard(output, logical, physical_shard_id_t(next_physical++));
+      partial_path = output.path_names[file] + ".partial";
+      partial_rank = output.rank_names[file] + ".partial";
+      std::remove(partial_path.c_str()); std::remove(partial_rank.c_str());
+      path_fd = ::open(partial_path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+      rank_fd = ::open(partial_rank.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+      if(path_fd < 0 || rank_fd < 0)
+      {
+        throw joinError("cannot create logical merge output: " + std::string(std::strerror(errno)),
+          (path_fd < 0 ? partial_path : partial_rank));
+      }
+      adviseSequential(path_fd); adviseSequential(rank_fd);
+      written_paths = 0; written_ranks = 0; path_released = 0; rank_released = 0;
+      path_buffer.clear(); rank_buffer.clear();
+      path_buffer.reserve(JOIN_IO_BUFFER_BYTES); rank_buffer.reserve(JOIN_IO_BUFFER_BYTES);
+    };
+    auto flush = [&](std::vector<std::uint8_t>& buffer, int descriptor, off_t& released,
+      const std::string& name)
+    {
+      if(!buffer.empty()) { writeAll(descriptor, buffer.data(), buffer.size(), name); buffer.clear(); }
+      trimWrittenCache(descriptor, released, false, name);
+    };
+    try
+    {
+      std::vector<std::unique_ptr<PathShardReader>> readers;
+      std::vector<JoinRecord> records(shards.size()); readers.reserve(shards.size());
+      std::priority_queue<size_type, std::vector<size_type>, HeapLess> queue((HeapLess{ &readers, &records }));
+      for(size_type i = 0; i < shards.size(); i++)
+      {
+        readers.emplace_back(new PathShardReader(input, shards[i]));
+        if(readers.back()->read(records[i])) { queue.push(i); }
+      }
+      open_output();
+      while(!queue.empty())
+      {
+        size_type best = queue.top(); queue.pop();
+        PathNode node = records[best].node;
+        if(node.ranks() > pointer_limit)
+        {
+          throw joinError("one path record exceeds the 40-bit rank pointer range");
+        }
+        if(written_ranks > pointer_limit - node.ranks())
+        {
+          flush(path_buffer, path_fd, path_released, partial_path);
+          flush(rank_buffer, rank_fd, rank_released, partial_rank);
+          close_output(); open_output();
+        }
+        node.setPointer(written_ranks);
+        const std::uint8_t* path_bytes = reinterpret_cast<const std::uint8_t*>(&node);
+        const std::uint8_t* rank_bytes = reinterpret_cast<const std::uint8_t*>(records[best].labels);
+        if(path_buffer.size() + sizeof(node) > JOIN_IO_BUFFER_BYTES)
+        {
+          flush(path_buffer, path_fd, path_released, partial_path);
+        }
+        if(rank_buffer.size() + node.ranks() * sizeof(PathNode::rank_type) > JOIN_IO_BUFFER_BYTES)
+        {
+          flush(rank_buffer, rank_fd, rank_released, partial_rank);
+        }
+        path_buffer.insert(path_buffer.end(), path_bytes, path_bytes + sizeof(node));
+        rank_buffer.insert(rank_buffer.end(), rank_bytes,
+          rank_bytes + node.ranks() * sizeof(PathNode::rank_type));
+        if(path_buffer.size() >= JOIN_IO_BUFFER_BYTES) { flush(path_buffer, path_fd, path_released, partial_path); }
+        if(rank_buffer.size() >= JOIN_IO_BUFFER_BYTES) { flush(rank_buffer, rank_fd, rank_released, partial_rank); }
+        written_paths++; written_ranks += node.ranks();
+        emitted_paths++; emitted_ranks += node.ranks();
+        if(readers[best]->read(records[best])) { queue.push(best); }
+      }
+      flush(path_buffer, path_fd, path_released, partial_path);
+      flush(rank_buffer, rank_fd, rank_released, partial_rank);
+      close_output();
+      if(emitted_paths != paths || emitted_ranks != ranks)
+      {
+        throw joinError("logical shard merge output count mismatch");
+      }
+      return true;
+    }
+    catch(...)
+    {
+      if(path_fd >= 0) { ::close(path_fd); }
+      if(rank_fd >= 0) { ::close(rank_fd); }
+      std::remove(partial_path.c_str()); std::remove(partial_rank.c_str());
+      throw;
+    }
+  };
+
   PathGraph compacted(0, source.k(), source.step());
-  size_type next_physical = 0;
+  compacted.delete_files = false; // It borrows retained source aliases until commit.
   std::vector<size_type> obsolete;
+  size_type next_physical = 0;
   for(const auto& group : groups)
   {
     logical_file_id_t logical = group.first;
-    const std::vector<size_type>& shards = group.second;
+    std::vector<size_type> shards = group.second;
     if(shards.size() == 1)
     {
       size_type file = shards.front();
-      compacted.path_names.push_back(source.path_names[file]);
-      compacted.rank_names.push_back(source.rank_names[file]);
-      compacted.path_counts.push_back(source.path_counts[file]);
-      compacted.rank_counts.push_back(source.rank_counts[file]);
-      compacted.logical_file_ids.push_back(logical);
-      compacted.physical_shard_ids.push_back(physical_shard_id_t(next_physical++));
-      compacted.path_count += source.path_counts[file];
-      compacted.rank_count += source.rank_counts[file];
+      compacted.path_names.push_back(source.path_names[file]); compacted.rank_names.push_back(source.rank_names[file]);
+      compacted.path_counts.push_back(source.path_counts[file]); compacted.rank_counts.push_back(source.rank_counts[file]);
+      compacted.logical_file_ids.push_back(logical); compacted.physical_shard_ids.push_back(physical_shard_id_t(next_physical++));
+      compacted.path_count += source.path_counts[file]; compacted.rank_count += source.rank_counts[file];
       continue;
     }
-
-    size_type output_file = appendOutputShard(compacted, logical,
-      physical_shard_id_t(next_physical++));
-    ExternalPathSortStats sort_stats;
-    ExternalPathSortSink sink(compacted, output_file, sort_budget, label_fan_in,
-      size_limit, committed_bytes, (stats == nullptr ? nullptr : &sort_stats));
-    for(size_type file : shards)
+    // Keep a bounded downstream frontier: one path/rank pair per retained
+    // stream, divided fairly among logical groups. The batch width is then
+    // derived from the group size and that target, but never exceeds the
+    // reader/descriptor limit.
+    const size_type target_pairs = std::max(static_cast<size_type>(1),
+      (parameters.getMaxOpenFiles() - 4) / (2 * groups.size()));
+    PathGraph current(0, source.k(), source.step()); current.delete_files = false;
+    std::vector<size_type> origin;
+    for(size_type source_file : shards)
     {
-      PathShardReader reader(source, file);
-      JoinRecord record;
-      while(reader.read(record)) { sink.write(record.node, record.labels); }
+      current.path_names.push_back(source.path_names[source_file]); current.rank_names.push_back(source.rank_names[source_file]);
+      current.path_counts.push_back(source.path_counts[source_file]); current.rank_counts.push_back(source.rank_counts[source_file]);
+      current.logical_file_ids.push_back(logical); current.physical_shard_ids.push_back(source.physical_shard_ids[source_file]);
+      current.path_count += source.path_counts[source_file]; current.rank_count += source.rank_counts[source_file];
+      origin.push_back(source_file);
     }
-    sink.finish();
-    obsolete.insert(obsolete.end(), shards.begin(), shards.end());
-    if(stats != nullptr)
+    while(current.files() > target_pairs)
     {
-      stats->label_sort_runs += sort_stats.runs;
-      stats->label_merge_passes = std::max(stats->label_merge_passes,
-        sort_stats.merge_passes);
-      stats->label_parallel_sorts += sort_stats.parallel_sorts;
-      stats->max_records_resident = std::max(stats->max_records_resident,
-        sort_stats.max_records_resident);
-      stats->max_bytes_resident = std::max(stats->max_bytes_resident,
-        checkedJoinAdd(reader_bytes, sort_stats.max_bytes_resident,
-          "logical shard compaction bytes"));
+      size_type batch_width = (current.files() + target_pairs - 1) / target_pairs;
+      batch_width = std::min(batch_width, merge_fan_in);
+      PathGraph pass(0, source.k(), source.step()); pass.delete_files = false;
+      std::vector<size_type> next_origin;
+      for(size_type first = 0; first < current.files(); first += batch_width)
+      {
+        size_type last = std::min(current.files(), first + batch_width);
+        if(last - first == 1)
+        {
+          size_type file = first;
+          pass.path_names.push_back(current.path_names[file]); pass.rank_names.push_back(current.rank_names[file]);
+          pass.path_counts.push_back(current.path_counts[file]); pass.rank_counts.push_back(current.rank_counts[file]);
+          pass.logical_file_ids.push_back(logical); pass.physical_shard_ids.push_back(current.physical_shard_ids[file]);
+          pass.path_count += current.path_counts[file]; pass.rank_count += current.rank_counts[file];
+          next_origin.push_back(origin[file]); continue;
+        }
+        std::vector<size_type> batch;
+        for(size_type file = first; file < last; file++) { batch.push_back(file); }
+        if(!merge_batch(current, batch, pass, logical, next_physical)) { return; }
+        for(size_type file = first; file < last; file++)
+        {
+          if(origin[file] != std::numeric_limits<size_type>::max()) { obsolete.push_back(origin[file]); }
+        }
+        next_origin.push_back(std::numeric_limits<size_type>::max());
+      }
+      current.swap(pass); current.delete_files = false;
+      origin.swap(next_origin);
+    }
+    for(size_type file = 0; file < current.files(); file++)
+    {
+      compacted.path_names.push_back(current.path_names[file]); compacted.rank_names.push_back(current.rank_names[file]);
+      compacted.path_counts.push_back(current.path_counts[file]); compacted.rank_counts.push_back(current.rank_counts[file]);
+      compacted.logical_file_ids.push_back(logical); compacted.physical_shard_ids.push_back(current.physical_shard_ids[file]);
+      compacted.path_count += current.path_counts[file]; compacted.rank_count += current.rank_counts[file];
     }
   }
-  // Only installed successors make their predecessors obsolete.
-  for(size_type file : obsolete)
+  // Intermediate generations stayed available until every logical group
+  // succeeded. Retire only those not retained by the final frontier, charging
+  // exactly the bytes whose unlink succeeded.
+  for(std::string& name : new_outputs)
   {
-    TempFile::remove(source.path_names[file]); TempFile::remove(source.rank_names[file]);
+    bool final_name = (std::find(compacted.path_names.begin(), compacted.path_names.end(), name) != compacted.path_names.end() ||
+      std::find(compacted.rank_names.begin(), compacted.rank_names.end(), name) != compacted.rank_names.end());
+    if(!final_name)
+    {
+      struct stat file_status;
+      if(::stat(name.c_str(), &file_status) == 0 && std::remove(name.c_str()) == 0)
+      {
+        staged_committed -= static_cast<size_type>(file_status.st_size);
+      }
+    }
   }
-  source.delete_files = false;
-  source.clear(); source.swap(compacted);
+  // Physical ids are artifact locators, not semantic graph ids. Intermediate
+  // passes may mix retained source ids with newly allocated ids, so normalize
+  // the published frontier to a deterministic collision-free sequence.
+  for(size_type file = 0; file < compacted.files(); file++)
+  {
+    compacted.physical_shard_ids[file] = physical_shard_id_t(file);
+  }
+  // Install the complete frontier before retiring any predecessor. On every
+  // earlier return/exception NewOutputCleanup removes only new outputs.
+  source.delete_files = false; source.swap(compacted); source.delete_files = true;
+  cleanup.keep = true; // The new frontier is now authoritative, even if cleanup leaks.
+  for(size_type source_file : obsolete)
+  {
+    size_type path_bytes = checkedJoinMultiply(compacted.path_counts[source_file], sizeof(PathNode),
+      "obsolete path bytes");
+    size_type rank_bytes = checkedJoinMultiply(compacted.rank_counts[source_file], sizeof(PathNode::rank_type),
+      "obsolete rank bytes");
+    // Failed cleanup leaves an unreachable predecessor on disk. Keep those
+    // bytes charged rather than risking deletion of the installed frontier.
+    if(std::remove(compacted.path_names[source_file].c_str()) == 0) { staged_committed -= path_bytes; }
+    if(std::remove(compacted.rank_names[source_file].c_str()) == 0) { staged_committed -= rank_bytes; }
+  }
+  committed_bytes = staged_committed;
+  if(stats != nullptr)
+  {
+    stats->max_records_resident = std::max(stats->max_records_resident, merge_fan_in);
+    stats->max_bytes_resident = std::max(stats->max_bytes_resident,
+      merge_reservation);
+  }
 }
 
 std::string
@@ -2907,8 +3171,9 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
     TempFile::remove(left.name); TempFile::remove(right.name);
   }
 
+  MemoryBudget compaction_memory(memory_budget, memory_budget / 16);
   compactLogicalJoinShards(next, size_limit, parameters, label_fan_in,
-    memory_budget, committed_bytes, stats);
+    compaction_memory, committed_bytes, stats);
   graph.clear(); graph.swap(next);
 }
 
