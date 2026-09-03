@@ -207,6 +207,26 @@ int main()
   require(streamed_fast.str() == expected_fast.str());
   require(std::filesystem::remove(large_masks));
 
+  // Exercise packed sample values crossing 64-bit word boundaries.
+  const std::array<std::uint64_t, 5> packed_values = {
+    1, 131071, 17, 65535, 42
+  };
+  const size_type packed_width = 17;
+  const std::string packed_ids = std::string(root) + "/packed-ids";
+  { std::ofstream create(packed_ids.c_str(), std::ios_base::binary); }
+  sdsl::int_vector<0> expected_ids(packed_values.size(), 0, packed_width);
+  for(size_type i = 0; i < packed_values.size(); i++)
+  {
+    writeInteger(packed_ids, i * 8, packed_values[i]);
+    expected_ids[i] = packed_values[i];
+  }
+  std::ostringstream streamed_ids, expected_id_bytes;
+  serializeSampleIds(streamed_ids, packed_ids, packed_values.size(),
+    packed_width, parameters);
+  expected_ids.serialize(expected_id_bytes);
+  require(streamed_ids.str() == expected_id_bytes.str());
+  require(std::filesystem::remove(packed_ids));
+
   // A path may represent more mapped start nodes than fit in RAM. Exercise
   // both reusable in-memory sets and the forced external sort/dedup path with
   // the minimum legal byte reservation.

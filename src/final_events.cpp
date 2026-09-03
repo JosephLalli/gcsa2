@@ -563,6 +563,62 @@ serializeFastVector(std::ostream& out, size_type bits, NextBit next_bit)
   return cumulative;
 }
 
+template<class NextValue>
+void
+serializePackedVector(std::ostream& out, size_type values, size_type width,
+  NextValue next_value)
+{
+  const size_type stored_width = (width == 0 ? 64 : width);
+  if(stored_width > 64 ||
+     values > std::numeric_limits<size_type>::max() / stored_width)
+  {
+    throw eventError("packed integer vector size overflows");
+  }
+  const size_type bits = values * stored_width;
+  sdsl::int_vector<0>::write_header(bits,
+    static_cast<std::uint8_t>(stored_width), out);
+
+  const auto write_word = [&out](std::uint64_t word)
+  {
+    out.write(reinterpret_cast<const char*>(&word), sizeof(word));
+    if(!out) { throw eventError("cannot serialize packed integer vector"); }
+  };
+  std::uint64_t word = 0;
+  size_type used = 0, written_words = 0;
+  for(size_type i = 0; i < values; i++)
+  {
+    const std::uint64_t value = next_value();
+    if(stored_width < 64 &&
+       value >= (static_cast<std::uint64_t>(1) << stored_width))
+    {
+      throw eventError("packed integer exceeds its declared width");
+    }
+    if(stored_width == 64)
+    {
+      write_word(value); written_words++; continue;
+    }
+
+    word |= value << used;
+    const size_type next_used = used + stored_width;
+    if(next_used >= 64)
+    {
+      write_word(word); written_words++;
+      used = next_used - 64;
+      word = (used == 0 ? 0 : value >> (stored_width - used));
+    }
+    else
+    {
+      used = next_used;
+    }
+  }
+  if(used > 0) { write_word(word); written_words++; }
+  const size_type expected_words = bits / 64 + (bits % 64 != 0);
+  if(written_words != expected_words)
+  {
+    throw eventError("packed integer vector word count mismatch");
+  }
+}
+
 void
 validatePayloads(const FinalEventFiles& files, const FinalEventMetadata& metadata)
 {
@@ -902,6 +958,27 @@ serializeFastBWTComponent(std::ostream& out, const std::string& mask_file,
   {
     throw eventError("BWT mask count does not match metadata");
   }
+}
+
+void
+serializeSampleIds(std::ostream& out, const std::string& sample_file,
+  size_type samples, size_type sample_bits,
+  const ConstructionParameters& parameters)
+{
+  if((samples == 0) != (sample_bits == 0) || sample_bits > 64)
+  {
+    throw eventError("invalid stored-sample width");
+  }
+  MemoryBudget budget(parameters.getMemoryLimitBytes(),
+    parameters.getMemoryLimitBytes() / 8);
+  BufferedEventReader ids(sample_file, 8, samples,
+    componentBufferBytes(parameters, 1), budget, "final-sample-id-reader");
+  serializePackedVector(out, samples, sample_bits, [&]()
+  {
+    std::uint64_t node = 0;
+    ids.nextInteger(node); return node;
+  });
+  ids.finish();
 }
 
 FinalEventFiles::FinalEventFiles(size_type sigma) :
@@ -1755,60 +1832,49 @@ storeFinalComponents(const GCSAHeader& header,
       MemoryBudget budget(parameters.getMemoryLimitBytes(),
         parameters.getMemoryLimitBytes() / 8);
       size_type buffer_bytes = componentBufferBytes(parameters, 1);
-      BufferedEventReader positions(files.sample_positions, 8,
-        metadata.sampled_paths, buffer_bytes, budget, "final-sample-path-reader");
-      std::uint64_t next_sample = 0, previous = 0;
-      bool sample_available = positions.nextInteger(next_sample);
-      size_type path = 0;
-      size_type observed_samples = serializeFastVector(out, metadata.paths, [&]()
       {
-        if(sample_available && next_sample < path)
+        BufferedEventReader positions(files.sample_positions, 8,
+          metadata.sampled_paths, buffer_bytes, budget,
+          "final-sample-path-reader");
+        std::uint64_t next_sample = 0, previous = 0;
+        bool sample_available = positions.nextInteger(next_sample);
+        size_type path = 0;
+        size_type observed_samples = serializeFastVector(out, metadata.paths, [&]()
         {
-          throw eventError("sampled path stream is not strictly increasing");
-        }
-        bool result = (sample_available && next_sample == path);
-        if(result)
-        {
-          previous = next_sample;
-          sample_available = positions.nextInteger(next_sample);
-          if(sample_available && next_sample <= previous)
+          if(sample_available && next_sample < path)
           {
             throw eventError("sampled path stream is not strictly increasing");
           }
+          bool result = (sample_available && next_sample == path);
+          if(result)
+          {
+            previous = next_sample;
+            sample_available = positions.nextInteger(next_sample);
+            if(sample_available && next_sample <= previous)
+            {
+              throw eventError("sampled path stream is not strictly increasing");
+            }
+          }
+          path++;
+          return result;
+        });
+        positions.finish();
+        if(sample_available || observed_samples != metadata.sampled_paths)
+        {
+          throw eventError("sampled path stream does not match metadata");
         }
-        path++;
-        return result;
-      });
-      positions.finish();
-      if(sample_available || observed_samples != metadata.sampled_paths)
-      {
-        throw eventError("sampled path stream does not match metadata");
       }
       GCSA::fast_vector::rank_1_type empty_rank;
       write(empty_rank);
 
-      sdsl::int_vector<0> ids_vector(metadata.sample_ids, 0,
-        metadata.sample_bits);
-      BufferedEventReader ids(files.sample_ids, 8, metadata.sample_ids,
-        buffer_bytes, budget, "final-sample-id-reader");
-      for(size_type i = 0; i < metadata.sample_ids; i++)
-      {
-        std::uint64_t node = 0;
-        ids.nextInteger(node);
-        if(metadata.sample_bits < 64 &&
-           node >= (static_cast<std::uint64_t>(1) << metadata.sample_bits))
-        {
-          throw eventError("sample identifier exceeds its declared width");
-        }
-        ids_vector[i] = node;
-      }
-      ids.finish();
-      write(ids_vector);
+      serializeSampleIds(out, files.sample_ids, metadata.sample_ids,
+        metadata.sample_bits, parameters);
+      if(!out) { throw eventError("cannot write partial final index", partial); }
 
       GCSA::bit_vector ends_vector(metadata.sample_ids, 0);
       BufferedEventReader ends(files.sample_ends, 8, metadata.sampled_paths,
         buffer_bytes, budget, "final-sample-end-reader");
-      previous = 0;
+      std::uint64_t previous = 0;
       for(size_type i = 0; i < metadata.sampled_paths; i++)
       {
         std::uint64_t end = 0;

@@ -159,6 +159,11 @@ void serializeFastBWTComponent(std::ostream& out,
   const std::string& mask_file, size_type paths, size_type expected_ones,
   comp_type comp, const ConstructionParameters& parameters);
 
+// Stream the stored-sample int_vector<0> in its existing packed format.
+void serializeSampleIds(std::ostream& out, const std::string& sample_file,
+  size_type samples, size_type sample_bits,
+  const ConstructionParameters& parameters);
+
 /*
   Build the existing GCSA members serially from event streams. This preserves
   the public .gcsa format and the historical fast/sparse BWT asymmetry. Final
