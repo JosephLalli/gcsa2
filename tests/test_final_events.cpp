@@ -605,6 +605,66 @@ int main()
   require(streamed_dense_occurrences.str() == expected_dense_occurrences.str());
   require(std::filesystem::remove(dense_occurrence_file));
 
+  // The same fast-initializer lookahead can change the representation, not
+  // merely its packed width. Keep the first 4096 paths dense and move the next
+  // path far enough away that SDSL classifies the first select block as long.
+  // Build the native reference with sparse builders so the large path universe
+  // does not require a correspondingly large CounterArray fixture.
+  const size_type lookahead_occurrence_paths = 835000000;
+  const size_type lookahead_occurrence_items = 50000;
+  const size_type select_block_size = 4096;
+  const size_type lookahead_second_block = lookahead_occurrence_paths -
+    (lookahead_occurrence_items - select_block_size);
+  const auto lookahead_params = SadaSparse::sd_vector::get_params(
+    lookahead_occurrence_paths, lookahead_occurrence_items);
+  const size_type lookahead_high_bits = lookahead_params.second;
+  const size_type lookahead_logn = sdsl::bits::hi(
+    ((lookahead_high_bits + 63) / 64) * 64) + 1;
+  const size_type lookahead_logn4 = lookahead_logn * lookahead_logn *
+    lookahead_logn * lookahead_logn;
+  require(lookahead_high_bits >= 100000);
+  require(((select_block_size - 1) >> lookahead_params.first) +
+    (select_block_size - 1) <= lookahead_logn4);
+  require((lookahead_second_block >> lookahead_params.first) +
+    select_block_size > lookahead_logn4);
+  const std::string lookahead_occurrence_file =
+    std::string(root) + "/lookahead-occurrences";
+  sdsl::sd_vector_builder lookahead_filter_builder(
+    lookahead_occurrence_paths, lookahead_occurrence_items);
+  sdsl::sd_vector_builder lookahead_values_builder(
+    lookahead_occurrence_items, lookahead_occurrence_items);
+  {
+    std::ofstream output(lookahead_occurrence_file.c_str(),
+      std::ios_base::binary);
+    require(static_cast<bool>(output));
+    for(size_type i = 0; i < lookahead_occurrence_items; i++)
+    {
+      const size_type path = (i < select_block_size ? i :
+        lookahead_second_block + (i - select_block_size));
+      appendInteger(output, path); appendInteger(output, 1);
+      lookahead_filter_builder.set(path); lookahead_values_builder.set(i);
+    }
+    require(static_cast<bool>(output));
+  }
+  SadaSparse native_lookahead_occurrences;
+  native_lookahead_occurrences.filter =
+    SadaSparse::sd_vector(lookahead_filter_builder);
+  native_lookahead_occurrences.values =
+    SadaSparse::sd_vector(lookahead_values_builder);
+  sdsl::util::init_support(native_lookahead_occurrences.filter_rank,
+    &(native_lookahead_occurrences.filter));
+  sdsl::util::init_support(native_lookahead_occurrences.value_select,
+    &(native_lookahead_occurrences.values));
+  std::ostringstream streamed_lookahead_occurrences,
+    expected_lookahead_occurrences;
+  serializeOccurrencePointers(streamed_lookahead_occurrences,
+    lookahead_occurrence_file, lookahead_occurrence_paths,
+    lookahead_occurrence_items, lookahead_occurrence_items, parameters);
+  native_lookahead_occurrences.serialize(expected_lookahead_occurrences);
+  require(streamed_lookahead_occurrences.str() ==
+    expected_lookahead_occurrences.str());
+  require(std::filesystem::remove(lookahead_occurrence_file));
+
   const std::string empty_occurrence_file = std::string(root) + "/empty-occurrences";
   { std::ofstream create(empty_occurrence_file.c_str(), std::ios_base::binary); }
   // A large empty filter still has a large Elias--Fano high vector and a
