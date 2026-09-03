@@ -420,9 +420,11 @@ struct MergedGraphReader
 
   void init(const MergedGraph& graph, const DeBruijnGraph* _mapper,
     const sdsl::int_vector<0>* _last_char,
-    size_type buffer_bytes = ReadBuffer<PathNode>::DEFAULT_BUFFER_BYTES);
+    size_type buffer_bytes = ReadBuffer<PathNode>::DEFAULT_BUFFER_BYTES,
+    bool release_cache = false);
   void init(const MergedGraph& graph, size_type comp,
-    size_type buffer_bytes = ReadBuffer<PathNode>::DEFAULT_BUFFER_BYTES);
+    size_type buffer_bytes = ReadBuffer<PathNode>::DEFAULT_BUFFER_BYTES,
+    bool release_cache = false);
   void close();
 
   void seek();
@@ -448,11 +450,11 @@ struct MergedGraphReader
 void
 MergedGraphReader::init(const MergedGraph& graph,
   const DeBruijnGraph* _mapper, const sdsl::int_vector<0>* _last_char,
-  size_type buffer_bytes)
+  size_type buffer_bytes, bool release_cache)
 {
-  this->paths.open(graph.path_name, buffer_bytes);
-  this->labels.open(graph.rank_name, buffer_bytes);
-  this->from_nodes.open(graph.from_name, buffer_bytes);
+  this->paths.open(graph.path_name, buffer_bytes, release_cache);
+  this->labels.open(graph.rank_name, buffer_bytes, release_cache);
+  this->from_nodes.open(graph.from_name, buffer_bytes, release_cache);
 
   this->path = this->rank = this->from = 0;
   this->seek();
@@ -463,11 +465,11 @@ MergedGraphReader::init(const MergedGraph& graph,
 
 void
 MergedGraphReader::init(const MergedGraph& graph, size_type comp,
-  size_type buffer_bytes)
+  size_type buffer_bytes, bool release_cache)
 {
-  this->paths.open(graph.path_name, buffer_bytes);
-  this->labels.open(graph.rank_name, buffer_bytes);
-  this->from_nodes.open(graph.from_name, buffer_bytes);
+  this->paths.open(graph.path_name, buffer_bytes, release_cache);
+  this->labels.open(graph.rank_name, buffer_bytes, release_cache);
+  this->from_nodes.open(graph.from_name, buffer_bytes, release_cache);
 
   this->path = graph.next[comp];
   this->from = graph.next_from[comp];
@@ -768,13 +770,13 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
         stack_cache, memory, true, 64 * KILOBYTE);
 
       std::vector<MergedGraphReader> reader(graph.alpha.sigma + 1);
-      reader[0].init(merged_graph, &mapper, &last_char, reader_buffer);
+      reader[0].init(merged_graph, &mapper, &last_char, reader_buffer, true);
       for(size_type comp = 0; comp < graph.alpha.sigma; comp++)
       {
-        reader[comp + 1].init(merged_graph, comp, reader_buffer);
+        reader[comp + 1].init(merged_graph, comp, reader_buffer, true);
       }
       ReadBuffer<uint8_t> lcp_array;
-      lcp_array.open(merged_graph.lcp_name, reader_buffer);
+      lcp_array.open(merged_graph.lcp_name, reader_buffer, true);
 
       PathLabel first, last;
       size_type stack_size = 0;

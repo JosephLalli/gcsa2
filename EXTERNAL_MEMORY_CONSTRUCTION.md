@@ -184,10 +184,14 @@ where implemented, sequential access advice plus rolling cache eviction.
 Sequential join and final-event writers sync and evict completed prefixes every
 512 MiB while retaining a 64 MiB tail; readers evict consumed prefixes. A
 backwards seek for a pathological join key resets the reader watermark so every
-replay remains bounded. `posix_fadvise()` is best-effort and non-semantic;
+replay remains bounded. External final-scan `ReadBuffer` instances use their
+existing descriptor for `pread()` and retire consumed prefixes every 32 MiB
+while retaining an 8 MiB tail. This adds no hidden descriptor per stream, and a
+backward seek simply rereads an evicted page. `posix_fadvise()` is best-effort
+and non-semantic;
 `fdatasync()` is the durability boundary. Pruning and `MergedGraph` now use
 bounded spill structures and byte-sized buffers, but their reservations, final
-SDSL component allocations, and some library-owned compression scratch are not
+mapping/input allocations, and some library-owned compression scratch are not
 all admitted through the process-wide `MemoryBudget`. The in-process token
 budget is therefore not yet an end-to-end RSS ceiling; a hard cgroup remains
 the acceptance boundary.
@@ -502,10 +506,12 @@ positions are externally sorted. Dense previous-occurrence state and the
 suffix-tree traversal stack are block-cached disk arrays. Mapped start nodes for
 one path use two reusable `SpillableNodeSet` instances: small sets stay in RAM,
 while oversized sets are externally sorted/deduplicated and rewound from disk
-for occurrence, continuation, and sample passes. All streams are
-synced and committed together as one workspace task; a crash restarts only this
-ordered scan. Mid-scan resume and the assignment-log protocol remain future
-work.
+for occurrence, continuation, and sample passes. The asynchronous merged-graph
+readers use byte-sized foreground/prefetch windows and explicitly release
+consumed kernel-cache ranges, so widely separated cursors do not rely on cgroup
+reclaim to bound clean cache. All streams are synced and committed together as
+one workspace task; a crash restarts only this ordered scan. Mid-scan resume and
+the assignment-log protocol remain future work.
 
 Final raw components are built serially, one at a time, from those streams.
 The library retains the resident-object constructor for compatibility, while
@@ -568,7 +574,7 @@ when its production call path and forced-spill/recovery tests pass.
 
 | Slice | State |
 | --- | --- |
-| Shared byte-token `MemoryBudget` and statvfs-aware `DiskBudget` | memory primitives and major external-phase byte caps implemented; pruning/merged-graph buffers are byte-bounded but not globally admitted; SDSL/library allocations remain outside the shared budget; disk guard covers generated path/join volume but not every final/LCP/checkpoint writer |
+| Shared byte-token `MemoryBudget` and statvfs-aware `DiskBudget` | memory primitives and major external-phase byte caps implemented; pruning/merged-graph buffers are byte-bounded but not globally admitted; final-scan readers retire cgroup-charged cache without extra descriptors; mapping/input/library allocations remain outside the shared budget; disk guard covers generated path/join volume but not every final/LCP/checkpoint writer |
 | Versioned workspace artifacts, atomic publication, manifest compatibility, recovery tests | phase and join-range checkpoints plus abrupt-exit commit-boundary tests implemented; transient distribution-run task records pending |
 | Human-readable operational construction parameters | core budget/run controls implemented and parser-tested; cleanup/cadence controls are not all wired |
 | Bounded external path-label runs and leveled multi-pass merge | versioned grouped/prefix-compressed runs, shared-left-context references, parallel in-place run sorting, rolling cache windows, one-run bypass, direct leveled merge of already-sorted worker shards, and forced multi-pass spilling implemented and tested |

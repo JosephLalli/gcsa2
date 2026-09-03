@@ -5,9 +5,14 @@
 
 // C++ threads for DiskIO, ReadBuffer.
 #include <atomic>
+#include <cerrno>
 #include <condition_variable>
+#include <fcntl.h>
+#include <limits>
 #include <mutex>
+#include <sys/stat.h>
 #include <thread>
+#include <unistd.h>
 
 #include <gcsa/utils.h>
 
@@ -321,9 +326,13 @@ struct ReadBuffer
   // Main thread.
   BufferWindow<Element>   buffer;
 
-  // File
-  std::ifstream           file;
+  // File. A POSIX descriptor lets the reader issue pread() from its background
+  // thread and explicitly retire consumed page-cache ranges without opening a
+  // second descriptor per stream.
+  int                     descriptor;
   size_type               elements, file_offset;
+  bool                    release_file_cache;
+  size_type               cache_released;
 
   // Reader thread.
   std::vector<Element>    read_buffer;
@@ -340,7 +349,9 @@ struct ReadBuffer
   ReadBuffer();
   ~ReadBuffer();
 
-  void open(const std::string& filename, size_type buffer_bytes = DEFAULT_BUFFER_BYTES);
+  void open(const std::string& filename,
+    size_type buffer_bytes = DEFAULT_BUFFER_BYTES,
+    bool release_cache = false);
   void close();
 
   inline size_type size() const { return this->elements; }
@@ -361,6 +372,8 @@ struct ReadBuffer
   bool fill();            // Fill the read buffer.
   void read(size_type i); // Read i into buffer, possibly seeking backwards.
   void forceRead();       // Add elements into buffer, assuming that the current thread holds the mutex.
+  void readBlock(size_type offset, Element* target, size_type count);
+  void releaseCache(size_type before, bool complete = false);
 
   ReadBuffer(const ReadBuffer&) = delete;
   ReadBuffer& operator= (const ReadBuffer&) = delete;
@@ -369,7 +382,8 @@ struct ReadBuffer
 template<class Element>
 ReadBuffer<Element>::ReadBuffer()
 {
-  this->elements = 0; this->file_offset = 0;
+  this->descriptor = -1; this->elements = 0; this->file_offset = 0;
+  this->release_file_cache = false; this->cache_released = 0;
   this->buffer_elements = std::max((size_type)1, DEFAULT_BUFFER_BYTES / sizeof(Element));
   this->minimum_elements = std::max((size_type)1, this->buffer_elements / 2);
 }
@@ -389,26 +403,46 @@ readerThread(ReadBuffer<Element>* buffer)
 
 template<class Element>
 void
-ReadBuffer<Element>::open(const std::string& filename, size_type buffer_bytes)
+ReadBuffer<Element>::open(const std::string& filename, size_type buffer_bytes,
+  bool release_cache)
 {
-  if(this->file.is_open())
+  if(this->descriptor >= 0)
   {
     std::cerr << "ReadBuffer::open(): The file is already open" << std::endl;
     std::exit(EXIT_FAILURE);
   }
 
-  this->file.open(filename.c_str(), std::ios_base::binary);
-  if(!(this->file))
+  this->descriptor = ::open(filename.c_str(), O_RDONLY);
+  if(this->descriptor < 0)
   {
     std::cerr << "ReadBuffer::open(): Cannot open input file " << filename << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  this->elements = fileSize(this->file) / sizeof(Element);
+  struct stat status;
+  if(::fstat(this->descriptor, &status) != 0 || status.st_size < 0 ||
+     static_cast<std::uintmax_t>(status.st_size) >
+       std::numeric_limits<size_type>::max() ||
+     static_cast<size_type>(status.st_size) % sizeof(Element) != 0)
+  {
+    std::cerr << "ReadBuffer::open(): Invalid input file " << filename << std::endl;
+    ::close(this->descriptor); this->descriptor = -1;
+    std::exit(EXIT_FAILURE);
+  }
+  this->elements = static_cast<size_type>(status.st_size) / sizeof(Element);
   this->file_offset = 0;
+  this->release_file_cache = release_cache;
+  this->cache_released = 0;
   this->buffer_elements = std::max((size_type)1, buffer_bytes / sizeof(Element));
   this->minimum_elements = std::max((size_type)1, this->buffer_elements / 2);
   sdsl::util::clear(this->read_buffer);
   this->read_buffer.reserve(this->buffer_elements);
+#if defined(POSIX_FADV_SEQUENTIAL)
+  if(this->release_file_cache)
+  {
+    static_cast<void>(::posix_fadvise(this->descriptor, 0, 0,
+      POSIX_FADV_SEQUENTIAL));
+  }
+#endif
 
   this->reader_thread = std::thread(readerThread<Element>, this);
 }
@@ -425,8 +459,12 @@ ReadBuffer<Element>::close()
   this->mtx.unlock();
   if(this->reader_thread.joinable()) { this->reader_thread.join(); }
 
-  this->file.close();
+  this->releaseCache(this->elements, true);
+  if(this->descriptor >= 0) { ::close(this->descriptor); }
+  this->descriptor = -1;
   this->elements = 0;
+  this->file_offset = 0;
+  this->release_file_cache = false; this->cache_released = 0;
 
   sdsl::util::clear(this->buffer);
   sdsl::util::clear(this->read_buffer);
@@ -441,13 +479,13 @@ ReadBuffer<Element>::seek(size_type i)
   // Move the buffer to the new position.
   // Clear the buffer and seek in the file if file offset is wrong.
   this->buffer.seek(i);
+  this->releaseCache(i);
   if(!(this->buffer.buffered(i)))
   {
     std::unique_lock<std::mutex> lock(this->mtx);
     if(this->file_offset != i + this->read_buffer.size())
     {
       this->read_buffer.clear();
-      this->file.seekg(i * sizeof(Element), std::ios_base::beg);
       this->file_offset = i;
     }
   }
@@ -469,11 +507,8 @@ ReadBuffer<Element>::fill()
   this->empty.wait(lock, [this]() { return read_buffer.empty(); } );
 
   this->read_buffer.resize(std::min(this->buffer_elements, this->size() - this->file_offset));
-  if(!DiskIO::read(this->file, this->read_buffer.data(), this->read_buffer.size()))
-  {
-    std::cerr << "ReadBuffer::fill(): Unexpected EOF" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
+  this->readBlock(this->file_offset, this->read_buffer.data(),
+    this->read_buffer.size());
   this->file_offset += this->read_buffer.size();
 
   return (this->file_offset >= this->size());
@@ -498,16 +533,87 @@ ReadBuffer<Element>::forceRead()
   if(this->read_buffer.empty())
   {
     this->read_buffer.resize(std::min(this->buffer_elements, this->size() - this->file_offset));
-    if(!DiskIO::read(this->file, this->read_buffer.data(), this->read_buffer.size()))
-    {
-      std::cerr << "ReadBuffer::forceRead(): Unexpected EOF" << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
+    this->readBlock(this->file_offset, this->read_buffer.data(),
+      this->read_buffer.size());
     this->file_offset += this->read_buffer.size();
   }
 
   this->buffer.insert(this->read_buffer.begin(), this->read_buffer.end());
   this->read_buffer.clear();
+}
+
+template<class Element>
+void
+ReadBuffer<Element>::readBlock(size_type offset, Element* target,
+  size_type count)
+{
+  if(count == 0) { return; }
+  if(offset > std::numeric_limits<size_type>::max() / sizeof(Element) ||
+     count > std::numeric_limits<size_type>::max() / sizeof(Element))
+  {
+    std::cerr << "ReadBuffer::readBlock(): File offset overflows" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  const size_type byte_offset = offset * sizeof(Element);
+  const size_type bytes = count * sizeof(Element);
+  if(byte_offset > static_cast<size_type>(std::numeric_limits<off_t>::max()))
+  {
+    std::cerr << "ReadBuffer::readBlock(): File offset is too large" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+
+  size_type done = 0;
+  std::uint8_t* data = reinterpret_cast<std::uint8_t*>(target);
+  while(done < bytes)
+  {
+    size_type request = std::min(bytes - done,
+      static_cast<size_type>(std::numeric_limits<ssize_t>::max()));
+    ssize_t got = ::pread(this->descriptor, data + done, request,
+      static_cast<off_t>(byte_offset + done));
+    if(got < 0 && errno == EINTR) { continue; }
+    if(got <= 0)
+    {
+      std::cerr << "ReadBuffer::readBlock(): Unexpected EOF" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    done += static_cast<size_type>(got);
+  }
+  DiskIO::read_volume += bytes;
+}
+
+template<class Element>
+void
+ReadBuffer<Element>::releaseCache(size_type before, bool complete)
+{
+#if defined(POSIX_FADV_DONTNEED)
+  if(!(this->release_file_cache) || this->descriptor < 0) { return; }
+  constexpr size_type CACHE_TAIL_BYTES = 8 * MEGABYTE;
+  constexpr size_type CACHE_FLUSH_BYTES = 32 * MEGABYTE;
+  if(before > std::numeric_limits<size_type>::max() / sizeof(Element)) { return; }
+  size_type consumed = before * sizeof(Element);
+  // A backwards seek can repopulate a prefix that was previously retired.
+  // Reset the best-effort watermark so a later forward replay can evict that
+  // prefix again; this changes performance only, never file semantics.
+  if(consumed < this->cache_released) { this->cache_released = 0; }
+  size_type discard_end = (complete ? consumed :
+    (consumed > CACHE_TAIL_BYTES ? consumed - CACHE_TAIL_BYTES : 0));
+  if(discard_end <= this->cache_released ||
+     (!complete && discard_end - this->cache_released < CACHE_FLUSH_BYTES))
+  {
+    return;
+  }
+  if(discard_end > static_cast<size_type>(std::numeric_limits<off_t>::max()))
+  {
+    discard_end = static_cast<size_type>(std::numeric_limits<off_t>::max());
+  }
+  const off_t first = static_cast<off_t>(this->cache_released);
+  const off_t length = static_cast<off_t>(discard_end - this->cache_released);
+  static_cast<void>(::posix_fadvise(this->descriptor, first, length,
+    POSIX_FADV_DONTNEED));
+  this->cache_released = discard_end;
+#else
+  static_cast<void>(before); static_cast<void>(complete);
+#endif
 }
 
 //------------------------------------------------------------------------------
