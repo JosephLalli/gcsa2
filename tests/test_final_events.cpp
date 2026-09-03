@@ -10,6 +10,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <vector>
 
 using namespace gcsa;
 
@@ -381,6 +382,52 @@ int main()
   std::ostringstream observed_bytes, expected_bytes;
   observed.serialize(observed_bytes); expected.serialize(expected_bytes);
   require(observed_bytes.str() == expected_bytes.str());
+
+  // The direct redundancy writer covers duplicate positions, a zero run, and
+  // the final suffix-tree slot in the same native SadaCount byte layout.
+  std::ostringstream streamed_redundancy, expected_redundancy;
+  serializeRedundantPointers(streamed_redundancy, restored.redundant, 4, 3,
+    parameters);
+  expected.redundant_pointers.serialize(expected_redundancy);
+  require(streamed_redundancy.str() == expected_redundancy.str());
+
+  // Cross select_support_mcl's 4096-one superblock boundary and its final
+  // partial-block path. This is a direct byte comparison against SDSL.
+  const size_type large_slots = 5 * 4096 + 17;
+  const std::string large_redundancy = std::string(root) + "/large-redundancy";
+  std::vector<size_type> large_counts(large_slots, 0);
+  size_type large_events = 0;
+  {
+    std::ofstream output(large_redundancy.c_str(), std::ios_base::binary);
+    require(static_cast<bool>(output));
+    for(size_type slot = 0; slot < large_slots; slot++)
+    {
+      large_counts[slot] = (slot % 5 == 0 ? 2 : (slot % 11 == 0 ? 1 : 0));
+      for(size_type i = 0; i < large_counts[slot]; i++)
+      {
+        std::uint64_t value = slot;
+        output.write(reinterpret_cast<const char*>(&value), sizeof(value));
+        large_events++;
+      }
+    }
+    require(static_cast<bool>(output));
+  }
+  GCSA::bit_vector large_data(large_slots + large_events, 0);
+  size_type large_tail = 0;
+  for(size_type slot = 0; slot < large_slots; slot++)
+  {
+    large_tail += large_counts[slot];
+    large_data[slot + large_tail] = 1;
+  }
+  SadaCount large_native;
+  large_native.data = large_data;
+  sdsl::util::init_support(large_native.select, &(large_native.data));
+  std::ostringstream streamed_large_redundancy, expected_large_redundancy;
+  serializeRedundantPointers(streamed_large_redundancy, large_redundancy,
+    large_slots + 1, large_events, parameters);
+  large_native.serialize(expected_large_redundancy);
+  require(streamed_large_redundancy.str() == expected_large_redundancy.str());
+  require(std::filesystem::remove(large_redundancy));
 
   // Direct packing preserves the public serialization exactly while keeping
   // component construction local to the writer. Loading proves that the

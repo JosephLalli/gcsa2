@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fcntl.h>
@@ -619,6 +620,129 @@ serializePackedVector(std::ostream& out, size_type values, size_type width,
   }
 }
 
+template<class NextPosition>
+void
+serializePlainBitVector(std::ostream& out, size_type bits, NextPosition next_position)
+{
+  sdsl::int_vector<1>::write_header(bits, 1, out);
+  const size_type words = (bits + 63) / 64;
+  size_type next = 0;
+  bool available = next_position(next);
+  for(size_type word_index = 0; word_index < words; word_index++)
+  {
+    std::uint64_t word = 0;
+    const size_type first = word_index * 64;
+    while(available && next < first + 64)
+    {
+      if(next < first) { throw eventError("bit positions are not increasing"); }
+      word |= static_cast<std::uint64_t>(1) << (next - first);
+      available = next_position(next);
+    }
+    out.write(reinterpret_cast<const char*>(&word), sizeof(word));
+    if(!out) { throw eventError("cannot serialize bitvector"); }
+  }
+  if(available) { throw eventError("bit position exceeds bitvector universe"); }
+}
+
+template<class NextPosition>
+void
+serializeSelectMCL(std::ostream& out, size_type bits, size_type ones,
+  NextPosition next_position)
+{
+  sdsl::write_member(ones, out);
+  if(ones == 0) { return; }
+
+  const size_type block_size = 4096;
+  const size_type blocks = (ones + block_size - 1) / block_size;
+  const size_type logn = sdsl::bits::hi(((bits + 63) / 64) * 64) + 1;
+  const size_type logn4 = logn * logn * logn * logn;
+  std::vector<size_type> superblocks; superblocks.reserve(blocks);
+  GCSA::bit_vector long_blocks(blocks, 0);
+  std::FILE* payload = std::tmpfile();
+  if(payload == nullptr) { throw eventError("cannot create select payload spool"); }
+
+  try
+  {
+    std::array<size_type, block_size> positions;
+    size_type next = 0, seen = 0;
+    bool available = next_position(next);
+    for(size_type block = 0; block < blocks; block++)
+    {
+      const size_type count = std::min(block_size, ones - seen);
+      for(size_type i = 0; i < count; i++)
+      {
+        if(!available || (i > 0 && next <= positions[i - 1]))
+        {
+          throw eventError("select positions are not strictly increasing");
+        }
+        positions[i] = next; seen++; available = next_position(next);
+      }
+      superblocks.push_back(positions[0]);
+      const size_type span = positions[count - 1] - positions[0];
+      // init_fast() encodes the final partial block as long.
+      const bool fast = (bits >= 100000);
+      const bool is_long = (span > logn4 || (fast && count < block_size));
+      long_blocks[block] = is_long;
+      sdsl::int_vector<0> encoded(is_long ? block_size : 64, 0,
+        is_long ? sdsl::bits::hi(fast ? bits - 1 : positions[count - 1]) + 1 :
+        sdsl::bits::hi(span) + 1);
+      if(is_long)
+      {
+        for(size_type i = 0; i < count; i++) { encoded[i] = positions[i]; }
+      }
+      else
+      {
+        for(size_type i = 0; i < count; i += 64)
+        {
+          encoded[i / 64] = positions[i] - positions[0];
+        }
+      }
+      std::ostringstream serialized;
+      encoded.serialize(serialized);
+      const std::string bytes = serialized.str();
+      if(std::fwrite(bytes.data(), 1, bytes.size(), payload) != bytes.size())
+      {
+        throw eventError("cannot write select payload spool");
+      }
+    }
+    if(available || seen != ones)
+    {
+      throw eventError("select position count does not match metadata");
+    }
+    sdsl::int_vector<0> superblock_vector(blocks, 0, logn);
+    for(size_type i = 0; i < blocks; i++) { superblock_vector[i] = superblocks[i]; }
+    superblock_vector.serialize(out);
+    bool any_long = false;
+    for(size_type i = 0; i < blocks; i++) { any_long = any_long || long_blocks[i]; }
+    if(any_long) { long_blocks.serialize(out); }
+    else { GCSA::bit_vector empty; empty.serialize(out); }
+    if(std::fflush(payload) != 0 || std::fseek(payload, 0, SEEK_SET) != 0)
+    {
+      throw eventError("cannot rewind select payload spool");
+    }
+    std::array<char, 64 * 1024> buffer;
+    while(true)
+    {
+      size_type count = std::fread(buffer.data(), 1, buffer.size(), payload);
+      if(count > 0)
+      {
+        out.write(buffer.data(), count);
+        if(!out) { throw eventError("cannot serialize select payload"); }
+      }
+      if(count < buffer.size())
+      {
+        if(std::ferror(payload)) { throw eventError("cannot read select payload spool"); }
+        break;
+      }
+    }
+    std::fclose(payload);
+  }
+  catch(...)
+  {
+    std::fclose(payload); throw;
+  }
+}
+
 void
 validatePayloads(const FinalEventFiles& files, const FinalEventMetadata& metadata)
 {
@@ -647,6 +771,63 @@ componentBufferBytes(const ConstructionParameters& parameters, size_type readers
   return std::max(static_cast<size_type>(16),
     std::min(parameters.getIOBufferSize(), share));
 }
+
+class RedundancyPositionReader
+{
+public:
+  RedundancyPositionReader(const std::string& filename, size_type paths,
+    size_type redundant, const ConstructionParameters& parameters) :
+    slots_(paths > 0 ? paths - 1 : 0), redundant_(redundant), slot_(0),
+    cumulative_(0), budget_(parameters.getMemoryLimitBytes(),
+      parameters.getMemoryLimitBytes() / 8), input_(new BufferedEventReader(filename, 8, redundant,
+      componentBufferBytes(parameters, 1), budget_, "final-redundancy-reader")),
+    current_(0), available_(input_->nextInteger(current_)), finished_(false)
+  {
+  }
+
+  ~RedundancyPositionReader()
+  {
+    if(!finished_)
+    {
+      try { finish(); } catch(...) { }
+    }
+  }
+
+  bool next(size_type& position)
+  {
+    if(slot_ == slots_)
+    {
+      finish(); return false;
+    }
+    if(available_ && current_ < slot_)
+    {
+      throw eventError("redundancy stream is not nondecreasing");
+    }
+    while(available_ && current_ == slot_)
+    {
+      cumulative_++; available_ = input_->nextInteger(current_);
+    }
+    position = slot_ + cumulative_;
+    slot_++; return true;
+  }
+
+private:
+  size_type slots_, redundant_, slot_, cumulative_;
+  MemoryBudget budget_;
+  std::unique_ptr<BufferedEventReader> input_;
+  std::uint64_t current_;
+  bool available_, finished_;
+
+  void finish()
+  {
+    if(finished_) { return; }
+    if(slot_ != slots_ || available_ || cumulative_ != redundant_)
+    {
+      throw eventError("redundancy rank exceeds suffix-tree slot universe");
+    }
+    input_->finish(); finished_ = true;
+  }
+};
 
 size_type
 residentMemoryUsage()
@@ -979,6 +1160,36 @@ serializeSampleIds(std::ostream& out, const std::string& sample_file,
     ids.nextInteger(node); return node;
   });
   ids.finish();
+}
+
+void
+serializeRedundantPointers(std::ostream& out, const std::string& redundancy_file,
+  size_type paths, size_type redundant, const ConstructionParameters& parameters)
+{
+  if(paths == 0 && redundant != 0)
+  {
+    throw eventError("redundancy events exist for an empty graph");
+  }
+  const size_type slots = (paths > 0 ? paths - 1 : 0);
+  if(redundant > std::numeric_limits<size_type>::max() - slots)
+  {
+    throw eventError("redundancy bitvector length overflows");
+  }
+  const size_type bits = slots + redundant;
+  {
+    RedundancyPositionReader input(redundancy_file, paths, redundant, parameters);
+    serializePlainBitVector(out, bits, [&](size_type& position)
+    {
+      return input.next(position);
+    });
+  }
+  {
+    RedundancyPositionReader input(redundancy_file, paths, redundant, parameters);
+    serializeSelectMCL(out, bits, slots, [&](size_type& position)
+    {
+      return input.next(position);
+    });
+  }
 }
 
 FinalEventFiles::FinalEventFiles(size_type sigma) :
@@ -1597,7 +1808,7 @@ buildFinalComponents(GCSA& index, const Alphabet& source_alphabet,
       throw eventError("redundancy bitvector length overflows");
     }
     size_type slots = (metadata.paths > 0 ? metadata.paths - 1 : 0);
-    GCSA::bit_vector data(slots + metadata.redundant, 0);
+    index.redundant_pointers.data = GCSA::bit_vector(slots + metadata.redundant, 0);
     MemoryBudget budget(parameters.getMemoryLimitBytes(),
       parameters.getMemoryLimitBytes() / 8);
     BufferedEventReader input(files.redundant, 8, metadata.redundant,
@@ -1615,13 +1826,13 @@ buildFinalComponents(GCSA& index, const Alphabet& source_alphabet,
       {
         cumulative++; available = input.nextInteger(current);
       }
-      data[slot + cumulative] = 1;
+      index.redundant_pointers.data[slot + cumulative] = 1;
     }
     if(available || cumulative != metadata.redundant)
     {
       throw eventError("redundancy rank exceeds suffix-tree slot universe");
     }
-    input.finish(); index.redundant_pointers.data = data; sdsl::util::clear(data);
+    input.finish();
     sdsl::util::init_support(index.redundant_pointers.select,
       &(index.redundant_pointers.data));
   }
@@ -1944,36 +2155,9 @@ storeFinalComponents(const GCSAHeader& header,
       {
         throw eventError("redundancy bitvector length overflows");
       }
-      GCSA::bit_vector data(slots + metadata.redundant, 0);
-      MemoryBudget budget(parameters.getMemoryLimitBytes(),
-        parameters.getMemoryLimitBytes() / 8);
-      BufferedEventReader input(files.redundant, 8, metadata.redundant,
-        componentBufferBytes(parameters, 1), budget, "final-redundancy-reader");
-      std::uint64_t current = 0;
-      bool available = input.nextInteger(current);
-      size_type cumulative = 0;
-      for(size_type slot = 0; slot < slots; slot++)
-      {
-        if(available && current < slot)
-        {
-          throw eventError("redundancy stream is not nondecreasing");
-        }
-        while(available && current == slot)
-        {
-          cumulative++;
-          available = input.nextInteger(current);
-        }
-        data[slot + cumulative] = 1;
-      }
-      if(available || cumulative != metadata.redundant)
-      {
-        throw eventError("redundancy rank exceeds suffix-tree slot universe");
-      }
-      input.finish();
-      SadaCount pointers;
-      pointers.data = data;
-      sdsl::util::init_support(pointers.select, &(pointers.data));
-      write(pointers);
+      serializeRedundantPointers(out, files.redundant, metadata.paths,
+        metadata.redundant, parameters);
+      if(!out) { throw eventError("cannot write partial final index", partial); }
     }
     out.flush();
     out.close();
