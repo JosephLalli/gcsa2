@@ -164,6 +164,12 @@ void serializeSampleIds(std::ostream& out, const std::string& sample_file,
   size_type samples, size_type sample_bits,
   const ConstructionParameters& parameters);
 
+// Stream the ordinary sample-boundary bit_vector and select_support_mcl from
+// the monotone sample-end event stream. Public for exact-format tests.
+void serializeSampleBoundaries(std::ostream& out,
+  const std::string& sample_end_file, size_type sample_ids,
+  size_type sampled_paths, const ConstructionParameters& parameters);
+
 // Stream SadaCount's ordinary bit_vector and select_support_mcl payload from
 // sorted redundancy events without materializing the dense unary vector.
 // Public only for exact-format regression tests.

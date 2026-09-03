@@ -228,6 +228,35 @@ int main()
   require(streamed_ids.str() == expected_id_bytes.str());
   require(std::filesystem::remove(packed_ids));
 
+  // Sample boundaries are a monotone event stream. Direct serialization must
+  // match the ordinary bit_vector followed by its select_support_mcl without
+  // allocating a bit for every sample ID.
+  const size_type boundary_count = 5 * 4096 + 17;
+  const size_type boundary_universe = boundary_count * 7 + 11;
+  const std::string boundary_file = std::string(root) + "/sample-boundaries";
+  GCSA::bit_vector expected_boundaries(boundary_universe, 0);
+  {
+    std::ofstream output(boundary_file.c_str(), std::ios_base::binary);
+    require(static_cast<bool>(output));
+    for(size_type i = 0; i < boundary_count; i++)
+    {
+      const std::uint64_t endpoint = (i + 1 == boundary_count ?
+        boundary_universe - 1 : i * 7);
+      output.write(reinterpret_cast<const char*>(&endpoint), sizeof(endpoint));
+      expected_boundaries[endpoint] = 1;
+    }
+    require(static_cast<bool>(output));
+  }
+  GCSA::bit_vector::select_1_type expected_boundary_select;
+  sdsl::util::init_support(expected_boundary_select, &expected_boundaries);
+  std::ostringstream streamed_boundaries, expected_boundary_bytes;
+  serializeSampleBoundaries(streamed_boundaries, boundary_file,
+    boundary_universe, boundary_count, parameters);
+  expected_boundaries.serialize(expected_boundary_bytes);
+  expected_boundary_select.serialize(expected_boundary_bytes);
+  require(streamed_boundaries.str() == expected_boundary_bytes.str());
+  require(std::filesystem::remove(boundary_file));
+
   // A path may represent more mapped start nodes than fit in RAM. Exercise
   // both reusable in-memory sets and the forced external sort/dedup path with
   // the minimum legal byte reservation.
