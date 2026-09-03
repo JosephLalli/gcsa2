@@ -197,6 +197,40 @@ ConstructionParameters::setJoinPartitionSize(size_type bytes)
   this->join_partition_size = std::max((size_type)KILOBYTE, bytes);
 }
 
+size_type
+ConstructionParameters::getSortRunSize() const
+{
+  return this->getSortRunSize(this->memory_limit);
+}
+
+size_type
+ConstructionParameters::getSortRunSize(size_type available_bytes) const
+{
+  if(!(this->sortRunSizeIsAutomatic()))
+  {
+    return std::min(this->sort_run_size, available_bytes);
+  }
+  // Subtract rather than multiply to avoid overflow near the absolute limit.
+  size_type join_share = available_bytes / 4;
+  return available_bytes - join_share;
+}
+
+size_type
+ConstructionParameters::getJoinPartitionSize() const
+{
+  return this->getJoinPartitionSize(this->memory_limit);
+}
+
+size_type
+ConstructionParameters::getJoinPartitionSize(size_type available_bytes) const
+{
+  if(!(this->joinPartitionSizeIsAutomatic()))
+  {
+    return std::min(this->join_partition_size, available_bytes);
+  }
+  return available_bytes / 4;
+}
+
 void
 ConstructionParameters::setMergeFanIn(size_type fan_in)
 {

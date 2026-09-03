@@ -628,6 +628,12 @@ every library allocation is admitted, a deployment cgroup must remain the hard
 whole-process ceiling, with the GCSA goal below it for allocator, SDSL, and
 charged page-cache headroom.
 
+When the expert overrides are omitted, label sorting receives 75% and join
+blocking 25% of the current process reservation. Process workers recompute the
+same ratio after the aggregate goal has been divided among admitted workers;
+they do not each inherit the full global target. Explicit `--sort-run-size` and
+`--join-partition-size` values remain upper bounds and may change on resume.
+
 The goal is operational, not semantic, and may change on resume. A larger value
 admits larger initial/sort runs, join blocks, and more worker reservations,
 usually reducing physical shards, merge passes, and HDD traffic. A smaller

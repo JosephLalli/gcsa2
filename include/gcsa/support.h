@@ -67,8 +67,10 @@ struct ConstructionParameters
   constexpr static size_type SAMPLE_PERIOD         = 64;
   constexpr static size_type LCP_BRANCHING         = 64;
   constexpr static size_type IO_BUFFER_SIZE        = 64 * MEGABYTE;
-  constexpr static size_type SORT_RUN_SIZE         = 4 * GIGABYTE;
-  constexpr static size_type JOIN_PARTITION_SIZE   = 16 * GIGABYTE;
+  // Zero means derive the cap from memory_limit. Explicit setters never store
+  // zero, so the mode does not require extra ABI-visible state.
+  constexpr static size_type SORT_RUN_SIZE         = 0;
+  constexpr static size_type JOIN_PARTITION_SIZE   = 0;
   constexpr static size_type MERGE_FAN_IN          = 64;
   constexpr static size_type MAX_OPEN_FILES        = 128;
   // Final external construction owns fixed event/read streams in addition to
@@ -118,8 +120,16 @@ struct ConstructionParameters
   bool getCleanObsolete() const { return this->clean_obsolete; }
   bool getAllowPathExplosion() const { return this->allow_path_explosion; }
   size_type getIOBufferSize() const { return this->io_buffer_size; }
-  size_type getSortRunSize() const { return this->sort_run_size; }
-  size_type getJoinPartitionSize() const { return this->join_partition_size; }
+  // With no expert override, derive phase workspace from the aggregate memory
+  // goal. Sorting receives 3/4 and join blocking 1/4 because the direct
+  // join-to-label pipeline needs both at the same time. The overloads repeat
+  // the same policy inside a process worker's smaller reservation.
+  size_type getSortRunSize() const;
+  size_type getSortRunSize(size_type available_bytes) const;
+  size_type getJoinPartitionSize() const;
+  size_type getJoinPartitionSize(size_type available_bytes) const;
+  bool sortRunSizeIsAutomatic() const { return this->sort_run_size == 0; }
+  bool joinPartitionSizeIsAutomatic() const { return this->join_partition_size == 0; }
   size_type getMergeFanIn() const { return this->merge_fan_in; }
   size_type getMaxOpenFiles() const { return this->max_open_files; }
   size_type getProcessWorkers() const { return this->process_workers; }

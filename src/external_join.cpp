@@ -3518,13 +3518,13 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
     throw joinError("memory limit cannot admit one external join worker process");
   }
   size_type worker_reservation = usable_memory / concurrency;
-  size_type sort_budget = std::min(parameters.getSortRunSize(),
+  size_type sort_budget = std::min(parameters.getSortRunSize(worker_reservation),
     worker_reservation - externalPathJoinMinimumBudget());
   if(sort_budget < externalPathGraphSortMinimumBudget())
   {
     throw joinError("per-worker label-sort budget is below the implementation minimum");
   }
-  size_type join_block_budget = std::min(parameters.getJoinPartitionSize(),
+  size_type join_block_budget = std::min(parameters.getJoinPartitionSize(worker_reservation),
     worker_reservation - sort_budget);
   if(join_block_budget < externalPathJoinMinimumBudget())
   {
