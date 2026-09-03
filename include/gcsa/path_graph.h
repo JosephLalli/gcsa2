@@ -273,11 +273,11 @@ struct LCP
 struct PathGraphMergeStats
 {
   size_type priority_spills, range_spills, from_set_sorts;
-  size_type max_open_input_pairs;
+  size_type max_open_input_pairs, max_open_output_pairs;
 
   PathGraphMergeStats() :
     priority_spills(0), range_spills(0), from_set_sorts(0),
-    max_open_input_pairs(0) { }
+    max_open_input_pairs(0), max_open_output_pairs(0) { }
 };
 
 //------------------------------------------------------------------------------
@@ -346,7 +346,8 @@ struct PathGraph
   // external route cannot retain an adversarial range in RAM.
   void prune(const LCP& lcp, size_type size_limit,
     size_type group_buffer_bytes = MEGABYTE,
-    PathGraphMergeStats* stats = nullptr);
+    PathGraphMergeStats* stats = nullptr,
+    size_type max_open_files = 128);
   void extend(size_type size_limit, size_type memory_limit);
 
   void debugExtend();
@@ -468,7 +469,8 @@ struct MergedGraph
   MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper,
     const LCP& kmer_lcp, size_type size_limit,
     size_type group_buffer_bytes = MEGABYTE,
-    PathGraphMergeStats* stats = nullptr);
+    PathGraphMergeStats* stats = nullptr,
+    size_type max_open_files = 128);
   ~MergedGraph();
 
   void clear();
