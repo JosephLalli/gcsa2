@@ -657,9 +657,19 @@ serializeSelectMCL(std::ostream& out, size_type bits, size_type ones,
   const size_type logn = sdsl::bits::hi(((bits + 63) / 64) * 64) + 1;
   const size_type logn4 = logn * logn * logn * logn;
   std::vector<size_type> superblocks; superblocks.reserve(blocks);
-  GCSA::bit_vector long_blocks(blocks, 0);
-  std::FILE* payload = std::tmpfile();
-  if(payload == nullptr) { throw eventError("cannot create select payload spool"); }
+  // SDSL calls this vector mini_or_long, but its bit convention is slightly
+  // surprising: 1 denotes a compact miniblock and 0 denotes a long block.
+  // The vector is omitted entirely when every block is compact.
+  GCSA::bit_vector mini_or_long(blocks, 0);
+  bool has_long_block = false;
+  std::string payload_name = TempFile::getName("gcsa_select_payload");
+  std::FILE* payload = std::fopen(payload_name.c_str(), "w+b");
+  if(payload == nullptr)
+  {
+    const std::string failed_name = payload_name;
+    TempFile::remove(payload_name);
+    throw eventError("cannot create select payload spool", failed_name);
+  }
 
   try
   {
@@ -677,14 +687,18 @@ serializeSelectMCL(std::ostream& out, size_type bits, size_type ones,
         }
         positions[i] = next; seen++; available = next_position(next);
       }
-      superblocks.push_back(positions[0]);
       const size_type span = positions[count - 1] - positions[0];
-      // init_fast() encodes the final partial block as long.
       const bool fast = (bits >= 100000);
-      const bool is_long = (span > logn4 || (fast && count < block_size));
-      long_blocks[block] = is_long;
+      // init_fast() encodes the final partial block as long and, unlike the
+      // slow initializer, leaves its otherwise-unused superblock entry zero.
+      const bool partial_fast_block = (fast && count < block_size);
+      const bool is_long = (span > logn4 || partial_fast_block);
+      superblocks.push_back(partial_fast_block ? 0 : positions[0]);
+      mini_or_long[block] = !is_long;
+      has_long_block = has_long_block || is_long;
       sdsl::int_vector<0> encoded(is_long ? block_size : 64, 0,
-        is_long ? sdsl::bits::hi(fast ? bits - 1 : positions[count - 1]) + 1 :
+        is_long ? sdsl::bits::hi(partial_fast_block ? bits - 1 :
+          positions[count - 1]) + 1 :
         sdsl::bits::hi(span) + 1);
       if(is_long)
       {
@@ -704,6 +718,7 @@ serializeSelectMCL(std::ostream& out, size_type bits, size_type ones,
       {
         throw eventError("cannot write select payload spool");
       }
+      DiskIO::write_volume += bytes.size();
     }
     if(available || seen != ones)
     {
@@ -712,9 +727,7 @@ serializeSelectMCL(std::ostream& out, size_type bits, size_type ones,
     sdsl::int_vector<0> superblock_vector(blocks, 0, logn);
     for(size_type i = 0; i < blocks; i++) { superblock_vector[i] = superblocks[i]; }
     superblock_vector.serialize(out);
-    bool any_long = false;
-    for(size_type i = 0; i < blocks; i++) { any_long = any_long || long_blocks[i]; }
-    if(any_long) { long_blocks.serialize(out); }
+    if(has_long_block) { mini_or_long.serialize(out); }
     else { GCSA::bit_vector empty; empty.serialize(out); }
     if(std::fflush(payload) != 0 || std::fseek(payload, 0, SEEK_SET) != 0)
     {
@@ -726,6 +739,7 @@ serializeSelectMCL(std::ostream& out, size_type bits, size_type ones,
       size_type count = std::fread(buffer.data(), 1, buffer.size(), payload);
       if(count > 0)
       {
+        DiskIO::read_volume += count;
         out.write(buffer.data(), count);
         if(!out) { throw eventError("cannot serialize select payload"); }
       }
@@ -735,11 +749,20 @@ serializeSelectMCL(std::ostream& out, size_type bits, size_type ones,
         break;
       }
     }
-    std::fclose(payload);
+    if(std::fclose(payload) != 0)
+    {
+      payload = nullptr;
+      TempFile::remove(payload_name);
+      throw eventError("cannot close select payload spool");
+    }
+    payload = nullptr;
+    TempFile::remove(payload_name);
   }
   catch(...)
   {
-    std::fclose(payload); throw;
+    if(payload != nullptr) { std::fclose(payload); }
+    TempFile::remove(payload_name);
+    throw;
   }
 }
 
@@ -1160,6 +1183,60 @@ serializeSampleIds(std::ostream& out, const std::string& sample_file,
     ids.nextInteger(node); return node;
   });
   ids.finish();
+}
+
+void
+serializeSampleBoundaries(std::ostream& out,
+  const std::string& sample_end_file, size_type sample_ids,
+  size_type sampled_paths, const ConstructionParameters& parameters)
+{
+  if(sampled_paths > sample_ids ||
+     ((sampled_paths == 0) != (sample_ids == 0)))
+  {
+    throw eventError("inconsistent sample-boundary counts");
+  }
+
+  // SDSL serializes the supported bitvector before select_support_mcl. Replay
+  // the immutable monotone event stream for each component, retaining only one
+  // configured input buffer instead of a bit for every stored sample ID.
+  const auto pass = [&](const auto& serialize)
+  {
+    MemoryBudget budget(parameters.getMemoryLimitBytes(),
+      parameters.getMemoryLimitBytes() / 8);
+    BufferedEventReader ends(sample_end_file, 8, sampled_paths,
+      componentBufferBytes(parameters, 1), budget,
+      "final-sample-end-reader");
+    size_type consumed = 0, previous = 0;
+    const auto next = [&](size_type& position)
+    {
+      if(consumed == sampled_paths) { return false; }
+      std::uint64_t end = 0;
+      ends.nextInteger(end);
+      if(end >= sample_ids || (consumed > 0 && end <= previous))
+      {
+        throw eventError("sample endpoint stream is not strictly increasing");
+      }
+      position = static_cast<size_type>(end);
+      previous = position; consumed++;
+      return true;
+    };
+    serialize(next);
+    ends.finish();
+    if(consumed != sampled_paths ||
+       (sampled_paths > 0 && previous + 1 != sample_ids))
+    {
+      throw eventError("final sample endpoint does not cover all sample IDs");
+    }
+  };
+
+  pass([&](const auto& next)
+  {
+    serializePlainBitVector(out, sample_ids, next);
+  });
+  pass([&](const auto& next)
+  {
+    serializeSelectMCL(out, sample_ids, sampled_paths, next);
+  });
 }
 
 void
@@ -2081,31 +2158,9 @@ storeFinalComponents(const GCSAHeader& header,
       serializeSampleIds(out, files.sample_ids, metadata.sample_ids,
         metadata.sample_bits, parameters);
       if(!out) { throw eventError("cannot write partial final index", partial); }
-
-      GCSA::bit_vector ends_vector(metadata.sample_ids, 0);
-      BufferedEventReader ends(files.sample_ends, 8, metadata.sampled_paths,
-        buffer_bytes, budget, "final-sample-end-reader");
-      std::uint64_t previous = 0;
-      for(size_type i = 0; i < metadata.sampled_paths; i++)
-      {
-        std::uint64_t end = 0;
-        ends.nextInteger(end);
-        if(end >= metadata.sample_ids || (i > 0 && end <= previous))
-        {
-          throw eventError("sample endpoint stream is not strictly increasing");
-        }
-        ends_vector[end] = 1;
-        previous = end;
-      }
-      ends.finish();
-      if(metadata.sampled_paths > 0 && previous + 1 != metadata.sample_ids)
-      {
-        throw eventError("final sample endpoint does not cover all sample IDs");
-      }
-      write(ends_vector);
-      GCSA::bit_vector::select_1_type select;
-      sdsl::util::init_support(select, &ends_vector);
-      write(select);
+      serializeSampleBoundaries(out, files.sample_ends, metadata.sample_ids,
+        metadata.sampled_paths, parameters);
+      if(!out) { throw eventError("cannot write partial final index", partial); }
     }
 
     {
