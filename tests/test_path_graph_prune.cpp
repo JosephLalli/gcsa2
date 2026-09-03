@@ -193,8 +193,12 @@ static void compare_merged_graph(const std::string& base)
     require(reference.size() == 1); require(reference.extra() == 15);
     require(reference_stats.priority_spills == 0);
     require(reference_stats.range_spills == 0);
+    // In-memory SameFromSet groups must not invoke the external sorter.
+    require(reference_stats.from_set_sorts == 0);
     require(spilled_stats.priority_spills > 0);
     require(spilled_stats.range_spills > 0);
+    // A tiny group budget cannot retain even one selected/candidate pair, so
+    // it takes the external path while producing byte-identical output above.
     require(spilled_stats.from_set_sorts >= 4);
     require(spilled_stats.max_open_input_pairs <= 1);
     require(2 * spilled_stats.max_open_input_pairs + 14 <= 16);
