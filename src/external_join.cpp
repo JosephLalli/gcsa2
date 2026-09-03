@@ -264,7 +264,8 @@ decodeJoinRecord(const std::array<std::uint8_t, JOIN_RECORD_BYTES>& buffer,
   target.node.fields = 0;
   target.node.setPredecessors(predecessors);
   target.node.setOrder(order); target.node.setLCP(lcp); target.node.setPointer(0);
-  if(order == 0 || order > PathLabel::LABEL_LENGTH || lcp > order)
+  // Order 0 is valid for a pruned sorted range and still carries one rank.
+  if(order > PathLabel::LABEL_LENGTH || lcp > order)
   {
     throw joinError("invalid join record path metadata");
   }
@@ -741,7 +742,10 @@ public:
       this->refillPaths();
     }
     record.node = this->path_buffer[this->path_offset - this->path_buffer_first];
-    if(record.node.pointer() != this->rank_offset || record.node.order() == 0 ||
+    // Pruning may collapse a unique equal-label range to order 0. Such a
+    // sorted path still owns one boundary rank (ranks() == order() + 1), can
+    // bypass left expansion, and remains a valid right-side join target.
+    if(record.node.pointer() != this->rank_offset ||
        record.node.order() > PathLabel::LABEL_LENGTH || record.node.lcp() > record.node.order() ||
        record.node.ranks() > this->rank_count - this->rank_offset)
     {
