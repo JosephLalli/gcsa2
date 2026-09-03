@@ -63,8 +63,9 @@ std::ostream& operator<< (std::ostream& out, const STNode& node);
 
 /*
   Bounded temporary storage used while constructing the range-minimum levels.
-  The final packed LCPArray::data is deliberately not included: constructing an
-  LCPArray necessarily retains its complete serialized hierarchy.
+  The resident-object constructor does not include final LCPArray::data in this
+  counter. buildAndStore(), however, emits that packed data directly and counts
+  its input/output buffers here.
 */
 struct LCPStreamingStats
 {
@@ -126,6 +127,18 @@ public:
   LCPArray(const std::string& leaf_filename, size_type branching,
     size_type byte_budget, BuildWorkspace* workspace = nullptr,
     LCPStreamingStats* stats = nullptr);
+
+  /*
+    Build the same legacy .lcp representation without retaining the packed
+    hierarchy. The InputGraph overload owns the durable lcp-levels child
+    workspace; the raw-leaf overload is exposed for focused tests and callers
+    that already own one. Both publish filename atomically.
+  */
+  static void buildAndStore(const InputGraph& graph,
+    const ConstructionParameters& parameters, const std::string& filename);
+  static void buildAndStore(const std::string& leaf_filename,
+    size_type branching, size_type byte_budget, const std::string& filename,
+    BuildWorkspace* workspace = nullptr, LCPStreamingStats* stats = nullptr);
 
 //------------------------------------------------------------------------------
 
