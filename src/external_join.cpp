@@ -2678,38 +2678,17 @@ joinPartitionArtifact(const std::string& task, const std::string& name,
 }
 
 BuildWorkspace::ArtifactRef
-copyJoinPartitionArtifact(BuildWorkspace& workspace,
+checkpointJoinPartitionArtifact(BuildWorkspace& workspace,
   const ArtifactIdentity& identity, logical_file_id_t logical,
   const std::string& source, size_type records, size_type expected_bytes,
   size_type buffer_bytes, const std::string& sort_order)
 {
-  std::ifstream input;
-  input.rdbuf()->pubsetbuf(nullptr, 0);
-  input.open(source.c_str(), std::ios_base::binary);
-  if(!input) { throw joinError("cannot checkpoint worker output", source); }
-  input.seekg(0, std::ios_base::end);
-  std::streamoff end = input.tellg();
-  input.seekg(0, std::ios_base::beg);
-  if(end < 0 || static_cast<size_type>(end) != expected_bytes)
-  {
-    throw joinError("worker output changed before checkpoint", source);
-  }
-  BuildWorkspace::ArtifactWriter writer = workspace.open_artifact(identity,
-    logical, physical_shard_id_t(0), sort_order, "all");
-  std::vector<std::uint8_t> buffer(std::max(static_cast<size_type>(1),
-    buffer_bytes));
-  size_type remaining = expected_bytes;
-  while(remaining > 0)
-  {
-    size_type bytes = std::min(remaining, buffer.size());
-    input.read(reinterpret_cast<char*>(buffer.data()), bytes);
-    if(input.gcount() != static_cast<std::streamsize>(bytes))
-    {
-      throw joinError("short read while checkpointing worker output", source);
-    }
-    writer.write(buffer.data(), bytes); remaining -= bytes;
-  }
-  return writer.finish(records);
+  static_cast<void>(sort_order);
+  // Worker outputs are immutable once their result marker is read. Adopt the
+  // raw payload so a colocated workspace keeps the same inode; the workspace
+  // primitive retains its bounded-copy fallback for other filesystems.
+  return workspace.adopt_raw_payload(identity, logical, physical_shard_id_t(0),
+    source, records, expected_bytes, buffer_bytes);
 }
 
 void
@@ -2719,12 +2698,12 @@ checkpointJoinPartition(BuildWorkspace& workspace, const std::string& task,
   size_type buffer_bytes)
 {
   std::vector<BuildWorkspace::ArtifactRef> artifacts;
-  artifacts.push_back(copyJoinPartitionArtifact(workspace,
+  artifacts.push_back(checkpointJoinPartitionArtifact(workspace,
     joinPartitionArtifact(task, "paths", "path-nodes-v1"), logical,
     path_name, partition.expected_paths,
     checkedJoinMultiply(partition.expected_paths, sizeof(PathNode),
       "checkpoint path bytes"), buffer_bytes, "label"));
-  artifacts.push_back(copyJoinPartitionArtifact(workspace,
+  artifacts.push_back(checkpointJoinPartitionArtifact(workspace,
     joinPartitionArtifact(task, "ranks", "path-ranks-v1"), logical,
     rank_name, partition.expected_ranks,
     checkedJoinMultiply(partition.expected_ranks, sizeof(PathNode::rank_type),
@@ -2734,13 +2713,20 @@ checkpointJoinPartition(BuildWorkspace& workspace, const std::string& task,
 
 void
 restoreJoinPartition(const BuildWorkspace& workspace, const std::string& task,
-  logical_file_id_t logical, const std::string& path_name,
+  logical_file_id_t logical, const JoinPartition& partition,
+  const std::string& path_name,
   const std::string& rank_name, size_type buffer_bytes)
 {
-  workspace.restore_artifact(joinPartitionArtifact(task, "paths", "path-nodes-v1"),
-    logical, physical_shard_id_t(0), path_name, buffer_bytes);
-  workspace.restore_artifact(joinPartitionArtifact(task, "ranks", "path-ranks-v1"),
-    logical, physical_shard_id_t(0), rank_name, buffer_bytes);
+  workspace.restore_adopted_payload(
+    joinPartitionArtifact(task, "paths", "path-nodes-v1"),
+    logical, physical_shard_id_t(0), path_name, partition.expected_paths,
+    checkedJoinMultiply(partition.expected_paths, sizeof(PathNode),
+      "restore path bytes"), buffer_bytes, true);
+  workspace.restore_adopted_payload(
+    joinPartitionArtifact(task, "ranks", "path-ranks-v1"),
+    logical, physical_shard_id_t(0), rank_name, partition.expected_ranks,
+    checkedJoinMultiply(partition.expected_ranks, sizeof(PathNode::rank_type),
+      "restore rank bytes"), buffer_bytes, true);
 }
 
 struct ActiveJoinWorker
@@ -2949,7 +2935,7 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
         // Do not overlap restore buffers with fully admitted child working
         // sets. Completed tasks are cheap to restore and never respawn.
         while(!active.empty()) { collect_one(); }
-        restoreJoinPartition(*workspace, partition_checkpoint, logical,
+        restoreJoinPartition(*workspace, partition_checkpoint, logical, partition,
           next.path_names[shard], next.rank_names[shard], checkpoint_buffer);
         validateWorkerOutput(next.path_names[shard],
           partition.expected_paths * sizeof(PathNode));
