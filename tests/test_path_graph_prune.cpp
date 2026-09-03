@@ -193,6 +193,16 @@ static void compare_merged_graph(const std::string& base)
     require(reference.size() == 1); require(reference.extra() == 15);
     require(reference_stats.priority_spills == 0);
     require(reference_stats.range_spills == 0);
+    // The merger reads each shard monotonically. Bounded 64 KiB windows must
+    // therefore turn many logical records into a small number of preads.
+    require(reference_stats.path_input_reads == paths.size());
+    require(reference_stats.rank_input_reads == paths.size());
+    require(reference_stats.path_input_refills > 0);
+    require(reference_stats.rank_input_refills > 0);
+    require(reference_stats.path_input_refills < reference_stats.path_input_reads);
+    require(reference_stats.rank_input_refills < reference_stats.rank_input_reads);
+    require(reference_stats.direct_input_reads == 0);
+    require(reference_stats.max_input_buffer_bytes <= MEGABYTE / 4);
     // In-memory SameFromSet groups must not invoke the external sorter.
     require(reference_stats.from_set_sorts == 0);
     require(spilled_stats.priority_spills > 0);
@@ -201,6 +211,9 @@ static void compare_merged_graph(const std::string& base)
     // it takes the external path while producing byte-identical output above.
     require(spilled_stats.from_set_sorts >= 4);
     require(spilled_stats.max_open_input_pairs <= 1);
+    require(spilled_stats.max_input_buffer_bytes == 0);
+    require(spilled_stats.direct_input_reads ==
+      spilled_stats.path_input_reads + spilled_stats.rank_input_reads);
     require(2 * spilled_stats.max_open_input_pairs + 14 <= 16);
 
     std::ifstream path_input(reference.path_name.c_str(), std::ios_base::binary);

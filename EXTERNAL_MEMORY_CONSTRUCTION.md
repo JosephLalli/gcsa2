@@ -412,6 +412,12 @@ versioned artifact lengths and checksums. Initial extraction and join workers
 may create many physical shards for one logical input; a bounded post-join sort
 compacts those runs, and pruning can directly emit one label-sorted shard per
 logical input because it already observes one global label-order stream.
+The global label merger keeps only an LRU-bounded set of path/rank descriptor
+pairs. Each open stream receives a 4--64 KiB sequential read window whose total
+capacity is derived from, and capped at one quarter of, the merge group budget.
+This preserves the descriptor and RAM ceilings while amortizing the 24-byte
+path records and short rank payloads that would otherwise require one `pread()`
+each. Budgets too small for one page deliberately fall back to direct reads.
 
 Generated paths enter a byte-bounded buffer and are written as deterministic
 label-sorted runs. The primary comparison is the existing first-label/rank
@@ -438,13 +444,17 @@ bytes plus suspected heavy keys. Pack memory is capped from the configured RAM
 budget; if that cap is reached, a coarser pack is retained and the exact pass
 continues splitting it. The plan is bound to both join-run payload checksums,
 committed as a checksummed workspace artifact, and restored independently of
-partition outputs. Completed partition task names carry the same run checksums,
-so equal-length replacement runs cannot reuse stale output. The already-sorted
-left/right join files act as shared pack files:
+partition outputs. Each sorted join run emits an exact compact sidecar with one
+fixed-width summary per join key and one byte of order/sorted detail per source
+record. Planning and pathological-key subdivision read those sidecars instead
+of rescanning the wide variable-rank `JoinRecord` payload. The plan is bound to
+the run and sidecar checksums; completed partition task names carry the same
+identities, so equal-length replacement runs cannot reuse stale output. The
+already-sorted left/right join files act as shared pack files:
 thousands of logical radix bins are half-open offsets in two files instead of
-thousands of open descriptors. An exact streaming group pass remains
-authoritative for every range, count, and byte estimate, so a sampling miss can
-change task balance but cannot change join semantics.
+thousands of open descriptors. Sidecar summaries remain authoritative for every
+range, count, and byte estimate, so a sampling miss can change task balance but
+cannot change join semantics.
 
 For each partition, the scheduler reserves a declared working set. If one side
 fits, it is indexed and the other is streamed. Otherwise the partition is
@@ -542,7 +552,7 @@ when its production call path and forced-spill/recovery tests pass.
 | Human-readable operational construction parameters | core budget/run controls implemented and parser-tested; cleanup/cadence controls are not all wired |
 | Bounded external path-label runs and leveled multi-pass merge | versioned grouped/prefix-compressed runs, shared-left-context references, parallel in-place run sorting, rolling cache windows, one-run bypass, direct leveled merge of already-sorted worker shards, and forced multi-pass spilling implemented and tested |
 | Logical/physical `PathGraph` identity in pruning and joining | implemented; pruning coalesces only by logical ID and never treats a physical shard as a semantic input; durable run-set manifest pending |
-| External prefix-doubling join | bounded sort-merge, rolling page-cache windows, RAM-capped persisted 4096-record MSD radix range-pack planning bound to run checksums, exact range contracts, recursive two-dimensional heavy-key splitting, blocked nested-loop expansion, and selectable checksum scans implemented and forced-spill tested |
+| External prefix-doubling join | bounded sort-merge, rolling page-cache windows, compact exact key-group sidecars, RAM-capped persisted 4096-record MSD radix range-pack planning bound to run/sidecar checksums, exact range contracts, recursive two-dimensional heavy-key splitting, blocked nested-loop expansion, and selectable checksum scans implemented and forced-spill tested |
 | Direct join-to-label pipeline | implemented and forced-spill tested; the unsorted generated path/rank pair is no longer materialized |
 | Process worker scheduler and partition resume | implemented with fork-free spawn, global byte admission, immutable-payload semantic range checkpoints, same-filesystem zero-copy restore, and one-/multi-partition tests |
 | External keys/start nodes/initial paths | implemented with bounded fixed-record runs, global duplicate reduction, streaming support construction, durable key/start checkpoints, and physical initial shards preserving logical IDs |
@@ -564,12 +574,11 @@ bounded by one final component rather than total intermediate path volume, but
 they keep the in-process budget from being a strict whole-process RSS ceiling;
 production runs retain a cgroup limit.
 
-Join distribution runs are checksummed immutable files but are not yet
-registered as resumable workspace tasks, so an incomplete generation rebuilds
-them before restoring the persisted MSD plan and completed join ranges. The
-exact group-summary pass still scans both shared pack files after sampling; this
-extra sequential I/O makes sampled boundaries safe rather than speculative.
-Initial records and join distribution records still repeat full rank payloads.
+Join distribution runs and their exact group sidecars are checksummed immutable
+files but are not yet registered as resumable workspace tasks, so an incomplete
+generation rebuilds them before restoring the persisted MSD plan and completed
+join ranges. Initial records and join distribution records still repeat full
+rank payloads.
 Label-sort runs group shared left contexts and prefix-compress labels, but a
 deeper reference representation spanning the pre-sort join stream remains an
 optional compaction rather than a feasibility dependency.
@@ -619,9 +628,8 @@ feasibility, RSS, then speed policy:
 4. Add block-level final-event recovery. The event scan is bounded but a crash
    currently restarts the complete scan; idempotent assignment logs and output
    blocks would retain finer progress.
-5. Persist distribution and group-summary products as task artifacts, and emit
-   exact group summaries while creating join runs. This removes the full
-   post-sampling rescan and avoids rebuilding distributions after interruption.
+5. Persist distribution runs and their already-emitted exact group sidecars as
+   task artifacts. This avoids rebuilding both products after interruption.
 6. Compact the repeated rank payload in join distribution records before
    increasing worker count. Only after per-path bytes and storage headroom are
    measured should more encoders, merge groups, or verifier label ranges run in

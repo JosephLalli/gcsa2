@@ -274,10 +274,16 @@ struct PathGraphMergeStats
 {
   size_type priority_spills, range_spills, from_set_sorts;
   size_type max_open_input_pairs, max_open_output_pairs;
+  size_type path_input_reads, rank_input_reads;
+  size_type path_input_refills, rank_input_refills, direct_input_reads;
+  size_type max_input_buffer_bytes;
 
   PathGraphMergeStats() :
     priority_spills(0), range_spills(0), from_set_sorts(0),
-    max_open_input_pairs(0), max_open_output_pairs(0) { }
+    max_open_input_pairs(0), max_open_output_pairs(0),
+    path_input_reads(0), rank_input_reads(0),
+    path_input_refills(0), rank_input_refills(0), direct_input_reads(0),
+    max_input_buffer_bytes(0) { }
 };
 
 //------------------------------------------------------------------------------
