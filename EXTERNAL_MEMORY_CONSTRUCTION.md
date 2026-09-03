@@ -39,8 +39,10 @@ unbounded `SameFromSet::nodes` group. The table describes the preserved legacy
 route. The workspace-selected route now replaces key/start/initial-path
 preprocessing, prefix-doubling joins and label sorting, final raw component
 construction, dense previous-occurrence state, and simultaneous raw LCP levels.
-Pruning equal-label groups and `MergedGraph` same-from groups remain resident
-limitations.
+It now also spills pruning equal-label/range state, externally reduces
+`MergedGraph` same-from sets, bounds input/output shard descriptors, and derives
+merged-graph output buffers from bytes rather than element counts. Remaining
+resident limitations are called out in the implementation ledger below.
 
 ### Production fixture and measured legacy baseline
 
@@ -70,6 +72,12 @@ Its successful legacy `vg index -k16 -X4 -Z2048 -t32` run took 2:07:13
 and 105,438,580 KiB maximum RSS (100.55 GiB). This is the primary target for
 the requested approximately 25 GiB comparison once the host's other heavy
 `vg prune`/GCSA work and I/O contention are absent.
+
+Only preexisting pruned fixtures are eligible for acceptance runs. The active
+chr19 production job had not published a committed nonempty k32-pruned graph at
+the latest gate check, so no competing chr19 index build was launched. The
+remaining final-component memory gaps below must be closed or bounded before
+that race is considered ready.
 
 The successful legacy command used `vg index -k 16 -X 4 -Z 700 -t 32 -V`.
 It produced a 682,869,673-byte GCSA and a 273,490,577-byte LCP in 1:55:35
@@ -175,10 +183,21 @@ Sequential join and final-event writers sync and evict completed prefixes every
 512 MiB while retaining a 64 MiB tail; readers evict consumed prefixes. A
 backwards seek for a pathological join key resets the reader watermark so every
 replay remains bounded. `posix_fadvise()` is best-effort and non-semantic;
-`fdatasync()` is the durability boundary. Pruning, `MergedGraph`, final SDSL
-component allocations, and some library-owned compression scratch are not all
-admitted through `MemoryBudget`, so the in-process token budget is not yet an
-end-to-end RSS ceiling. A hard cgroup remains the acceptance boundary.
+`fdatasync()` is the durability boundary. Pruning and `MergedGraph` now use
+bounded spill structures and byte-sized buffers, but their reservations, final
+SDSL component allocations, and some library-owned compression scratch are not
+all admitted through the process-wide `MemoryBudget`. The in-process token
+budget is therefore not yet an end-to-end RSS ceiling; a hard cgroup remains
+the acceptance boundary.
+
+`--max-open-files` is now enforced for the prune and final merge run sets.
+Pruning reserves its two possible spill descriptors before dividing the
+remainder between two-descriptor input and output cache entries. Final merge
+reserves fourteen descriptors for four sequential outputs, two possible spill
+files, and the worst overlapping two-way `SameFromSet` external-sort state;
+each remaining input-cache entry consumes two. The supported minimum is 16.
+This ceiling covers GCSA2 construction files, not descriptors already inherited
+from the embedding process.
 
 ### Compute and I/O concurrency
 
@@ -198,8 +217,10 @@ Merge emitters remain single-writer, while prefix-doubling joins can now use
 deterministic range partitions of `(logical_file_id, join_key)`. Worker tasks
 reserve byte tokens, consume disjoint immutable input ranges, and publish
 separate physical output shards. Those shards retain their shared logical ID
-and are consumed as a run set. A heavy key is recursively split on both left
-and right record ranges; splitting the left range suppresses duplicate sorted
+and are compacted through the bounded label sorter before the next prune;
+pruning itself projects its globally label-sorted merge directly to one output
+shard per logical input. A heavy key is recursively split on both left and
+right record ranges; splitting the left range suppresses duplicate sorted
 bypasses, while splitting the right range gives each task a disjoint bypass.
 Separate admission for compute and writers remains future work for filesystems
 that cannot sustain all admitted writers concurrently.
@@ -303,10 +324,11 @@ for provenance but excluded from the fingerprint.
 Durable phase artifacts have explicit little-endian headers and footers with
 magic, format version, artifact kind, logical ID, physical shard ID, record and
 payload byte counts, checksum, sort order, and key range. Join runs also use an
-explicit versioned encoding. Transient label-sort runs still write the raw
-`PathSortRecord` layout and therefore are not reusable across builds; replacing
-that layout is a remaining format-hardening task. The final public index keeps
-its unchanged legacy format.
+explicit versioned encoding. Transient label-sort runs use an explicit
+little-endian, versioned prefix-compressed format: the first label is complete
+and following labels store LCP length plus suffix. They remain transient rather
+than workspace tasks, but no longer dump an unstable C++ object layout. The
+final public index keeps its unchanged legacy format.
 
 ### Commit and recovery protocol
 
@@ -357,10 +379,12 @@ digit.
 
 ### Run-set PathGraph and label ordering
 
-A `PathGraph` is a manifest of immutable shards, each carrying logical ID,
-physical ID, sort order, counts, byte size, key range, and checksum. The next
-phase consumes a run set directly. Compaction limits fan-in but does not force a
-single logical input into one giant file.
+A `PathGraph` is an in-process run set of immutable shards carrying distinct
+logical and physical IDs plus path/rank counts. Workspace checkpoints add
+versioned artifact lengths and checksums. Initial extraction and join workers
+may create many physical shards for one logical input; a bounded post-join sort
+compacts those runs, and pruning can directly emit one label-sorted shard per
+logical input because it already observes one global label-order stream.
 
 Generated paths enter a byte-bounded buffer and are written as deterministic
 label-sorted runs. The primary comparison is the existing first-label/rank
@@ -379,10 +403,12 @@ left key  = (logical_file, path.to)
 right key = (logical_file, path.from)
 ```
 
-A sampling pass records key/range histograms, heavy keys, leading label ranks,
-and fanout estimates. It commits a deterministic range partition plan. MSD
-radix distribution writes left and right pack files with per-bin offsets, so the
-number of logical bins is independent of open file count.
+The complete target design samples key/range and leading-label distributions,
+then commits an MSD radix partition plan backed by pack files. The implemented
+planner currently takes a deterministic systematic sample of at most 4096
+records from each side to identify likely pathological keys. An exact streaming
+group pass remains authoritative for every boundary, count, and byte estimate;
+full sampled quantile/MSD pack planning is not implemented yet.
 
 For each partition, the scheduler reserves a declared working set. If one side
 fits, it is indexed and the other is streamed. Otherwise the partition is
@@ -396,24 +422,27 @@ Sorted paths bypass the join and enter label-run generation unchanged. A later
 optimization may encode one left reference followed by many right references,
 delaying repeated-label materialization.
 
-The first production slice uses an external sort-merge implementation of the
-same plan. For every logical input it writes explicit, versioned left-by-`to`
-and right-by-`from` run records. Run creation uses leveled compaction, so file
-name metadata is `O(F log_F R)` for merge fan-in `F` and `R` initial runs. A
-matching key is processed without materializing either key group: the right
-range is replayed for each left record. This is deliberately slower than the
-planned sampled range partitions, but it already handles an individual key
-larger than RAM and preserves joins across physical shards. Generated records
-flow directly to the bounded external label sorter.
+The production route uses an external sort-merge implementation. For every
+logical input it writes explicit, versioned left-by-`to` and right-by-`from`
+run records. Run creation uses leveled compaction, so file-name metadata is
+`O(F log_F R)` for merge fan-in `F` and `R` initial runs. A matching key is
+processed without materializing either key group: it loads bounded blocks from
+the smaller side and replays disk-backed blocks/ranges from the other side.
+This already handles an individual key larger than RAM and preserves joins
+across physical shards. Generated records flow directly to prefix-compressed
+bounded label-sort runs. The expansion record itself still repeats the complete
+generated label; true left-context-plus-right-reference encoding remains an
+I/O optimization.
 
 ### Pruning
 
-`SpillableGroup` keeps only a bounded prefix plus a summary: first/last label,
-common LCP, first `from`, all-from-equal, first logical ID,
-all-logical-equal, predecessor union, count, and required minima/maxima. Records
-beyond the cap spill sequentially. Summary-only decisions avoid rereads; output
-branches replay the group once. Physical shard IDs never participate in
-`SameFromFile` semantics.
+`SpillableGroup` and `SpillableDeque` keep only bounded resident windows for
+equal-label records and extended ranges, spilling excess records to sequential
+files. `SameFromLogicalFile` computes the required all-from/all-logical summary
+through bounded record access. Output branches replay spilled records only when
+individual paths must be emitted. `MergedGraph` likewise externally
+sorts/deduplicates its potentially huge same-from sets. Physical shard IDs never
+participate in `SameFromFile` semantics.
 
 ### Final components and LCP
 
@@ -443,41 +472,43 @@ when its production call path and forced-spill/recovery tests pass.
 
 | Slice | State |
 | --- | --- |
-| Shared byte-token `MemoryBudget` and statvfs-aware `DiskBudget` | memory primitives and major external-phase byte caps implemented; SDSL/library allocations and legacy groups are not globally admitted; disk guard covers generated path/join volume but not every final/LCP/checkpoint writer |
+| Shared byte-token `MemoryBudget` and statvfs-aware `DiskBudget` | memory primitives and major external-phase byte caps implemented; pruning/merged-graph buffers are byte-bounded but not globally admitted; SDSL/library allocations remain outside the shared budget; disk guard covers generated path/join volume but not every final/LCP/checkpoint writer |
 | Versioned workspace artifacts, atomic publication, manifest compatibility, recovery tests | phase and join-range checkpoints plus abrupt-exit commit-boundary tests implemented; transient distribution-run task records pending |
 | Human-readable operational construction parameters | core budget/run controls implemented and parser-tested; cleanup/cadence controls are not all wired |
-| Bounded external path-label runs and leveled multi-pass merge | parallel in-place run sorting, rolling cache windows, one-run bypass, and forced multi-pass spilling implemented and tested |
-| Logical/physical `PathGraph` identity in pruning and joining | implemented; durable run-set manifest pending |
-| External prefix-doubling join | bounded sort-merge, rolling page-cache windows, deterministic range partitioning, recursive two-dimensional heavy-key splitting, and selectable checksum scans implemented; sampled/radix planning pending |
+| Bounded external path-label runs and leveled multi-pass merge | versioned prefix-compressed runs, parallel in-place run sorting, rolling cache windows, one-run bypass, and forced multi-pass spilling implemented and tested |
+| Logical/physical `PathGraph` identity in pruning and joining | implemented; pruning coalesces only by logical ID and never treats a physical shard as a semantic input; durable run-set manifest pending |
+| External prefix-doubling join | bounded sort-merge, rolling page-cache windows, deterministic 4096-record heavy-key sampling, exact range partitioning, recursive two-dimensional heavy-key splitting, blocked nested-loop expansion, and selectable checksum scans implemented; full sampled MSD/radix pack planning pending |
 | Direct join-to-label pipeline | implemented and forced-spill tested; the unsorted generated path/rank pair is no longer materialized |
 | Process worker scheduler and partition resume | implemented with fork-free spawn, global byte admission, semantic range checkpoints, and one-/multi-partition tests |
 | External keys/start nodes/initial paths | implemented with bounded fixed-record runs, global duplicate reduction, streaming support construction, durable key/start checkpoints, and physical initial shards preserving logical IDs |
-| Spillable pruning groups | not implemented |
+| Spillable pruning groups | implemented and forced-spill tested for equal-label priority groups, extended ranges, external same-from sets, and bounded input/output descriptor caches |
 | Final event/component passes | implemented with one-task event checkpoint, disk-backed `prev_occ` and suffix-tree stack, external redundancy sort, and component-at-a-time construction; mid-scan assignment logs and direct component packer pending |
 | Streaming LCP levels | implemented and resume-tested with one raw level resident at a time and byte-identical legacy serialization; final packed hierarchy remains resident |
 | Standalone and `vg index` / `vg autoindex` CLI integration | implemented; forced-spill/resume integration tested |
 | Chromosome-scale benchmark | preexisting chr20 k32-pruned fixture completed and verified at 32.36 GiB RSS under a 128 GiB cgroup; outputs are byte-identical to legacy; separate 25 GiB forced-spill/recovery path exercised |
 
 Current limitations are intentionally explicit. The external route is selected
-only when `ConstructionParameters::work_directory` is nonempty. Pruning still
-retains an equal-label/extended group, and `MergedGraph` still retains a
-same-from group. Final-scan `curr_from` and `pred_from` vectors may grow with one
-path's start-node set. Final SDSL bitvectors and succinct components allocate
-outside the token budget and all completed components coexist in the returned
-object; callers may also retain the completed GCSA while constructing the LCP.
-These gaps prevent a strict end-to-end RAM guarantee today.
+only when `ConstructionParameters::work_directory` is nonempty. Final-scan
+`curr_from` and `pred_from` vectors may grow with one path's start-node set.
+Final SDSL bitvectors and succinct components allocate outside the token budget
+and all completed components coexist in the returned object; callers may also
+retain the completed GCSA while constructing the LCP. These gaps prevent a
+strict end-to-end RAM guarantee today, so chromosome-scale racing remains gated
+on closing or directly bounding them.
 
 Join distribution runs are checksummed immutable files but are not yet
 registered as resumable workspace tasks, so an incomplete generation rebuilds
 them before restoring completed join ranges. Recursive range planning is exact
 but performs an additional sequential group-summary pass and does not yet use
-sampled MSD/radix boundaries. Initial and label-sort fixed records repeat full
-payloads; grouped expansion/super-k-mer-like compression is not implemented.
+sampled MSD/radix boundaries. Initial records and generated expansion records
+repeat full payloads; label-sort runs prefix-compress adjacent labels, but
+grouped expansion/super-k-mer-like reference encoding is not implemented.
 Final component construction is serial and the ordered event scan resumes only
 at its task boundary. Process workers currently accelerate independent join
 ranges only. Even with these limitations, preprocessing and prefix doubling no
-longer require a logical chromosome, physical shard, join key, or generated
-label run to fit in RAM, and LCP no longer retains all raw hierarchy levels.
+longer require a logical chromosome, physical shard, join key, equal-label prune
+group, same-from set, or generated label run to fit in RAM, and LCP no longer
+retains all raw hierarchy levels.
 
 ## Build, test, and usage
 
