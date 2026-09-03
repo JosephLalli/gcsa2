@@ -91,6 +91,7 @@ constructionSemanticSettings(const InputGraph& graph,
   // old initial/path checkpoints with the v1 reduced key/start artifacts.
   settings["external_preprocessing"] = "v1";
   settings["external_final_events"] = "v1";
+  settings["path_graph_checkpoint"] = "v2-adopted-raw";
   // Both formats affect deterministic transient ordering and therefore the
   // semantic range names used by resumable join-partition tasks.
   settings["external_join_planner"] = "v2-msd-range-pack";
@@ -1011,7 +1012,8 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
           std::cerr << "GCSA::GCSA(): Restoring checkpoint "
                     << task << "/extend" << std::endl;
         }
-        restorePathGraph(*workspace, path_graph, task, "extend", checkpoint_buffer);
+        restorePathGraph(*workspace, path_graph, task, "extend", checkpoint_buffer,
+          parameters.getVerifyWorkspace());
         first_step = step + 1; restored_graph = true; break;
       }
       if(pathGraphCheckpointExists(*workspace, task, "prune"))
@@ -1021,7 +1023,8 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
           std::cerr << "GCSA::GCSA(): Restoring checkpoint "
                     << task << "/prune" << std::endl;
         }
-        restorePathGraph(*workspace, path_graph, task, "prune", checkpoint_buffer);
+        restorePathGraph(*workspace, path_graph, task, "prune", checkpoint_buffer,
+          parameters.getVerifyWorkspace());
         first_step = step; restored_prune = true; restored_graph = true; break;
       }
     }
@@ -1031,7 +1034,8 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
       {
         std::cerr << "GCSA::GCSA(): Restoring checkpoint initial/paths" << std::endl;
       }
-      restorePathGraph(*workspace, path_graph, "initial", "paths", checkpoint_buffer);
+      restorePathGraph(*workspace, path_graph, "initial", "paths", checkpoint_buffer,
+        parameters.getVerifyWorkspace());
       restored_graph = true;
     }
   }

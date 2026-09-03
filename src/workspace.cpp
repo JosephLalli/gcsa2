@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -51,6 +52,31 @@ void trim_written_cache(int fd,off_t& released,bool complete,const std::string& 
   off_t discard_end=(complete?end:std::max(released,end-CACHE_TAIL_BYTES));
   if(discard_end>released){discard_cache(fd,released,discard_end-released);released=discard_end;}
 }
+uint64_t checksum_raw_file(int fd,uint64_t bytes,std::vector<uint8_t>& buffer,
+  const std::string& path) {
+  advise_sequential(fd);off_t released=0;uint64_t result=1469598103934665603ULL;
+  while(bytes>0) {
+    size_t want=std::min<uint64_t>(bytes,buffer.size()),offset=0;
+    while(offset<want) {
+      ssize_t got=read(fd,buffer.data()+offset,want-offset);
+      if(got<0&&errno==EINTR)continue;
+      if(got<=0)throw err("truncated raw payload",path);
+      offset+=got;
+    }
+    result=BuildWorkspace::checksum(buffer.data(),want,result);bytes-=want;
+    off_t consumed=lseek(fd,0,SEEK_CUR);
+    if(consumed<0)throw err("cannot determine raw payload input position",path);
+    trim_read_cache(fd,consumed,released);
+  }
+  char extra;ssize_t got;
+  do { got=read(fd,&extra,1); } while(got<0&&errno==EINTR);
+  if(got<0)throw err("read failed",path);
+  if(got>0)throw err("raw payload has trailing data",path);
+  off_t consumed=lseek(fd,0,SEEK_CUR);
+  if(consumed<0)throw err("cannot determine raw payload input position",path);
+  trim_read_cache(fd,consumed,released,true);
+  return result;
+}
 bool exists(const std::string& p) { return access(p.c_str(),F_OK)==0; }
 std::string base(const std::string& p) { size_t x=p.find_last_of('/'); return x==std::string::npos?p:p.substr(x+1); }
 std::string parent(const std::string& p) { size_t x=p.find_last_of('/'); return x==std::string::npos?".":(x==0?"/":p.substr(0,x)); }
@@ -84,7 +110,65 @@ BuildWorkspace::ArtifactRef BuildWorkspace::ArtifactWriter::finish(uint64_t reco
 BuildWorkspace::ArtifactWriter BuildWorkspace::open_artifact(const ArtifactIdentity& i,logical_file_id_t l,physical_shard_id_t s,const std::string& so,const std::string& kr){return ArtifactWriter(this,i,l,s,so,kr);}
 void BuildWorkspace::commit_artifact(logical_file_id_t l,physical_shard_id_t s,uint64_t r,const std::vector<uint8_t>& p){ArtifactIdentity i;ArtifactWriter w=open_artifact(i,l,s);w.write(p.data(),p.size());ArtifactRef ref=w.finish(r);std::vector<ArtifactRef> a(1,ref);commit_task(i.task,i.phase,a);}
 void BuildWorkspace::commit_task(const std::string& task,const std::string& phase,const std::vector<ArtifactRef>& a,const std::vector<std::string>& deps){if(a.empty())throw std::runtime_error("cannot commit empty task completion record");std::string final=completion_path(task,phase),tmp=final+partial_suffix();int fd=open(tmp.c_str(),O_CREAT|O_EXCL|O_WRONLY,0644);if(fd<0)throw err("cannot create completion record",tmp);try{std::ostringstream x;x<<"version=1\nfingerprint="<<fingerprint_<<"\n";for(size_t n=0;n<a.size();++n){std::string p=artifact_path(a[n].identity,a[n].logical,a[n].shard);if(!exists(p))throw err("completion references missing artifact",p);x<<"artifact\t"<<base(p)<<"\t"<<a[n].records<<"\t"<<a[n].bytes<<"\t"<<a[n].checksum<<"\n";}for(size_t n=0;n<deps.size();++n)x<<"dependency\t"<<deps[n]<<"\n";std::string text=x.str();write_all(fd,text.data(),text.size(),tmp);sync_file(fd,tmp);crash_if_requested("task-before-rename");if(rename(tmp.c_str(),final.c_str())!=0)throw err("cannot publish completion record",final);sync_dir(directory_);crash_if_requested("task-after-rename");}catch(...){close(fd);unlink(tmp.c_str());throw;}}
-void BuildWorkspace::ensure_completed(const ArtifactIdentity& i,const std::string& b,uint64_t sum)const{std::string p=completion_path(i.task,i.phase);int fd=open(p.c_str(),O_RDONLY);if(fd<0)throw err("missing task completion record",p);std::string text;char buf[4096];for(;;){ssize_t n=read(fd,buf,sizeof(buf));if(n<0&&errno==EINTR)continue;if(n<0){close(fd);throw err("cannot read task completion record",p);}if(n==0)break;text.append(buf,n);}close(fd);std::string prefix="artifact\t"+b+"\t";size_t found=text.find(prefix);if(text.find("fingerprint="+fingerprint_+"\n")==std::string::npos||found==std::string::npos||text.find("\t"+std::to_string(sum)+"\n",found+prefix.size())==std::string::npos)throw err("artifact not committed by matching completion record",p);}
+uint64_t
+BuildWorkspace::committed_artifact_checksum(const ArtifactIdentity& identity,
+  const std::string& basename, uint64_t records, uint64_t bytes) const
+{
+  const std::string path = completion_path(identity.task, identity.phase);
+  int descriptor = open(path.c_str(), O_RDONLY);
+  if(descriptor < 0) { throw err("missing task completion record", path); }
+  std::string text;
+  char buffer[4096];
+  for(;;)
+  {
+    ssize_t got = read(descriptor, buffer, sizeof(buffer));
+    if(got < 0 && errno == EINTR) { continue; }
+    if(got < 0)
+    {
+      close(descriptor); throw err("cannot read task completion record", path);
+    }
+    if(got == 0) { break; }
+    text.append(buffer, got);
+  }
+  if(close(descriptor) != 0) { throw err("cannot close task completion record", path); }
+  if(text.find("fingerprint=" + fingerprint_ + "\n") == std::string::npos)
+  {
+    throw err("task completion fingerprint mismatch", path);
+  }
+
+  std::istringstream input(text);
+  std::string line;
+  while(std::getline(input, line))
+  {
+    std::istringstream fields(line);
+    std::string tag, name;
+    uint64_t committed_records = 0, committed_bytes = 0, committed_checksum = 0;
+    if(fields >> tag >> name >> committed_records >> committed_bytes >> committed_checksum &&
+       tag == "artifact" && name == basename)
+    {
+      const uint64_t any = std::numeric_limits<uint64_t>::max();
+      if((records != any && records != committed_records) ||
+         (bytes != any && bytes != committed_bytes))
+      {
+        throw err("artifact count or length disagrees with completion record", path);
+      }
+      return committed_checksum;
+    }
+  }
+  throw err("artifact not committed by matching completion record", path);
+}
+
+void
+BuildWorkspace::ensure_completed(const ArtifactIdentity& identity,
+  const std::string& basename, uint64_t checksum) const
+{
+  const uint64_t any = std::numeric_limits<uint64_t>::max();
+  if(committed_artifact_checksum(identity, basename, any, any) != checksum)
+  {
+    throw err("artifact checksum disagrees with completion record",
+      completion_path(identity.task, identity.phase));
+  }
+}
 void
 BuildWorkspace::validate_artifact(const ArtifactIdentity& i,logical_file_id_t l,
   physical_shard_id_t s) const
@@ -264,6 +348,189 @@ BuildWorkspace::restore_artifact(const ArtifactIdentity& identity,
   catch(...)
   {
     if(input>=0){close(input);}if(output>=0){close(output);}unlink(partial.c_str());throw;
+  }
+}
+
+BuildWorkspace::ArtifactRef
+BuildWorkspace::adopt_raw_payload(const ArtifactIdentity& identity,
+  logical_file_id_t logical, physical_shard_id_t shard,
+  const std::string& source, uint64_t records, uint64_t expected_bytes,
+  size_t buffer_bytes)
+{
+  if(buffer_bytes == 0)
+  {
+    throw std::invalid_argument("raw payload buffer must be nonzero");
+  }
+  struct stat st;
+  if(stat(source.c_str(), &st) != 0 || !S_ISREG(st.st_mode) ||
+     st.st_size < 0 || static_cast<uint64_t>(st.st_size) != expected_bytes)
+  {
+    throw err("raw payload length mismatch", source);
+  }
+
+  const std::string target = artifact_path(identity, logical, shard);
+  const std::string partial = target + partial_suffix();
+  std::vector<uint8_t> buffer(std::max<size_t>(1, buffer_bytes));
+  int input = -1, output = -1;
+  uint64_t sum = 1469598103934665603ULL;
+  try
+  {
+    if(link(source.c_str(), partial.c_str()) == 0)
+    {
+      // The writer that produced `source` is closed before checkpointing.
+      // Syncing through the new link makes its data durable without copying.
+      input = open(partial.c_str(), O_RDONLY);
+      if(input < 0) { throw err("cannot read linked raw payload", partial); }
+      if(fdatasync(input) != 0) { throw err("fdatasync failed", partial); }
+      sum = checksum_raw_file(input, expected_bytes, buffer, partial);
+      if(close(input) != 0) { throw err("close failed", partial); }
+      input = -1;
+    }
+    else
+    {
+      // Cross-filesystem and filesystems without hardlinks retain a bounded
+      // copy fallback. Compute the checksum during that one unavoidable pass.
+      input = open(source.c_str(), O_RDONLY);
+      output = open(partial.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+      if(input < 0 || output < 0)
+      {
+        throw err("cannot create raw payload fallback", partial);
+      }
+      advise_sequential(input); advise_sequential(output);
+      off_t input_released = 0, output_released = 0;
+      uint64_t left = expected_bytes;
+      while(left > 0)
+      {
+        size_t want = std::min<uint64_t>(left, buffer.size()), offset = 0;
+        while(offset < want)
+        {
+          ssize_t got = read(input, buffer.data() + offset, want - offset);
+          if(got < 0 && errno == EINTR) { continue; }
+          if(got <= 0) { throw err("truncated raw payload", source); }
+          offset += got;
+        }
+        sum = checksum(buffer.data(), want, sum);
+        write_all(output, buffer.data(), want, partial); left -= want;
+        off_t consumed = lseek(input, 0, SEEK_CUR);
+        if(consumed < 0) { throw err("cannot determine raw payload input position", source); }
+        trim_read_cache(input, consumed, input_released);
+        trim_written_cache(output, output_released, false, partial);
+      }
+      char extra; ssize_t got;
+      do { got = read(input, &extra, 1); } while(got < 0 && errno == EINTR);
+      if(got < 0) { throw err("read failed", source); }
+      if(got > 0) { throw err("raw payload has trailing data", source); }
+      off_t consumed = lseek(input, 0, SEEK_CUR);
+      if(consumed < 0) { throw err("cannot determine raw payload input position", source); }
+      trim_read_cache(input, consumed, input_released, true);
+      if(close(input) != 0) { throw err("close failed", source); }
+      input = -1;
+      trim_written_cache(output, output_released, true, partial);
+      if(close(output) != 0) { throw err("close failed", partial); }
+      output = -1;
+    }
+
+    crash_if_requested("artifact-before-rename");
+    if(rename(partial.c_str(), target.c_str()) != 0)
+    {
+      throw err("cannot atomically publish raw payload", target);
+    }
+    sync_dir(directory_);
+    crash_if_requested("artifact-after-rename");
+  }
+  catch(...)
+  {
+    if(input >= 0) { close(input); }
+    if(output >= 0) { close(output); }
+    unlink(partial.c_str()); throw;
+  }
+  return ArtifactRef(identity, logical, shard, records, expected_bytes, sum);
+}
+
+void
+BuildWorkspace::restore_adopted_payload(const ArtifactIdentity& identity,
+  logical_file_id_t logical, physical_shard_id_t shard,
+  const std::string& output, uint64_t records, uint64_t expected_bytes,
+  size_t buffer_bytes, bool verify_checksum) const
+{
+  if(buffer_bytes == 0)
+  {
+    throw std::invalid_argument("raw payload buffer must be nonzero");
+  }
+  const std::string source = artifact_path(identity, logical, shard);
+  struct stat st;
+  if(stat(source.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+     static_cast<uint64_t>(st.st_size) != expected_bytes)
+  {
+    throw err("raw payload length mismatch", source);
+  }
+  const uint64_t expected_checksum = committed_artifact_checksum(
+    identity, base(source), records, expected_bytes);
+  const std::string partial = output + partial_suffix();
+  std::vector<uint8_t> buffer(std::max<size_t>(1, buffer_bytes));
+  int input = -1, destination = -1;
+  try
+  {
+    if(link(source.c_str(), partial.c_str()) == 0)
+    {
+      // Normal resume is O(metadata): committed length and task identity are
+      // enough. --verify-workspace explicitly requests the full checksum pass.
+      if(verify_checksum)
+      {
+        input = open(partial.c_str(), O_RDONLY);
+        if(input < 0) { throw err("cannot verify linked raw payload", partial); }
+        uint64_t actual = checksum_raw_file(input, expected_bytes, buffer, partial);
+        if(close(input) != 0) { throw err("close failed", partial); }
+        input = -1;
+        if(actual != expected_checksum) { throw err("raw payload checksum mismatch", source); }
+      }
+    }
+    else
+    {
+      input = open(source.c_str(), O_RDONLY);
+      destination = open(partial.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+      if(input < 0 || destination < 0)
+      {
+        throw err("cannot create restored raw payload", partial);
+      }
+      advise_sequential(input); advise_sequential(destination);
+      uint64_t actual = 1469598103934665603ULL, left = expected_bytes;
+      off_t input_released = 0, output_released = 0;
+      while(left > 0)
+      {
+        size_t want = std::min<uint64_t>(left, buffer.size()), offset = 0;
+        while(offset < want)
+        {
+          ssize_t got = read(input, buffer.data() + offset, want - offset);
+          if(got < 0 && errno == EINTR) { continue; }
+          if(got <= 0) { throw err("truncated raw payload", source); }
+          offset += got;
+        }
+        actual = checksum(buffer.data(), want, actual);
+        write_all(destination, buffer.data(), want, partial); left -= want;
+        off_t consumed = lseek(input, 0, SEEK_CUR);
+        if(consumed < 0) { throw err("cannot determine raw payload input position", source); }
+        trim_read_cache(input, consumed, input_released);
+        trim_written_cache(destination, output_released, false, partial);
+      }
+      if(actual != expected_checksum) { throw err("raw payload checksum mismatch", source); }
+      if(close(input) != 0) { throw err("close failed", source); }
+      input = -1;
+      trim_written_cache(destination, output_released, true, partial);
+      if(close(destination) != 0) { throw err("close failed", partial); }
+      destination = -1;
+    }
+    if(rename(partial.c_str(), output.c_str()) != 0)
+    {
+      throw err("cannot publish restored raw payload", output);
+    }
+    sync_dir(parent(output));
+  }
+  catch(...)
+  {
+    if(input >= 0) { close(input); }
+    if(destination >= 0) { close(destination); }
+    unlink(partial.c_str()); throw;
   }
 }
 

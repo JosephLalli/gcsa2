@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -64,6 +65,65 @@ int main() {
   char root[]="/tmp/gcsa-workspace-XXXXXX"; require(mkdtemp(root)); BuildWorkspace::Settings sem,op; sem["k"]="64"; op["threads"]="2"; BuildWorkspace w(root,sem,op,BuildWorkspace::NEW_WORKSPACE); require(access((std::string(root)+"/build.json").c_str(),F_OK)==0);
   bool new_refused=false, semantic_refused=false; try { BuildWorkspace again(root,sem,op,BuildWorkspace::NEW_WORKSPACE); } catch(const std::runtime_error&) { new_refused=true; } BuildWorkspace::Settings changed=sem; changed["k"]="65"; try { BuildWorkspace bad(root,changed); } catch(const std::runtime_error&) { semantic_refused=true; } require(new_refused && semantic_refused); BuildWorkspace resumed(root,sem,BuildWorkspace::Settings());
   ArtifactIdentity id("phase/task","sort stage","relative/path","payload-kind"); require(!resumed.task_completed(id.task,id.phase)); std::vector<uint8_t> payload(2*1024*1024+17); for(size_t n=0;n<payload.size();++n) payload[n]=uint8_t(n); BuildWorkspace::ArtifactWriter writer=resumed.open_artifact(id,logical_file_id_t(7),physical_shard_id_t(9),"key","a-z"); writer.write(&payload[0],1024*1024); writer.write(&payload[1024*1024],payload.size()-1024*1024); BuildWorkspace::ArtifactRef ref=writer.finish(3); std::vector<BuildWorkspace::ArtifactRef> refs(1,ref); resumed.commit_task(id.task,id.phase,refs,std::vector<std::string>(1,"input-checksum")); resumed.validate_artifact(id,logical_file_id_t(7),physical_shard_id_t(9)); require(resumed.task_completed(id.task,id.phase)); require(resumed.read_artifact_payload(id,logical_file_id_t(7),physical_shard_id_t(9),payload.size())==payload); std::string restored=std::string(root)+"/restored.payload"; resumed.restore_artifact(id,logical_file_id_t(7),physical_shard_id_t(9),restored,7777); { std::ifstream input(restored.c_str(),std::ios::binary); std::vector<uint8_t> copy((std::istreambuf_iterator<char>(input)),std::istreambuf_iterator<char>()); require(copy==payload); } require(unlink(restored.c_str())==0);
+  // Same-filesystem raw checkpoints are published and restored by hard link:
+  // no payload copy, while the completion marker still governs publication.
+  ArtifactIdentity raw_id("raw", "checkpoint", "payload", "raw-v1");
+  std::string raw_source = std::string(root) + "/raw-source";
+  {
+    std::ofstream out(raw_source.c_str(), std::ios::binary);
+    out.write(reinterpret_cast<const char*>(payload.data()), payload.size());
+  }
+  BuildWorkspace::ArtifactRef raw_ref = resumed.adopt_raw_payload(raw_id,
+    logical_file_id_t(8), physical_shard_id_t(10), raw_source, 5,
+    payload.size(), 7777);
+  std::vector<BuildWorkspace::ArtifactRef> raw_refs(1, raw_ref);
+  resumed.commit_task(raw_id.task, raw_id.phase, raw_refs);
+  std::string raw_stored = resumed.artifact_path(raw_id,
+    logical_file_id_t(8), physical_shard_id_t(10));
+  std::string raw_restored = std::string(root) + "/raw-restored";
+  struct stat source_stat, stored_stat, restored_stat;
+  require(stat(raw_source.c_str(), &source_stat) == 0 &&
+    stat(raw_stored.c_str(), &stored_stat) == 0 &&
+    source_stat.st_ino == stored_stat.st_ino && stored_stat.st_nlink >= 2);
+  resumed.restore_adopted_payload(raw_id, logical_file_id_t(8),
+    physical_shard_id_t(10), raw_restored, 5, payload.size(), 7777);
+  require(stat(raw_restored.c_str(), &restored_stat) == 0 &&
+    restored_stat.st_ino == stored_stat.st_ino);
+  require(unlink(raw_source.c_str()) == 0);
+  BuildWorkspace resumed_raw(root, sem);
+  resumed_raw.restore_adopted_payload(raw_id, logical_file_id_t(8),
+    physical_shard_id_t(10), raw_source, 5, payload.size(), 7777);
+  require(stat(raw_source.c_str(), &source_stat) == 0 &&
+    source_stat.st_ino == stored_stat.st_ino);
+  {
+    std::fstream file(raw_stored.c_str(), std::ios::in | std::ios::out | std::ios::binary);
+    file.seekp(0); char bad = 127; file.write(&bad, 1);
+  }
+  bool raw_bad = false;
+  try
+  {
+    // Ordinary resume trusts the committed checksum and validates identity,
+    // record count, and byte length. Explicit verification rereads payloads.
+    resumed_raw.restore_adopted_payload(raw_id, logical_file_id_t(8),
+      physical_shard_id_t(10), std::string(root) + "/bad-raw", 5,
+      payload.size(), 7777, true);
+  }
+  catch(const std::runtime_error&) { raw_bad = true; }
+  require(raw_bad);
+  // Disk accounting follows allocated inode blocks rather than summing every
+  // hardlink name as another full payload.
+  std::string budget_source = std::string(root) + "/budget-source";
+  std::string budget_link = std::string(root) + "/budget-link";
+  {
+    std::ofstream file(budget_source.c_str(), std::ios::binary);
+    file.write(reinterpret_cast<const char*>(payload.data()), payload.size());
+  }
+  DiskBudget linked_budget(root, 100ULL * 1024 * 1024, 0);
+  uint64_t before_link = linked_budget.available();
+  require(link(budget_source.c_str(), budget_link.c_str()) == 0);
+  require(linked_budget.available() == before_link);
+  require(unlink(budget_link.c_str()) == 0);
+  require(unlink(budget_source.c_str()) == 0);
   std::string good=resumed.artifact_path(id,logical_file_id_t(7),physical_shard_id_t(9)); std::string unmarked=resumed.artifact_path(ArtifactIdentity("other","phase","uncommitted","bin"),logical_file_id_t(1),physical_shard_id_t(2)); BuildWorkspace::ArtifactWriter orphan=resumed.open_artifact(ArtifactIdentity("other","phase","uncommitted","bin"),logical_file_id_t(1),physical_shard_id_t(2)); orphan.write(payload.data(),7); orphan.finish(1); std::string renamed=std::string(root)+"/renamed-successor.bin"; require(rename(unmarked.c_str(),renamed.c_str())==0); { std::ofstream stale((std::string(root)+"/stale.partial").c_str()); stale<<"partial"; } resumed.recover(); require(access(renamed.c_str(),F_OK)!=0 && access((std::string(root)+"/stale.partial").c_str(),F_OK)!=0); resumed.validate_artifact(id,logical_file_id_t(7),physical_shard_id_t(9));
   { std::fstream f(good.c_str(),std::ios::in|std::ios::out|std::ios::binary); f.seekp(54); char x=127; f.write(&x,1); } require(invalid(resumed,id)); require(restore_invalid(resumed,id,restored)); BuildWorkspace::ArtifactWriter repair=resumed.open_artifact(id,logical_file_id_t(7),physical_shard_id_t(9),"key","a-z"); repair.write(payload.data(),payload.size()); ref=repair.finish(3); refs[0]=ref; resumed.commit_task(id.task,id.phase,refs); { std::fstream f(good.c_str(),std::ios::in|std::ios::out|std::ios::binary); f.seekp(0,std::ios::end); std::streamoff n=f.tellp(); f.close(); require(truncate(good.c_str(),n-1)==0); } require(invalid(resumed,id)); require(restore_invalid(resumed,id,restored));
   // Exercise the actual durability boundaries with abrupt child exits. A

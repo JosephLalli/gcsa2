@@ -66,11 +66,19 @@ public:
     logical_file_id_t,physical_shard_id_t,size_t maximum_bytes) const;
   void restore_artifact(const ArtifactIdentity&,logical_file_id_t,
     physical_shard_id_t,const std::string& output_path,size_t buffer_bytes) const;
+  ArtifactRef adopt_raw_payload(const ArtifactIdentity&,logical_file_id_t,
+    physical_shard_id_t,const std::string& source_path,uint64_t records,
+    uint64_t expected_bytes,size_t buffer_bytes);
+  void restore_adopted_payload(const ArtifactIdentity&,logical_file_id_t,
+    physical_shard_id_t,const std::string& output_path,uint64_t records,
+    uint64_t expected_bytes,size_t buffer_bytes,bool verify_checksum=false) const;
   void recover(); static uint64_t checksum(const void*,size_t,uint64_t seed=1469598103934665603ULL);
 private:
   std::string directory_,fingerprint_; Settings semantic_,operational_;
   std::string completion_path(const std::string&,const std::string&) const; static std::string safe(const std::string&);
   void ensure_completed(const ArtifactIdentity&,const std::string&,uint64_t) const;
+  uint64_t committed_artifact_checksum(const ArtifactIdentity&,
+    const std::string&,uint64_t records,uint64_t bytes) const;
 };
 } // namespace gcsa
 #endif
