@@ -3116,10 +3116,28 @@ private:
 
 struct SameFromSet
 {
+  struct Result
+  {
+    std::string name;
+    size_type nodes;
+    bool in_memory;
+
+    Result() : name(), nodes(0), in_memory(false) { }
+    Result(const std::string& file_name, size_type count) :
+      name(file_name), nodes(count), in_memory(false) { }
+    explicit Result(size_type count) : name(), nodes(count), in_memory(true) { }
+  };
+
   const PathGraphMerger& merger;
   std::string            selected;
   size_type              selected_nodes, budget, stream_buffer;
   PathGraphMergeStats*   stats;
+  // Keep the selected set and the next candidate within one byte budget.
+  // The vectors retain their allocation across groups, avoiding per-group I/O
+  // and allocation for the common small-set case.
+  std::vector<node_type> selected_memory, scratch;
+  size_type              memory_records;
+  bool                   selected_in_memory;
 
   SameFromSet(const PathGraphMerger& source, size_type group_buffer_bytes,
     PathGraphMergeStats* merge_stats) :
@@ -3128,14 +3146,32 @@ struct SameFromSet
       group_buffer_bytes)),
     stream_buffer(std::max(static_cast<size_type>(sizeof(node_type)),
       std::min(static_cast<size_type>(64 * KILOBYTE), this->budget / 4))),
-    stats(merge_stats)
+    stats(merge_stats), selected_memory(), scratch(),
+    memory_records(group_buffer_bytes / (2 * sizeof(node_type))),
+    selected_in_memory(false)
   {
+    this->selected_memory.reserve(this->memory_records);
+    this->scratch.reserve(this->memory_records);
   }
 
   ~SameFromSet() { if(!this->selected.empty()) { TempFile::remove(this->selected); } }
 
-  std::pair<std::string, size_type> fromNodes(range_type range) const
+  Result fromNodes(range_type range)
   {
+    size_type records = Range::length(range);
+    if(records <= this->memory_records)
+    {
+      this->scratch.clear();
+      for(size_type i = range.first; i <= range.second; i++)
+      {
+        this->scratch.push_back(this->merger.buffer.get(i).node.from);
+      }
+      std::sort(this->scratch.begin(), this->scratch.end());
+      this->scratch.erase(std::unique(this->scratch.begin(), this->scratch.end()),
+        this->scratch.end());
+      return Result(this->scratch.size());
+    }
+
     std::string raw = TempFile::getName("gcsa_same_from_raw");
     std::string reduced = TempFile::getName("gcsa_same_from_set");
     size_type count = 0;
@@ -3163,49 +3199,97 @@ struct SameFromSet
     {
       TempFile::remove(raw); TempFile::remove(reduced); throw;
     }
-    TempFile::remove(raw); return std::make_pair(reduced, count);
+    TempFile::remove(raw); return Result(reduced, count);
   }
 
   bool operator() (range_type range)
   {
-    std::pair<std::string, size_type> next_set = this->fromNodes(range);
-    bool equal = (next_set.second == this->selected_nodes);
+    Result next_set = this->fromNodes(range);
+    bool equal = (next_set.nodes == this->selected_nodes);
     try
     {
       if(equal)
       {
-        SequentialRecordReader<node_type> left(this->selected, this->stream_buffer);
-        SequentialRecordReader<node_type> right(next_set.first, this->stream_buffer);
-        node_type a, b;
-        for(size_type i = 0; equal && i < this->selected_nodes; i++)
+        if(this->selected_in_memory && next_set.in_memory)
         {
-          equal = (left.next(a) && right.next(b) && a == b);
+          equal = (this->selected_memory == this->scratch);
         }
-        if(equal) { equal = (!left.next(a) && !right.next(b)); }
+        else if(this->selected_in_memory)
+        {
+          SequentialRecordReader<node_type> right(next_set.name, this->stream_buffer);
+          node_type value;
+          for(size_type i = 0; equal && i < this->selected_nodes; i++)
+          {
+            equal = (right.next(value) && value == this->selected_memory[i]);
+          }
+          if(equal) { equal = !right.next(value); }
+        }
+        else if(next_set.in_memory)
+        {
+          SequentialRecordReader<node_type> left(this->selected, this->stream_buffer);
+          node_type value;
+          for(size_type i = 0; equal && i < this->selected_nodes; i++)
+          {
+            equal = (left.next(value) && value == this->scratch[i]);
+          }
+          if(equal) { equal = !left.next(value); }
+        }
+        else
+        {
+          SequentialRecordReader<node_type> left(this->selected, this->stream_buffer);
+          SequentialRecordReader<node_type> right(next_set.name, this->stream_buffer);
+          node_type a, b;
+          for(size_type i = 0; equal && i < this->selected_nodes; i++)
+          {
+            equal = (left.next(a) && right.next(b) && a == b);
+          }
+          if(equal) { equal = (!left.next(a) && !right.next(b)); }
+        }
       }
     }
     catch(...)
     {
-      TempFile::remove(next_set.first); throw;
+      if(!next_set.in_memory) { TempFile::remove(next_set.name); }
+      throw;
     }
-    TempFile::remove(next_set.first); return equal;
+    if(!next_set.in_memory) { TempFile::remove(next_set.name); }
+    return equal;
   }
 
   void select(range_type range)
   {
-    std::pair<std::string, size_type> result = this->fromNodes(range);
-    if(result.second == 0)
+    Result result = this->fromNodes(range);
+    if(result.nodes == 0)
     {
-      TempFile::remove(result.first);
+      if(!result.in_memory) { TempFile::remove(result.name); }
       throw std::runtime_error("SameFromSet: empty selected set");
     }
     if(!this->selected.empty()) { TempFile::remove(this->selected); }
-    this->selected = result.first; this->selected_nodes = result.second;
+    this->selected.clear(); this->selected_nodes = result.nodes;
+    this->selected_in_memory = result.in_memory;
+    if(result.in_memory)
+    {
+      this->selected_memory.swap(this->scratch); this->scratch.clear();
+    }
+    else
+    {
+      this->selected_memory.clear(); this->selected = result.name;
+    }
   }
 
   template<class Callback>
   node_type streamAfterFirst(Callback callback) const
   {
+    if(this->selected_in_memory)
+    {
+      if(this->selected_memory.empty()) { throw std::runtime_error("SameFromSet: empty selected set"); }
+      for(size_type i = 1; i < this->selected_memory.size(); i++) { callback(this->selected_memory[i]); }
+      if(this->selected_memory.size() != this->selected_nodes)
+      {
+        throw std::runtime_error("SameFromSet: selected set size changed");
+      }
+      return this->selected_memory.front();
+    }
     SequentialRecordReader<node_type> input(this->selected, this->stream_buffer);
     node_type first_value;
     if(!input.next(first_value)) { throw std::runtime_error("SameFromSet: empty selected set"); }
