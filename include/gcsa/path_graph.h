@@ -423,6 +423,11 @@ struct ExternalPathJoinStats
   size_type sampled_plan_records, radix_plan_bins, radix_plan_splits;
   size_type radix_plan_max_bits, radix_plan_capped;
   size_type radix_boundary_flushes, restored_radix_plans;
+  // Exact process-worker planning streams these compact sidecars. The full
+  // JoinRecord counter must remain zero: the 4096-record sample is the only
+  // planner read of the wide run payload.
+  size_type sidecar_plan_groups, sidecar_plan_detail_records;
+  size_type full_record_plan_rescans, restored_sidecar_metadata;
   size_type grouped_expansion_records, expansion_context_bytes_saved;
   // These aggregate PathSortRun codec references across all label-run passes.
   // A record rewritten by a merge may therefore contribute more than once.
@@ -438,6 +443,8 @@ struct ExternalPathJoinStats
     sampled_plan_records(0), radix_plan_bins(0), radix_plan_splits(0),
     radix_plan_max_bits(0), radix_plan_capped(0),
     radix_boundary_flushes(0), restored_radix_plans(0),
+    sidecar_plan_groups(0), sidecar_plan_detail_records(0),
+    full_record_plan_rescans(0), restored_sidecar_metadata(0),
     grouped_expansion_records(0), expansion_context_bytes_saved(0),
     max_records_resident(0), max_bytes_resident(0) { }
 };

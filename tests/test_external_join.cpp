@@ -2,6 +2,7 @@
 #include <gcsa/checkpoint.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -134,6 +135,39 @@ readGraph(const PathGraph& graph)
   }
   std::sort(result.begin(), result.end());
   return result;
+}
+
+std::vector<std::uint8_t>
+readBytes(const std::string& name)
+{
+  std::ifstream input(name.c_str(), std::ios_base::binary);
+  require(static_cast<bool>(input));
+  input.seekg(0, std::ios_base::end);
+  std::streamoff end = input.tellg();
+  require(end >= 0);
+  input.seekg(0, std::ios_base::beg);
+  std::vector<std::uint8_t> result(static_cast<size_type>(end));
+  if(!result.empty())
+  {
+    input.read(reinterpret_cast<char*>(result.data()), result.size());
+    require(input.gcount() == static_cast<std::streamsize>(result.size()));
+  }
+  return result;
+}
+
+void
+requireByteIdenticalGraph(const PathGraph& expected, const PathGraph& actual)
+{
+  require(expected.files() == actual.files());
+  for(size_type file = 0; file < expected.files(); file++)
+  {
+    require(expected.logicalFile(file) == actual.logicalFile(file));
+    require(expected.physicalShard(file) == actual.physicalShard(file));
+    require(expected.path_counts[file] == actual.path_counts[file]);
+    require(expected.rank_counts[file] == actual.rank_counts[file]);
+    require(readBytes(expected.path_names[file]) == readBytes(actual.path_names[file]));
+    require(readBytes(expected.rank_names[file]) == readBytes(actual.rank_names[file]));
+  }
 }
 
 void
@@ -353,9 +387,30 @@ int main(int argc, char** argv)
   require(process_stats.sorted_bypass == 2);
   require(process_stats.sampled_plan_records > 0);
   require(process_stats.radix_plan_bins >= 1);
+  require(process_stats.sidecar_plan_groups > 0);
+  require(process_stats.sidecar_plan_detail_records > 0);
+  require(process_stats.full_record_plan_rescans == 0);
   require(process_stats.grouped_expansion_records > 0);
   require(process_stats.expansion_context_bytes_saved > 0);
   require(process_stats.max_bytes_resident <= process_parameters.getMemoryLimitBytes());
+
+  // Rebuild the cross-file, high-fanout worker plan without a workspace. The
+  // compact sidecars must produce the same physical streams, not merely the
+  // same logical record multiset.
+  PathGraph fresh_process(left_path, left_rank);
+  fresh_process.order = 1;
+  fresh_process.logical_file_ids[0] = logical_file_id_t(7);
+  fresh_process.physical_shard_ids[0] = physical_shard_id_t(101);
+  appendShard(fresh_process, right_path, right_rank,
+    logical_file_id_t(7), physical_shard_id_t(202));
+  ConstructionParameters fresh_parameters = process_parameters;
+  fresh_parameters.setVerifyWorkspace();
+  ExternalPathJoinStats fresh_stats;
+  externalPathGraphExtend(fresh_process, GIGABYTE,
+    fresh_parameters, &fresh_stats);
+  requireSameGraph(process_graph, fresh_process, "fresh sidecar worker plan");
+  requireByteIdenticalGraph(process_graph, fresh_process);
+  require(fresh_stats.full_record_plan_rescans == 0);
 
   PathGraph resumed_process(left_path, left_rank);
   resumed_process.order = 1;
@@ -367,6 +422,7 @@ int main(int argc, char** argv)
   externalPathGraphExtend(resumed_process, GIGABYTE,
     process_parameters, &resumed_stats, &workspace, "step-process");
   require(readGraph(process_graph) == readGraph(resumed_process));
+  requireByteIdenticalGraph(process_graph, resumed_process);
   require(resumed_process.files() == process_graph.files());
   require(labelSorted(resumed_process));
   for(size_type file = 0; file < resumed_process.files(); file++)
@@ -376,6 +432,8 @@ int main(int argc, char** argv)
   require(resumed_stats.worker_processes == 0);
   require(resumed_stats.restored_partitions == resumed_stats.join_partitions);
   require(resumed_stats.restored_radix_plans == 1);
+  require(resumed_stats.restored_sidecar_metadata == 2);
+  require(resumed_stats.full_record_plan_rescans == 0);
 
   // Spread exact join keys across the most-significant nibble of node_type.
   // The 4 KiB target cannot admit their combined output, but each key fits by
@@ -426,6 +484,7 @@ int main(int argc, char** argv)
   require(radix_stats.radix_plan_bins > 1);
   require(radix_stats.radix_plan_max_bits >= 4);
   require(radix_stats.radix_boundary_flushes > 0);
+  require(radix_stats.full_record_plan_rescans == 0);
 
   PathGraph radix_resumed(radix_left_path, radix_left_rank);
   radix_resumed.order = 1;
@@ -437,7 +496,9 @@ int main(int argc, char** argv)
   externalPathGraphExtend(radix_resumed, GIGABYTE, radix_parameters,
     &radix_resumed_stats, &workspace, "step-msd");
   require(readGraph(radix_external) == readGraph(radix_resumed));
+  requireByteIdenticalGraph(radix_external, radix_resumed);
   require(radix_resumed_stats.restored_radix_plans == 1);
+  require(radix_resumed_stats.restored_sidecar_metadata == 2);
   require(radix_resumed_stats.worker_processes == 0);
 
   // A same-length run with different payload must not inherit either the plan
