@@ -458,9 +458,17 @@ struct ExternalPathJoinStats
   // planner read of the wide run payload.
   size_type sidecar_plan_groups, sidecar_plan_detail_records;
   size_type full_record_plan_rescans, restored_sidecar_metadata;
-  size_type grouped_expansion_records, expansion_context_bytes_saved;
   // These aggregate PathSortRun codec references across all label-run passes.
   // A record rewritten by a merge may therefore contribute more than once.
+  size_type grouped_expansion_records, expansion_context_bytes_saved;
+  // Join-run byte totals include every immutable primary run generation,
+  // including merge rewrites. Logical bytes describe the unchanged
+  // fixed-record stream; stored bytes are exact primary-artifact sizes. Raw
+  // group/detail sidecars are reported by the general I/O counters instead.
+  size_type join_run_logical_bytes, join_run_stored_bytes, compressed_join_runs;
+  // Top-level operational allocations. Distribution has its own lifetime;
+  // label sorting and join blocking are concurrent and must sum to the limit.
+  size_type distribution_sort_budget, label_sort_budget, join_block_budget;
   size_type max_records_resident, max_bytes_resident;
 
   ExternalPathJoinStats() :
@@ -476,6 +484,8 @@ struct ExternalPathJoinStats
     sidecar_plan_groups(0), sidecar_plan_detail_records(0),
     full_record_plan_rescans(0), restored_sidecar_metadata(0),
     grouped_expansion_records(0), expansion_context_bytes_saved(0),
+    join_run_logical_bytes(0), join_run_stored_bytes(0), compressed_join_runs(0),
+    distribution_sort_budget(0), label_sort_budget(0), join_block_budget(0),
     max_records_resident(0), max_bytes_resident(0) { }
 };
 

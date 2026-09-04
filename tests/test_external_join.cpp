@@ -9,6 +9,7 @@
 #include <fstream>
 #include <filesystem>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -302,6 +303,7 @@ int main(int argc, char** argv)
   parameters.setSortRunSize(externalPathGraphSortMinimumBudget());
   parameters.setMergeFanIn(2);
   parameters.setWorkDirectory(".");
+  parameters.setTempCompression("none");
   ExternalPathJoinStats stats;
   externalPathGraphExtend(external, GIGABYTE, parameters, &stats);
 
@@ -315,6 +317,8 @@ int main(int argc, char** argv)
   require(stats.initial_runs > 2 && stats.merge_operations > 0);
   require(stats.label_sort_runs > 2 && stats.label_merge_passes > 0);
   require(stats.blocked_key_groups > 0);
+  require(stats.compressed_join_runs == 0);
+  require(stats.join_run_stored_bytes == stats.join_run_logical_bytes);
   require(stats.max_bytes_resident <= memory_budget);
 
   // A tiny single-process budget forces the same high-fanout key through
@@ -334,6 +338,35 @@ int main(int argc, char** argv)
   require(blocked_stats.blocked_key_blocks > 1);
   require(blocked_stats.max_bytes_resident <= blocked_parameters.getMemoryLimitBytes());
 
+  // These are caps, not two simultaneous reservations. Distribution sorting
+  // precedes label generation and may use the complete phase-local sort cap;
+  // setting both expert caps to the global ceiling must therefore produce one
+  // right run and one left run instead of starving distribution down to the
+  // join minimum and creating a deep merge cascade.
+  PathGraph roomy_graph(left_path, left_rank);
+  roomy_graph.order = 1;
+  roomy_graph.logical_file_ids[0] = logical_file_id_t(7);
+  roomy_graph.physical_shard_ids[0] = physical_shard_id_t(101);
+  appendShard(roomy_graph, right_path, right_rank,
+    logical_file_id_t(7), physical_shard_id_t(202));
+  ConstructionParameters roomy_parameters;
+  roomy_parameters.setMemoryLimitBytes(8 * MEGABYTE);
+  roomy_parameters.setSortRunSize(8 * MEGABYTE);
+  roomy_parameters.setJoinPartitionSize(8 * MEGABYTE);
+  roomy_parameters.setMergeFanIn(2);
+  roomy_parameters.setWorkDirectory(".");
+  roomy_parameters.setTempCompression("none");
+  ExternalPathJoinStats roomy_stats;
+  externalPathGraphExtend(roomy_graph, GIGABYTE, roomy_parameters,
+    &roomy_stats);
+  requireSameGraph(legacy, roomy_graph, "phase-local distribution budget");
+  require(roomy_stats.initial_runs == 2);
+  require(roomy_stats.distribution_sort_budget == 8 * MEGABYTE);
+  require(roomy_stats.label_sort_budget + roomy_stats.join_block_budget <=
+    roomy_parameters.getMemoryLimitBytes());
+  require(roomy_stats.max_bytes_resident <=
+    roomy_parameters.getMemoryLimitBytes());
+
   // The aggregate goal normally derives a 75/25 sort/join split. At 1 MiB,
   // however, the nominal join quarter is smaller than its fixed stream
   // buffers. The allocator must rebalance the still-feasible aggregate budget
@@ -350,12 +383,37 @@ int main(int argc, char** argv)
   automatic_parameters.setMemoryLimitBytes(MEGABYTE);
   automatic_parameters.setMergeFanIn(2);
   automatic_parameters.setWorkDirectory(".");
+  // Make even the minimum framed writer workspace infeasible. AUTO must keep
+  // the byte-identical raw JOIN stream instead of rejecting an otherwise
+  // feasible aggregate memory goal.
+  automatic_parameters.setCompressionWorkers(256);
   ExternalPathJoinStats automatic_stats;
   externalPathGraphExtend(automatic_graph, GIGABYTE,
     automatic_parameters, &automatic_stats);
   requireSameGraph(legacy, automatic_graph, "automatic aggregate budget");
+  require(automatic_stats.compressed_join_runs == 0);
   require(automatic_stats.max_bytes_resident <=
     automatic_parameters.getMemoryLimitBytes());
+
+  PathGraph rejected_graph(left_path, left_rank);
+  rejected_graph.order = 1;
+  rejected_graph.logical_file_ids[0] = logical_file_id_t(7);
+  rejected_graph.physical_shard_ids[0] = physical_shard_id_t(101);
+  appendShard(rejected_graph, right_path, right_rank,
+    logical_file_id_t(7), physical_shard_id_t(202));
+  ConstructionParameters rejected_parameters = automatic_parameters;
+  rejected_parameters.setTempCompression("zstd");
+  bool rejected_zstd = false;
+  try
+  {
+    externalPathGraphExtend(rejected_graph, GIGABYTE, rejected_parameters);
+  }
+  catch(const std::runtime_error& error)
+  {
+    rejected_zstd = (std::string(error.what()).find(
+      "join-sort budget cannot admit compressed join-run") != std::string::npos);
+  }
+  require(rejected_zstd);
 
   char workspace_root[] = "/tmp/gcsa-path-checkpoint-XXXXXX";
   require(mkdtemp(workspace_root) != nullptr);
@@ -375,7 +433,9 @@ int main(int argc, char** argv)
     logical_file_id_t(7), physical_shard_id_t(202));
   ConstructionParameters process_parameters = parameters;
   process_parameters.setMemoryLimitBytes(8 * MEGABYTE);
-  process_parameters.setJoinPartitionSize(2 * MEGABYTE);
+  // Four MiB admits the framed run writer plus two framed run readers and,
+  // on the next doubling step, the compressed source-shard decoder pair.
+  process_parameters.setJoinPartitionSize(4 * MEGABYTE);
   process_parameters.setSortRunSize(2 * MEGABYTE);
   process_parameters.setCheckpointBytes(32 * KILOBYTE);
   process_parameters.setProcessWorkers(2);
@@ -419,6 +479,9 @@ int main(int argc, char** argv)
   require(process_stats.sidecar_plan_groups > 0);
   require(process_stats.sidecar_plan_detail_records > 0);
   require(process_stats.full_record_plan_rescans == 0);
+  require(process_stats.compressed_join_runs > 0);
+  require(process_stats.join_run_stored_bytes <
+    process_stats.join_run_logical_bytes);
   require(process_stats.grouped_expansion_records > 0);
   require(process_stats.expansion_context_bytes_saved > 0);
   require(process_stats.max_bytes_resident <= process_parameters.getMemoryLimitBytes());
