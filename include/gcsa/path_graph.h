@@ -470,9 +470,11 @@ struct ExternalPathJoinStats
   size_type grouped_expansion_records, expansion_context_bytes_saved;
   // Join-run byte totals include every immutable primary run generation,
   // including merge rewrites. Logical bytes describe the unchanged
-  // fixed-record stream; stored bytes are exact primary-artifact sizes. Raw
-  // group/detail sidecars are reported by the general I/O counters instead.
+  // fixed-record stream. Sidecar totals include every immutable group/detail
+  // pair written alongside those runs, in their logical and installed forms.
   size_type join_run_logical_bytes, join_run_stored_bytes, compressed_join_runs;
+  size_type join_sidecar_logical_bytes, join_sidecar_stored_bytes;
+  size_type compressed_join_sidecars;
   // Top-level operational allocations. Distribution has its own lifetime;
   // label sorting and join blocking are concurrent and must sum to the limit.
   size_type distribution_sort_budget, label_sort_budget, join_block_budget;
@@ -492,6 +494,8 @@ struct ExternalPathJoinStats
     full_record_plan_rescans(0), restored_sidecar_metadata(0),
     grouped_expansion_records(0), expansion_context_bytes_saved(0),
     join_run_logical_bytes(0), join_run_stored_bytes(0), compressed_join_runs(0),
+    join_sidecar_logical_bytes(0), join_sidecar_stored_bytes(0),
+    compressed_join_sidecars(0),
     distribution_sort_budget(0), label_sort_budget(0), join_block_budget(0),
     max_records_resident(0), max_bytes_resident(0) { }
 };

@@ -1332,6 +1332,17 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
                     << join_stats.compressed_join_runs << " compressed runs, "
                     << ratio << " stored/logical)" << std::endl;
         }
+        if(join_stats.join_sidecar_logical_bytes > 0)
+        {
+          double ratio = static_cast<double>(join_stats.join_sidecar_stored_bytes) /
+            static_cast<double>(join_stats.join_sidecar_logical_bytes);
+          std::cerr << "externalPathGraphExtend(): stored "
+                    << formatBytes(join_stats.join_sidecar_stored_bytes) << " for "
+                    << formatBytes(join_stats.join_sidecar_logical_bytes)
+                    << " of logical join group/detail sidecars ("
+                    << join_stats.compressed_join_sidecars << " compressed sidecars, "
+                    << ratio << " stored/logical)" << std::endl;
+        }
         std::cerr << "externalPathGraphExtend(): maximum bounded workspace "
                   << formatBytes(join_stats.max_bytes_resident) << " ("
                   << join_stats.max_records_resident << " records)" << std::endl;

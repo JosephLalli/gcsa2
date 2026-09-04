@@ -47,6 +47,7 @@ constexpr std::uint64_t JOIN_GROUP_FOOTER_MAGIC = 0x31444e4547534347ULL; // "GCS
 constexpr std::uint64_t JOIN_DETAIL_HEADER_MAGIC = 0x314c544447534347ULL; // "GCSGDTL1"
 constexpr std::uint64_t JOIN_DETAIL_FOOTER_MAGIC = 0x3154454447534347ULL; // "GCSGDET1"
 constexpr std::uint32_t JOIN_GROUP_FORMAT_VERSION = 1;
+constexpr std::uint32_t JOIN_GROUP_FRAMED_FORMAT_VERSION = 2;
 constexpr size_type JOIN_BASE_FIXED_BYTES = 32 * KILOBYTE;
 constexpr size_type JOIN_LABEL_COUNT = PathLabel::LABEL_LENGTH + 1;
 constexpr size_type JOIN_HEADER_BYTES = 8 + 4 + 4 + 4 + 8;
@@ -381,30 +382,42 @@ decodeJoinGroupSummary(const std::array<std::uint8_t, JOIN_GROUP_SUMMARY_BYTES>&
 class JoinGroupSidecarWriter
 {
 public:
-  JoinGroupSidecarWriter(logical_file_id_t logical, JoinKeyKind kind) :
+  JoinGroupSidecarWriter(logical_file_id_t logical, JoinKeyKind kind,
+    size_type records, const TempFileCodecParameters& codec) :
     logical_id(logical), key_kind(kind), summary_name(TempFile::getName("gcsa_join_groups")),
     detail_name(TempFile::getName("gcsa_join_group_detail")),
     summary_descriptor(-1), detail_descriptor(-1), group_count(0), detail_records(0),
     summary_checksum(1469598103934665603ULL),
     detail_checksum(1469598103934665603ULL), summary_released(0), detail_released(0),
-    active(), have_active(false), finished(false), summary_buffer(), detail_buffer()
+    active(), have_active(false), finished(false), summary_buffer(), detail_buffer(),
+    summary_compressed(), detail_compressed(), framed(codec.enabled()),
+    frame_block_size(codec.block_size), expected_records(records)
   {
-    this->summary_descriptor = ::open(this->summary_name.c_str(),
-      O_CREAT | O_EXCL | O_WRONLY, 0644);
-    if(this->summary_descriptor < 0)
+    if(this->framed)
     {
-      throw joinError("cannot create join group sidecar", this->summary_name);
+      this->summary_compressed.reset(new CompressedBlockWriter(this->summary_name,
+        codec.block_size, CompressedBlockWriter::ZSTD, codec.level, codec.workers));
+      this->detail_compressed.reset(new CompressedBlockWriter(this->detail_name,
+        codec.block_size, CompressedBlockWriter::ZSTD, codec.level, codec.workers));
     }
-    this->detail_descriptor = ::open(this->detail_name.c_str(),
-      O_CREAT | O_EXCL | O_WRONLY, 0644);
-    if(this->detail_descriptor < 0)
+    else
     {
-      int saved_errno = errno; ::close(this->summary_descriptor);
-      this->summary_descriptor = -1;
-      errno = saved_errno;
-      throw joinError("cannot create join group detail sidecar", this->detail_name);
+      this->summary_descriptor = ::open(this->summary_name.c_str(),
+        O_CREAT | O_EXCL | O_WRONLY, 0644);
+      if(this->summary_descriptor < 0)
+      {
+        throw joinError("cannot create join group detail sidecar", this->detail_name);
+      }
+      this->detail_descriptor = ::open(this->detail_name.c_str(),
+        O_CREAT | O_EXCL | O_WRONLY, 0644);
+      if(this->detail_descriptor < 0)
+      {
+        ::close(this->summary_descriptor); this->summary_descriptor = -1;
+        TempFile::remove(this->summary_name);
+        throw joinError("cannot create join group sidecar", this->summary_name);
+      }
+      adviseSequential(this->summary_descriptor); adviseSequential(this->detail_descriptor);
     }
-    adviseSequential(this->summary_descriptor); adviseSequential(this->detail_descriptor);
     this->writeHeaders();
     this->summary_buffer.reserve(std::max(static_cast<size_type>(1),
       JOIN_IO_BUFFER_BYTES / JOIN_GROUP_SUMMARY_BYTES));
@@ -474,18 +487,22 @@ public:
     }
     if(this->have_active) { this->finishGroup(records); }
     this->flushSummaries(); this->flushDetails();
-    this->writeFinalMetadata(records, run_checksum);
+    if(!this->framed) { this->writeFinalMetadata(records, run_checksum); }
     this->writeFooters(records, run_checksum);
-    trimWrittenCache(this->summary_descriptor, this->summary_released, true,
-      this->summary_name);
-    trimWrittenCache(this->detail_descriptor, this->detail_released, true,
-      this->detail_name);
-    if(::close(this->summary_descriptor) != 0)
+    if(this->framed) { this->summary_compressed->finish(); this->detail_compressed->finish(); }
+    if(!this->framed)
+    {
+      trimWrittenCache(this->summary_descriptor, this->summary_released, true,
+        this->summary_name);
+      trimWrittenCache(this->detail_descriptor, this->detail_released, true,
+        this->detail_name);
+    }
+    if(!this->framed && ::close(this->summary_descriptor) != 0)
     {
       throw joinError("cannot close join group sidecar", this->summary_name);
     }
     this->summary_descriptor = -1;
-    if(::close(this->detail_descriptor) != 0)
+    if(!this->framed && ::close(this->detail_descriptor) != 0)
     {
       throw joinError("cannot close join group detail sidecar", this->detail_name);
     }
@@ -508,33 +525,35 @@ public:
     this->finished = true;
   }
 
+  bool isFramed() const { return this->framed; }
+
 private:
   void writeHeaders()
   {
     std::array<std::uint8_t, JOIN_GROUP_HEADER_BYTES> summary_header;
     std::uint8_t* summary = summary_header.data();
     encodeLittle<std::uint64_t>(summary, JOIN_GROUP_HEADER_MAGIC);
-    encodeLittle<std::uint32_t>(summary, JOIN_GROUP_FORMAT_VERSION);
+    encodeLittle<std::uint32_t>(summary, this->framed ?
+      JOIN_GROUP_FRAMED_FORMAT_VERSION : JOIN_GROUP_FORMAT_VERSION);
     encodeLittle<std::uint32_t>(summary, static_cast<std::uint32_t>(this->key_kind));
     encodeLittle<std::uint32_t>(summary, this->logical_id.value);
     encodeLittle<std::uint32_t>(summary, 0);
+    encodeLittle<std::uint64_t>(summary, this->expected_records);
     encodeLittle<std::uint64_t>(summary, 0);
     encodeLittle<std::uint64_t>(summary, 0);
-    encodeLittle<std::uint64_t>(summary, 0);
-    writeAll(this->summary_descriptor, summary_header.data(), summary_header.size(),
-      this->summary_name);
+    this->writeSummary(summary_header.data(), summary_header.size());
 
     std::array<std::uint8_t, JOIN_DETAIL_HEADER_BYTES> detail_header;
     std::uint8_t* details = detail_header.data();
     encodeLittle<std::uint64_t>(details, JOIN_DETAIL_HEADER_MAGIC);
-    encodeLittle<std::uint32_t>(details, JOIN_GROUP_FORMAT_VERSION);
+    encodeLittle<std::uint32_t>(details, this->framed ?
+      JOIN_GROUP_FRAMED_FORMAT_VERSION : JOIN_GROUP_FORMAT_VERSION);
     encodeLittle<std::uint32_t>(details, static_cast<std::uint32_t>(this->key_kind));
     encodeLittle<std::uint32_t>(details, this->logical_id.value);
     encodeLittle<std::uint32_t>(details, 0);
+    encodeLittle<std::uint64_t>(details, this->expected_records);
     encodeLittle<std::uint64_t>(details, 0);
-    encodeLittle<std::uint64_t>(details, 0);
-    writeAll(this->detail_descriptor, detail_header.data(), detail_header.size(),
-      this->detail_name);
+    this->writeDetail(detail_header.data(), detail_header.size());
   }
 
   void startGroup(node_type key, size_type begin)
@@ -567,10 +586,10 @@ private:
   void flushSummaries()
   {
     if(this->summary_buffer.empty()) { return; }
-    writeAll(this->summary_descriptor, this->summary_buffer.data(),
-      this->summary_buffer.size() * JOIN_GROUP_SUMMARY_BYTES, this->summary_name);
+    this->writeSummary(this->summary_buffer.data(),
+      this->summary_buffer.size() * JOIN_GROUP_SUMMARY_BYTES);
     this->summary_buffer.clear();
-    if(::lseek(this->summary_descriptor, 0, SEEK_CUR) - this->summary_released >=
+    if(!this->framed && ::lseek(this->summary_descriptor, 0, SEEK_CUR) - this->summary_released >=
        JOIN_CACHE_FLUSH_BYTES)
     {
       trimWrittenCache(this->summary_descriptor, this->summary_released, false,
@@ -581,10 +600,9 @@ private:
   void flushDetails()
   {
     if(this->detail_buffer.empty()) { return; }
-    writeAll(this->detail_descriptor, this->detail_buffer.data(),
-      this->detail_buffer.size(), this->detail_name);
+    this->writeDetail(this->detail_buffer.data(), this->detail_buffer.size());
     this->detail_buffer.clear();
-    if(::lseek(this->detail_descriptor, 0, SEEK_CUR) - this->detail_released >=
+    if(!this->framed && ::lseek(this->detail_descriptor, 0, SEEK_CUR) - this->detail_released >=
        JOIN_CACHE_FLUSH_BYTES)
     {
       trimWrittenCache(this->detail_descriptor, this->detail_released, false,
@@ -619,8 +637,7 @@ private:
     encodeLittle<std::uint64_t>(summary, run_checksum);
     encodeLittle<std::uint64_t>(summary, this->group_count);
     encodeLittle<std::uint64_t>(summary, this->summary_checksum);
-    writeAll(this->summary_descriptor, summary_footer.data(), summary_footer.size(),
-      this->summary_name);
+    this->writeSummary(summary_footer.data(), summary_footer.size());
 
     std::array<std::uint8_t, JOIN_DETAIL_FOOTER_BYTES> detail_footer;
     std::uint8_t* details = detail_footer.data();
@@ -628,8 +645,35 @@ private:
     encodeLittle<std::uint64_t>(details, records);
     encodeLittle<std::uint64_t>(details, run_checksum);
     encodeLittle<std::uint64_t>(details, this->detail_checksum);
-    writeAll(this->detail_descriptor, detail_footer.data(), detail_footer.size(),
-      this->detail_name);
+    this->writeDetail(detail_footer.data(), detail_footer.size());
+  }
+
+  void writeSummary(const void* data, size_type bytes)
+  {
+    if(this->framed)
+    {
+      const std::uint8_t* source = static_cast<const std::uint8_t*>(data);
+      while(bytes > 0)
+      {
+        size_type chunk = std::min(bytes, this->frame_block_size);
+        this->summary_compressed->writeRecord(source, chunk); source += chunk; bytes -= chunk;
+      }
+    }
+    else { writeAll(this->summary_descriptor, data, bytes, this->summary_name); }
+  }
+
+  void writeDetail(const void* data, size_type bytes)
+  {
+    if(this->framed)
+    {
+      const std::uint8_t* source = static_cast<const std::uint8_t*>(data);
+      while(bytes > 0)
+      {
+        size_type chunk = std::min(bytes, this->frame_block_size);
+        this->detail_compressed->writeRecord(source, chunk); source += chunk; bytes -= chunk;
+      }
+    }
+    else { writeAll(this->detail_descriptor, data, bytes, this->detail_name); }
   }
 
   JoinGroupSidecarWriter(const JoinGroupSidecarWriter&);
@@ -646,6 +690,10 @@ private:
   bool have_active, finished;
   std::vector<std::array<std::uint8_t, JOIN_GROUP_SUMMARY_BYTES>> summary_buffer;
   std::vector<std::uint8_t> detail_buffer;
+  std::unique_ptr<CompressedBlockWriter> summary_compressed, detail_compressed;
+  bool framed;
+  size_type frame_block_size;
+  size_type expected_records;
 };
 
 bool
@@ -682,7 +730,7 @@ public:
     name(path), logical_id(logical), key_kind(kind), descriptor(-1),
     expected_count(expected_records), count(0),
     checksum(1469598103934665603ULL), cache_released(0), finished(false),
-    statistics(stats), sidecar(logical, kind), compressed(),
+    statistics(stats), sidecar(logical, kind, expected_records, codec), compressed(),
     batch_records(JOIN_IO_BUFFER_RECORDS), buffer()
   {
     try
@@ -809,6 +857,31 @@ public:
             this->statistics->compressed_join_runs, 1,
             "compressed join-run count");
         }
+        const size_type summary_logical = checkedJoinAdd(JOIN_GROUP_HEADER_BYTES,
+          checkedJoinAdd(checkedJoinMultiply(group_sidecar.groups,
+            JOIN_GROUP_SUMMARY_BYTES, "join sidecar summary payload bytes"),
+            JOIN_GROUP_FOOTER_BYTES, "join sidecar summary footer bytes"),
+          "join sidecar summary logical bytes");
+        const size_type detail_logical = checkedJoinAdd(JOIN_DETAIL_HEADER_BYTES,
+          checkedJoinAdd(this->count, JOIN_DETAIL_FOOTER_BYTES,
+            "join sidecar detail footer bytes"),
+          "join sidecar detail logical bytes");
+        const size_type sidecar_logical = checkedJoinAdd(summary_logical,
+          detail_logical, "join sidecar logical bytes");
+        const size_type sidecar_stored = checkedJoinAdd(storedJoinBytes(group_sidecar.summary_name),
+          storedJoinBytes(group_sidecar.detail_name), "join sidecar stored bytes");
+        this->statistics->join_sidecar_logical_bytes = checkedJoinAdd(
+          this->statistics->join_sidecar_logical_bytes, sidecar_logical,
+          "aggregate join sidecar logical bytes");
+        this->statistics->join_sidecar_stored_bytes = checkedJoinAdd(
+          this->statistics->join_sidecar_stored_bytes, sidecar_stored,
+          "aggregate join sidecar stored bytes");
+        if(this->framedSidecars())
+        {
+          this->statistics->compressed_join_sidecars = checkedJoinAdd(
+            this->statistics->compressed_join_sidecars, 2,
+            "compressed join sidecar count");
+        }
       }
       this->finished = true;
       return JoinRun(this->name, this->count, this->checksum, group_sidecar);
@@ -846,6 +919,11 @@ private:
         trimWrittenCache(this->descriptor, this->cache_released, false, this->name);
       }
     }
+  }
+
+  bool framedSidecars() const
+  {
+    return this->sidecar.isFramed();
   }
 
   JoinFileWriter(const JoinFileWriter&);
@@ -1112,7 +1190,8 @@ joinRunWriterExtra(const TempFileCodecParameters& codec)
 {
   // JOIN_FIXED_BYTES owns the aligned JOIN staging buffer in both formats.
   // Framing adds its block, compressed output, and codec context on top.
-  return joinRunWriterMemory(codec);
+  return checkedJoinMultiply(3, joinRunWriterMemory(codec),
+    "compressed join and sidecar writer workspaces");
 }
 
 size_type
@@ -1140,6 +1219,29 @@ joinRunReaderPairMemory(const JoinRun& left, const JoinRun& right)
 {
   return checkedJoinAdd(joinRunReaderMemory(left), joinRunReaderMemory(right),
     "join-run reader codec workspaces");
+}
+
+size_type
+joinSidecarReaderMemory(const JoinRun& run)
+{
+  const bool summary_framed = CompressedBlockReader::isFramed(run.sidecar.summary_name);
+  const bool detail_framed = CompressedBlockReader::isFramed(run.sidecar.detail_name);
+  if(summary_framed != detail_framed)
+  {
+    throw joinError("join sidecar uses inconsistent storage formats", run.sidecar.summary_name);
+  }
+  if(!summary_framed) { return 0; }
+  std::uint64_t summary_block = CompressedBlockReader::declaredBlockSize(run.sidecar.summary_name);
+  std::uint64_t detail_block = CompressedBlockReader::declaredBlockSize(run.sidecar.detail_name);
+  if(summary_block > std::numeric_limits<size_type>::max() ||
+     detail_block > std::numeric_limits<size_type>::max())
+  {
+    throw joinError("compressed join sidecar block exceeds this build", run.sidecar.summary_name);
+  }
+  return checkedJoinAdd(CompressedBlockReader::workingMemoryEstimate(
+      static_cast<size_type>(summary_block)),
+    CompressedBlockReader::workingMemoryEstimate(static_cast<size_type>(detail_block)),
+    "join sidecar reader workspaces");
 }
 
 size_type
@@ -1205,8 +1307,10 @@ public:
   JoinGroupSidecarReader(const JoinRun& run, logical_file_id_t logical,
     JoinKeyKind kind) :
     summary_name(run.sidecar.summary_name), detail_name(run.sidecar.detail_name),
-    summary_descriptor(-1), detail_descriptor(-1), record_count(run.records),
-    group_count(0), expected_summary_checksum(0), expected_detail_checksum(0),
+    summary_descriptor(-1), detail_descriptor(-1),
+    summary_compressed(), detail_compressed(),
+    record_count(run.records), group_count(0),
+    expected_summary_checksum(0), expected_detail_checksum(0),
     summary_cache_released(0), detail_cache_released(0),
     summary_buffer(std::max(static_cast<size_type>(1),
       JOIN_IO_BUFFER_BYTES / JOIN_GROUP_SUMMARY_BYTES)),
@@ -1217,106 +1321,159 @@ public:
     {
       throw joinError("join run has no group sidecar", run.name);
     }
-    this->summary_descriptor = ::open(this->summary_name.c_str(), O_RDONLY);
-    this->detail_descriptor = ::open(this->detail_name.c_str(), O_RDONLY);
-    if(this->summary_descriptor < 0 || this->detail_descriptor < 0)
+    try
     {
-      throw joinError("cannot open join group sidecar", this->summary_name);
-    }
-    adviseSequential(this->summary_descriptor); adviseSequential(this->detail_descriptor);
+      const bool summary_framed = CompressedBlockReader::isFramed(this->summary_name);
+      const bool detail_framed = CompressedBlockReader::isFramed(this->detail_name);
+      if(summary_framed != detail_framed)
+      {
+        throw joinError("join sidecar uses inconsistent storage formats",
+          this->summary_name);
+      }
+      if(summary_framed)
+      {
+        this->summary_compressed.reset(new CompressedBlockReader(this->summary_name));
+        this->detail_compressed.reset(new CompressedBlockReader(this->detail_name));
+      }
+      else
+      {
+        this->summary_descriptor = ::open(this->summary_name.c_str(), O_RDONLY);
+        if(this->summary_descriptor < 0)
+        {
+          throw joinError("cannot open join group sidecar", this->summary_name);
+        }
+        this->detail_descriptor = ::open(this->detail_name.c_str(), O_RDONLY);
+        if(this->detail_descriptor < 0)
+        {
+          throw joinError("cannot open join group detail sidecar", this->detail_name);
+        }
+        adviseSequential(this->summary_descriptor);
+        adviseSequential(this->detail_descriptor);
+      }
 
-    std::array<std::uint8_t, JOIN_GROUP_HEADER_BYTES> summary_header;
-    preadAll(this->summary_descriptor, summary_header.data(), summary_header.size(), 0,
-      this->summary_name);
-    const std::uint8_t* input = summary_header.data();
-    std::uint64_t summary_magic = decodeLittle<std::uint64_t>(input);
-    std::uint32_t summary_version = decodeLittle<std::uint32_t>(input);
-    std::uint32_t summary_kind = decodeLittle<std::uint32_t>(input);
-    std::uint32_t summary_logical = decodeLittle<std::uint32_t>(input);
-    std::uint32_t summary_reserved = decodeLittle<std::uint32_t>(input);
-    size_type summary_records = decodeLittle<std::uint64_t>(input);
-    std::uint64_t summary_run_checksum = decodeLittle<std::uint64_t>(input);
-    this->group_count = decodeLittle<std::uint64_t>(input);
-    if(summary_magic != JOIN_GROUP_HEADER_MAGIC ||
-       summary_version != JOIN_GROUP_FORMAT_VERSION ||
-       summary_kind != static_cast<std::uint32_t>(kind) ||
-       summary_logical != logical.value || summary_reserved != 0 ||
-       summary_records != run.records || summary_run_checksum != run.checksum ||
-       this->group_count != run.sidecar.groups ||
-       this->group_count > (std::numeric_limits<size_type>::max() -
-         JOIN_GROUP_HEADER_BYTES - JOIN_GROUP_FOOTER_BYTES) / JOIN_GROUP_SUMMARY_BYTES)
-    {
-      throw joinError("join group sidecar header mismatch", this->summary_name);
-    }
-    struct stat summary_info;
-    size_type summary_bytes = JOIN_GROUP_HEADER_BYTES +
-      this->group_count * JOIN_GROUP_SUMMARY_BYTES + JOIN_GROUP_FOOTER_BYTES;
-    if(::fstat(this->summary_descriptor, &summary_info) != 0 ||
-       summary_info.st_size < 0 || static_cast<size_type>(summary_info.st_size) != summary_bytes)
-    {
-      throw joinError("join group sidecar length mismatch", this->summary_name);
-    }
-    std::array<std::uint8_t, JOIN_GROUP_FOOTER_BYTES> summary_footer;
-    preadAll(this->summary_descriptor, summary_footer.data(), summary_footer.size(),
-      JOIN_GROUP_HEADER_BYTES + this->group_count * JOIN_GROUP_SUMMARY_BYTES,
-      this->summary_name);
-    input = summary_footer.data();
-    if(decodeLittle<std::uint64_t>(input) != JOIN_GROUP_FOOTER_MAGIC ||
-       decodeLittle<std::uint64_t>(input) != run.records ||
-       decodeLittle<std::uint64_t>(input) != run.checksum ||
-       decodeLittle<std::uint64_t>(input) != this->group_count)
-    {
-      throw joinError("join group sidecar footer mismatch", this->summary_name);
-    }
-    this->expected_summary_checksum = decodeLittle<std::uint64_t>(input);
-    if(this->expected_summary_checksum != run.sidecar.summary_checksum)
-    {
-      throw joinError("join group sidecar checksum identity mismatch", this->summary_name);
-    }
+      std::array<std::uint8_t, JOIN_GROUP_HEADER_BYTES> summary_header;
+      this->readSummary(summary_header.data(), summary_header.size(), 0);
+      const std::uint8_t* input = summary_header.data();
+      std::uint64_t summary_magic = decodeLittle<std::uint64_t>(input);
+      std::uint32_t summary_version = decodeLittle<std::uint32_t>(input);
+      std::uint32_t summary_kind = decodeLittle<std::uint32_t>(input);
+      std::uint32_t summary_logical = decodeLittle<std::uint32_t>(input);
+      std::uint32_t summary_reserved = decodeLittle<std::uint32_t>(input);
+      size_type summary_records = decodeLittle<std::uint64_t>(input);
+      std::uint64_t summary_run_checksum = decodeLittle<std::uint64_t>(input);
+      this->group_count = decodeLittle<std::uint64_t>(input);
+      if(this->summary_compressed && this->group_count == 0)
+      {
+        // The framed stream cannot patch its first logical block after the
+        // terminal group is known; the immutable JoinRun carries that same
+        // footer-authenticated count.
+        this->group_count = run.sidecar.groups;
+      }
+      std::uint32_t expected_summary_version = (this->summary_compressed ?
+        JOIN_GROUP_FRAMED_FORMAT_VERSION : JOIN_GROUP_FORMAT_VERSION);
+      if(summary_magic != JOIN_GROUP_HEADER_MAGIC ||
+         summary_version != expected_summary_version ||
+         summary_kind != static_cast<std::uint32_t>(kind) ||
+         summary_logical != logical.value || summary_reserved != 0 ||
+         summary_records != run.records ||
+         (summary_run_checksum != run.checksum &&
+          !(this->summary_compressed && summary_run_checksum == 0)) ||
+         this->group_count != run.sidecar.groups ||
+         this->group_count > (std::numeric_limits<size_type>::max() -
+           JOIN_GROUP_HEADER_BYTES - JOIN_GROUP_FOOTER_BYTES) /
+           JOIN_GROUP_SUMMARY_BYTES)
+      {
+        throw joinError("join group sidecar header mismatch", this->summary_name);
+      }
+      size_type summary_bytes = JOIN_GROUP_HEADER_BYTES +
+        this->group_count * JOIN_GROUP_SUMMARY_BYTES + JOIN_GROUP_FOOTER_BYTES;
+      if((this->summary_compressed &&
+          this->summary_compressed->logicalSize() != summary_bytes) ||
+         (!this->summary_compressed &&
+          !this->rawLength(this->summary_descriptor, summary_bytes)))
+      {
+        throw joinError("join group sidecar length mismatch", this->summary_name);
+      }
+      std::array<std::uint8_t, JOIN_GROUP_FOOTER_BYTES> summary_footer;
+      this->readSummary(summary_footer.data(), summary_footer.size(),
+        JOIN_GROUP_HEADER_BYTES + this->group_count * JOIN_GROUP_SUMMARY_BYTES);
+      input = summary_footer.data();
+      if(decodeLittle<std::uint64_t>(input) != JOIN_GROUP_FOOTER_MAGIC ||
+         decodeLittle<std::uint64_t>(input) != run.records ||
+         decodeLittle<std::uint64_t>(input) != run.checksum ||
+         decodeLittle<std::uint64_t>(input) != this->group_count)
+      {
+        throw joinError("join group sidecar footer mismatch", this->summary_name);
+      }
+      this->expected_summary_checksum = decodeLittle<std::uint64_t>(input);
+      if(this->expected_summary_checksum != run.sidecar.summary_checksum)
+      {
+        throw joinError("join group sidecar checksum identity mismatch",
+          this->summary_name);
+      }
 
-    std::array<std::uint8_t, JOIN_DETAIL_HEADER_BYTES> detail_header;
-    preadAll(this->detail_descriptor, detail_header.data(), detail_header.size(), 0,
-      this->detail_name);
-    input = detail_header.data();
-    std::uint64_t detail_magic = decodeLittle<std::uint64_t>(input);
-    std::uint32_t detail_version = decodeLittle<std::uint32_t>(input);
-    std::uint32_t detail_kind = decodeLittle<std::uint32_t>(input);
-    std::uint32_t detail_logical = decodeLittle<std::uint32_t>(input);
-    std::uint32_t detail_reserved = decodeLittle<std::uint32_t>(input);
-    size_type detail_records = decodeLittle<std::uint64_t>(input);
-    std::uint64_t detail_run_checksum = decodeLittle<std::uint64_t>(input);
-    if(detail_magic != JOIN_DETAIL_HEADER_MAGIC ||
-       detail_version != JOIN_GROUP_FORMAT_VERSION ||
-       detail_kind != static_cast<std::uint32_t>(kind) ||
-       detail_logical != logical.value || detail_reserved != 0 ||
-       detail_records != run.records || detail_run_checksum != run.checksum ||
-       detail_records > std::numeric_limits<size_type>::max() -
-         JOIN_DETAIL_HEADER_BYTES - JOIN_DETAIL_FOOTER_BYTES)
-    {
-      throw joinError("join group detail header mismatch", this->detail_name);
+      std::array<std::uint8_t, JOIN_DETAIL_HEADER_BYTES> detail_header;
+      this->readDetail(detail_header.data(), detail_header.size(), 0);
+      input = detail_header.data();
+      std::uint64_t detail_magic = decodeLittle<std::uint64_t>(input);
+      std::uint32_t detail_version = decodeLittle<std::uint32_t>(input);
+      std::uint32_t detail_kind = decodeLittle<std::uint32_t>(input);
+      std::uint32_t detail_logical = decodeLittle<std::uint32_t>(input);
+      std::uint32_t detail_reserved = decodeLittle<std::uint32_t>(input);
+      size_type detail_records = decodeLittle<std::uint64_t>(input);
+      std::uint64_t detail_run_checksum = decodeLittle<std::uint64_t>(input);
+      std::uint32_t expected_detail_version = (this->detail_compressed ?
+        JOIN_GROUP_FRAMED_FORMAT_VERSION : JOIN_GROUP_FORMAT_VERSION);
+      if(detail_magic != JOIN_DETAIL_HEADER_MAGIC ||
+         detail_version != expected_detail_version ||
+         detail_kind != static_cast<std::uint32_t>(kind) ||
+         detail_logical != logical.value || detail_reserved != 0 ||
+         detail_records != run.records ||
+         (detail_run_checksum != run.checksum &&
+          !(this->detail_compressed && detail_run_checksum == 0)) ||
+         detail_records > std::numeric_limits<size_type>::max() -
+           JOIN_DETAIL_HEADER_BYTES - JOIN_DETAIL_FOOTER_BYTES)
+      {
+        throw joinError("join group detail header mismatch", this->detail_name);
+      }
+      size_type detail_bytes = JOIN_DETAIL_HEADER_BYTES + detail_records +
+        JOIN_DETAIL_FOOTER_BYTES;
+      if((this->detail_compressed &&
+          this->detail_compressed->logicalSize() != detail_bytes) ||
+         (!this->detail_compressed &&
+          !this->rawLength(this->detail_descriptor, detail_bytes)))
+      {
+        throw joinError("join group detail length mismatch", this->detail_name);
+      }
+      std::array<std::uint8_t, JOIN_DETAIL_FOOTER_BYTES> detail_footer;
+      this->readDetail(detail_footer.data(), detail_footer.size(),
+        JOIN_DETAIL_HEADER_BYTES + detail_records);
+      input = detail_footer.data();
+      if(decodeLittle<std::uint64_t>(input) != JOIN_DETAIL_FOOTER_MAGIC ||
+         decodeLittle<std::uint64_t>(input) != run.records ||
+         decodeLittle<std::uint64_t>(input) != run.checksum)
+      {
+        throw joinError("join group detail footer mismatch", this->detail_name);
+      }
+      this->expected_detail_checksum = decodeLittle<std::uint64_t>(input);
+      if(this->expected_detail_checksum != run.sidecar.detail_checksum)
+      {
+        throw joinError("join group detail checksum identity mismatch",
+          this->detail_name);
+      }
     }
-    struct stat detail_info;
-    size_type detail_bytes = JOIN_DETAIL_HEADER_BYTES + detail_records +
-      JOIN_DETAIL_FOOTER_BYTES;
-    if(::fstat(this->detail_descriptor, &detail_info) != 0 ||
-       detail_info.st_size < 0 || static_cast<size_type>(detail_info.st_size) != detail_bytes)
+    catch(...)
     {
-      throw joinError("join group detail length mismatch", this->detail_name);
-    }
-    std::array<std::uint8_t, JOIN_DETAIL_FOOTER_BYTES> detail_footer;
-    preadAll(this->detail_descriptor, detail_footer.data(), detail_footer.size(),
-      JOIN_DETAIL_HEADER_BYTES + detail_records, this->detail_name);
-    input = detail_footer.data();
-    if(decodeLittle<std::uint64_t>(input) != JOIN_DETAIL_FOOTER_MAGIC ||
-       decodeLittle<std::uint64_t>(input) != run.records ||
-       decodeLittle<std::uint64_t>(input) != run.checksum)
-    {
-      throw joinError("join group detail footer mismatch", this->detail_name);
-    }
-    this->expected_detail_checksum = decodeLittle<std::uint64_t>(input);
-    if(this->expected_detail_checksum != run.sidecar.detail_checksum)
-    {
-      throw joinError("join group detail checksum identity mismatch", this->detail_name);
+      if(this->summary_descriptor >= 0)
+      {
+        ::close(this->summary_descriptor); this->summary_descriptor = -1;
+      }
+      if(this->detail_descriptor >= 0)
+      {
+        ::close(this->detail_descriptor); this->detail_descriptor = -1;
+      }
+      this->summary_compressed.reset(); this->detail_compressed.reset();
+      throw;
     }
   }
 
@@ -1372,10 +1529,9 @@ public:
     for(size_type offset = begin; offset < end; )
     {
       size_type bytes = std::min(this->detail_buffer.size(), end - offset);
-      preadAll(this->detail_descriptor, this->detail_buffer.data(), bytes,
-        JOIN_DETAIL_HEADER_BYTES + offset, this->detail_name);
-      trimReadCache(this->detail_descriptor, JOIN_DETAIL_HEADER_BYTES + offset + bytes,
-        this->detail_cache_released);
+      this->readDetail(this->detail_buffer.data(), bytes, JOIN_DETAIL_HEADER_BYTES + offset);
+      if(!this->detail_compressed) { trimReadCache(this->detail_descriptor,
+        JOIN_DETAIL_HEADER_BYTES + offset + bytes, this->detail_cache_released); }
       for(size_type i = 0; i < bytes; i++)
       {
         std::uint8_t detail = this->detail_buffer[i];
@@ -1407,12 +1563,12 @@ public:
     std::array<std::uint8_t, JOIN_GROUP_SUMMARY_BYTES> encoded;
     for(size_type group = 0; group < this->group_count; group++)
     {
-      preadAll(this->summary_descriptor, encoded.data(), encoded.size(),
-        JOIN_GROUP_HEADER_BYTES + group * JOIN_GROUP_SUMMARY_BYTES,
-        this->summary_name);
+      this->readSummary(encoded.data(), encoded.size(),
+        JOIN_GROUP_HEADER_BYTES + group * JOIN_GROUP_SUMMARY_BYTES);
       summary_checksum = joinChecksum(encoded.data(), encoded.size(), summary_checksum);
-      trimReadCache(this->summary_descriptor, JOIN_GROUP_HEADER_BYTES +
-        (group + 1) * JOIN_GROUP_SUMMARY_BYTES, this->summary_cache_released);
+      if(!this->summary_compressed) { trimReadCache(this->summary_descriptor,
+        JOIN_GROUP_HEADER_BYTES + (group + 1) * JOIN_GROUP_SUMMARY_BYTES,
+        this->summary_cache_released); }
       JoinGroupSummary summary;
       decodeJoinGroupSummary(encoded, summary);
       if(summary.begin != cursor || summary.end > this->record_count ||
@@ -1430,11 +1586,10 @@ public:
     for(size_type offset = 0; offset < this->record_count; )
     {
       size_type bytes = std::min(this->detail_buffer.size(), this->record_count - offset);
-      preadAll(this->detail_descriptor, this->detail_buffer.data(), bytes,
-        JOIN_DETAIL_HEADER_BYTES + offset, this->detail_name);
+      this->readDetail(this->detail_buffer.data(), bytes, JOIN_DETAIL_HEADER_BYTES + offset);
       detail_checksum = joinChecksum(this->detail_buffer.data(), bytes, detail_checksum);
-      trimReadCache(this->detail_descriptor, JOIN_DETAIL_HEADER_BYTES + offset + bytes,
-        this->detail_cache_released);
+      if(!this->detail_compressed) { trimReadCache(this->detail_descriptor,
+        JOIN_DETAIL_HEADER_BYTES + offset + bytes, this->detail_cache_released); }
       for(size_type i = 0; i < bytes; i++)
       {
         size_type order = this->detail_buffer[i] & JOIN_DETAIL_ORDER_MASK;
@@ -1450,25 +1605,55 @@ public:
     {
       throw joinError("join group detail checksum mismatch", this->detail_name);
     }
-    discardCachedRange(this->summary_descriptor, 0, 0);
-    discardCachedRange(this->detail_descriptor, 0, 0);
+    if(this->summary_descriptor >= 0) { discardCachedRange(this->summary_descriptor, 0, 0); }
+    if(this->detail_descriptor >= 0) { discardCachedRange(this->detail_descriptor, 0, 0); }
     this->summary_cache_released = 0; this->detail_cache_released = 0;
     this->summary_buffer_records = 0;
   }
 
 private:
+  bool rawLength(int descriptor, size_type expected) const
+  {
+    struct stat info;
+    return (::fstat(descriptor, &info) == 0 && info.st_size >= 0 &&
+      static_cast<size_type>(info.st_size) == expected);
+  }
+
+  void readSummary(void* target, size_type bytes, size_type offset) const
+  {
+    if(this->summary_compressed)
+    {
+      if(this->summary_compressed->readAt(offset, target, bytes) != bytes)
+      {
+        throw joinError("unexpected end of framed join group sidecar", this->summary_name);
+      }
+    }
+    else { preadAll(this->summary_descriptor, target, bytes, offset, this->summary_name); }
+  }
+
+  void readDetail(void* target, size_type bytes, size_type offset) const
+  {
+    if(this->detail_compressed)
+    {
+      if(this->detail_compressed->readAt(offset, target, bytes) != bytes)
+      {
+        throw joinError("unexpected end of framed join group detail sidecar", this->detail_name);
+      }
+    }
+    else { preadAll(this->detail_descriptor, target, bytes, offset, this->detail_name); }
+  }
+
   void refillSummaries(size_type first) const
   {
     this->summary_buffer_first = first;
     this->summary_buffer_records = std::min(this->summary_buffer.size(),
       this->group_count - first);
-    preadAll(this->summary_descriptor, this->summary_buffer.data(),
+    this->readSummary(this->summary_buffer.data(),
       this->summary_buffer_records * JOIN_GROUP_SUMMARY_BYTES,
-      JOIN_GROUP_HEADER_BYTES + first * JOIN_GROUP_SUMMARY_BYTES,
-      this->summary_name);
-    trimReadCache(this->summary_descriptor, JOIN_GROUP_HEADER_BYTES +
-      (first + this->summary_buffer_records) * JOIN_GROUP_SUMMARY_BYTES,
-      this->summary_cache_released);
+      JOIN_GROUP_HEADER_BYTES + first * JOIN_GROUP_SUMMARY_BYTES);
+    if(!this->summary_compressed) { trimReadCache(this->summary_descriptor,
+      JOIN_GROUP_HEADER_BYTES + (first + this->summary_buffer_records) * JOIN_GROUP_SUMMARY_BYTES,
+      this->summary_cache_released); }
   }
 
   JoinGroupSidecarReader(const JoinGroupSidecarReader&);
@@ -1476,6 +1661,7 @@ private:
 
   std::string summary_name, detail_name;
   int summary_descriptor, detail_descriptor;
+  mutable std::unique_ptr<CompressedBlockReader> summary_compressed, detail_compressed;
   size_type record_count, group_count;
   std::uint64_t expected_summary_checksum, expected_detail_checksum;
   mutable off_t summary_cache_released, detail_cache_released;
@@ -2921,6 +3107,10 @@ planJoinPartitions(const JoinRun& left_run, const JoinRun& right_run,
   const std::string& checkpoint_task = std::string())
 {
   size_type reader_codec_bytes = joinRunReaderPairMemory(left_run, right_run);
+  reader_codec_bytes = checkedJoinAdd(reader_codec_bytes,
+    checkedJoinAdd(joinSidecarReaderMemory(left_run), joinSidecarReaderMemory(right_run),
+      "join planner sidecar reader workspaces"),
+    "join planner codec workspaces");
   size_type minimum_planner = checkedJoinAdd(JOIN_PLAN_RUNTIME_OVERHEAD,
     reader_codec_bytes, "compressed join planner minimum");
   minimum_planner = checkedJoinAdd(minimum_planner,

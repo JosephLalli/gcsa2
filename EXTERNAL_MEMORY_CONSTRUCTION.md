@@ -321,6 +321,13 @@ cannot admit. Compression mode, block size, level, and worker count are
 operational settings and may change on resume. Join child processes clamp
 zstd's internal worker count to their assigned thread share, preventing
 process-level and codec-level parallelism from multiplying unnoticed.
+Join group-summary and one-byte detail sidecars use the same random-readable
+framing. Their inner version-2 headers declare the record count up front and
+leave terminal checksum/group fields for the authenticated footer, because a
+streamed compressed first block cannot be patched in place. Readers retain raw
+version-1 compatibility and continue to address summaries and details by
+logical ordinal. Primary-run and sidecar stored/logical ratios are reported
+separately so nearly-unique join-key workloads remain visible in telemetry.
 
 A retained chr21 workspace inventory explains why the implementation batches
 large streams instead of combining task markers into a general small-file
@@ -334,13 +341,22 @@ streams, 14--77x for generation rank streams, about 32x for join-partition
 ranks, and 6--12x for final event streams. Those ratios motivate the codec but
 are not a replacement for a new end-to-end chromosome benchmark.
 
+An interrupted chr21 k32 diagnostic after the fixed-record codec landed made
+the next bottleneck measurable. At 7,864,288 distributed records, 849,343,104
+logical primary bytes occupied 114,797,355 stored bytes (0.135 stored/logical),
+while 7,200,595 nearly-unique key groups produced 353,493,032 raw sidecar bytes.
+The process was waiting in `balance_dirty_pages` and used only a small fraction
+of one CPU during the final sample. The run was deliberately stopped before a
+checkpoint; these measurements motivated framing the sidecars and are not an
+end-to-end performance result.
+
 The largest remaining I/O opportunity is further record compaction, not extra
-writer processes. Framing now compresses fixed-width join runs, but their
-logical records still repeat complete path labels and may be larger than the
-variable-width source path/rank pair. The separately written fixed-width group
-summary and one-byte detail sidecars also remain raw. A versioned grouped
-codec now writes one left context for consecutive expansions in each label-sort
-run, followed by compact right-dependent records that reference it. This removes
+writer processes. Framing now compresses fixed-width join runs and their exact
+group/detail sidecars, but logical join records still repeat complete path
+labels and may be larger than the variable-width source path/rank pair. A
+versioned grouped codec writes one left context for consecutive expansions in
+each label-sort run, followed by compact right-dependent records that reference
+it. This removes
 14 bytes of repeated `PathNode` context per grouped reference in addition to
 label-prefix compression. A future join-run reference format could also avoid
 repeating the complete rank payload before label sorting. Asynchronous
@@ -380,8 +396,9 @@ temporary index copy present during commit; completed and restored shards then
 replace that reservation with their exact `st_size` totals. The `DiskBudget`
 primitive can also inspect recursively live workspace bytes and `statvfs()`
 free space, but it is not yet shared by every writer. In particular, final-event
-copies, LCP raw levels, and some checkpoint copies currently stop on a failed
-write/ENOSPC rather than reserving their complete output first. Consequently
+copies, LCP raw levels, transient join-distribution runs/sidecars, and some
+checkpoint copies currently stop on a failed write/ENOSPC rather than reserving
+their complete output first. Consequently
 `--disk-limit` is presently a spill-generation budget, not a strict global
 workspace quota. A generation estimate remains diagnostic; RAM size is never a
 disk-limit proxy.
@@ -678,7 +695,7 @@ when its production call path and forced-spill/recovery tests pass.
 | Shared byte-token `MemoryBudget` and statvfs-aware `DiskBudget` | memory primitives, major external-phase byte caps, and framed encoder/decoder/zstd-worker reservations implemented; pruning/merged-graph buffers are byte-bounded but not globally admitted; final-scan readers retire cgroup-charged cache without extra descriptors; mapping/input/library allocations remain outside the shared budget; disk guard uses conservative framed peaks and exact installed sizes for generated path/join volume but not every final/LCP/checkpoint writer |
 | Versioned workspace artifacts, atomic publication, manifest compatibility, recovery tests | phase and join-range checkpoints plus abrupt-exit commit-boundary tests implemented; raw/framed mixed restore and journaled idempotent predecessor/family retirement implemented; transient distribution-run task records pending |
 | Human-readable operational construction parameters | core budget/run, temporary-compression, process-worker, and safe-cleanup controls implemented and parser-tested; checkpoint cadence remains standalone-only |
-| Framed temporary-file compression | versioned independently checksummed zstd/raw blocks, disk-spooled footer index, logical random access, raw fallback, mixed raw/framed join reading, exact primary-artifact size telemetry, shared-budget admission, and multithreaded zstd contexts implemented for path/rank, fixed-record join-run, and final-event streams; join group/detail sidecars, redundancy, preprocessing, and LCP level files remain raw |
+| Framed temporary-file compression | versioned independently checksummed zstd/raw blocks, disk-spooled footer index, logical random access, raw fallback, mixed raw/framed join reading, exact primary/sidecar size telemetry, shared-budget admission, and multithreaded zstd contexts implemented for path/rank, fixed-record join-run plus group/detail sidecars, and final-event streams; redundancy, preprocessing, and LCP level files remain raw |
 | Bounded external path-label runs and leveled multi-pass merge | versioned grouped/prefix-compressed runs, shared-left-context references, parallel in-place run sorting, rolling cache windows, one-run bypass, direct leveled merge of already-sorted worker shards, and forced multi-pass spilling implemented and tested |
 | Logical/physical `PathGraph` identity in pruning and joining | implemented; pruning coalesces only by logical ID and never treats a physical shard as a semantic input; durable run-set manifest pending |
 | External prefix-doubling join | bounded sort-merge, rolling page-cache windows, compact exact key-group sidecars, RAM-capped persisted 4096-record MSD radix range-pack planning bound to run/sidecar checksums, exact range contracts, recursive two-dimensional heavy-key splitting, blocked nested-loop expansion, and selectable checksum scans implemented and forced-spill tested |
@@ -713,8 +730,8 @@ generation rebuilds them before restoring the persisted MSD plan and completed
 join ranges. Initial records and join distribution records still repeat full
 rank payloads.
 Framed compression currently targets the dominant committed path/rank,
-fixed-record join distribution, and final-event streams. Key/start preprocessing
-runs, join group/detail sidecars, transient grouped label runs, the externally
+fixed-record join distribution and its group/detail sidecars, and final-event
+streams. Key/start preprocessing runs, transient grouped label runs, the externally
 sorted redundancy stream, and LCP level files remain in their existing
 compact/raw formats. Framed final-event
 adoption also performs one physical checksum pass after close; exposing the
@@ -791,13 +808,14 @@ feasibility, RSS, then speed policy:
    blocks would retain finer progress.
 5. Persist distribution runs and their already-emitted exact group sidecars as
    task artifacts. This avoids rebuilding both products after interruption.
-6. Compact the repeated rank payload in join distribution records and frame or
-   delta-code the group/detail sidecars before increasing worker count. The
-   first-stage block codec reduces physical fixed-record bytes without changing
-   the logical format; a later side-specific/reference format should reduce the
-   logical bytes themselves. Only after per-path bytes and storage headroom are
-   measured should more encoders, merge groups, or verifier label ranges run in
-   parallel under combined memory and I/O admission.
+6. Compact the repeated rank payload in join distribution records. Framed
+   group/detail sidecars now remove the immediate raw-write bottleneck; delta
+   coding remains an optional second-stage reduction before increasing worker
+   count. The first-stage block codec reduces physical fixed-record bytes
+   without changing the logical format; a later side-specific/reference format
+   should reduce the logical bytes themselves. Only after per-path bytes and
+   storage headroom are measured should more encoders, merge groups, or verifier
+   label ranges run in parallel under combined memory and I/O admission.
 7. Extend framing only where measurement justifies it: LCP levels and
    preprocessing ranks are promising, while already grouped/prefix-compressed
    label runs may not repay another codec layer. Export the framed writer's
