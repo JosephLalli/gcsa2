@@ -111,6 +111,10 @@ main(int argc, char** argv)
     std::cerr << "      --merge-fan-in N           maximum merge inputs" << std::endl;
     std::cerr << "      --max-open-files N         construction descriptor ceiling" << std::endl;
     std::cerr << "      --process-workers N        parallel external join worker processes" << std::endl;
+    std::cerr << "      --temp-compression MODE    auto, none, or zstd (default auto)" << std::endl;
+    std::cerr << "      --compression-block-size S independent compressed block size (default 16M)" << std::endl;
+    std::cerr << "      --compression-workers N   zstd worker threads per active stream (default 4)" << std::endl;
+    std::cerr << "      --compression-level N     zstd level -5..22 (default 1)" << std::endl;
     std::cerr << "      --checkpoint-records N     record checkpoint interval" << std::endl;
     std::cerr << "      --checkpoint-bytes SIZE    byte checkpoint interval" << std::endl;
     std::cerr << "      --verify-workspace         verify payload checksums on reuse" << std::endl;
@@ -132,7 +136,9 @@ main(int argc, char** argv)
     OPT_DISK_LIMIT, OPT_IO_BUFFER, OPT_SORT_RUN, OPT_JOIN_PARTITION,
     OPT_MERGE_FAN_IN, OPT_MAX_OPEN_FILES, OPT_CHECKPOINT_RECORDS,
     OPT_CHECKPOINT_BYTES, OPT_VERIFY_WORKSPACE, OPT_CLEAN_OBSOLETE,
-    OPT_STOP_AFTER, OPT_ALLOW_PATH_EXPLOSION, OPT_PROCESS_WORKERS
+    OPT_STOP_AFTER, OPT_ALLOW_PATH_EXPLOSION, OPT_PROCESS_WORKERS,
+    OPT_TEMP_COMPRESSION, OPT_COMPRESSION_BLOCK_SIZE,
+    OPT_COMPRESSION_WORKERS, OPT_COMPRESSION_LEVEL
   };
   static struct option long_options[] =
   {
@@ -147,6 +153,10 @@ main(int argc, char** argv)
     { "merge-fan-in", required_argument, nullptr, OPT_MERGE_FAN_IN },
     { "max-open-files", required_argument, nullptr, OPT_MAX_OPEN_FILES },
     { "process-workers", required_argument, nullptr, OPT_PROCESS_WORKERS },
+    { "temp-compression", required_argument, nullptr, OPT_TEMP_COMPRESSION },
+    { "compression-block-size", required_argument, nullptr, OPT_COMPRESSION_BLOCK_SIZE },
+    { "compression-workers", required_argument, nullptr, OPT_COMPRESSION_WORKERS },
+    { "compression-level", required_argument, nullptr, OPT_COMPRESSION_LEVEL },
     { "checkpoint-records", required_argument, nullptr, OPT_CHECKPOINT_RECORDS },
     { "checkpoint-bytes", required_argument, nullptr, OPT_CHECKPOINT_BYTES },
     { "verify-workspace", no_argument, nullptr, OPT_VERIFY_WORKSPACE },
@@ -212,6 +222,14 @@ main(int argc, char** argv)
       parameters.setMaxOpenFiles(std::stoull(optarg)); break;
     case OPT_PROCESS_WORKERS:
       parameters.setProcessWorkers(std::stoull(optarg)); break;
+    case OPT_TEMP_COMPRESSION:
+      parameters.setTempCompression(optarg); break;
+    case OPT_COMPRESSION_BLOCK_SIZE:
+      parameters.setCompressionBlockSize(parseBytes(optarg)); break;
+    case OPT_COMPRESSION_WORKERS:
+      parameters.setCompressionWorkers(std::stoull(optarg)); break;
+    case OPT_COMPRESSION_LEVEL:
+      parameters.setCompressionLevel(std::stoi(optarg)); break;
     case OPT_CHECKPOINT_RECORDS:
       parameters.setCheckpointRecords(std::stoull(optarg)); break;
     case OPT_CHECKPOINT_BYTES:
@@ -294,6 +312,14 @@ main(int argc, char** argv)
                 << (parameters.joinPartitionSizeIsAutomatic() ? " (auto)" : " (explicit)") << std::endl;
       printHeader("Join worker processes", INDENT);
       std::cout << parameters.getProcessWorkers() << std::endl;
+      printHeader("Temp compression", INDENT);
+      std::cout << tempCompressionName(parameters.getTempCompression()) << std::endl;
+      printHeader("Compression block", INDENT);
+      std::cout << formatBytes(parameters.getCompressionBlockSize()) << std::endl;
+      printHeader("Compression workers", INDENT);
+      std::cout << parameters.getCompressionWorkers() << std::endl;
+      printHeader("Compression level", INDENT);
+      std::cout << parameters.getCompressionLevel() << std::endl;
     }
     printHeader("Threads", INDENT); std::cout << omp_get_max_threads() << std::endl;
     printHeader("Verbosity", INDENT); std::cout << Verbosity::levelName() << std::endl;

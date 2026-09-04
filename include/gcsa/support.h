@@ -41,6 +41,36 @@ public:
   std::string completed_phase;
 };
 
+// Compression is an operational property of durable construction artifacts.
+// It never changes logical records or the public GCSA/LCP serialization. AUTO
+// lets a writer retain an incompressible block verbatim, while NONE is useful
+// for diagnostics and for comparing codec overhead against raw I/O.
+enum class TempCompression : std::uint8_t
+{
+  AUTO = 0,
+  NONE = 1,
+  ZSTD = 2
+};
+
+const char* tempCompressionName(TempCompression compression);
+
+// A copyable description of the codec used for large immutable temporary
+// streams. Keeping this separate from ConstructionParameters makes it safe to
+// serialize into child-process task records without confusing operational
+// knobs with graph semantics.
+struct TempFileCodecParameters
+{
+  TempCompression compression;
+  size_type block_size, workers;
+  int level;
+
+  TempFileCodecParameters(TempCompression codec = TempCompression::NONE,
+    size_type bytes = 16 * MEGABYTE, size_type threads = 1, int zstd_level = 1) :
+    compression(codec), block_size(bytes), workers(threads), level(zstd_level) { }
+
+  bool enabled() const { return this->compression != TempCompression::NONE; }
+};
+
 /*
   support.h: Support structures included in the public interface.
 */
@@ -80,6 +110,9 @@ struct ConstructionParameters
   constexpr static size_type PROCESS_WORKERS       = 1;
   constexpr static size_type CHECKPOINT_RECORDS    = 16 * MILLION;
   constexpr static size_type CHECKPOINT_BYTES      = GIGABYTE;
+  constexpr static size_type COMPRESSION_BLOCK_SIZE = 16 * MEGABYTE;
+  constexpr static size_type COMPRESSION_WORKERS    = 4;
+  constexpr static int COMPRESSION_LEVEL             = 1;
   
 
   ConstructionParameters();
@@ -106,6 +139,11 @@ struct ConstructionParameters
   void setWorkerExecutable(const std::string& executable);
   void setCheckpointRecords(size_type records);
   void setCheckpointBytes(size_type bytes);
+  void setTempCompression(TempCompression compression);
+  void setTempCompression(const std::string& compression);
+  void setCompressionBlockSize(size_type bytes);
+  void setCompressionWorkers(size_type workers);
+  void setCompressionLevel(int level);
   void setStopAfter(const std::string& phase);
 
   size_type getSteps() const { return this->doubling_steps; }
@@ -136,6 +174,16 @@ struct ConstructionParameters
   const std::string& getWorkerExecutable() const { return this->worker_executable; }
   size_type getCheckpointRecords() const { return this->checkpoint_records; }
   size_type getCheckpointBytes() const { return this->checkpoint_bytes; }
+  TempCompression getTempCompression() const { return this->temp_compression; }
+  size_type getCompressionBlockSize() const { return this->compression_block_size; }
+  size_type getCompressionWorkers() const { return this->compression_workers; }
+  int getCompressionLevel() const { return this->compression_level; }
+  TempFileCodecParameters getTempFileCodecParameters() const
+  {
+    return TempFileCodecParameters(this->temp_compression,
+      this->compression_block_size, this->compression_workers,
+      this->compression_level);
+  }
   const std::string& getStopAfter() const { return this->stop_after; }
 
   // The external route is opt-in until all legacy phases have disk-first
@@ -156,6 +204,9 @@ struct ConstructionParameters
   size_type process_workers;
   std::string worker_executable;
   size_type checkpoint_records, checkpoint_bytes;
+  TempCompression temp_compression;
+  size_type compression_block_size, compression_workers;
+  int compression_level;
   std::string stop_after;
 };
 

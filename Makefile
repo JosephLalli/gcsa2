@@ -15,10 +15,10 @@ PARALLEL_FLAGS=-fopenmp -pthread
 # beside this checkout. This matters on systems with an incompatible SDSL in a
 # compiler default or Homebrew prefix.
 GCSA2_LIB_DIR := $(abspath $(LIB_DIR))
-LIBS=-L$(GCSA2_LIB_DIR) -lsdsl -ldivsufsort -ldivsufsort64
+LIBS=-L$(GCSA2_LIB_DIR) -lsdsl -ldivsufsort -ldivsufsort64 -lzstd
 ifeq ($(shell uname -s), Linux)
     LIBS := -L$(GCSA2_LIB_DIR) -Wl,-rpath,$(GCSA2_LIB_DIR) -Wl,--disable-new-dtags \
-      -lsdsl -ldivsufsort -ldivsufsort64
+      -lsdsl -ldivsufsort -ldivsufsort64 -lzstd
 endif
 
 # Apple Clang does not support OpenMP directly, so we need special handling.
@@ -64,13 +64,13 @@ GCSA2_HELPER_CXX_FLAGS := $(filter-out -I% -L%,$(MY_CXX_FLAGS))
 CXX_FLAGS=$(GCSA2_HELPER_CXX_FLAGS) $(VERIFY_FLAGS) $(PARALLEL_FLAGS) $(MY_CXX_OPT_FLAGS)
 
 HEADERS=$(wildcard include/gcsa/*.h)
-LIBOBJS=$(addprefix $(BUILD_OBJ)/,algorithms.o checkpoint.o dbg.o disk_array.o external_join.o external_preprocessing.o external_sort.o files.o final_events.o gcsa.o internal.o lcp.o path_graph.o path_sort_run.o support.o utils.o resources.o workspace.o)
+LIBOBJS=$(addprefix $(BUILD_OBJ)/,algorithms.o checkpoint.o compressed_block.o dbg.o disk_array.o external_join.o external_preprocessing.o external_sort.o files.o final_events.o gcsa.o internal.o lcp.o path_graph.o path_sort_run.o support.o utils.o resources.o workspace.o)
 LIBRARY=$(BUILD_LIB)/libgcsa2.a
 
 PROGRAMS=$(addprefix $(BUILD_BIN)/,build_gcsa convert_graph gcsa_format try_extend)
 OBSOLETE=build_gcsa convert_graph gcsa_format try_extend
 
-.PHONY: all clean directories test workspace-test external-path-sort-test path-sort-run-test external-join-test external-sort-test external-preprocessing-test external-verification-test final-events-test lcp-streaming-test disk-array-test internal-buffer-test parameter-test construction-resume-test path-graph-prune-test
+.PHONY: all clean directories test compressed-block-test workspace-test external-path-sort-test path-sort-run-test external-join-test external-sort-test external-preprocessing-test external-verification-test final-events-test lcp-streaming-test disk-array-test internal-buffer-test parameter-test construction-resume-test path-graph-prune-test
 all: directories $(LIBRARY) $(PROGRAMS)
 
 directories: $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)
@@ -92,6 +92,13 @@ $(LIBRARY):$(LIBOBJS)
 
 $(BUILD_BIN)/%:$(BUILD_OBJ)/%.o $(LIBRARY)
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $@ $< $(LIBRARY) $(LIBS)
+
+$(BUILD_OBJ)/test_compressed_block.o:tests/test_compressed_block.cpp include/gcsa/compressed_block.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+compressed-block-test: directories $(BUILD_OBJ)/test_compressed_block.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_compressed_block $(BUILD_OBJ)/test_compressed_block.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_compressed_block
 
 $(BUILD_OBJ)/test_workspace.o:tests/test_workspace.cpp include/gcsa/resources.h include/gcsa/workspace.h
 	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
@@ -191,7 +198,7 @@ path-graph-prune-test: directories $(BUILD_OBJ)/test_path_graph_prune.o $(LIBRAR
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_path_graph_prune $(BUILD_OBJ)/test_path_graph_prune.o $(LIBRARY) $(LIBS)
 	$(BUILD_BIN)/test_path_graph_prune
 
-test: workspace-test external-path-sort-test path-sort-run-test external-join-test external-sort-test external-preprocessing-test external-verification-test final-events-test lcp-streaming-test disk-array-test internal-buffer-test parameter-test construction-resume-test path-graph-prune-test
+test: compressed-block-test workspace-test external-path-sort-test path-sort-run-test external-join-test external-sort-test external-preprocessing-test external-verification-test final-events-test lcp-streaming-test disk-array-test internal-buffer-test parameter-test construction-resume-test path-graph-prune-test
 
 clean:
 	rm -rf $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)
