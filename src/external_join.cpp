@@ -155,6 +155,7 @@ joinError(const std::string& message, const std::string& path = std::string())
 
 size_type checkedJoinAdd(size_type left, size_type right, const char* description);
 size_type checkedJoinMultiply(size_type left, size_type right, const char* description);
+size_type storedJoinBytes(const std::string& path);
 
 void
 adviseSequential(int descriptor)
@@ -3110,7 +3111,7 @@ planJoinPartitions(const JoinRun& left_run, const JoinRun& right_run,
 
 constexpr std::uint64_t WORKER_TASK_MAGIC = 0x314b535441534347ULL;   // "GCSATSK1"
 constexpr std::uint64_t WORKER_RESULT_MAGIC = 0x3153455241534347ULL; // "GCSARES1"
-constexpr std::uint32_t WORKER_FORMAT_VERSION = 4;
+constexpr std::uint32_t WORKER_FORMAT_VERSION = 5;
 constexpr size_type WORKER_CONTROL_LIMIT = MEGABYTE;
 
 struct ExternalJoinWorkerTask
@@ -3126,12 +3127,12 @@ struct ExternalJoinWorkerTask
 
 struct ExternalJoinWorkerResult
 {
-  size_type paths, ranks, bytes;
+  size_type paths, ranks, bytes, stored_bytes;
   size_type generated, bypassed, label_runs, label_merge_passes, label_parallel_sorts;
   size_type grouped_records, group_headers, context_bytes_saved;
   size_type max_records, max_bytes, blocks, bytes_read, bytes_written;
 
-  ExternalJoinWorkerResult() : paths(0), ranks(0), bytes(0), generated(0),
+  ExternalJoinWorkerResult() : paths(0), ranks(0), bytes(0), stored_bytes(0), generated(0),
     bypassed(0), label_runs(0), label_merge_passes(0), label_parallel_sorts(0),
     grouped_records(0), group_headers(0), context_bytes_saved(0),
     max_records(0), max_bytes(0), blocks(0), bytes_read(0), bytes_written(0) { }
@@ -3327,6 +3328,7 @@ encodeWorkerResult(const ExternalJoinWorkerResult& result)
   appendWorkerValue<std::uint64_t>(data, result.paths);
   appendWorkerValue<std::uint64_t>(data, result.ranks);
   appendWorkerValue<std::uint64_t>(data, result.bytes);
+  appendWorkerValue<std::uint64_t>(data, result.stored_bytes);
   appendWorkerValue<std::uint64_t>(data, result.generated);
   appendWorkerValue<std::uint64_t>(data, result.bypassed);
   appendWorkerValue<std::uint64_t>(data, result.label_runs);
@@ -3356,6 +3358,7 @@ decodeWorkerResult(const std::vector<std::uint8_t>& data)
   result.paths = readWorkerValue<std::uint64_t>(data, offset);
   result.ranks = readWorkerValue<std::uint64_t>(data, offset);
   result.bytes = readWorkerValue<std::uint64_t>(data, offset);
+  result.stored_bytes = readWorkerValue<std::uint64_t>(data, offset);
   result.generated = readWorkerValue<std::uint64_t>(data, offset);
   result.bypassed = readWorkerValue<std::uint64_t>(data, offset);
   result.label_runs = readWorkerValue<std::uint64_t>(data, offset);
@@ -3409,8 +3412,11 @@ externalPathJoinWorker(const std::string& task_file)
     size_type committed_bytes = 0;
     ExternalPathSortStats sort_stats;
     ExternalPathJoinStats join_stats;
+    const size_type peak_output_bytes = externalPathGraphShardPeakBytes(
+      task.partition.expected_paths, task.partition.expected_ranks,
+      task.sort_budget, task.codec);
     ExternalPathSortSink sink(output, 0, task.sort_budget, task.fan_in,
-      task.partition.expected_bytes, committed_bytes, &sort_stats, task.codec);
+      peak_output_bytes, committed_bytes, &sort_stats, task.codec);
     joinSortedRuns(task.left, task.right, task.logical, task.join_block_budget,
       sink, task.verify_payloads, &join_stats,
       task.partition.left_begin, task.partition.left_end,
@@ -3428,7 +3434,8 @@ externalPathJoinWorker(const std::string& task_file)
 
     ExternalJoinWorkerResult result;
     result.paths = output.path_counts[0]; result.ranks = output.rank_counts[0];
-    result.bytes = sink.bytes(); result.generated = join_stats.generated_records;
+    result.bytes = sink.bytes(); result.stored_bytes = sink.storedBytes();
+    result.generated = join_stats.generated_records;
     result.bypassed = join_stats.sorted_bypass; result.label_runs = sort_stats.runs;
     result.label_merge_passes = sort_stats.merge_passes;
     result.label_parallel_sorts = sort_stats.parallel_sorts;
@@ -3468,6 +3475,42 @@ appendOutputShard(PathGraph& graph, logical_file_id_t logical,
   graph.logical_file_ids.push_back(logical);
   graph.physical_shard_ids.push_back(physical);
   return file;
+}
+
+size_type
+pathPairPeakForCodec(size_type paths, size_type ranks,
+  size_type output_pairs, const TempFileCodecParameters& codec)
+{
+  const size_type path_bytes = checkedJoinMultiply(paths, sizeof(PathNode),
+    "peak path output bytes");
+  const size_type rank_bytes = checkedJoinMultiply(ranks,
+    sizeof(PathNode::rank_type), "peak rank output bytes");
+  if(!codec.enabled())
+  {
+    return checkedJoinAdd(path_bytes, rank_bytes, "peak raw path/rank bytes");
+  }
+  std::uint64_t path_peak = CompressedBlockWriter::maximumTemporaryBytes(
+    path_bytes, sizeof(PathNode), codec.block_size);
+  std::uint64_t rank_peak = CompressedBlockWriter::maximumTemporaryBytes(
+    rank_bytes, (PathLabel::LABEL_LENGTH + 1) * sizeof(PathNode::rank_type),
+    codec.block_size);
+  if(path_peak > std::numeric_limits<size_type>::max() ||
+     rank_peak > std::numeric_limits<size_type>::max() - path_peak)
+  {
+    throw joinError("framed path/rank output size overflow");
+  }
+  size_type result = static_cast<size_type>(path_peak + rank_peak);
+  if(output_pairs > 1)
+  {
+    // Splitting a stream can add at most one partial block per new file. Each
+    // framed pair also repeats two headers/footers. maximumTemporaryBytes()
+    // charges 72 bytes per peak block and 88 fixed bytes per stream.
+    const size_type split_overhead = checkedJoinMultiply(output_pairs - 1,
+      2 * (72 + 88), "split framed path/rank overhead");
+    result = checkedJoinAdd(result, split_overhead,
+      "split framed path/rank peak bytes");
+  }
+  return result;
 }
 
 // Workers deliberately produce independent physical shards. Before exposing a
@@ -3634,20 +3677,23 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
   auto merge_batch = [&](const PathGraph& input, const std::vector<size_type>& shards,
     PathGraph& output, logical_file_id_t logical, size_type& next_physical) -> bool
   {
-    size_type paths = 0, ranks = 0, payload = 0;
+    size_type paths = 0, ranks = 0;
     for(size_type shard : shards)
     {
       paths = checkedJoinAdd(paths, input.path_counts[shard], "logical merge path count");
       ranks = checkedJoinAdd(ranks, input.rank_counts[shard], "logical merge rank count");
     }
-    payload = checkedJoinAdd(checkedJoinMultiply(paths, sizeof(PathNode), "logical merge path bytes"),
-      checkedJoinMultiply(ranks, sizeof(PathNode::rank_type), "logical merge rank bytes"),
-      "logical merge payload bytes");
-    if(payload > size_limit || staged_committed > size_limit - payload)
+    const size_type pointer_limit = (static_cast<size_type>(1) << 40);
+    const size_type rank_capacity = pointer_limit - PathLabel::LABEL_LENGTH;
+    const size_type output_pairs = (ranks == 0 ? 1 :
+      1 + (ranks - 1) / rank_capacity);
+    const size_type peak_output_bytes = pathPairPeakForCodec(paths, ranks,
+      output_pairs, output_codec);
+    if(peak_output_bytes > size_limit ||
+       staged_committed > size_limit - peak_output_bytes)
     {
       return false; // Preserve the original bounded streams when duplication will not fit.
     }
-    const size_type pointer_limit = (static_cast<size_type>(1) << 40);
     int path_fd = -1, rank_fd = -1;
     std::unique_ptr<CompressedBlockWriter> compressed_path, compressed_rank;
     std::string partial_path, partial_rank;
@@ -3671,10 +3717,10 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
       // fails after the first succeeds, generation rollback still owns the
       // partially installed pair.
       new_outputs.push_back(output.path_names[file]); new_outputs.push_back(output.rank_names[file]);
-      new_output_charges[output.path_names[file]] = checkedJoinMultiply(
-        written_paths, sizeof(PathNode), "logical output path charge");
-      new_output_charges[output.rank_names[file]] = checkedJoinMultiply(
-        written_ranks, sizeof(PathNode::rank_type), "logical output rank charge");
+      const size_type stored_path_bytes = storedJoinBytes(partial_path);
+      const size_type stored_rank_bytes = storedJoinBytes(partial_rank);
+      new_output_charges[output.path_names[file]] = stored_path_bytes;
+      new_output_charges[output.rank_names[file]] = stored_rank_bytes;
       if(::rename(partial_path.c_str(), output.path_names[file].c_str()) != 0 ||
          ::rename(partial_rank.c_str(), output.rank_names[file].c_str()) != 0)
       {
@@ -3682,12 +3728,10 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
       }
       output.path_counts[file] = written_paths; output.rank_counts[file] = written_ranks;
       output.path_count += written_paths; output.rank_count += written_ranks;
-      size_type output_bytes = checkedJoinAdd(
-        checkedJoinMultiply(written_paths, sizeof(PathNode), "logical output path bytes"),
-        checkedJoinMultiply(written_ranks, sizeof(PathNode::rank_type), "logical output rank bytes"),
-        "logical output bytes");
+      const size_type output_bytes = checkedJoinAdd(stored_path_bytes,
+        stored_rank_bytes, "stored logical-merge output bytes");
       staged_committed = checkedJoinAdd(staged_committed, output_bytes,
-        "committed logical output bytes");
+        "committed stored output bytes");
     };
     auto open_output = [&]()
     {
@@ -3906,10 +3950,8 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
   cleanup.keep = true; // The new frontier is now authoritative, even if cleanup leaks.
   for(size_type source_file : obsolete)
   {
-    size_type path_bytes = checkedJoinMultiply(compacted.path_counts[source_file], sizeof(PathNode),
-      "obsolete path bytes");
-    size_type rank_bytes = checkedJoinMultiply(compacted.rank_counts[source_file], sizeof(PathNode::rank_type),
-      "obsolete rank bytes");
+    const size_type path_bytes = storedJoinBytes(compacted.path_names[source_file]);
+    const size_type rank_bytes = storedJoinBytes(compacted.rank_names[source_file]);
     // Failed cleanup leaves an unreachable predecessor on disk. Keep those
     // bytes charged rather than risking deletion of the installed frontier.
     if(std::remove(compacted.path_names[source_file].c_str()) == 0) { staged_committed -= path_bytes; }
@@ -4014,16 +4056,17 @@ restoreJoinPartition(const BuildWorkspace& workspace, const std::string& task,
 struct ActiveJoinWorker
 {
   pid_t pid;
-  size_type shard;
+  size_type shard, maximum_stored_bytes;
   JoinPartition partition;
   std::string task_file, checkpoint_name;
   MemoryBudget::Reservation reservation;
 
   ActiveJoinWorker(pid_t process, size_type output_shard,
     const JoinPartition& range, const std::string& task,
-    const std::string& checkpoint,
+    const std::string& checkpoint, size_type stored_limit,
     MemoryBudget::Reservation memory) :
-    pid(process), shard(output_shard), partition(range), task_file(task),
+    pid(process), shard(output_shard), maximum_stored_bytes(stored_limit),
+    partition(range), task_file(task),
     checkpoint_name(checkpoint),
     reservation(std::move(memory)) { }
 
@@ -4172,14 +4215,21 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
   size_type join_block_budget = worker_budgets.join;
   size_type worker_threads = std::max(static_cast<size_type>(1),
     static_cast<size_type>(omp_get_max_threads()) / concurrency);
+  TempFileCodecParameters worker_codec = parameters.getTempFileCodecParameters();
+  // Process workers are the outer parallelism layer. Bound zstd's inner pool
+  // before calculating the same framed-output limit the child will enforce.
+  worker_codec.workers = std::min(worker_codec.workers, worker_threads);
   size_type checkpoint_buffer = std::min(parameters.getIOBufferSize(),
     std::max(static_cast<size_type>(KILOBYTE), worker_reservation / 8));
 
   size_type planned_bytes = 0;
   for(const JoinPartition& partition : partitions)
   {
-    planned_bytes = checkedJoinAdd(planned_bytes, partition.expected_bytes,
-      "all worker output bytes");
+    const size_type peak_bytes = externalPathGraphShardPeakBytes(
+      partition.expected_paths, partition.expected_ranks,
+      sort_budget, worker_codec);
+    planned_bytes = checkedJoinAdd(planned_bytes, peak_bytes,
+      "all worker peak output bytes");
     if(partition.expected_ranks > (static_cast<size_type>(1) << 40))
     {
       throw joinError("one join partition exceeds the 40-bit rank pointer range");
@@ -4225,6 +4275,15 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
       result.paths * sizeof(PathNode));
     validateWorkerOutput(next.rank_names[worker.shard],
       result.ranks * sizeof(PathNode::rank_type));
+    const size_type actual_stored_bytes = checkedJoinAdd(
+      storedJoinBytes(next.path_names[worker.shard]),
+      storedJoinBytes(next.rank_names[worker.shard]),
+      "worker stored output bytes");
+    if(result.stored_bytes != actual_stored_bytes ||
+       result.stored_bytes > worker.maximum_stored_bytes)
+    {
+      throw joinError("worker stored output exceeds its admitted peak", result_file);
+    }
     if(workspace != nullptr && !worker.checkpoint_name.empty())
     {
       checkpointJoinPartition(*workspace, worker.checkpoint_name, logical,
@@ -4234,7 +4293,8 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
     next.path_counts[worker.shard] = result.paths;
     next.rank_counts[worker.shard] = result.ranks;
     next.path_count += result.paths; next.rank_count += result.ranks;
-    committed_bytes += result.bytes;
+    committed_bytes = checkedJoinAdd(committed_bytes, result.stored_bytes,
+      "committed worker output bytes");
     DiskIO::read_volume += result.bytes_read;
     DiskIO::write_volume += result.bytes_written;
     if(stats != nullptr)
@@ -4273,6 +4333,9 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
   {
     for(const JoinPartition& partition : partitions)
     {
+      const size_type peak_output_bytes = externalPathGraphShardPeakBytes(
+        partition.expected_paths, partition.expected_ranks,
+        sort_budget, worker_codec);
       size_type shard = appendOutputShard(next, logical,
         physical_shard_id_t(next_physical++));
       std::string partition_checkpoint = (checkpoint_task.empty() ? std::string() :
@@ -4294,7 +4357,16 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
         next.rank_counts[shard] = partition.expected_ranks;
         next.path_count += partition.expected_paths;
         next.rank_count += partition.expected_ranks;
-        committed_bytes += partition.expected_bytes;
+        const size_type restored_bytes = checkedJoinAdd(
+          storedJoinBytes(next.path_names[shard]),
+          storedJoinBytes(next.rank_names[shard]),
+          "restored worker output bytes");
+        if(restored_bytes > peak_output_bytes)
+        {
+          throw joinError("restored worker output exceeds its admitted peak");
+        }
+        committed_bytes = checkedJoinAdd(committed_bytes, restored_bytes,
+          "committed restored output bytes");
         if(stats != nullptr)
         {
           stats->restored_partitions++;
@@ -4315,11 +4387,7 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
       task.sort_budget = sort_budget; task.join_block_budget = join_block_budget;
       task.fan_in = label_fan_in;
       task.threads = worker_threads;
-      task.codec = parameters.getTempFileCodecParameters();
-      // Process workers are the outer parallelism layer. Bound zstd's inner
-      // worker pool by the CPU share assigned to this child so several join
-      // partitions cannot silently multiply the requested concurrency.
-      task.codec.workers = std::min(task.codec.workers, worker_threads);
+      task.codec = worker_codec;
       task.verify_payloads = parameters.getVerifyWorkspace();
       std::string task_file = TempFile::getName("gcsa_join_worker_task");
       writeWorkerControl(task_file, encodeWorkerTask(task));
@@ -4336,7 +4404,7 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
         throw;
       }
       active.emplace_back(child, shard, partition, task_file,
-        partition_checkpoint,
+        partition_checkpoint, peak_output_bytes,
         std::move(reservation));
     }
     while(!active.empty()) { collect_one(); }

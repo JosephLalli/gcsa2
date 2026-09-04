@@ -22,6 +22,13 @@ public:
   static std::size_t workingMemoryEstimate(std::size_t block_bytes, Mode mode,
     int zstd_level = 3, std::size_t compression_workers = 1);
 
+  // Conservative peak filesystem bytes while committing one framed stream.
+  // The bound includes the construction-only index sidecar while the same
+  // index is being appended to the final artifact. Every logical record must
+  // be at most maximum_record_bytes and is kept within one block.
+  static std::uint64_t maximumTemporaryBytes(std::uint64_t logical_bytes,
+    std::size_t maximum_record_bytes, std::size_t block_bytes);
+
   CompressedBlockWriter(const std::string& filename, std::size_t block_bytes,
     Mode mode = ZSTD, int zstd_level = 3,
     std::size_t compression_workers = 1);

@@ -94,6 +94,11 @@ main()
     require(input.read(&byte, 1) == 1 && byte == data[28]);
     require(input.readAt(4, &byte, 1) == 1 && byte == data[4]);
   }
+  require(readAll(first).size() <=
+    CompressedBlockWriter::maximumTemporaryBytes(data.size(), 7, 16));
+  // Even an empty framed stream has a fixed header/footer. The peak bound also
+  // models the temporary index copy, which is empty in this case.
+  require(CompressedBlockWriter::maximumTemporaryBytes(0, 7, 16) == 88);
   {
     CompressedBlockWriter output(second, 16, CompressedBlockWriter::ZSTD);
     for(std::size_t i = 0; i < data.size(); i += 7)

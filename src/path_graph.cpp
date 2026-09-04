@@ -1207,6 +1207,69 @@ boundedPathCodec(const TempFileCodecParameters& requested, size_type byte_budget
   return result;
 }
 
+size_type
+pathSortLogicalBytes(size_type records, size_type record_bytes,
+  const char* description)
+{
+  if(record_bytes != 0 &&
+     records > std::numeric_limits<size_type>::max() / record_bytes)
+  {
+    externalSortFailure(std::string(description) + " overflow");
+  }
+  return records * record_bytes;
+}
+
+size_type
+pathSortAddBytes(size_type left, size_type right, const char* description)
+{
+  if(left > std::numeric_limits<size_type>::max() - right)
+  {
+    externalSortFailure(std::string(description) + " overflow");
+  }
+  return left + right;
+}
+
+size_type
+pathPairPeakBytes(size_type paths, size_type ranks,
+  const TempFileCodecParameters& codec)
+{
+  const size_type path_bytes = pathSortLogicalBytes(paths, sizeof(PathNode),
+    "path shard bytes");
+  const size_type rank_bytes = pathSortLogicalBytes(ranks,
+    sizeof(PathNode::rank_type), "rank shard bytes");
+  if(!codec.enabled())
+  {
+    return pathSortAddBytes(path_bytes, rank_bytes, "path/rank shard bytes");
+  }
+
+  const std::uint64_t framed_paths =
+    CompressedBlockWriter::maximumTemporaryBytes(path_bytes,
+      sizeof(PathNode), codec.block_size);
+  const std::uint64_t framed_ranks =
+    CompressedBlockWriter::maximumTemporaryBytes(rank_bytes,
+      (PathLabel::LABEL_LENGTH + 1) * sizeof(PathNode::rank_type),
+      codec.block_size);
+  if(framed_paths > std::numeric_limits<size_type>::max() ||
+     framed_ranks > std::numeric_limits<size_type>::max() - framed_paths)
+  {
+    externalSortFailure("framed path/rank shard size overflow");
+  }
+  return static_cast<size_type>(framed_paths + framed_ranks);
+}
+
+size_type
+pathSortStoredBytes(const std::string& name)
+{
+  struct stat info;
+  if(::stat(name.c_str(), &info) != 0 || info.st_size < 0 ||
+     static_cast<std::uintmax_t>(info.st_size) >
+       std::numeric_limits<size_type>::max())
+  {
+    externalSortFailure("cannot determine stored shard bytes for " + name);
+  }
+  return static_cast<size_type>(info.st_size);
+}
+
 void
 addPathSortRun(std::vector<std::vector<std::string>>& levels, const std::string& run,
   size_type level, size_type fan_in, size_type buffer_records,
@@ -1225,6 +1288,20 @@ addPathSortRun(std::vector<std::vector<std::string>>& levels, const std::string&
 
 } // namespace
 
+size_type
+externalPathGraphShardPeakBytes(size_type paths, size_type ranks,
+  size_type sort_byte_budget, const TempFileCodecParameters& requested_codec)
+{
+  if(sort_byte_budget < externalPathGraphSortMinimumBudget())
+  {
+    externalSortFailure("streaming sort byte budget is too small");
+  }
+  const size_type available = sort_byte_budget - PATH_SORT_FIXED_BYTES;
+  const size_type materialize_available = available - pathSortReaderReservation();
+  return pathPairPeakBytes(paths, ranks,
+    boundedPathCodec(requested_codec, materialize_available));
+}
+
 struct ExternalPathSortSink::Impl
 {
   Impl(PathGraph& target, size_type target_file, size_type byte_budget,
@@ -1234,7 +1311,7 @@ struct ExternalPathSortSink::Impl
     graph(target), file(target_file), limit(size_limit),
     committed_bytes(already_committed), stats(statistics), fan_in(0),
     merge_records(0), run_records(0), path_count(0), rank_count(0),
-    payload_bytes(0), codec(), complete(false)
+    payload_bytes(0), stored_bytes(0), codec(), complete(false)
   {
     if(this->file >= this->graph.files()) { externalSortFailure("invalid sink file number"); }
     if(this->graph.path_counts[this->file] != 0 || this->graph.rank_counts[this->file] != 0)
@@ -1299,11 +1376,14 @@ struct ExternalPathSortSink::Impl
     {
       externalSortFailure("missing labels for streaming sort sink record");
     }
-    size_type record_bytes = sizeof(PathNode) +
+    const size_type record_bytes = sizeof(PathNode) +
       source.ranks() * sizeof(PathNode::rank_type);
-    if(record_bytes > this->limit ||
-       this->committed_bytes > this->limit - record_bytes ||
-       this->payload_bytes > this->limit - this->committed_bytes - record_bytes)
+    const size_type next_paths = this->path_count + 1;
+    const size_type next_ranks = this->rank_count + source.ranks();
+    const size_type peak_bytes = pathPairPeakBytes(next_paths, next_ranks,
+      this->codec);
+    if(peak_bytes > this->limit ||
+       this->committed_bytes > this->limit - peak_bytes)
     {
       externalSortFailure("configured disk limit exceeded while generating sorted paths");
     }
@@ -1406,7 +1486,14 @@ struct ExternalPathSortSink::Impl
     this->graph.rank_counts[this->file] = this->rank_count;
     this->graph.path_count += this->path_count;
     this->graph.rank_count += this->rank_count;
-    this->committed_bytes += this->payload_bytes;
+    this->stored_bytes = pathSortAddBytes(pathSortStoredBytes(final_path),
+      pathSortStoredBytes(final_rank), "stored path/rank shard bytes");
+    if(this->stored_bytes > this->limit ||
+       this->committed_bytes > this->limit - this->stored_bytes)
+    {
+      externalSortFailure("installed path/rank shard exceeds the configured disk limit");
+    }
+    this->committed_bytes += this->stored_bytes;
     this->complete = true;
   }
 
@@ -1415,7 +1502,7 @@ struct ExternalPathSortSink::Impl
   size_type& committed_bytes;
   ExternalPathSortStats* stats;
   size_type fan_in, merge_records, run_records;
-  size_type path_count, rank_count, payload_bytes;
+  size_type path_count, rank_count, payload_bytes, stored_bytes;
   TempFileCodecParameters codec;
   bool complete;
   std::vector<PathSortRecord> records;
@@ -1464,6 +1551,12 @@ size_type
 ExternalPathSortSink::bytes() const
 {
   return this->impl->payload_bytes;
+}
+
+size_type
+ExternalPathSortSink::storedBytes() const
+{
+  return this->impl->stored_bytes;
 }
 
 void
