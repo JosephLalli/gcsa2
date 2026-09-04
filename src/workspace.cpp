@@ -80,6 +80,82 @@ uint64_t checksum_raw_file(int fd,uint64_t bytes,std::vector<uint8_t>& buffer,
 bool exists(const std::string& p) { return access(p.c_str(),F_OK)==0; }
 std::string base(const std::string& p) { size_t x=p.find_last_of('/'); return x==std::string::npos?p:p.substr(x+1); }
 std::string parent(const std::string& p) { size_t x=p.find_last_of('/'); return x==std::string::npos?".":(x==0?"/":p.substr(0,x)); }
+std::string read_text_file(const std::string& path) {
+  int fd=open(path.c_str(),O_RDONLY);if(fd<0)throw err("cannot read workspace record",path);
+  std::string text;char buffer[4096];
+  for(;;) { ssize_t n=read(fd,buffer,sizeof(buffer));if(n<0&&errno==EINTR)continue;if(n<0){close(fd);throw err("cannot read workspace record",path);}if(n==0)break;text.append(buffer,n); }
+  if(close(fd)!=0)throw err("cannot close workspace record",path);
+  return text;
+}
+std::set<std::string> committed_artifact_names(const std::string& path,
+  const std::string& fingerprint,bool require_artifacts=true) {
+  std::istringstream input(read_text_file(path));std::string line;bool version=false,match=false;std::set<std::string> names;
+  while(std::getline(input,line)) {
+    if(line=="version=1"){version=true;continue;}
+    if(line=="fingerprint="+fingerprint){match=true;continue;}
+    if(line.compare(0,9,"artifact\t")!=0)continue;
+    std::istringstream fields(line);std::string tag,name;uint64_t records=0,bytes=0,sum=0;
+    if(!(fields>>tag>>name>>records>>bytes>>sum) || tag!="artifact" || (fields>>std::ws && !fields.eof()) ||
+      name!=base(name) || name.size()<4 || name.substr(name.size()-4)!=".bin")
+    {throw err("corrupt task completion record",path);}
+    if(require_artifacts) { struct stat st;if(stat((parent(path)+"/"+name).c_str(),&st)!=0||!S_ISREG(st.st_mode))throw err("completion references missing artifact",parent(path)+"/"+name); }
+    names.insert(name);
+  }
+  if(!version||!match||names.empty())throw err("missing or corrupt successor task completion record",path);
+  return names;
+}
+std::set<std::string> referenced_by_other_tasks(const std::string& directory,
+  const std::string& exclude) {
+  std::set<std::string> result;DIR* d=opendir(directory.c_str());if(d==0)throw err("cannot open workspace",directory);
+  for(dirent* entry;(entry=readdir(d));) { std::string name=entry->d_name,path=directory+"/"+name;
+    if(path==exclude||name.size()<=9||name.substr(name.size()-9)!=".complete")continue;
+    std::istringstream input(read_text_file(path));std::string line;
+    while(std::getline(input,line)) { if(line.compare(0,9,"artifact\t")!=0)continue;size_t end=line.find('\t',9);if(end!=std::string::npos)result.insert(line.substr(9,end-9)); }
+  }
+  closedir(d);return result;
+}
+struct RetirementRecord
+{
+  std::string predecessor,successor;
+  bool complete;
+};
+RetirementRecord read_retirement_record(const std::string& path,
+  const std::string& expected_fingerprint) {
+  std::istringstream input(read_text_file(path));std::string line;
+  bool version=false,fingerprint=false,complete=false;RetirementRecord result;
+  while(std::getline(input,line)) {
+    if(line=="version=1")version=true;
+    else if(line=="fingerprint="+expected_fingerprint)fingerprint=true;
+    else if(line.compare(0,12,"predecessor=")==0)result.predecessor=line.substr(12);
+    else if(line.compare(0,10,"successor=")==0)result.successor=line.substr(10);
+    else if(line=="complete=1")complete=true;
+  }
+  if(!version||!fingerprint||result.predecessor.empty()||result.successor.empty()||
+    result.predecessor!=base(result.predecessor)||result.successor!=base(result.successor)||
+    result.predecessor.size()<9||result.successor.size()<9||
+    result.predecessor.substr(result.predecessor.size()-9)!=".complete"||
+    result.successor.substr(result.successor.size()-9)!=".complete")
+  {throw err("corrupt retirement record",path);}
+  result.complete=complete;return result;
+}
+void complete_retirement_record(const std::string& path) {
+  std::string text=read_text_file(path);
+  if(text.find("complete=1\n")!=std::string::npos)return;
+  if(text.empty()||text.back()!='\n')text+='\n';
+  text+="complete=1\n";
+  std::string temporary=path+partial_suffix();
+  int fd=open(temporary.c_str(),O_CREAT|O_EXCL|O_WRONLY,0644);
+  if(fd<0)throw err("cannot create completed retirement record",temporary);
+  try {
+    write_all(fd,text.data(),text.size(),temporary);
+    if(fdatasync(fd)!=0)throw err("fdatasync failed",temporary);
+    int completed_fd=fd;fd=-1;
+    if(close(completed_fd)!=0)throw err("close failed",temporary);
+    if(rename(temporary.c_str(),path.c_str())!=0)
+      throw err("cannot complete retirement record",path);
+    sync_dir(parent(path));
+  } catch(...) { if(fd>=0)close(fd);unlink(temporary.c_str());throw; }
+}
 std::string json(const std::string& s) { std::string r; for(size_t i=0;i<s.size();++i) { unsigned char c=s[i]; if(c=='"'||c=='\\') { r+='\\'; r+=c; } else if(c=='\n') r+="\\n"; else if(c=='\r') r+="\\r"; else if(c=='\t') r+="\\t"; else if(c<32) throw std::runtime_error("control character in manifest setting"); else r+=c; } return r; }
 
 // Deterministic crash injection for recovery tests. _exit() intentionally
@@ -100,6 +176,7 @@ std::string BuildWorkspace::manifest() const { std::ostringstream x; x<<"{\"vers
 std::string BuildWorkspace::artifact_path(const ArtifactIdentity& i,logical_file_id_t l,physical_shard_id_t s) const { std::ostringstream x; x<<directory_<<"/"<<safe(i.task)<<"--"<<safe(i.phase)<<"--"<<safe(i.relative_path)<<"--"<<safe(i.kind)<<"--"<<l.value<<"--"<<s.value<<".bin"; return x.str(); }
 std::string BuildWorkspace::artifact_path(logical_file_id_t l,physical_shard_id_t s) const { return artifact_path(ArtifactIdentity(),l,s); }
 std::string BuildWorkspace::completion_path(const std::string& t,const std::string& p) const { return directory_+"/"+safe(t)+"--"+safe(p)+".complete"; }
+std::string BuildWorkspace::retirement_path(const std::string& pt,const std::string& pp,const std::string& st,const std::string& sp) const { return directory_+"/retire--"+safe(pt)+"--"+safe(pp)+"--after--"+safe(st)+"--"+safe(sp)+".retired"; }
 BuildWorkspace::ArtifactWriter::ArtifactWriter():ws_(0),fd_(-1),bytes_(0),sum_(1469598103934665603ULL),cache_released_(0),done_(true) {}
 BuildWorkspace::ArtifactWriter::ArtifactWriter(BuildWorkspace* w,const ArtifactIdentity& i,logical_file_id_t l,physical_shard_id_t s,const std::string& so,const std::string& kr):ws_(w),id_(i),logical_(l),shard_(s),final_(w->artifact_path(i,l,s)),sort_(so),range_(kr),fd_(-1),bytes_(0),sum_(1469598103934665603ULL),cache_released_(0),done_(false) { partial_=final_+partial_suffix(); fd_=open(partial_.c_str(),O_CREAT|O_EXCL|O_WRONLY,0644); if(fd_<0) throw err("cannot create unique partial artifact",partial_); advise_sequential(fd_);put(fd_,HEAD,4,partial_);put(fd_,ArtifactHeader::VERSION,4,partial_);put_string(fd_,id_.kind,partial_);put(fd_,logical_.value,4,partial_);put(fd_,shard_.value,8,partial_);put(fd_,0,8,partial_);put(fd_,0,8,partial_);put(fd_,0,8,partial_);put_string(fd_,sort_,partial_);put_string(fd_,range_,partial_); }
 BuildWorkspace::ArtifactWriter::ArtifactWriter(ArtifactWriter&& o):ws_(o.ws_),id_(o.id_),logical_(o.logical_),shard_(o.shard_),final_(o.final_),partial_(o.partial_),sort_(o.sort_),range_(o.range_),fd_(o.fd_),bytes_(o.bytes_),sum_(o.sum_),cache_released_(o.cache_released_),done_(o.done_){o.fd_=-1;o.done_=true;}
@@ -110,6 +187,110 @@ BuildWorkspace::ArtifactRef BuildWorkspace::ArtifactWriter::finish(uint64_t reco
 BuildWorkspace::ArtifactWriter BuildWorkspace::open_artifact(const ArtifactIdentity& i,logical_file_id_t l,physical_shard_id_t s,const std::string& so,const std::string& kr){return ArtifactWriter(this,i,l,s,so,kr);}
 void BuildWorkspace::commit_artifact(logical_file_id_t l,physical_shard_id_t s,uint64_t r,const std::vector<uint8_t>& p){ArtifactIdentity i;ArtifactWriter w=open_artifact(i,l,s);w.write(p.data(),p.size());ArtifactRef ref=w.finish(r);std::vector<ArtifactRef> a(1,ref);commit_task(i.task,i.phase,a);}
 void BuildWorkspace::commit_task(const std::string& task,const std::string& phase,const std::vector<ArtifactRef>& a,const std::vector<std::string>& deps){if(a.empty())throw std::runtime_error("cannot commit empty task completion record");std::string final=completion_path(task,phase),tmp=final+partial_suffix();int fd=open(tmp.c_str(),O_CREAT|O_EXCL|O_WRONLY,0644);if(fd<0)throw err("cannot create completion record",tmp);try{std::ostringstream x;x<<"version=1\nfingerprint="<<fingerprint_<<"\n";for(size_t n=0;n<a.size();++n){std::string p=artifact_path(a[n].identity,a[n].logical,a[n].shard);if(!exists(p))throw err("completion references missing artifact",p);x<<"artifact\t"<<base(p)<<"\t"<<a[n].records<<"\t"<<a[n].bytes<<"\t"<<a[n].checksum<<"\n";}for(size_t n=0;n<deps.size();++n)x<<"dependency\t"<<deps[n]<<"\n";std::string text=x.str();write_all(fd,text.data(),text.size(),tmp);sync_file(fd,tmp);crash_if_requested("task-before-rename");if(rename(tmp.c_str(),final.c_str())!=0)throw err("cannot publish completion record",final);sync_dir(directory_);crash_if_requested("task-after-rename");}catch(...){close(fd);unlink(tmp.c_str());throw;}}
+void BuildWorkspace::retire_marked(const std::string& predecessor,const std::string& successor)
+{
+  // Validate the successor before every unlink, including resume after a crash.
+  committed_artifact_names(successor,fingerprint_);
+  std::set<std::string> obsolete=committed_artifact_names(predecessor,fingerprint_,false);
+  std::set<std::string> shared=referenced_by_other_tasks(directory_,predecessor);
+  for(std::set<std::string>::const_iterator i=obsolete.begin();i!=obsolete.end();++i)
+  {
+    if(shared.find(*i)!=shared.end())continue;
+    std::string path=directory_+"/"+*i;
+    if(unlink(path.c_str())==0)crash_if_requested("retire-after-remove");
+    else if(errno!=ENOENT)throw err("cannot retire obsolete artifact",path);
+  }
+  sync_dir(directory_);
+}
+void BuildWorkspace::retire_obsolete(const std::string& predecessor_task,
+  const std::string& predecessor_phase,const std::string& successor_task,
+  const std::string& successor_phase)
+{
+  const std::string predecessor=completion_path(predecessor_task,predecessor_phase);
+  const std::string successor=completion_path(successor_task,successor_phase);
+  const std::string final=retirement_path(predecessor_task,predecessor_phase,successor_task,successor_phase);
+  if(exists(final))
+  {
+    RetirementRecord record=read_retirement_record(final,fingerprint_);
+    if(record.predecessor!=base(predecessor)||record.successor!=base(successor))
+      throw err("retirement record identity mismatch",final);
+    if(record.complete)return;
+    // The marker is the durable deletion intent. Its replay path accepts
+    // already-missing predecessor artifacts, making direct retries idempotent.
+    retire_marked(predecessor,successor);
+    complete_retirement_record(final);
+    return;
+  }
+  // Do not publish a recovery journal until both task markers are trustworthy.
+  committed_artifact_names(successor,fingerprint_);
+  // The successor is the authoritative frontier. Accept an already-partially
+  // retired predecessor so cleanup can recover even if an older deletion
+  // journal was lost after one or more unlinks.
+  std::set<std::string> predecessor_artifacts=
+    committed_artifact_names(predecessor,fingerprint_,false);
+  bool remains=false;
+  for(const std::string& artifact:predecessor_artifacts)
+  {
+    if(exists(directory_+"/"+artifact)){remains=true;break;}
+  }
+  if(!remains)return;
+  const std::string temporary=final+partial_suffix();int fd=open(temporary.c_str(),O_CREAT|O_EXCL|O_WRONLY,0644);
+  if(fd<0)throw err("cannot create retirement record",temporary);
+  try {
+    std::string text="version=1\nfingerprint="+fingerprint_+"\npredecessor="+base(predecessor)+"\nsuccessor="+base(successor)+"\n";
+    write_all(fd,text.data(),text.size(),temporary);sync_file(fd,temporary);fd=-1;
+    crash_if_requested("retire-before-marker-rename");
+    if(rename(temporary.c_str(),final.c_str())!=0)throw err("cannot publish retirement record",final);
+    sync_dir(directory_);
+  } catch(...) { if(fd>=0)close(fd);unlink(temporary.c_str());throw; }
+  retire_marked(predecessor,successor);
+  complete_retirement_record(final);
+}
+
+void
+BuildWorkspace::retire_obsolete_family(
+  const std::string& predecessor_task_prefix,
+  const std::string& predecessor_phase,
+  const std::string& successor_task,
+  const std::string& successor_phase)
+{
+  const std::string prefix=safe(predecessor_task_prefix);
+  const std::string suffix="--"+safe(predecessor_phase)+".complete";
+  std::vector<std::string> tasks;
+  DIR* directory=opendir(directory_.c_str());
+  if(directory==0)throw err("cannot open workspace",directory_);
+  for(dirent* entry;(entry=readdir(directory));)
+  {
+    std::string name=entry->d_name;
+    if(name.size()<prefix.size()+suffix.size() ||
+       name.compare(0,prefix.size(),prefix)!=0 ||
+       name.compare(name.size()-suffix.size(),suffix.size(),suffix)!=0)
+    {
+      continue;
+    }
+    tasks.push_back(name.substr(0,name.size()-suffix.size()));
+  }
+  closedir(directory);
+  std::sort(tasks.begin(),tasks.end());
+  tasks.erase(std::unique(tasks.begin(),tasks.end()),tasks.end());
+  for(const std::string& task:tasks)
+  {
+    if(task==successor_task && predecessor_phase==successor_phase)continue;
+    const std::string predecessor=completion_path(task,predecessor_phase);
+    std::set<std::string> artifacts=committed_artifact_names(
+      predecessor,fingerprint_,false);
+    bool remains=false;
+    for(const std::string& artifact:artifacts)
+    {
+      if(exists(directory_+"/"+artifact)){remains=true;break;}
+    }
+    // A prior retirement journal may already have removed this task. Avoid
+    // publishing a redundant marker for a predecessor with nothing left.
+    if(!remains)continue;
+    this->retire_obsolete(task,predecessor_phase,
+      successor_task,successor_phase);
+  }
+}
 uint64_t
 BuildWorkspace::committed_artifact_checksum(const ArtifactIdentity& identity,
   const std::string& basename, uint64_t records, uint64_t bytes) const
@@ -557,10 +738,27 @@ BuildWorkspace::recover()
   DIR* directory=opendir(directory_.c_str());
   if(directory==0){throw err("cannot open workspace",directory_);}
 
+  // A renamed retirement record is a durable promise to finish deleting the
+  // predecessor names. Revalidate its successor before doing so on every
+  // resume; a missing or damaged successor leaves the predecessor untouched.
+  for(dirent* entry;(entry=readdir(directory));)
+  {
+    std::string name=entry->d_name,path=directory_+"/"+name;
+    if(name.size()<=8||name.substr(name.size()-8)!=".retired")continue;
+    RetirementRecord record;
+    try { record=read_retirement_record(path,fingerprint_); }
+    catch(...) { closedir(directory);throw; }
+    if(record.complete)continue;
+    retire_marked(directory_+"/"+record.predecessor,
+      directory_+"/"+record.successor);
+    complete_retirement_record(path);
+  }
+
   // A completion record is the commit point. Renamed artifacts without one
   // are intentionally excluded, because a crash may have happened after an
   // artifact rename but before all outputs of its task were durable.
   std::set<std::string> keep;
+  rewinddir(directory);
   for(dirent* entry;(entry=readdir(directory));)
   {
     std::string name=entry->d_name;
@@ -583,7 +781,10 @@ BuildWorkspace::recover()
   for(dirent* entry;(entry=readdir(directory));)
   {
     std::string name=entry->d_name,path=directory_+"/"+name;
-    bool partial=(name.find(".partial")!=std::string::npos);
+    // The framed writer uses a bounded on-disk footer-index sidecar. Neither
+    // it nor a unique partial is reusable after a crash without a task marker.
+    bool partial=(name.find(".partial")!=std::string::npos ||
+      name.find(".index.")!=std::string::npos);
     bool uncommitted=(name.size()>4&&name.substr(name.size()-4)==".bin"&&
       keep.find(name)==keep.end());
     if(partial||uncommitted)
