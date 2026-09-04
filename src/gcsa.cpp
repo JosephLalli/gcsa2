@@ -1275,6 +1275,11 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
         std::cerr << "externalPathGraphExtend(): "
                   << join_stats.join_parallel_sorts << " parallel join sorts, "
                   << join_stats.label_parallel_sorts << " parallel label sorts" << std::endl;
+        std::cerr << "externalPathGraphExtend(): phase budgets: distribution "
+                  << formatBytes(join_stats.distribution_sort_budget)
+                  << "; concurrent label sort "
+                  << formatBytes(join_stats.label_sort_budget) << " + join block "
+                  << formatBytes(join_stats.join_block_budget) << std::endl;
         std::cerr << "externalPathGraphExtend(): sampled "
                   << join_stats.sampled_plan_records << " join keys into "
                   << join_stats.radix_plan_bins << " MSD range packs ("
@@ -1291,6 +1296,17 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
                   << " compact left-context references across transient run passes; avoided "
                   << formatBytes(join_stats.expansion_context_bytes_saved)
                   << " of transient run payload" << std::endl;
+        if(join_stats.join_run_logical_bytes > 0)
+        {
+          double ratio = static_cast<double>(join_stats.join_run_stored_bytes) /
+            static_cast<double>(join_stats.join_run_logical_bytes);
+          std::cerr << "externalPathGraphExtend(): stored "
+                    << formatBytes(join_stats.join_run_stored_bytes) << " for "
+                    << formatBytes(join_stats.join_run_logical_bytes)
+                    << " of logical fixed-record join runs ("
+                    << join_stats.compressed_join_runs << " compressed runs, "
+                    << ratio << " stored/logical)" << std::endl;
+        }
         std::cerr << "externalPathGraphExtend(): maximum bounded workspace "
                   << formatBytes(join_stats.max_bytes_resident) << " ("
                   << join_stats.max_records_resident << " records)" << std::endl;
