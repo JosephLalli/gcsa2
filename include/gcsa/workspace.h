@@ -59,6 +59,18 @@ public:
   ArtifactWriter open_artifact(const ArtifactIdentity&,logical_file_id_t,physical_shard_id_t,const std::string& sort_order="",const std::string& key_range="");
   void commit_artifact(logical_file_id_t,physical_shard_id_t,uint64_t,const std::vector<uint8_t>&);
   void commit_task(const std::string&,const std::string&,const std::vector<ArtifactRef>&,const std::vector<std::string>& dependencies=std::vector<std::string>());
+  // Durably retire artifacts published by predecessor only after successor's
+  // completion marker is present and structurally valid. Safe to repeat after
+  // a crash; the retirement marker is retained as the recovery journal.
+  void retire_obsolete(const std::string& predecessor_task,
+    const std::string& predecessor_phase,const std::string& successor_task,
+    const std::string& successor_phase);
+  // Retire every committed task in one deterministic task-name family. This
+  // is used after a complete extend checkpoint supersedes its per-partition
+  // join outputs and sampled partition plan.
+  void retire_obsolete_family(const std::string& predecessor_task_prefix,
+    const std::string& predecessor_phase,const std::string& successor_task,
+    const std::string& successor_phase);
   void validate_artifact(const ArtifactIdentity&,logical_file_id_t,physical_shard_id_t) const;
   void validate_artifact(logical_file_id_t,physical_shard_id_t) const;
   bool task_completed(const std::string& task,const std::string& phase) const;
@@ -79,7 +91,10 @@ public:
   void recover(); static uint64_t checksum(const void*,size_t,uint64_t seed=1469598103934665603ULL);
 private:
   std::string directory_,fingerprint_; Settings semantic_,operational_;
-  std::string completion_path(const std::string&,const std::string&) const; static std::string safe(const std::string&);
+  std::string completion_path(const std::string&,const std::string&) const;
+  std::string retirement_path(const std::string&,const std::string&,const std::string&,const std::string&) const;
+  void retire_marked(const std::string&,const std::string&);
+  static std::string safe(const std::string&);
   void ensure_completed(const ArtifactIdentity&,const std::string&,uint64_t) const;
   uint64_t committed_artifact_checksum(const ArtifactIdentity&,
     const std::string&,uint64_t records,uint64_t bytes) const;

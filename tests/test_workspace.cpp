@@ -59,6 +59,22 @@ static void crash_during_recovery(const std::string& root,
   require(WIFEXITED(status)&&WEXITSTATUS(status)==86);
 }
 
+static void crash_retirement(const std::string& root,
+  const BuildWorkspace::Settings& semantic,const std::string& point,
+  const ArtifactIdentity& predecessor,const ArtifactIdentity& successor)
+{
+  pid_t child=fork();require(child>=0);
+  if(child==0)
+  {
+    setenv("GCSA_WORKSPACE_CRASH_POINT",point.c_str(),1);
+    BuildWorkspace workspace(root,semantic);
+    workspace.retire_obsolete(predecessor.task,predecessor.phase,
+      successor.task,successor.phase);::_exit(87);
+  }
+  int status=0;require(waitpid(child,&status,0)==child);
+  require(WIFEXITED(status)&&WEXITSTATUS(status)==86);
+}
+
 int main() {
   MemoryBudget b(100,10); MemoryBudget::Reservation first=b.reserve(90,"first"); std::atomic<bool> started(false),got(false);
   std::thread waiter([&]{started=true;MemoryBudget::Reservation second=b.reserve(1,"second");got=true;}); while(!started) std::this_thread::yield(); std::this_thread::sleep_for(std::chrono::milliseconds(25)); require(!got); first=MemoryBudget::Reservation(); waiter.join(); require(got && b.stats().current==0 && b.stats().maximum==90); bool over=false; try { b.reserve(91,"too-large"); } catch(const std::runtime_error&) { over=true; } require(over);
@@ -180,7 +196,7 @@ int main() {
   require(linked_budget.available() == before_link);
   require(unlink(budget_link.c_str()) == 0);
   require(unlink(budget_source.c_str()) == 0);
-  std::string good=resumed.artifact_path(id,logical_file_id_t(7),physical_shard_id_t(9)); std::string unmarked=resumed.artifact_path(ArtifactIdentity("other","phase","uncommitted","bin"),logical_file_id_t(1),physical_shard_id_t(2)); BuildWorkspace::ArtifactWriter orphan=resumed.open_artifact(ArtifactIdentity("other","phase","uncommitted","bin"),logical_file_id_t(1),physical_shard_id_t(2)); orphan.write(payload.data(),7); orphan.finish(1); std::string renamed=std::string(root)+"/renamed-successor.bin"; require(rename(unmarked.c_str(),renamed.c_str())==0); { std::ofstream stale((std::string(root)+"/stale.partial").c_str()); stale<<"partial"; } resumed.recover(); require(access(renamed.c_str(),F_OK)!=0 && access((std::string(root)+"/stale.partial").c_str(),F_OK)!=0); resumed.validate_artifact(id,logical_file_id_t(7),physical_shard_id_t(9));
+  std::string good=resumed.artifact_path(id,logical_file_id_t(7),physical_shard_id_t(9)); std::string unmarked=resumed.artifact_path(ArtifactIdentity("other","phase","uncommitted","bin"),logical_file_id_t(1),physical_shard_id_t(2)); BuildWorkspace::ArtifactWriter orphan=resumed.open_artifact(ArtifactIdentity("other","phase","uncommitted","bin"),logical_file_id_t(1),physical_shard_id_t(2)); orphan.write(payload.data(),7); orphan.finish(1); std::string renamed=std::string(root)+"/renamed-successor.bin"; require(rename(unmarked.c_str(),renamed.c_str())==0); std::string stale_partial=std::string(root)+"/stale.partial",stale_index=std::string(root)+"/framed.index.orphan"; { std::ofstream stale(stale_partial.c_str()); stale<<"partial"; std::ofstream index(stale_index.c_str()); index<<"index"; } resumed.recover(); require(access(renamed.c_str(),F_OK)!=0 && access(stale_partial.c_str(),F_OK)!=0 && access(stale_index.c_str(),F_OK)!=0); resumed.validate_artifact(id,logical_file_id_t(7),physical_shard_id_t(9));
   { std::fstream f(good.c_str(),std::ios::in|std::ios::out|std::ios::binary); f.seekp(54); char x=127; f.write(&x,1); } require(invalid(resumed,id)); require(restore_invalid(resumed,id,restored)); BuildWorkspace::ArtifactWriter repair=resumed.open_artifact(id,logical_file_id_t(7),physical_shard_id_t(9),"key","a-z"); repair.write(payload.data(),payload.size()); ref=repair.finish(3); refs[0]=ref; resumed.commit_task(id.task,id.phase,refs); { std::fstream f(good.c_str(),std::ios::in|std::ios::out|std::ios::binary); f.seekp(0,std::ios::end); std::streamoff n=f.tellp(); f.close(); require(truncate(good.c_str(),n-1)==0); } require(invalid(resumed,id)); require(restore_invalid(resumed,id,restored));
   // Exercise the actual durability boundaries with abrupt child exits. A
   // synced partial, a renamed-but-unmarked artifact, and a partial task marker
@@ -196,5 +212,30 @@ int main() {
   BuildWorkspace::ArtifactWriter cleanup_writer_a=resumed.open_artifact(cleanup_a,logical_file_id_t(21),physical_shard_id_t(1)); cleanup_writer_a.write(payload.data(),19); cleanup_writer_a.finish(1);
   BuildWorkspace::ArtifactWriter cleanup_writer_b=resumed.open_artifact(cleanup_b,logical_file_id_t(21),physical_shard_id_t(2)); cleanup_writer_b.write(payload.data(),23); cleanup_writer_b.finish(1);
   crash_during_recovery(root,sem); { BuildWorkspace recovered(root,sem); require(access(recovered.artifact_path(cleanup_a,logical_file_id_t(21),physical_shard_id_t(1)).c_str(),F_OK)!=0&&access(recovered.artifact_path(cleanup_b,logical_file_id_t(21),physical_shard_id_t(2)).c_str(),F_OK)!=0); }
+  // Retirement is journaled before removal. A pre-marker crash changes
+  // nothing, while a crash after one unlink is completed by the next resume.
+  ArtifactIdentity retire_a("retire-a","phase","payload","bin"),retire_b("retire-b","phase","payload","bin");
+  BuildWorkspace::ArtifactWriter retire_writer_a=resumed.open_artifact(retire_a,logical_file_id_t(31),physical_shard_id_t(1));retire_writer_a.write(payload.data(),29);BuildWorkspace::ArtifactRef retire_ref_a=retire_writer_a.finish(1);resumed.commit_task(retire_a.task,retire_a.phase,std::vector<BuildWorkspace::ArtifactRef>(1,retire_ref_a));
+  BuildWorkspace::ArtifactWriter retire_writer_b=resumed.open_artifact(retire_b,logical_file_id_t(32),physical_shard_id_t(1));retire_writer_b.write(payload.data(),31);BuildWorkspace::ArtifactRef retire_ref_b=retire_writer_b.finish(1);resumed.commit_task(retire_b.task,retire_b.phase,std::vector<BuildWorkspace::ArtifactRef>(1,retire_ref_b));
+  const std::string retire_path_a=resumed.artifact_path(retire_a,logical_file_id_t(31),physical_shard_id_t(1)),retire_path_b=resumed.artifact_path(retire_b,logical_file_id_t(32),physical_shard_id_t(1));
+  crash_retirement(root,sem,"retire-before-marker-rename",retire_a,retire_b);require(access(retire_path_a.c_str(),F_OK)==0);
+  resumed.retire_obsolete(retire_a.task,retire_a.phase,retire_b.task,retire_b.phase);require(access(retire_path_a.c_str(),F_OK)!=0&&access(retire_path_b.c_str(),F_OK)==0);
+  ArtifactIdentity retire_c("retire-c","phase","payload","bin"),retire_d("retire-d","phase","payload","bin");
+  BuildWorkspace::ArtifactWriter retire_writer_c=resumed.open_artifact(retire_c,logical_file_id_t(33),physical_shard_id_t(1));retire_writer_c.write(payload.data(),37);BuildWorkspace::ArtifactRef retire_ref_c=retire_writer_c.finish(1);resumed.commit_task(retire_c.task,retire_c.phase,std::vector<BuildWorkspace::ArtifactRef>(1,retire_ref_c));
+  BuildWorkspace::ArtifactWriter retire_writer_d=resumed.open_artifact(retire_d,logical_file_id_t(34),physical_shard_id_t(1));retire_writer_d.write(payload.data(),41);BuildWorkspace::ArtifactRef retire_ref_d=retire_writer_d.finish(1);resumed.commit_task(retire_d.task,retire_d.phase,std::vector<BuildWorkspace::ArtifactRef>(1,retire_ref_d));
+  const std::string retire_path_c=resumed.artifact_path(retire_c,logical_file_id_t(33),physical_shard_id_t(1)),retire_path_d=resumed.artifact_path(retire_d,logical_file_id_t(34),physical_shard_id_t(1));
+  crash_retirement(root,sem,"retire-after-remove",retire_c,retire_d); { BuildWorkspace recovered(root,sem);require(access(retire_path_c.c_str(),F_OK)!=0&&access(retire_path_d.c_str(),F_OK)==0); }
+  // Direct retry and family cleanup are both idempotent. The family form is
+  // what retires all partition checkpoints after a generation-level extend
+  // marker has become the durable resume frontier.
+  resumed.retire_obsolete(retire_a.task,retire_a.phase,retire_b.task,retire_b.phase);
+  ArtifactIdentity family_a("step-04-join-a","join-partition","paths","bin"),family_b("step-04-join-b","join-partition","paths","bin"),family_successor("step-04","extend","paths","bin");
+  BuildWorkspace::ArtifactWriter family_writer_a=resumed.open_artifact(family_a,logical_file_id_t(41),physical_shard_id_t(1));family_writer_a.write(payload.data(),11);BuildWorkspace::ArtifactRef family_ref_a=family_writer_a.finish(1);resumed.commit_task(family_a.task,family_a.phase,std::vector<BuildWorkspace::ArtifactRef>(1,family_ref_a));
+  BuildWorkspace::ArtifactWriter family_writer_b=resumed.open_artifact(family_b,logical_file_id_t(41),physical_shard_id_t(2));family_writer_b.write(payload.data(),13);BuildWorkspace::ArtifactRef family_ref_b=family_writer_b.finish(1);resumed.commit_task(family_b.task,family_b.phase,std::vector<BuildWorkspace::ArtifactRef>(1,family_ref_b));
+  BuildWorkspace::ArtifactWriter family_writer_successor=resumed.open_artifact(family_successor,logical_file_id_t(41),physical_shard_id_t(3));family_writer_successor.write(payload.data(),17);BuildWorkspace::ArtifactRef family_ref_successor=family_writer_successor.finish(1);resumed.commit_task(family_successor.task,family_successor.phase,std::vector<BuildWorkspace::ArtifactRef>(1,family_ref_successor));
+  const std::string family_path_a=resumed.artifact_path(family_a,logical_file_id_t(41),physical_shard_id_t(1)),family_path_b=resumed.artifact_path(family_b,logical_file_id_t(41),physical_shard_id_t(2)),family_path_successor=resumed.artifact_path(family_successor,logical_file_id_t(41),physical_shard_id_t(3));
+  resumed.retire_obsolete_family("step-04-join-","join-partition","step-04","extend");
+  resumed.retire_obsolete_family("step-04-join-","join-partition","step-04","extend");
+  require(access(family_path_a.c_str(),F_OK)!=0&&access(family_path_b.c_str(),F_OK)!=0&&access(family_path_successor.c_str(),F_OK)==0);
   DiskBudget disk(root,1,0); std::string why; require(!disk.can_reserve(2,&why) && !why.empty()); return 0;
 }
