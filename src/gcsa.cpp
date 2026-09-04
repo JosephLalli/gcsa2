@@ -63,6 +63,46 @@ doublingTask(size_type step)
   return result.str();
 }
 
+// Catch up journaled cleanup when it is enabled only on a resumed run. A
+// restored prune still needs this step's completed join ranges, while a
+// restored extend supersedes them. Every deletion is anchored directly to the
+// validated current frontier rather than depending on an intermediate
+// predecessor that may itself already have been retired.
+void
+retireBeforeFrontier(BuildWorkspace& workspace,
+  const std::string& successor_task, const std::string& successor_phase,
+  size_type completed_step, bool extend_complete)
+{
+  if(workspace.task_completed("initial", "paths"))
+  {
+    workspace.retire_obsolete("initial", "paths",
+      successor_task, successor_phase);
+  }
+  for(size_type step = 1; step <= completed_step; step++)
+  {
+    const std::string task = doublingTask(step);
+    if(!(task == successor_task && successor_phase == "prune") &&
+       workspace.task_completed(task, "prune"))
+    {
+      workspace.retire_obsolete(task, "prune",
+        successor_task, successor_phase);
+    }
+    if(!(task == successor_task && successor_phase == "extend") &&
+       workspace.task_completed(task, "extend"))
+    {
+      workspace.retire_obsolete(task, "extend",
+        successor_task, successor_phase);
+    }
+    if(step < completed_step || extend_complete)
+    {
+      workspace.retire_obsolete_family(task + "-join-", "join-partition",
+        successor_task, successor_phase);
+      workspace.retire_obsolete_family(task + "-msd-plan-", "join-plan",
+        successor_task, successor_phase);
+    }
+  }
+}
+
 std::uint64_t
 constructionFileChecksum(const std::string& filename, size_type buffer_bytes)
 {
@@ -94,6 +134,9 @@ constructionSemanticSettings(const InputGraph& graph,
   // old initial/path checkpoints with the v1 reduced key/start artifacts.
   settings["external_preprocessing"] = "v1";
   settings["external_final_events"] = "v1";
+  // Keep the v2 compatibility tag: v3 metadata and the framed reader both
+  // deliberately accept the older raw payloads, so changing the semantic
+  // fingerprint would reject workspaces this build can safely resume.
   settings["path_graph_checkpoint"] = "v2-adopted-raw";
   // Both formats affect deterministic transient ordering and therefore the
   // semantic range names used by resumable join-partition tasks.
@@ -147,6 +190,11 @@ constructionOperationalSettings(const ConstructionParameters& parameters)
   settings["merge_fan_in"] = std::to_string(parameters.getMergeFanIn());
   settings["max_open_files"] = std::to_string(parameters.getMaxOpenFiles());
   settings["process_workers"] = std::to_string(parameters.getProcessWorkers());
+  settings["temp_compression"] = tempCompressionName(parameters.getTempCompression());
+  settings["compression_block_size"] = std::to_string(parameters.getCompressionBlockSize());
+  settings["compression_workers"] = std::to_string(parameters.getCompressionWorkers());
+  settings["compression_level"] = std::to_string(parameters.getCompressionLevel());
+  settings["clean_obsolete"] = (parameters.getCleanObsolete() ? "true" : "false");
   settings["threads"] = std::to_string(omp_get_max_threads());
   return settings;
 }
@@ -779,7 +827,8 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
       {
         throw std::runtime_error("GCSA::GCSA(): memory limit cannot hold final event buffers");
       }
-      FinalEventWriter output(files, graph.alpha.sigma, writer_buffer, memory);
+      FinalEventWriter output(files, graph.alpha.sigma, writer_buffer, memory,
+        parameters.getTempFileCodecParameters());
       size_type cache_bytes = memory.available();
       size_type previous_cache = cache_bytes / 2;
       size_type stack_cache = cache_bytes - previous_cache;
@@ -1094,6 +1143,11 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   PathGraph path_graph(0, graph.k(), 0);
   size_type first_step = 1;
   bool restored_prune = false, restored_graph = false;
+  // Tracks the durable checkpoint backing the current in-memory frontier.
+  // --clean-obsolete may retire it only after the next frontier has its own
+  // synced task marker. Operational cleanup therefore cannot invalidate a
+  // graph still needed after a crash.
+  std::string frontier_task, frontier_phase;
   if(workspace)
   {
     for(size_type step = parameters.getSteps(); step > 0; step--)
@@ -1108,6 +1162,11 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
         }
         restorePathGraph(*workspace, path_graph, task, "extend", checkpoint_buffer,
           parameters.getVerifyWorkspace());
+        frontier_task = task; frontier_phase = "extend";
+        if(parameters.getCleanObsolete())
+        {
+          retireBeforeFrontier(*workspace, task, "extend", step, true);
+        }
         first_step = step + 1; restored_graph = true; break;
       }
       if(pathGraphCheckpointExists(*workspace, task, "prune"))
@@ -1119,6 +1178,11 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
         }
         restorePathGraph(*workspace, path_graph, task, "prune", checkpoint_buffer,
           parameters.getVerifyWorkspace());
+        frontier_task = task; frontier_phase = "prune";
+        if(parameters.getCleanObsolete())
+        {
+          retireBeforeFrontier(*workspace, task, "prune", step, false);
+        }
         first_step = step; restored_prune = true; restored_graph = true; break;
       }
     }
@@ -1130,6 +1194,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
       }
       restorePathGraph(*workspace, path_graph, "initial", "paths", checkpoint_buffer,
         parameters.getVerifyWorkspace());
+      frontier_task = "initial"; frontier_phase = "paths";
       restored_graph = true;
     }
   }
@@ -1149,6 +1214,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     if(workspace)
     {
       checkpointPathGraph(*workspace, path_graph, "initial", "paths", checkpoint_buffer);
+      frontier_task = "initial"; frontier_phase = "paths";
       stopAfterCommittedPhase(parameters, "initial");
     }
   }
@@ -1199,6 +1265,11 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
       if(workspace)
       {
         checkpointPathGraph(*workspace, path_graph, task, "prune", checkpoint_buffer);
+        if(parameters.getCleanObsolete() && !frontier_task.empty())
+        {
+          workspace->retire_obsolete(frontier_task, frontier_phase, task, "prune");
+        }
+        frontier_task = task; frontier_phase = "prune";
         stopAfterCommittedPhase(parameters, task + "-prune");
       }
     }
@@ -1258,6 +1329,22 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     if(workspace)
     {
       checkpointPathGraph(*workspace, path_graph, task, "extend", checkpoint_buffer);
+      if(parameters.getCleanObsolete() && !frontier_task.empty())
+      {
+        workspace->retire_obsolete(frontier_task, frontier_phase, task, "extend");
+      }
+      if(parameters.getCleanObsolete())
+      {
+        // The full generation checkpoint now supersedes fine-grained join
+        // outputs and its sampled MSD plan. A resume repeats this family scan,
+        // so a crash between individual retirement markers only delays space
+        // reclamation; it cannot lose the committed frontier.
+        workspace->retire_obsolete_family(task + "-join-", "join-partition",
+          task, "extend");
+        workspace->retire_obsolete_family(task + "-msd-plan-", "join-plan",
+          task, "extend");
+      }
+      frontier_task = task; frontier_phase = "extend";
       stopAfterCommittedPhase(parameters, task + "-extend");
     }
   }

@@ -8,6 +8,7 @@
 
 #include <limits>
 #include <stdexcept>
+#include <sys/stat.h>
 
 namespace gcsa
 {
@@ -16,9 +17,15 @@ namespace
 {
 
 constexpr std::uint64_t PATH_GRAPH_CHECKPOINT_MAGIC = 0x3154504b434750ULL;
-constexpr std::uint32_t PATH_GRAPH_CHECKPOINT_VERSION = 2;
+constexpr std::uint32_t PATH_GRAPH_CHECKPOINT_VERSION = 3;
+constexpr std::uint32_t PATH_GRAPH_CHECKPOINT_RAW_VERSION = 2;
 constexpr size_type PATH_GRAPH_METADATA_FIXED = 8 + 4 + 10 * 8;
-constexpr size_type PATH_GRAPH_METADATA_PER_FILE = 4 + 8 + 8 + 8;
+constexpr size_type PATH_GRAPH_METADATA_PER_FILE_V2 = 4 + 8 + 8 + 8;
+// Version 3 records both logical record counts and physical stored bytes.
+// Framed compression changes only the latter; PathNode pointers and all graph
+// semantics continue to use logical rank-record offsets.
+constexpr size_type PATH_GRAPH_METADATA_PER_FILE =
+  PATH_GRAPH_METADATA_PER_FILE_V2 + 8 + 8;
 constexpr size_type PATH_GRAPH_METADATA_LIMIT = 256 * MEGABYTE;
 
 template<class Value>
@@ -77,6 +84,20 @@ checkedPayloadBytes(size_type records, size_type record_bytes,
   return records * record_bytes;
 }
 
+size_type
+storedBytes(const std::string& source)
+{
+  struct stat info;
+  if(::stat(source.c_str(), &info) != 0 || info.st_size < 0 ||
+     static_cast<std::uintmax_t>(info.st_size) >
+       std::numeric_limits<size_type>::max())
+  {
+    throw std::runtime_error(
+      "checkpointPathGraph(): cannot determine stored bytes: " + source);
+  }
+  return static_cast<size_type>(info.st_size);
+}
+
 BuildWorkspace::ArtifactRef
 checkpointPayload(BuildWorkspace& workspace, const ArtifactIdentity& identity,
   logical_file_id_t logical, physical_shard_id_t shard, const std::string& source,
@@ -127,6 +148,8 @@ checkpointPathGraph(BuildWorkspace& workspace, const PathGraph& graph,
     appendLittle<std::uint64_t>(metadata, graph.physicalShard(file).value);
     appendLittle<std::uint64_t>(metadata, graph.path_counts[file]);
     appendLittle<std::uint64_t>(metadata, graph.rank_counts[file]);
+    appendLittle<std::uint64_t>(metadata, storedBytes(graph.path_names[file]));
+    appendLittle<std::uint64_t>(metadata, storedBytes(graph.rank_names[file]));
   }
 
   std::vector<BuildWorkspace::ArtifactRef> artifacts;
@@ -140,13 +163,11 @@ checkpointPathGraph(BuildWorkspace& workspace, const PathGraph& graph,
   {
     artifacts.push_back(checkpointPayload(workspace, pathIdentity(task, phase, file),
       graph.logicalFile(file), graph.physicalShard(file), graph.path_names[file],
-      graph.path_counts[file], checkedPayloadBytes(graph.path_counts[file],
-        sizeof(PathNode), graph.path_names[file]),
+      graph.path_counts[file], storedBytes(graph.path_names[file]),
       buffer_bytes, "label"));
     artifacts.push_back(checkpointPayload(workspace, rankIdentity(task, phase, file),
       graph.logicalFile(file), graph.physicalShard(file), graph.rank_names[file],
-      graph.rank_counts[file], checkedPayloadBytes(graph.rank_counts[file],
-        sizeof(PathNode::rank_type), graph.rank_names[file]),
+      graph.rank_counts[file], storedBytes(graph.rank_names[file]),
       buffer_bytes, "path-order"));
   }
   workspace.commit_task(task, phase, artifacts);
@@ -172,8 +193,13 @@ restorePathGraph(const BuildWorkspace& workspace, PathGraph& graph,
     metadataIdentity(task, phase), logical_file_id_t(0), physical_shard_id_t(0),
     PATH_GRAPH_METADATA_LIMIT);
   size_type offset = 0;
-  if(readLittle<std::uint64_t>(metadata, offset) != PATH_GRAPH_CHECKPOINT_MAGIC ||
-     readLittle<std::uint32_t>(metadata, offset) != PATH_GRAPH_CHECKPOINT_VERSION)
+  if(readLittle<std::uint64_t>(metadata, offset) != PATH_GRAPH_CHECKPOINT_MAGIC)
+  {
+    throw std::runtime_error("restorePathGraph(): incompatible checkpoint metadata");
+  }
+  const std::uint32_t version = readLittle<std::uint32_t>(metadata, offset);
+  if(version != PATH_GRAPH_CHECKPOINT_VERSION &&
+     version != PATH_GRAPH_CHECKPOINT_RAW_VERSION)
   {
     throw std::runtime_error("restorePathGraph(): incompatible checkpoint metadata");
   }
@@ -187,8 +213,10 @@ restorePathGraph(const BuildWorkspace& workspace, PathGraph& graph,
   size_type redundant = readLittle<std::uint64_t>(metadata, offset);
   size_type unsorted = readLittle<std::uint64_t>(metadata, offset);
   size_type nondeterministic = readLittle<std::uint64_t>(metadata, offset);
-  if(files > (metadata.size() - offset) / PATH_GRAPH_METADATA_PER_FILE ||
-     offset + files * PATH_GRAPH_METADATA_PER_FILE != metadata.size())
+  const size_type per_file = (version == PATH_GRAPH_CHECKPOINT_VERSION ?
+    PATH_GRAPH_METADATA_PER_FILE : PATH_GRAPH_METADATA_PER_FILE_V2);
+  if(files > (metadata.size() - offset) / per_file ||
+     offset + files * per_file != metadata.size())
   {
     throw std::runtime_error("restorePathGraph(): invalid checkpoint shard count");
   }
@@ -205,18 +233,25 @@ restorePathGraph(const BuildWorkspace& workspace, PathGraph& graph,
       readLittle<std::uint64_t>(metadata, offset));
     restored.path_counts[file] = readLittle<std::uint64_t>(metadata, offset);
     restored.rank_counts[file] = readLittle<std::uint64_t>(metadata, offset);
+    size_type path_storage = checkedPayloadBytes(restored.path_counts[file],
+      sizeof(PathNode), restored.path_names[file]);
+    size_type rank_storage = checkedPayloadBytes(restored.rank_counts[file],
+      sizeof(PathNode::rank_type), restored.rank_names[file]);
+    if(version == PATH_GRAPH_CHECKPOINT_VERSION)
+    {
+      path_storage = readLittle<std::uint64_t>(metadata, offset);
+      rank_storage = readLittle<std::uint64_t>(metadata, offset);
+    }
     restored.path_count += restored.path_counts[file];
     restored.rank_count += restored.rank_counts[file];
     workspace.restore_adopted_payload(pathIdentity(task, phase, file),
       restored.logicalFile(file), restored.physicalShard(file),
       restored.path_names[file], restored.path_counts[file],
-      checkedPayloadBytes(restored.path_counts[file], sizeof(PathNode),
-        restored.path_names[file]), buffer_bytes, verify_checksum);
+      path_storage, buffer_bytes, verify_checksum);
     workspace.restore_adopted_payload(rankIdentity(task, phase, file),
       restored.logicalFile(file), restored.physicalShard(file),
       restored.rank_names[file], restored.rank_counts[file],
-      checkedPayloadBytes(restored.rank_counts[file], sizeof(PathNode::rank_type),
-        restored.rank_names[file]), buffer_bytes, verify_checksum);
+      rank_storage, buffer_bytes, verify_checksum);
   }
   if(restored.path_count != total_paths || restored.rank_count != total_ranks)
   {

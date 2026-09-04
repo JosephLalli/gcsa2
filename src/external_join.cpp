@@ -6,6 +6,7 @@
 */
 
 #include <gcsa/path_graph.h>
+#include <gcsa/compressed_block.h>
 #include <gcsa/resources.h>
 
 #include <algorithm>
@@ -1369,8 +1370,30 @@ public:
     rank_buffer(std::max(static_cast<size_type>(1),
       JOIN_IO_BUFFER_BYTES / sizeof(PathNode::rank_type))),
     path_buffer_first(0), path_buffer_records(0),
-    rank_buffer_first(0), rank_buffer_records(0)
+    rank_buffer_first(0), rank_buffer_records(0), compressed_path(), compressed_rank()
   {
+    const bool path_framed = CompressedBlockReader::isFramed(this->path_name);
+    const bool rank_framed = CompressedBlockReader::isFramed(this->rank_name);
+    if(path_framed != rank_framed)
+    {
+      throw joinError("path/rank shard uses inconsistent storage formats",
+        this->path_name);
+    }
+    if(path_framed)
+    {
+      this->compressed_path.reset(new CompressedBlockReader(this->path_name));
+      this->compressed_rank.reset(new CompressedBlockReader(this->rank_name));
+      if(this->compressed_path->logicalSize() !=
+           checkedJoinMultiply(this->path_count, sizeof(PathNode), "path shard logical bytes") ||
+         this->compressed_rank->logicalSize() !=
+           checkedJoinMultiply(this->rank_count, sizeof(PathNode::rank_type), "rank shard logical bytes"))
+      {
+        throw joinError("compressed path shard length does not match metadata",
+          this->path_name);
+      }
+      return;
+    }
+
     this->path_descriptor = ::open(this->path_name.c_str(), O_RDONLY);
     this->rank_descriptor = ::open(this->rank_name.c_str(), O_RDONLY);
     if(this->path_descriptor < 0 || this->rank_descriptor < 0)
@@ -1440,12 +1463,25 @@ private:
     this->path_buffer_first = this->path_offset;
     this->path_buffer_records = std::min(this->path_buffer.size(),
       this->path_count - this->path_buffer_first);
-    preadAll(this->path_descriptor, this->path_buffer.data(),
-      this->path_buffer_records * sizeof(PathNode),
-      this->path_buffer_first * sizeof(PathNode), this->path_name);
-    trimReadCache(this->path_descriptor,
-      (this->path_buffer_first + this->path_buffer_records) * sizeof(PathNode),
-      this->path_cache_released);
+    const size_type bytes = this->path_buffer_records * sizeof(PathNode);
+    if(this->compressed_path)
+    {
+      if(this->compressed_path->read(this->path_buffer.data(), bytes) != bytes)
+      {
+        throw joinError("short compressed path shard", this->path_name);
+      }
+    }
+    else
+    {
+      preadAll(this->path_descriptor, this->path_buffer.data(), bytes,
+        this->path_buffer_first * sizeof(PathNode), this->path_name);
+    }
+    if(this->path_descriptor >= 0)
+    {
+      trimReadCache(this->path_descriptor,
+        (this->path_buffer_first + this->path_buffer_records) * sizeof(PathNode),
+        this->path_cache_released);
+    }
   }
 
   void refillRanks()
@@ -1453,12 +1489,25 @@ private:
     this->rank_buffer_first = this->rank_offset;
     this->rank_buffer_records = std::min(this->rank_buffer.size(),
       this->rank_count - this->rank_buffer_first);
-    preadAll(this->rank_descriptor, this->rank_buffer.data(),
-      this->rank_buffer_records * sizeof(PathNode::rank_type),
-      this->rank_buffer_first * sizeof(PathNode::rank_type), this->rank_name);
-    trimReadCache(this->rank_descriptor,
-      (this->rank_buffer_first + this->rank_buffer_records) * sizeof(PathNode::rank_type),
-      this->rank_cache_released);
+    const size_type bytes = this->rank_buffer_records * sizeof(PathNode::rank_type);
+    if(this->compressed_rank)
+    {
+      if(this->compressed_rank->read(this->rank_buffer.data(), bytes) != bytes)
+      {
+        throw joinError("short compressed rank shard", this->rank_name);
+      }
+    }
+    else
+    {
+      preadAll(this->rank_descriptor, this->rank_buffer.data(), bytes,
+        this->rank_buffer_first * sizeof(PathNode::rank_type), this->rank_name);
+    }
+    if(this->rank_descriptor >= 0)
+    {
+      trimReadCache(this->rank_descriptor,
+        (this->rank_buffer_first + this->rank_buffer_records) * sizeof(PathNode::rank_type),
+        this->rank_cache_released);
+    }
   }
 
   void readRanks(PathNode::rank_type* target, size_type records)
@@ -1489,6 +1538,7 @@ private:
   std::vector<PathNode::rank_type> rank_buffer;
   size_type path_buffer_first, path_buffer_records;
   size_type rank_buffer_first, rank_buffer_records;
+  std::unique_ptr<CompressedBlockReader> compressed_path, compressed_rank;
 };
 
 void
@@ -1516,6 +1566,33 @@ scanJoinSide(const PathGraph& graph, const std::vector<size_type>& shards,
       }
     }
   }
+}
+
+size_type
+maximumCompressedShardReaderBytes(const PathGraph& graph)
+{
+  size_type maximum = 0;
+  for(size_type file = 0; file < graph.files(); file++)
+  {
+    const bool path_framed = CompressedBlockReader::isFramed(
+      graph.path_names[file]);
+    const bool rank_framed = CompressedBlockReader::isFramed(
+      graph.rank_names[file]);
+    if(path_framed != rank_framed)
+    {
+      throw joinError("path/rank shard uses inconsistent storage formats",
+        graph.path_names[file]);
+    }
+    if(!path_framed) { continue; }
+    size_type pair = checkedJoinAdd(
+      CompressedBlockReader::workingMemoryEstimate(
+        CompressedBlockReader::declaredBlockSize(graph.path_names[file])),
+      CompressedBlockReader::workingMemoryEstimate(
+        CompressedBlockReader::declaredBlockSize(graph.rank_names[file])),
+      "compressed source shard reader bytes");
+    maximum = std::max(maximum, pair);
+  }
+  return maximum;
 }
 
 JoinRecord
@@ -2666,7 +2743,7 @@ planJoinPartitions(const JoinRun& left_run, const JoinRun& right_run,
 
 constexpr std::uint64_t WORKER_TASK_MAGIC = 0x314b535441534347ULL;   // "GCSATSK1"
 constexpr std::uint64_t WORKER_RESULT_MAGIC = 0x3153455241534347ULL; // "GCSARES1"
-constexpr std::uint32_t WORKER_FORMAT_VERSION = 3;
+constexpr std::uint32_t WORKER_FORMAT_VERSION = 4;
 constexpr size_type WORKER_CONTROL_LIMIT = MEGABYTE;
 
 struct ExternalJoinWorkerTask
@@ -2676,6 +2753,7 @@ struct ExternalJoinWorkerTask
   JoinPartition partition;
   std::string output_path, output_rank, temp_directory;
   size_type sort_budget, join_block_budget, fan_in, threads;
+  TempFileCodecParameters codec;
   bool verify_payloads;
 };
 
@@ -2803,6 +2881,12 @@ encodeWorkerTask(const ExternalJoinWorkerTask& task)
   appendWorkerValue<std::uint64_t>(data, task.join_block_budget);
   appendWorkerValue<std::uint64_t>(data, task.fan_in);
   appendWorkerValue<std::uint64_t>(data, task.threads);
+  appendWorkerValue<std::uint8_t>(data,
+    static_cast<std::uint8_t>(task.codec.compression));
+  appendWorkerValue<std::uint64_t>(data, task.codec.block_size);
+  appendWorkerValue<std::uint64_t>(data, task.codec.workers);
+  appendWorkerValue<std::uint32_t>(data,
+    static_cast<std::uint32_t>(static_cast<std::int32_t>(task.codec.level)));
   appendWorkerValue<std::uint8_t>(data, task.partition.emit_bypass ? 1 : 0);
   appendWorkerValue<std::uint8_t>(data, task.verify_payloads ? 1 : 0);
   appendWorkerString(data, task.left.name);
@@ -2841,6 +2925,21 @@ decodeWorkerTask(const std::vector<std::uint8_t>& data)
   task.join_block_budget = readWorkerValue<std::uint64_t>(data, offset);
   task.fan_in = readWorkerValue<std::uint64_t>(data, offset);
   task.threads = readWorkerValue<std::uint64_t>(data, offset);
+  const std::uint8_t compression = readWorkerValue<std::uint8_t>(data, offset);
+  if(compression > static_cast<std::uint8_t>(TempCompression::ZSTD))
+  {
+    throw joinError("invalid temporary compression mode in worker task");
+  }
+  task.codec.compression = static_cast<TempCompression>(compression);
+  task.codec.block_size = readWorkerValue<std::uint64_t>(data, offset);
+  task.codec.workers = readWorkerValue<std::uint64_t>(data, offset);
+  task.codec.level = static_cast<std::int32_t>(
+    readWorkerValue<std::uint32_t>(data, offset));
+  if(task.codec.block_size == 0 || task.codec.workers == 0 ||
+     task.codec.level < -5 || task.codec.level > 22)
+  {
+    throw joinError("invalid temporary compression settings in worker task");
+  }
   task.partition.emit_bypass = (readWorkerValue<std::uint8_t>(data, offset) != 0);
   task.verify_payloads = (readWorkerValue<std::uint8_t>(data, offset) != 0);
   task.left.name = readWorkerString(data, offset);
@@ -2944,7 +3043,7 @@ externalPathJoinWorker(const std::string& task_file)
     ExternalPathSortStats sort_stats;
     ExternalPathJoinStats join_stats;
     ExternalPathSortSink sink(output, 0, task.sort_budget, task.fan_in,
-      task.partition.expected_bytes, committed_bytes, &sort_stats);
+      task.partition.expected_bytes, committed_bytes, &sort_stats, task.codec);
     joinSortedRuns(task.left, task.right, task.logical, task.join_block_budget,
       sink, task.verify_payloads, &join_stats,
       task.partition.left_begin, task.partition.left_end,
@@ -3038,10 +3137,66 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
   // merge-only operation into a full extra external sort.  Keep two file
   // descriptors per reader, two for the output pair, and two descriptors of
   // reserve for the surrounding construction.
-  const size_type reader_bytes = 2 * JOIN_IO_BUFFER_BYTES + sizeof(JoinRecord) +
-    4 * sizeof(size_type);
-  const size_type writer_bytes = 2 * JOIN_IO_BUFFER_BYTES;
   const size_type available_memory = static_cast<size_type>(memory.available());
+  const size_type base_reader_bytes = 2 * JOIN_IO_BUFFER_BYTES + sizeof(JoinRecord) +
+    4 * sizeof(size_type);
+  size_type maximum_reader_codec = 0;
+  for(size_type file = 0; file < source.files(); file++)
+  {
+    if(CompressedBlockReader::isFramed(source.path_names[file]))
+    {
+      size_type codec_bytes = checkedJoinAdd(
+        CompressedBlockReader::workingMemoryEstimate(
+          CompressedBlockReader::declaredBlockSize(source.path_names[file])),
+        CompressedBlockReader::workingMemoryEstimate(
+          CompressedBlockReader::declaredBlockSize(source.rank_names[file])),
+        "logical merge compressed reader bytes");
+      maximum_reader_codec = std::max(maximum_reader_codec, codec_bytes);
+    }
+  }
+  const size_type reader_bytes = checkedJoinAdd(base_reader_bytes,
+    maximum_reader_codec, "logical merge reader reservation");
+
+  TempFileCodecParameters output_codec = parameters.getTempFileCodecParameters();
+  const size_type minimum_block = std::max(sizeof(PathNode),
+    (PathLabel::LABEL_LENGTH + 1) * sizeof(PathNode::rank_type));
+  size_type writer_bytes = 2 * JOIN_IO_BUFFER_BYTES;
+  if(output_codec.enabled())
+  {
+    output_codec.block_size = std::max(minimum_block,
+      std::min(output_codec.block_size, available_memory));
+    auto writer_memory = [&]() -> size_type
+    {
+      return checkedJoinMultiply(2,
+        CompressedBlockWriter::workingMemoryEstimate(output_codec.block_size,
+          CompressedBlockWriter::ZSTD, output_codec.level,
+          output_codec.workers),
+        "logical merge compressed writer bytes");
+    };
+    const size_type two_readers = checkedJoinMultiply(2, reader_bytes,
+      "minimum logical merge readers");
+    while(output_codec.block_size > minimum_block &&
+          (writer_memory() > available_memory ||
+           two_readers > available_memory - writer_memory()))
+    {
+      output_codec.block_size = std::max(minimum_block,
+        output_codec.block_size / 2);
+    }
+    writer_bytes = writer_memory();
+    if(writer_bytes > available_memory ||
+       two_readers > available_memory - writer_bytes)
+    {
+      if(output_codec.compression == TempCompression::AUTO)
+      {
+        output_codec.compression = TempCompression::NONE;
+        writer_bytes = 2 * JOIN_IO_BUFFER_BYTES;
+      }
+      else
+      {
+        return; // Optional compaction cannot fit the explicit codec workspace.
+      }
+    }
+  }
   size_type merge_fan_in = std::min(label_fan_in,
     (parameters.getMaxOpenFiles() - 4) / 2);
   if(merge_fan_in > 0)
@@ -3070,6 +3225,7 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
     "logical-shard-merge");
   size_type staged_committed = committed_bytes;
   std::vector<std::string> new_outputs;
+  std::map<std::string, size_type> new_output_charges;
   struct NewOutputCleanup
   {
     std::vector<std::string>& names; bool keep;
@@ -3126,6 +3282,7 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
     }
     const size_type pointer_limit = (static_cast<size_type>(1) << 40);
     int path_fd = -1, rank_fd = -1;
+    std::unique_ptr<CompressedBlockWriter> compressed_path, compressed_rank;
     std::string partial_path, partial_rank;
     size_type file = 0, written_paths = 0, written_ranks = 0;
     size_type emitted_paths = 0, emitted_ranks = 0;
@@ -3133,6 +3290,11 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
     std::vector<std::uint8_t> path_buffer, rank_buffer;
     auto close_output = [&]()
     {
+      if(compressed_path)
+      {
+        compressed_path->finish(); compressed_rank->finish();
+        compressed_path.reset(); compressed_rank.reset();
+      }
       if(path_fd >= 0) { trimWrittenCache(path_fd, path_released, true, partial_path); }
       if(rank_fd >= 0) { trimWrittenCache(rank_fd, rank_released, true, partial_rank); }
       int path_error = (path_fd >= 0 ? ::close(path_fd) : 0); path_fd = -1;
@@ -3142,6 +3304,10 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
       // fails after the first succeeds, generation rollback still owns the
       // partially installed pair.
       new_outputs.push_back(output.path_names[file]); new_outputs.push_back(output.rank_names[file]);
+      new_output_charges[output.path_names[file]] = checkedJoinMultiply(
+        written_paths, sizeof(PathNode), "logical output path charge");
+      new_output_charges[output.rank_names[file]] = checkedJoinMultiply(
+        written_ranks, sizeof(PathNode::rank_type), "logical output rank charge");
       if(::rename(partial_path.c_str(), output.path_names[file].c_str()) != 0 ||
          ::rename(partial_rank.c_str(), output.rank_names[file].c_str()) != 0)
       {
@@ -3162,6 +3328,17 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
       partial_path = output.path_names[file] + ".partial";
       partial_rank = output.rank_names[file] + ".partial";
       std::remove(partial_path.c_str()); std::remove(partial_rank.c_str());
+      if(output_codec.enabled())
+      {
+        compressed_path.reset(new CompressedBlockWriter(partial_path,
+          output_codec.block_size, CompressedBlockWriter::ZSTD,
+          output_codec.level, output_codec.workers));
+        compressed_rank.reset(new CompressedBlockWriter(partial_rank,
+          output_codec.block_size, CompressedBlockWriter::ZSTD,
+          output_codec.level, output_codec.workers));
+        written_paths = 0; written_ranks = 0;
+        return;
+      }
       path_fd = ::open(partial_path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
       rank_fd = ::open(partial_rank.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
       if(path_fd < 0 || rank_fd < 0)
@@ -3201,13 +3378,29 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
         }
         if(written_ranks > pointer_limit - node.ranks())
         {
-          flush(path_buffer, path_fd, path_released, partial_path);
-          flush(rank_buffer, rank_fd, rank_released, partial_rank);
+          if(!compressed_path)
+          {
+            flush(path_buffer, path_fd, path_released, partial_path);
+            flush(rank_buffer, rank_fd, rank_released, partial_rank);
+          }
           close_output(); open_output();
         }
         node.setPointer(written_ranks);
         const std::uint8_t* path_bytes = reinterpret_cast<const std::uint8_t*>(&node);
         const std::uint8_t* rank_bytes = reinterpret_cast<const std::uint8_t*>(records[best].labels);
+        if(compressed_path)
+        {
+          compressed_path->writeRecord(path_bytes, sizeof(node));
+          if(node.ranks() > 0)
+          {
+            compressed_rank->writeRecord(rank_bytes,
+              node.ranks() * sizeof(PathNode::rank_type));
+          }
+          written_paths++; written_ranks += node.ranks();
+          emitted_paths++; emitted_ranks += node.ranks();
+          if(readers[best]->read(records[best])) { queue.push(best); }
+          continue;
+        }
         if(path_buffer.size() + sizeof(node) > JOIN_IO_BUFFER_BYTES)
         {
           flush(path_buffer, path_fd, path_released, partial_path);
@@ -3225,8 +3418,11 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
         emitted_paths++; emitted_ranks += node.ranks();
         if(readers[best]->read(records[best])) { queue.push(best); }
       }
-      flush(path_buffer, path_fd, path_released, partial_path);
-      flush(rank_buffer, rank_fd, rank_released, partial_rank);
+      if(!compressed_path)
+      {
+        flush(path_buffer, path_fd, path_released, partial_path);
+        flush(rank_buffer, rank_fd, rank_released, partial_rank);
+      }
       close_output();
       if(emitted_paths != paths || emitted_ranks != ranks)
       {
@@ -3238,6 +3434,7 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
     {
       if(path_fd >= 0) { ::close(path_fd); }
       if(rank_fd >= 0) { ::close(rank_fd); }
+      compressed_path.reset(); compressed_rank.reset();
       std::remove(partial_path.c_str()); std::remove(partial_rank.c_str());
       throw;
     }
@@ -3323,10 +3520,9 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
       std::find(compacted.rank_names.begin(), compacted.rank_names.end(), name) != compacted.rank_names.end());
     if(!final_name)
     {
-      struct stat file_status;
-      if(::stat(name.c_str(), &file_status) == 0 && std::remove(name.c_str()) == 0)
+      if(std::remove(name.c_str()) == 0)
       {
-        staged_committed -= static_cast<size_type>(file_status.st_size);
+        staged_committed -= new_output_charges.at(name);
       }
     }
   }
@@ -3397,6 +3593,19 @@ checkpointJoinPartitionArtifact(BuildWorkspace& workspace,
     source, records, expected_bytes, buffer_bytes);
 }
 
+size_type
+storedJoinBytes(const std::string& path)
+{
+  struct stat info;
+  if(::stat(path.c_str(), &info) != 0 || info.st_size < 0 ||
+     static_cast<std::uintmax_t>(info.st_size) >
+       std::numeric_limits<size_type>::max())
+  {
+    throw joinError("cannot determine stored shard bytes", path);
+  }
+  return static_cast<size_type>(info.st_size);
+}
+
 void
 checkpointJoinPartition(BuildWorkspace& workspace, const std::string& task,
   logical_file_id_t logical, const JoinPartition& partition,
@@ -3407,13 +3616,11 @@ checkpointJoinPartition(BuildWorkspace& workspace, const std::string& task,
   artifacts.push_back(checkpointJoinPartitionArtifact(workspace,
     joinPartitionArtifact(task, "paths", "path-nodes-v1"), logical,
     path_name, partition.expected_paths,
-    checkedJoinMultiply(partition.expected_paths, sizeof(PathNode),
-      "checkpoint path bytes"), buffer_bytes, "label"));
+    storedJoinBytes(path_name), buffer_bytes, "label"));
   artifacts.push_back(checkpointJoinPartitionArtifact(workspace,
     joinPartitionArtifact(task, "ranks", "path-ranks-v1"), logical,
     rank_name, partition.expected_ranks,
-    checkedJoinMultiply(partition.expected_ranks, sizeof(PathNode::rank_type),
-      "checkpoint rank bytes"), buffer_bytes, "path-order"));
+    storedJoinBytes(rank_name), buffer_bytes, "path-order"));
   workspace.commit_task(task, "join-partition", artifacts);
 }
 
@@ -3426,13 +3633,15 @@ restoreJoinPartition(const BuildWorkspace& workspace, const std::string& task,
   workspace.restore_adopted_payload(
     joinPartitionArtifact(task, "paths", "path-nodes-v1"),
     logical, physical_shard_id_t(0), path_name, partition.expected_paths,
-    checkedJoinMultiply(partition.expected_paths, sizeof(PathNode),
-      "restore path bytes"), buffer_bytes, true);
+    storedJoinBytes(workspace.artifact_path(
+      joinPartitionArtifact(task, "paths", "path-nodes-v1"), logical,
+      physical_shard_id_t(0))), buffer_bytes, true);
   workspace.restore_adopted_payload(
     joinPartitionArtifact(task, "ranks", "path-ranks-v1"),
     logical, physical_shard_id_t(0), rank_name, partition.expected_ranks,
-    checkedJoinMultiply(partition.expected_ranks, sizeof(PathNode::rank_type),
-      "restore rank bytes"), buffer_bytes, true);
+    storedJoinBytes(workspace.artifact_path(
+      joinPartitionArtifact(task, "ranks", "path-ranks-v1"), logical,
+      physical_shard_id_t(0))), buffer_bytes, true);
 }
 
 struct ActiveJoinWorker
@@ -3483,6 +3692,14 @@ spawnJoinWorker(const std::string& executable, const std::string& task_file)
 void
 validateWorkerOutput(const std::string& path, size_type expected_bytes)
 {
+  if(CompressedBlockReader::isFramed(path))
+  {
+    if(CompressedBlockReader::declaredLogicalSize(path) != expected_bytes)
+    {
+      throw joinError("compressed worker output length mismatch", path);
+    }
+    return;
+  }
   struct stat info;
   if(::stat(path.c_str(), &info) != 0 || info.st_size < 0 ||
      static_cast<size_type>(info.st_size) != expected_bytes)
@@ -3733,6 +3950,11 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
       task.sort_budget = sort_budget; task.join_block_budget = join_block_budget;
       task.fan_in = label_fan_in;
       task.threads = worker_threads;
+      task.codec = parameters.getTempFileCodecParameters();
+      // Process workers are the outer parallelism layer. Bound zstd's inner
+      // worker pool by the CPU share assigned to this child so several join
+      // partitions cannot silently multiply the requested concurrency.
+      task.codec.workers = std::min(task.codec.workers, worker_threads);
       task.verify_payloads = parameters.getVerifyWorkspace();
       std::string task_file = TempFile::getName("gcsa_join_worker_task");
       writeWorkerControl(task_file, encodeWorkerTask(task));
@@ -3806,6 +4028,35 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
   size_type join_budget = direct_budgets.join;
   size_type direct_sort_budget = direct_budgets.sort;
   size_type direct_join_budget = direct_budgets.join;
+  // The join-run sorter and one source PathShardReader coexist during each
+  // distribution scan. Raw source caches are already included in
+  // JOIN_FIXED_BYTES; framed inputs additionally own two decode workspaces.
+  // Deduct those bytes from the sorter instead of silently exceeding the
+  // configured phase share on the doubling step after compression starts.
+  size_type source_codec_bytes = maximumCompressedShardReaderBytes(graph);
+  size_type required_distribution = checkedJoinAdd(
+    externalPathJoinMinimumBudget(), source_codec_bytes,
+    "compressed distribution minimum");
+  if(join_budget < required_distribution &&
+     parameters.joinPartitionSizeIsAutomatic())
+  {
+    size_type transfer = required_distribution - join_budget;
+    size_type minimum_sort = externalPathGraphSortMinimumBudget();
+    if(direct_sort_budget >= minimum_sort &&
+       transfer <= direct_sort_budget - minimum_sort)
+    {
+      join_budget += transfer;
+      direct_join_budget += transfer;
+      direct_sort_budget -= transfer;
+    }
+  }
+  if(join_budget < required_distribution)
+  {
+    throw joinError(
+      "join budget cannot admit one compressed source shard reader; "
+      "increase --memory-limit or rebuild with a smaller compression block");
+  }
+  size_type distribution_sort_budget = join_budget - source_codec_bytes;
   if(parameters.getMaxOpenFiles() < 6)
   {
     throw joinError("max-open-files must be at least 6 for the external join");
@@ -3841,15 +4092,24 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
   {
     logical_file_id_t logical = group.first;
 
-    ExternalJoinSorter right_sorter(logical, RIGHT_BY_FROM, join_budget,
+    ExternalJoinSorter right_sorter(logical, RIGHT_BY_FROM,
+      distribution_sort_budget,
       join_fan_in, parameters.getVerifyWorkspace(), stats);
     scanJoinSide(graph, group.second, logical, RIGHT_BY_FROM, right_sorter, stats);
     JoinRun right = right_sorter.finish();
 
-    ExternalJoinSorter left_sorter(logical, LEFT_BY_TO, join_budget,
+    ExternalJoinSorter left_sorter(logical, LEFT_BY_TO,
+      distribution_sort_budget,
       join_fan_in, parameters.getVerifyWorkspace(), stats);
     scanJoinSide(graph, group.second, logical, LEFT_BY_TO, left_sorter, stats);
     JoinRun left = left_sorter.finish();
+
+    if(stats != nullptr && source_codec_bytes > 0)
+    {
+      stats->max_bytes_resident = std::max(stats->max_bytes_resident,
+        checkedJoinAdd(distribution_sort_budget, source_codec_bytes,
+          "compressed distribution scan peak"));
+    }
 
     if(parameters.getProcessWorkers() > 1)
     {
@@ -3871,7 +4131,8 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
       ExternalPathJoinStats direct_join_stats;
       ExternalPathSortSink output(next, output_file, direct_sort_budget,
         label_fan_in, size_limit, committed_bytes,
-        (stats == nullptr ? nullptr : &sort_stats));
+        (stats == nullptr ? nullptr : &sort_stats),
+        parameters.getTempFileCodecParameters());
       joinSortedRuns(left, right, logical, direct_join_budget, output,
         parameters.getVerifyWorkspace(), (stats == nullptr ? nullptr : &direct_join_stats));
       output.finish();

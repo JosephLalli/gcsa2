@@ -1,5 +1,6 @@
 #include <gcsa/path_graph.h>
 #include <gcsa/checkpoint.h>
+#include <gcsa/compressed_block.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -378,6 +379,9 @@ int main(int argc, char** argv)
   process_parameters.setSortRunSize(2 * MEGABYTE);
   process_parameters.setCheckpointBytes(32 * KILOBYTE);
   process_parameters.setProcessWorkers(2);
+  process_parameters.setTempCompression("zstd");
+  process_parameters.setCompressionBlockSize(64 * KILOBYTE);
+  process_parameters.setCompressionWorkers(1);
   // The setter clamps to MIN_OPEN_FILES (64). Compaction retains a bounded
   // multi-run frontier rather than pretending this request limits it to 8.
   process_parameters.setMaxOpenFiles(8);
@@ -397,6 +401,8 @@ int main(int argc, char** argv)
   {
     require(process_graph.logicalFile(file) == logical_file_id_t(7));
     require(process_graph.physicalShard(file) == physical_shard_id_t(file));
+    require(CompressedBlockReader::isFramed(process_graph.path_names[file]));
+    require(CompressedBlockReader::isFramed(process_graph.rank_names[file]));
   }
   require(process_stats.join_partitions > 1);
   // The sampled planner must turn this single high-fanout semantic key into
@@ -457,6 +463,24 @@ int main(int argc, char** argv)
   require(resumed_stats.restored_radix_plans == 1);
   require(resumed_stats.restored_sidecar_metadata == 2);
   require(resumed_stats.full_record_plan_rescans == 0);
+
+  // Consume the restored compressed shards in another doubling step. This is
+  // the important mixed-format boundary: the distribution sorter and two
+  // framed decode workspaces must share the same join budget rather than
+  // adding an untracked block cache on top of it.
+  PathGraph second_legacy(combined_path, combined_rank);
+  second_legacy.order = 1;
+  second_legacy.extend(GIGABYTE, 64 * MEGABYTE);
+  second_legacy.extend(GIGABYTE, 64 * MEGABYTE);
+  ConstructionParameters second_parameters = process_parameters;
+  second_parameters.setProcessWorkers(1);
+  ExternalPathJoinStats second_stats;
+  externalPathGraphExtend(resumed_process, GIGABYTE, second_parameters,
+    &second_stats);
+  requireSameGraph(second_legacy, resumed_process,
+    "compressed source doubling step");
+  require(second_stats.max_bytes_resident <=
+    second_parameters.getMemoryLimitBytes());
 
   // Spread exact join keys across the most-significant nibble of node_type.
   // The 4 KiB target cannot admit their combined output, but each key fits by
