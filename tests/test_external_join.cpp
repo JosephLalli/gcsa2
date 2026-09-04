@@ -364,6 +364,8 @@ int main(int argc, char** argv)
   require(stats.blocked_key_groups > 0);
   require(stats.compressed_join_runs == 0);
   require(stats.join_run_stored_bytes == stats.join_run_logical_bytes);
+  require(stats.compressed_join_sidecars == 0);
+  require(stats.join_sidecar_stored_bytes == stats.join_sidecar_logical_bytes);
   require(stats.max_bytes_resident <= memory_budget);
 
   // A tiny single-process budget forces the same high-fanout key through
@@ -485,7 +487,11 @@ int main(int argc, char** argv)
   process_parameters.setCheckpointBytes(32 * KILOBYTE);
   process_parameters.setProcessWorkers(2);
   process_parameters.setTempCompression("zstd");
-  process_parameters.setCompressionBlockSize(64 * KILOBYTE);
+  // 1 KiB frames force both the 40-summary stream and the recursively
+  // split 1201-detail stream across several blocks. Planning consequently
+  // exercises framed readAt() for nonzero subgroup offsets, rather than only
+  // a sequential first-block read.
+  process_parameters.setCompressionBlockSize(KILOBYTE);
   process_parameters.setCompressionWorkers(1);
   // The setter clamps to MIN_OPEN_FILES (64). Compaction retains a bounded
   // multi-run frontier rather than pretending this request limits it to 8.
@@ -523,10 +529,15 @@ int main(int argc, char** argv)
   require(process_stats.radix_plan_bins >= 1);
   require(process_stats.sidecar_plan_groups > 0);
   require(process_stats.sidecar_plan_detail_records > 0);
+  require(process_stats.sidecar_plan_groups * 48 > KILOBYTE);
+  require(process_stats.sidecar_plan_detail_records > KILOBYTE);
   require(process_stats.full_record_plan_rescans == 0);
   require(process_stats.compressed_join_runs > 0);
   require(process_stats.join_run_stored_bytes <
     process_stats.join_run_logical_bytes);
+  require(process_stats.compressed_join_sidecars > 0);
+  require(process_stats.join_sidecar_stored_bytes <
+    process_stats.join_sidecar_logical_bytes);
   require(process_stats.grouped_expansion_records > 0);
   require(process_stats.expansion_context_bytes_saved > 0);
   require(process_stats.max_bytes_resident <= process_parameters.getMemoryLimitBytes());
