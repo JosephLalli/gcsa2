@@ -42,6 +42,10 @@ int main()
   require(parameters.getJoinPartitionSize() == 16 * GIGABYTE);
   parameters.setMergeFanIn(32); parameters.setMaxOpenFiles(96);
   parameters.setProcessWorkers(4);
+  parameters.setTempCompression("zstd");
+  parameters.setCompressionBlockSize(parseBytes("8M"));
+  parameters.setCompressionWorkers(3);
+  parameters.setCompressionLevel(2);
   parameters.setWorkerExecutable("/tmp/build_gcsa");
   require(parameters.externalMemory());
   require(parameters.getWorkDirectory() == "/tmp/example.gcsa-work");
@@ -50,6 +54,16 @@ int main()
   require(parameters.getLimitBytes() == 40 * KILOBYTE * GIGABYTE);
   require(parameters.getMergeFanIn() == 32 && parameters.getMaxOpenFiles() == 96);
   require(parameters.getProcessWorkers() == 4);
+  require(parameters.getTempCompression() == TempCompression::ZSTD);
+  require(std::string(tempCompressionName(parameters.getTempCompression())) == "zstd");
+  require(parameters.getCompressionBlockSize() == 8 * MEGABYTE);
+  require(parameters.getCompressionWorkers() == 3);
+  require(parameters.getCompressionLevel() == 2);
   require(parameters.getWorkerExecutable() == "/tmp/build_gcsa");
+
+  invalid = false;
+  try { parameters.setTempCompression("gzip"); }
+  catch(const std::invalid_argument&) { invalid = true; }
+  require(invalid);
   return 0;
 }

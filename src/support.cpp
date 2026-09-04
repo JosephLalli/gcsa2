@@ -85,8 +85,23 @@ ConstructionParameters::ConstructionParameters() :
   sort_run_size(SORT_RUN_SIZE), join_partition_size(JOIN_PARTITION_SIZE),
   merge_fan_in(MERGE_FAN_IN), max_open_files(MAX_OPEN_FILES),
   process_workers(PROCESS_WORKERS),
-  checkpoint_records(CHECKPOINT_RECORDS), checkpoint_bytes(CHECKPOINT_BYTES)
+  checkpoint_records(CHECKPOINT_RECORDS), checkpoint_bytes(CHECKPOINT_BYTES),
+  temp_compression(TempCompression::AUTO),
+  compression_block_size(COMPRESSION_BLOCK_SIZE),
+  compression_workers(COMPRESSION_WORKERS), compression_level(COMPRESSION_LEVEL)
 {
+}
+
+const char*
+tempCompressionName(TempCompression compression)
+{
+  switch(compression)
+  {
+  case TempCompression::AUTO: return "auto";
+  case TempCompression::NONE: return "none";
+  case TempCompression::ZSTD: return "zstd";
+  }
+  return "invalid";
 }
 
 void
@@ -242,6 +257,48 @@ void
 ConstructionParameters::setCheckpointBytes(size_type bytes)
 {
   this->checkpoint_bytes = std::max((size_type)KILOBYTE, bytes);
+}
+
+void
+ConstructionParameters::setTempCompression(TempCompression compression)
+{
+  this->temp_compression = compression;
+}
+
+void
+ConstructionParameters::setTempCompression(const std::string& compression)
+{
+  if(compression == "auto") { this->setTempCompression(TempCompression::AUTO); }
+  else if(compression == "none") { this->setTempCompression(TempCompression::NONE); }
+  else if(compression == "zstd") { this->setTempCompression(TempCompression::ZSTD); }
+  else
+  {
+    throw std::invalid_argument(
+      "temporary compression must be one of: auto, none, zstd");
+  }
+}
+
+void
+ConstructionParameters::setCompressionBlockSize(size_type bytes)
+{
+  // Independent frames need enough payload to amortize their fixed header,
+  // while the upper bound keeps one queue slot reasonable under small budgets.
+  this->compression_block_size = Range::bound(bytes,
+    static_cast<size_type>(64 * KILOBYTE), static_cast<size_type>(GIGABYTE));
+}
+
+void
+ConstructionParameters::setCompressionWorkers(size_type workers)
+{
+  this->compression_workers = Range::bound(workers,
+    static_cast<size_type>(1), static_cast<size_type>(256));
+}
+
+void
+ConstructionParameters::setCompressionLevel(int level)
+{
+  // Avoid exposing libzstd headers through the public support interface.
+  this->compression_level = std::max(-5, std::min(level, 22));
 }
 
 void
