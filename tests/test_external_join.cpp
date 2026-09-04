@@ -11,6 +11,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
@@ -249,6 +250,50 @@ int main(int argc, char** argv)
     return externalPathJoinWorker(argv[2]);
   }
   omp_set_num_threads(1);
+
+  // The disk ceiling applies to the peak physical framed pair, not merely its
+  // logical PathNode/rank payload. Verify rejection in a child because the
+  // legacy sorter error path deliberately terminates the current process.
+  TempFileCodecParameters limit_codec(TempCompression::ZSTD,
+    64 * KILOBYTE, 1, 1);
+  const size_type limit_sort_budget = 8 * MEGABYTE;
+  PathNode limit_node;
+  limit_node.from = 1; limit_node.to = 2; limit_node.fields = 0;
+  limit_node.setPredecessors(1); limit_node.setOrder(1);
+  limit_node.setLCP(1); limit_node.setPointer(0);
+  PathNode::rank_type limit_ranks[PathLabel::LABEL_LENGTH + 1] = { 17, 19 };
+  const size_type logical_pair_bytes = sizeof(PathNode) +
+    limit_node.ranks() * sizeof(PathNode::rank_type);
+  const size_type peak_pair_bytes = externalPathGraphShardPeakBytes(1,
+    limit_node.ranks(), limit_sort_budget, limit_codec);
+  require(peak_pair_bytes > logical_pair_bytes);
+  {
+    PathGraph rejected_output(1, 0, 0);
+    pid_t child = ::fork();
+    require(child >= 0);
+    if(child == 0)
+    {
+      size_type committed = 0;
+      ExternalPathSortSink sink(rejected_output, 0, limit_sort_budget, 2,
+        logical_pair_bytes, committed, nullptr, limit_codec);
+      sink.write(limit_node, limit_ranks);
+      std::_Exit(EXIT_SUCCESS);
+    }
+    int status = 0;
+    require(::waitpid(child, &status, 0) == child);
+    require(WIFEXITED(status) && WEXITSTATUS(status) == EXIT_FAILURE);
+  }
+  {
+    PathGraph admitted_output(1, 0, 0);
+    size_type committed = 0;
+    ExternalPathSortSink sink(admitted_output, 0, limit_sort_budget, 2,
+      peak_pair_bytes, committed, nullptr, limit_codec);
+    sink.write(limit_node, limit_ranks);
+    sink.finish();
+    require(sink.storedBytes() == committed);
+    require(committed > logical_pair_bytes && committed <= peak_pair_bytes);
+  }
+
   std::vector<TestRecord> left;
   for(size_type i = 0; i < 40; i++)
   {

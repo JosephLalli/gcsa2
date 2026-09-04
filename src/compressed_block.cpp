@@ -187,6 +187,40 @@ CompressedBlockWriter::workingMemoryEstimate(std::size_t block_bytes,
   return slots * per_worker;
 }
 
+std::uint64_t
+CompressedBlockWriter::maximumTemporaryBytes(std::uint64_t logical_bytes,
+  std::size_t maximum_record_bytes, std::size_t block_bytes)
+{
+  if(block_bytes == 0 || maximum_record_bytes == 0 ||
+     maximum_record_bytes > block_bytes)
+  {
+    throw std::invalid_argument("invalid compressed block record bound");
+  }
+
+  // Before a non-final block is flushed, the next record did not fit. As that
+  // record is at most maximum_record_bytes, every completed block contains at
+  // least block_bytes - maximum_record_bytes + 1 logical bytes. This is much
+  // tighter than assuming one block per record while remaining valid for the
+  // variable-width rank records.
+  const std::uint64_t minimum_fill =
+    static_cast<std::uint64_t>(block_bytes - maximum_record_bytes) + 1;
+  const std::uint64_t blocks = (logical_bytes == 0 ? 0 :
+    1 + (logical_bytes - 1) / minimum_fill);
+  const std::uint64_t per_block_peak = BLOCK_HEADER_SIZE + 2 * INDEX_ENTRY_SIZE;
+  const std::uint64_t fixed = HEADER_SIZE + FOOTER_SIZE;
+  if(blocks > (std::numeric_limits<std::uint64_t>::max() - fixed) /
+       per_block_peak)
+  {
+    throw std::overflow_error("compressed block temporary size overflow");
+  }
+  const std::uint64_t metadata = fixed + blocks * per_block_peak;
+  if(logical_bytes > std::numeric_limits<std::uint64_t>::max() - metadata)
+  {
+    throw std::overflow_error("compressed block temporary size overflow");
+  }
+  return logical_bytes + metadata;
+}
+
 CompressedBlockWriter::CompressedBlockWriter(const std::string& filename,
   std::size_t block_bytes, Mode mode, int zstd_level, std::size_t workers) :
   final_name(filename), temporary_name(), index_name(), output(), index_output(),

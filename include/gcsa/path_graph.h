@@ -408,6 +408,12 @@ size_type externalPathGraphSortMinimumBudget();
 void externalPathGraphSort(PathGraph& graph, size_type file,
   size_type byte_budget, size_type fan_in, ExternalPathSortStats* stats = nullptr);
 
+// Worst-case live filesystem bytes for the final path/rank pair produced by a
+// streaming label sorter. The bound includes framed commit metadata and its
+// temporary index copy; raw output is exactly its logical payload size.
+size_type externalPathGraphShardPeakBytes(size_type paths, size_type ranks,
+  size_type sort_byte_budget, const TempFileCodecParameters& codec);
+
 /*
   A bounded sink for records that are produced incrementally but must become a
   label-sorted PathGraph shard. Full buffers are sorted into immutable runs;
@@ -433,6 +439,7 @@ public:
   size_type paths() const;
   size_type ranks() const;
   size_type bytes() const;
+  size_type storedBytes() const;
 
 private:
   struct Impl;

@@ -374,7 +374,10 @@ remains more valuable than running two encoders against the same disk.
 
 The current disk guard is exact for generated path/label sinks and deterministic
 join-partition output: it counts committed and pending generation bytes against
-`--disk-limit` and never compares those bytes with RAM. The `DiskBudget`
+`--disk-limit` and never compares those bytes with RAM. Framed output is admitted
+using a conservative physical peak that includes per-block metadata and the
+temporary index copy present during commit; completed and restored shards then
+replace that reservation with their exact `st_size` totals. The `DiskBudget`
 primitive can also inspect recursively live workspace bytes and `statvfs()`
 free space, but it is not yet shared by every writer. In particular, final-event
 copies, LCP raw levels, and some checkpoint copies currently stop on a failed
@@ -672,7 +675,7 @@ when its production call path and forced-spill/recovery tests pass.
 
 | Slice | State |
 | --- | --- |
-| Shared byte-token `MemoryBudget` and statvfs-aware `DiskBudget` | memory primitives, major external-phase byte caps, and framed encoder/decoder/zstd-worker reservations implemented; pruning/merged-graph buffers are byte-bounded but not globally admitted; final-scan readers retire cgroup-charged cache without extra descriptors; mapping/input/library allocations remain outside the shared budget; disk guard covers generated path/join volume but not every final/LCP/checkpoint writer |
+| Shared byte-token `MemoryBudget` and statvfs-aware `DiskBudget` | memory primitives, major external-phase byte caps, and framed encoder/decoder/zstd-worker reservations implemented; pruning/merged-graph buffers are byte-bounded but not globally admitted; final-scan readers retire cgroup-charged cache without extra descriptors; mapping/input/library allocations remain outside the shared budget; disk guard uses conservative framed peaks and exact installed sizes for generated path/join volume but not every final/LCP/checkpoint writer |
 | Versioned workspace artifacts, atomic publication, manifest compatibility, recovery tests | phase and join-range checkpoints plus abrupt-exit commit-boundary tests implemented; raw/framed mixed restore and journaled idempotent predecessor/family retirement implemented; transient distribution-run task records pending |
 | Human-readable operational construction parameters | core budget/run, temporary-compression, process-worker, and safe-cleanup controls implemented and parser-tested; checkpoint cadence remains standalone-only |
 | Framed temporary-file compression | versioned independently checksummed zstd/raw blocks, disk-spooled footer index, logical random access, raw fallback, mixed raw/framed join reading, exact primary-artifact size telemetry, shared-budget admission, and multithreaded zstd contexts implemented for path/rank, fixed-record join-run, and final-event streams; join group/detail sidecars, redundancy, preprocessing, and LCP level files remain raw |
