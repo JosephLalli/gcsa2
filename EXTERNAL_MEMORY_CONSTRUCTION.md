@@ -1,9 +1,12 @@
 # External-memory GCSA2 construction
 
-Status: implementation in progress on top of GCSA2 `2a1d479`. The public
-`.gcsa` and `.lcp` formats remain unchanged. This document records both the
-measured baseline and the invariants of the disk-first route; the final section
-tracks which parts are actually implemented.
+Status: the production disk-first route is implemented through prefix doubling,
+bounded pruning, final component packing, streaming LCP, framed temporary-file
+compression, and durable predecessor retirement. Whole-process input decoding
+and global disk admission remain open work. The public `.gcsa` and `.lcp`
+formats remain unchanged. This document records both the measured baseline and
+the invariants of the disk-first route; the final section tracks which parts
+are actually implemented.
 
 ## Baseline audit
 
@@ -37,7 +40,7 @@ vectors per OpenMP thread rather than as one shared pair, and
 `MergedGraph::MergedGraph()` was already mostly streaming but retained an
 unbounded `SameFromSet::nodes` group. The table describes the preserved legacy
 route. The workspace-selected route now replaces key/start/initial-path
-preprocessing, prefix-doubling joins and label sorting, final raw component
+preprocessing, prefix-doubling joins and label sorting, final event/component
 construction, dense previous-occurrence state, and simultaneous raw LCP levels.
 It now also spills pruning equal-label/range state, externally reduces
 `MergedGraph` same-from sets, bounds input/output shard descriptors, and derives
@@ -105,8 +108,9 @@ Only preexisting pruned fixtures are eligible for acceptance runs. The chr19
 production prune exited successfully after 49:45:06 at 154,737,660 KiB maximum
 RSS, but its wrapper did not publish the 748,778,080-byte `.partial` graph as a
 committed fixture. No competing chr19 index build was launched. The remaining
-final-component memory gaps below must be closed or bounded before that race is
-considered ready.
+whole-physical-graph input load, allocations outside the shared byte budget,
+and global disk-admission gaps below must be closed or deployment-bounded before
+that race is considered ready.
 
 The successful legacy command used `vg index -k 16 -X 4 -Z 700 -t 32 -V`.
 It produced a 682,869,673-byte GCSA and a 273,490,577-byte LCP in 1:55:35
@@ -218,9 +222,12 @@ while retaining an 8 MiB tail. This adds no hidden descriptor per stream, and a
 backward seek simply rereads an evicted page. `posix_fadvise()` is best-effort
 and non-semantic;
 `fdatasync()` is the durability boundary. Pruning and `MergedGraph` now use
-bounded spill structures and byte-sized buffers, but their reservations, final
-mapping/input allocations, and some library-owned compression scratch are not
-all admitted through the process-wide `MemoryBudget`. The in-process token
+bounded spill structures and byte-sized buffers. Every active framed-stream
+encoder reserves its input block, worst-case output, zstd context, and a
+conservative allowance for each requested zstd worker; framed readers reserve
+encoded and decoded blocks plus decoder context before construction. Final
+mapping/input allocations and some older pruning/merged-graph reservations are
+not all admitted through the process-wide `MemoryBudget`. The in-process token
 budget is therefore not yet an end-to-end RSS ceiling; a hard cgroup remains
 the acceptance boundary.
 
@@ -288,6 +295,41 @@ counts and lengths, and kills sibling workers after a failure. Each completed
 semantic range is committed independently, so a resumed generation restores
 valid ranges and only respawns missing work. Cgroup-charged filesystem cache
 still needs a deployment-level ceiling in addition to allocator byte tokens.
+
+### Framed temporary streams and small-file policy
+
+Large immutable path, rank, and final-event streams can use a version-2 framed
+format below their record API. Its 32-byte header identifies the codec and
+logical block size. Each independently decodable block has a 40-byte header,
+logical record count, raw/stored lengths, and checksum. A 16-byte-per-block
+physical/logical offset index and a 56-byte footer provide counts, total logical
+bytes, and a whole-stream checksum. The writer spools that index to one
+construction-only sidecar and appends it at commit, so neither the number of
+blocks nor random-seek metadata grows in RAM or remains as thousands of small
+files.
+
+All `PathNode` pointers and rank offsets remain **logical uncompressed byte
+offsets**. Readers binary-search the on-disk footer index, decode one admitted
+block, and can mix legacy raw shards with framed shards in the same resumed
+workspace. `auto` uses zstd level 1 when its workspace fits and stores an
+incompressible block raw; under a very small memory budget it falls back to a
+raw stream. Explicit `zstd` instead reports the minimum codec workspace it
+cannot admit. Compression mode, block size, level, and worker count are
+operational settings and may change on resume. Join child processes clamp
+zstd's internal worker count to their assigned thread share, preventing
+process-level and codec-level parallelism from multiplying unnoticed.
+
+A retained chr21 workspace inventory explains why the implementation batches
+large streams instead of combining task markers into a general small-file
+container: 534 files below 1 MiB occupied only 18.1 MiB, and 498 files below
+64 KiB occupied 1.25 MiB, in an approximately 260 GiB workspace. Completion
+records remain separate because their atomic rename is the task commit point.
+Logical join bins are already ranges in shared pack files, while compressed
+data blocks and their offset index travel in one artifact. Preliminary
+`zstd -1` samples of the old workspace showed roughly 4--5x reduction for path
+streams, 14--77x for generation rank streams, about 32x for join-partition
+ranks, and 6--12x for final event streams. Those ratios motivate the codec but
+are not a replacement for a new end-to-end chromosome benchmark.
 
 The largest remaining I/O opportunity is further record compaction, not extra
 writer processes. Current fixed-width join runs repeat complete path labels and
@@ -367,7 +409,10 @@ versions, input identities/sizes/checksums, mapping identity, k-mer length,
 doubling steps, sample period, LCP branching, alphabet, and logical input IDs.
 Those fields form the semantic fingerprint. Memory, threads, run size,
 partition target, merge fan-in, open-file limit, and I/O buffer size are stored
-for provenance but excluded from the fingerprint.
+for provenance but excluded from the fingerprint. Temporary compression mode,
+block size, level, worker count, and obsolete-artifact cleanup are likewise
+operational: a resumed build may use a different codec or RAM/disk tradeoff for
+new artifacts without invalidating already committed raw or framed inputs.
 
 Durable phase artifacts have explicit little-endian headers and footers with
 magic, format version, artifact kind, logical ID, physical shard ID, record and
@@ -397,26 +442,39 @@ are replayed in dependency order. Headers, lengths, footers, and task metadata
 are always checked. Join-run payload checksums are selected by
 `--verify-workspace`; normal construction trusts the checksum computed while a
 newly synced run was written and avoids immediately rereading it. Phase
-path/rank checkpoints use immutable raw fixed-record payloads: the checkpoint
-hard-links them into the workspace when source and workspace share a filesystem
-and otherwise performs one bounded copy. The payload is checksummed once while
-it is committed. Normal same-filesystem restore validates task identity, record
-count, and byte length and then hard-links the committed inode into the next
-`PathGraph`; `--verify-workspace` additionally rereads the complete checksum.
-Join-range worker outputs and final-event streams use the same immutable raw
-payload protocol, avoiding both the checkpoint rewrite and normal resume copy.
+path/rank checkpoints adopt an immutable fixed-record payload: they hard-link
+the raw or framed file into the workspace when source and workspace share a
+filesystem and otherwise perform one bounded copy. Version-3 checkpoint
+metadata records both logical record bytes and physical stored bytes and still
+restores version-2 raw checkpoints. Normal same-filesystem restore validates
+task identity, record count, and byte length and then hard-links the committed
+inode into the next `PathGraph`; `--verify-workspace` additionally rereads the
+complete checksum. Join-range worker outputs and final-event streams use the
+same immutable opaque-payload protocol, avoiding both checkpoint rewrite and
+normal resume copy.
 The final-event writer incrementally hashes BWT masks, edge destinations,
-samples, and occurrence events while producing them; same-filesystem adoption
-reuses those digests instead of rereading each closed stream. The externally
-sorted redundancy stream retains a full checksum pass, and cross-filesystem
-fallback always validates the writer digest while copying.
+samples, and occurrence events while producing them. Raw same-filesystem
+adoption reuses those logical-stream digests. A framed stream is checksummed as
+stored during adoption because its physical header/index/payload differs from
+the logical records. The externally sorted redundancy stream remains raw and
+retains a full checksum pass; cross-filesystem fallback always validates while
+copying.
 Final events retain a checked header/footer compatibility restore for older
 workspaces. Cross-filesystem restore copies and checksum-validates in one pass.
 A task with a missing or truncated output is invalidated and rerun along with
 its dependants. `--verify-workspace` additionally discovers same-length payload
 corruption by replaying the committed checksum; ordinary resume deliberately
-trusts the checksum recorded by the closed writer. Cleanup is itself idempotent
-and never removes the newest committed predecessor of an incomplete task.
+trusts the checksum recorded by the closed writer. Cleanup first validates
+predecessor and successor markers, atomically publishes a `*.retired`
+deletion-intent journal, and only then unlinks predecessor artifacts not
+referenced by another task. Recovery replays journals idempotently, including a
+crash after any individual unlink. Once those deletions and their directory are
+synced, the journal is atomically replaced by a `complete=1` audit record;
+recovery does not revalidate an old immediate successor that was itself retired
+later. A completed extend checkpoint also retires all of its fine-grained
+join-partition and MSD-plan families. Enabling cleanup only on resume catches up
+all generations older than the restored frontier. Cleanup never removes the
+newest committed predecessor of an incomplete task.
 
 Crash tests use deterministic process termination, without stack unwinding,
 immediately before and after artifact rename, immediately before and after task
@@ -609,9 +667,10 @@ when its production call path and forced-spill/recovery tests pass.
 
 | Slice | State |
 | --- | --- |
-| Shared byte-token `MemoryBudget` and statvfs-aware `DiskBudget` | memory primitives and major external-phase byte caps implemented; pruning/merged-graph buffers are byte-bounded but not globally admitted; final-scan readers retire cgroup-charged cache without extra descriptors; mapping/input/library allocations remain outside the shared budget; disk guard covers generated path/join volume but not every final/LCP/checkpoint writer |
-| Versioned workspace artifacts, atomic publication, manifest compatibility, recovery tests | phase and join-range checkpoints plus abrupt-exit commit-boundary tests implemented; transient distribution-run task records pending |
-| Human-readable operational construction parameters | core budget/run controls implemented and parser-tested; cleanup/cadence controls are not all wired |
+| Shared byte-token `MemoryBudget` and statvfs-aware `DiskBudget` | memory primitives, major external-phase byte caps, and framed encoder/decoder/zstd-worker reservations implemented; pruning/merged-graph buffers are byte-bounded but not globally admitted; final-scan readers retire cgroup-charged cache without extra descriptors; mapping/input/library allocations remain outside the shared budget; disk guard covers generated path/join volume but not every final/LCP/checkpoint writer |
+| Versioned workspace artifacts, atomic publication, manifest compatibility, recovery tests | phase and join-range checkpoints plus abrupt-exit commit-boundary tests implemented; raw/framed mixed restore and journaled idempotent predecessor/family retirement implemented; transient distribution-run task records pending |
+| Human-readable operational construction parameters | core budget/run, temporary-compression, process-worker, and safe-cleanup controls implemented and parser-tested; checkpoint cadence remains standalone-only |
+| Framed temporary-file compression | versioned independently checksummed zstd/raw blocks, disk-spooled footer index, logical random access, raw fallback, mixed-workspace resume, physical I/O accounting, shared-budget admission, and multithreaded zstd contexts implemented for path/rank and final-event streams; redundancy, preprocessing, join distribution, and LCP level files remain raw |
 | Bounded external path-label runs and leveled multi-pass merge | versioned grouped/prefix-compressed runs, shared-left-context references, parallel in-place run sorting, rolling cache windows, one-run bypass, direct leveled merge of already-sorted worker shards, and forced multi-pass spilling implemented and tested |
 | Logical/physical `PathGraph` identity in pruning and joining | implemented; pruning coalesces only by logical ID and never treats a physical shard as a semantic input; durable run-set manifest pending |
 | External prefix-doubling join | bounded sort-merge, rolling page-cache windows, compact exact key-group sidecars, RAM-capped persisted 4096-record MSD radix range-pack planning bound to run/sidecar checksums, exact range contracts, recursive two-dimensional heavy-key splitting, blocked nested-loop expansion, and selectable checksum scans implemented and forced-spill tested |
@@ -622,7 +681,7 @@ when its production call path and forced-spill/recovery tests pass.
 | Final event/component passes | implemented with one-task immutable-payload event checkpoint, same-filesystem zero-copy restore, spillable mapped start-node sets, disk-backed `prev_occ` and suffix-tree stack, external redundancy sort, streaming fast/sparse BWT, packed-sample-ID, sample-boundary, SadaSparse, and SadaCount serialization, and direct component-at-a-time packing in standalone/vg/autoindex; mid-scan assignment logs pending |
 | Streaming LCP levels and direct packing | implemented and resume-tested with one raw level resident at a time, bounded direct final serialization, atomic publication, and byte-identical legacy output including padding edge cases |
 | External verification | implemented and forced-spill tested with bounded input blocks, external expected/actual occurrence sorts, callback-based locate, and sequential set comparison; resumable runs and parallel label ranges pending |
-| Standalone and `vg index` / `vg autoindex` CLI integration | implemented; forced-spill/resume integration tested |
+| Standalone and `vg index` / `vg autoindex` CLI integration | implemented for memory/disk, process workers, temporary compression, and safe cleanup; forced-spill/resume and raw-versus-framed equivalence integration tested |
 | Chromosome-scale benchmark | preexisting chr20 k32-pruned fixture completed and verified at 32.36 GiB RSS under a 128 GiB cgroup with byte-identical legacy outputs; preexisting chr21 k32-pruned fixture completed and verified at 21.34 GiB process RSS under a hard 25 GiB cgroup, including a successful step-4 resume |
 
 Current limitations are intentionally explicit. The external route is selected
@@ -645,6 +704,15 @@ files but are not yet registered as resumable workspace tasks, so an incomplete
 generation rebuilds them before restoring the persisted MSD plan and completed
 join ranges. Initial records and join distribution records still repeat full
 rank payloads.
+Framed compression currently targets the dominant committed path/rank and
+final-event streams. Key/start preprocessing runs, join distribution runs,
+transient grouped label runs, the externally sorted redundancy stream, and LCP
+level files remain in their existing compact/raw formats. Framed final-event
+adoption also performs one physical checksum pass after close; exposing the
+codec's stored-byte digest to the workspace would remove that pass. A configured
+compressed block establishes the minimum decoder reservation for any later
+phase that reads it, so very small resume budgets must still fit one block or
+receive a clear refusal.
 Label-sort runs group shared left contexts and prefix-compress labels, but a
 deeper reference representation spanning the pre-sort join stream remains an
 optional compaction rather than a feasibility dependency.
@@ -713,6 +781,17 @@ feasibility, RSS, then speed policy:
    increasing worker count. Only after per-path bytes and storage headroom are
    measured should more encoders, merge groups, or verifier label ranges run in
    parallel under combined memory and I/O admission.
+7. Extend framing only where measurement justifies it: LCP levels and
+   preprocessing ranks are promising, while already grouped/prefix-compressed
+   label runs may not repay another codec layer. Export the framed writer's
+   physical checksum to checkpoint adoption and fuse compatible occurrence
+   component passes to remove rereads.
+8. Add a resource-aware read/compute/write pipeline. Join partitions already
+   run as independent `posix_spawn` workers and each stream can use bounded zstd
+   threads; final component encoders and verifier label ranges are the next
+   safe process tasks. Their combined RAM reservations and device throughput
+   must be admitted globally so concurrency stops increasing once the storage
+   device is saturated.
 
 Acceptance should report the configured GCSA goal and cgroup cap separately,
 along with peak anonymous/cache/PSS memory, live disk, records and bytes per
@@ -756,6 +835,8 @@ deps/gcsa2/bin/build_gcsa \
   --memory-limit 96G --disk-limit 40T \
   --io-buffer-size 64M --sort-run-size 4G \
   --join-partition-size 16G --process-workers 4 --merge-fan-in 64 \
+  --temp-compression auto --compression-block-size 16M \
+  --compression-workers 4 --compression-level 1 --clean-obsolete \
   --max-open-files 128 --allow-path-explosion \
   -T 32 -o chr6 chr6
 ```
@@ -770,6 +851,9 @@ vg index -p -V -g chr6.gcsa -k 16 -X 4 -t 32 \
   --gcsa-resume \
   --gcsa-memory-limit 96G --gcsa-disk-limit 40T \
   --gcsa-process-workers 4 \
+  --gcsa-temp-compression auto --gcsa-compression-block-size 16M \
+  --gcsa-compression-workers 4 --gcsa-compression-level 1 \
+  --gcsa-clean-obsolete \
   --gcsa-sort-run-size 64G --gcsa-join-partition-size 64G \
   -f chr6.mapping chr6.pruned.vg
 ```
@@ -788,5 +872,8 @@ scripts/benchmark-gcsa-external.sh \
   --run-dir /large-local-disk/chr6-run \
   --memory-limit 94G --cgroup-limit 96G --disk-limit 40T \
   --sort-run-size 64G --join-partition-size 64G \
-  --process-workers 4 --threads 32 --kmer-length 16 --doubling-steps 4
+  --process-workers 4 --threads 32 \
+  --temp-compression auto --compression-block-size 16M \
+  --compression-workers 4 --compression-level 1 --clean-obsolete \
+  --kmer-length 16 --doubling-steps 4
 ```

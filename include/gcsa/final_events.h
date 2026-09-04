@@ -125,7 +125,8 @@ class FinalEventWriter
 {
 public:
   FinalEventWriter(const FinalEventFiles& files, size_type sigma,
-    size_type buffer_bytes, MemoryBudget& budget);
+    size_type buffer_bytes, MemoryBudget& budget,
+    const TempFileCodecParameters& codec = TempFileCodecParameters());
   ~FinalEventWriter();
 
   void path(byte_type predecessor_mask);

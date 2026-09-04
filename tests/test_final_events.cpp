@@ -1,4 +1,5 @@
 #include <gcsa/final_events.h>
+#include <gcsa/compressed_block.h>
 #include <gcsa/internal.h>
 
 #include <array>
@@ -527,6 +528,67 @@ int main()
   std::ostringstream observed_bytes, expected_bytes;
   observed.serialize(observed_bytes); expected.serialize(expected_bytes);
   require(observed_bytes.str() == expected_bytes.str());
+
+  // Final-event streams retain their exact logical records when framed in
+  // tiny zstd blocks. Checkpointing stores the physical framed payload while
+  // resume validates the metadata-derived logical record lengths.
+  FinalEventFiles compressed_files(alphabet.sigma);
+  FinalEventMetadata compressed_metadata;
+  FinalEventChecksums compressed_checksums(alphabet.sigma);
+  ConstructionParameters compressed_parameters = parameters;
+  compressed_parameters.setMemoryLimitBytes(1024 * MEGABYTE);
+  {
+    MemoryBudget compressed_budget(1024 * MEGABYTE);
+    FinalEventWriter writer(compressed_files, alphabet.sigma, 32,
+      compressed_budget, TempFileCodecParameters(TempCompression::ZSTD, 16, 1, 1));
+    writer.path((1U << 0) | (1U << 1));
+    writer.edge(0, 0); writer.edge(1, 0);
+    writer.sampledPath(0); writer.sample(5); writer.sample(7); writer.sampleEnd();
+    writer.occurrence(0, 2);
+    writer.path(1U << 1); writer.edge(1, 1);
+    writer.path((1U << 2) | (1U << 5));
+    writer.edge(2, 2); writer.edge(5, 3); writer.occurrence(2, 20);
+    writer.path(1U << 0); writer.edge(0, 2);
+    writer.sampledPath(3); writer.sample(100); writer.sampleEnd();
+    writer.redundancy(2); writer.redundancy(0); writer.redundancy(2);
+    compressed_metadata = writer.finish(); compressed_checksums = writer.checksums();
+  }
+  require(CompressedBlockReader::isFramed(compressed_files.bwt_masks));
+  compressed_metadata.fast_chars = alphabet.fast_chars;
+  sortFinalRedundancy(compressed_files, compressed_parameters);
+  writeFinalEventMetadata(compressed_files, compressed_metadata);
+  const std::string compressed_root = std::string(root) + "/compressed-workspace";
+  BuildWorkspace compressed_workspace(compressed_root, semantic,
+    BuildWorkspace::Settings(), BuildWorkspace::NEW_WORKSPACE);
+  checkpointFinalEvents(compressed_workspace, compressed_files,
+    compressed_metadata, 64, &compressed_checksums);
+  FinalEventFiles compressed_restored(alphabet.sigma);
+  FinalEventMetadata compressed_restored_metadata;
+  require(restoreFinalEvents(compressed_workspace, compressed_restored,
+    compressed_restored_metadata, 4, alphabet.sigma, 64, true));
+  GCSA compressed_observed;
+  compressed_observed.header.path_nodes = 4; compressed_observed.header.edges = 6;
+  compressed_observed.header.order = 8;
+  buildFinalComponents(compressed_observed, alphabet, compressed_restored,
+    compressed_restored_metadata, compressed_parameters);
+  std::ostringstream compressed_bytes;
+  compressed_observed.serialize(compressed_bytes);
+  require(compressed_bytes.str() == expected_bytes.str());
+  const std::string compressed_mask_artifact = compressed_workspace.artifact_path(
+    ArtifactIdentity("final", "events", "bwt-masks", "bwt-mask-u8-v1"),
+    logical_file_id_t(0), physical_shard_id_t(1));
+  writeByte(compressed_mask_artifact, 72, 0x80);
+  bool compressed_corruption_rejected = false;
+  try
+  {
+    FinalEventFiles corrupt_restore(alphabet.sigma);
+    FinalEventMetadata corrupt_metadata;
+    restoreFinalEvents(compressed_workspace, corrupt_restore, corrupt_metadata,
+      4, alphabet.sigma, 64, true);
+  }
+  catch(const std::runtime_error&) { compressed_corruption_rejected = true; }
+  require(compressed_corruption_rejected);
+  compressed_restored.clear(); compressed_files.clear();
 
   // The direct redundancy writer covers duplicate positions, a zero run, and
   // the final suffix-tree slot in the same native SadaCount byte layout.

@@ -1,4 +1,5 @@
 #include <gcsa/path_graph.h>
+#include <gcsa/compressed_block.h>
 #include <gcsa/external_sort.h>
 #include <gcsa/path_sort_run.h>
 
@@ -1059,9 +1060,42 @@ mergePathSortRuns(const std::vector<std::string>& inputs, size_type,
 void
 writeSortedPathPair(const std::string& run_name, const std::string& path_name,
   const std::string& rank_name, size_type expected_paths, size_type expected_ranks,
-  size_type buffer_records, ExternalPathSortStats* stats)
+  size_type buffer_records, ExternalPathSortStats* stats,
+  const TempFileCodecParameters& codec)
 {
   PathSortRunReader reader(run_name, PATH_SORT_RUN_BUFFER_BYTES);
+  if(codec.enabled())
+  {
+    const CompressedBlockWriter::Mode mode = CompressedBlockWriter::ZSTD;
+    CompressedBlockWriter paths(path_name, codec.block_size, mode, codec.level,
+      codec.workers);
+    CompressedBlockWriter ranks(rank_name, codec.block_size, mode, codec.level,
+      codec.workers);
+    updatePathSortStats(stats, 1,
+      PATH_SORT_FIXED_BYTES + reader.bufferBytes() + sizeof(PathSortRunReader) +
+      2 * CompressedBlockWriter::workingMemoryEstimate(
+        codec.block_size, mode, codec.level, codec.workers));
+    size_type path_count = 0, rank_count = 0;
+    while(!(reader.atEnd()))
+    {
+      PathNode node = reader.current().node;
+      node.setPointer(rank_count);
+      paths.writeRecord(&node, sizeof(node));
+      if(node.ranks() > 0)
+      {
+        ranks.writeRecord(reader.current().labels,
+          node.ranks() * sizeof(PathNode::rank_type));
+      }
+      path_count++; rank_count += node.ranks(); reader.advance();
+    }
+    paths.finish(); ranks.finish();
+    if(path_count != expected_paths || rank_count != expected_ranks)
+    {
+      externalSortFailure("compressed sorted path pair has incorrect counts");
+    }
+    return;
+  }
+
   std::ofstream paths, ranks;
   paths.rdbuf()->pubsetbuf(nullptr, 0); ranks.rdbuf()->pubsetbuf(nullptr, 0);
   paths.open(path_name.c_str(), std::ios_base::binary);
@@ -1138,6 +1172,41 @@ writeSortedPathPair(const std::string& run_name, const std::string& path_name,
   if(path_count != expected_paths || rank_count != expected_ranks) { externalSortFailure("sorted path pair has incorrect counts"); }
 }
 
+TempFileCodecParameters
+boundedPathCodec(const TempFileCodecParameters& requested, size_type byte_budget)
+{
+  if(!requested.enabled()) { return requested; }
+  TempFileCodecParameters result = requested;
+  const size_type minimum_block = std::max(sizeof(PathNode),
+    (PathLabel::LABEL_LENGTH + 1) * sizeof(PathNode::rank_type));
+  result.block_size = std::max(minimum_block,
+    std::min(result.block_size, byte_budget));
+  auto fits = [&](size_type block_bytes) -> bool
+  {
+    const size_type one = CompressedBlockWriter::workingMemoryEstimate(
+      block_bytes, CompressedBlockWriter::ZSTD, result.level, result.workers);
+    return (one <= byte_budget / 2);
+  };
+  while(result.block_size > minimum_block && !fits(result.block_size))
+  {
+    result.block_size = std::max(minimum_block, result.block_size / 2);
+  }
+  if(!fits(result.block_size))
+  {
+    // AUTO is a feasibility policy: under a deliberately tiny test budget,
+    // retain the raw writer rather than rejecting a build that otherwise fits.
+    // Explicit ZSTD remains strict and reports that its codec workspace cannot
+    // be admitted under the configured ceiling.
+    if(requested.compression == TempCompression::AUTO)
+    {
+      result.compression = TempCompression::NONE;
+      return result;
+    }
+    externalSortFailure("memory budget cannot admit two compressed path writers");
+  }
+  return result;
+}
+
 void
 addPathSortRun(std::vector<std::vector<std::string>>& levels, const std::string& run,
   size_type level, size_type fan_in, size_type buffer_records,
@@ -1160,11 +1229,12 @@ struct ExternalPathSortSink::Impl
 {
   Impl(PathGraph& target, size_type target_file, size_type byte_budget,
     size_type requested_fan_in, size_type size_limit,
-    size_type& already_committed, ExternalPathSortStats* statistics) :
+    size_type& already_committed, ExternalPathSortStats* statistics,
+    const TempFileCodecParameters& requested_codec) :
     graph(target), file(target_file), limit(size_limit),
     committed_bytes(already_committed), stats(statistics), fan_in(0),
     merge_records(0), run_records(0), path_count(0), rank_count(0),
-    payload_bytes(0), complete(false)
+    payload_bytes(0), codec(), complete(false)
   {
     if(this->file >= this->graph.files()) { externalSortFailure("invalid sink file number"); }
     if(this->graph.path_counts[this->file] != 0 || this->graph.rank_counts[this->file] != 0)
@@ -1189,6 +1259,7 @@ struct ExternalPathSortSink::Impl
       externalSortFailure("streaming sort sink cannot support a two-way merge");
     }
     size_type materialize_available = available - reader_bytes;
+    this->codec = boundedPathCodec(requested_codec, materialize_available);
     this->merge_records = materialize_available /
       pathSortOutputRecordReservation();
     if(this->merge_records == 0)
@@ -1321,7 +1392,8 @@ struct ExternalPathSortSink::Impl
     std::string partial_rank = final_rank + ".partial";
     std::remove(partial_path.c_str()); std::remove(partial_rank.c_str());
     writeSortedPathPair(merged, partial_path, partial_rank,
-      this->path_count, this->rank_count, this->merge_records, this->stats);
+      this->path_count, this->rank_count, this->merge_records, this->stats,
+      this->codec);
     TempFile::remove(merged);
     syncPathSortFile(partial_path); syncPathSortFile(partial_rank);
     if(std::rename(partial_path.c_str(), final_path.c_str()) != 0 ||
@@ -1344,6 +1416,7 @@ struct ExternalPathSortSink::Impl
   ExternalPathSortStats* stats;
   size_type fan_in, merge_records, run_records;
   size_type path_count, rank_count, payload_bytes;
+  TempFileCodecParameters codec;
   bool complete;
   std::vector<PathSortRecord> records;
   std::vector<std::vector<std::string>> levels;
@@ -1351,9 +1424,10 @@ struct ExternalPathSortSink::Impl
 
 ExternalPathSortSink::ExternalPathSortSink(PathGraph& graph, size_type file,
   size_type byte_budget, size_type fan_in, size_type size_limit,
-  size_type& committed_bytes, ExternalPathSortStats* stats) :
+  size_type& committed_bytes, ExternalPathSortStats* stats,
+  const TempFileCodecParameters& codec) :
   impl(new Impl(graph, file, byte_budget, fan_in, size_limit,
-    committed_bytes, stats))
+    committed_bytes, stats, codec))
 {
 }
 
@@ -1531,7 +1605,8 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
 
   std::string final_path = TempFile::getName(PathGraph::PREFIX), final_rank = TempFile::getName(PathGraph::PREFIX);
   std::string partial_path = final_path + ".partial", partial_rank = final_rank + ".partial";
-  writeSortedPathPair(merged, partial_path, partial_rank, graph.path_counts[file], graph.rank_counts[file], merge_records, stats);
+  writeSortedPathPair(merged, partial_path, partial_rank, graph.path_counts[file],
+    graph.rank_counts[file], merge_records, stats, TempFileCodecParameters());
   TempFile::remove(merged);
   syncPathSortFile(partial_path); syncPathSortFile(partial_rank);
   if(std::rename(partial_path.c_str(), final_path.c_str()) != 0 || std::rename(partial_rank.c_str(), final_rank.c_str()) != 0)
@@ -2058,11 +2133,19 @@ struct PathGraphInputCache
     int path, rank;
     off_t path_high, rank_high, path_released, rank_released;
     Window path_window, rank_window;
+    std::unique_ptr<CompressedBlockReader> compressed_path, compressed_rank;
 
     explicit Entry(size_type window_bytes = 0) :
       file(PathGraph::UNKNOWN), stamp(0), path(-1), rank(-1),
       path_high(0), rank_high(0), path_released(0), rank_released(0),
-      path_window(window_bytes), rank_window(window_bytes) { }
+      path_window(window_bytes), rank_window(window_bytes),
+      compressed_path(), compressed_rank() { }
+
+    Entry(Entry&&) = default;
+    Entry& operator=(Entry&&) = default;
+
+    Entry(const Entry&) = delete;
+    Entry& operator=(const Entry&) = delete;
 
     void reset(size_type new_file, size_type new_stamp)
     {
@@ -2071,12 +2154,13 @@ struct PathGraphInputCache
       this->path_high = 0; this->rank_high = 0;
       this->path_released = 0; this->rank_released = 0;
       this->path_window.reset(); this->rank_window.reset();
+      this->compressed_path.reset(); this->compressed_rank.reset();
     }
   };
 
   const PathGraph& graph;
   std::vector<Entry> entries;
-  size_type clock, max_pairs, window_bytes;
+  size_type clock, max_pairs, window_bytes, compressed_pair_bytes;
   PathGraphMergeStats* stats;
 
   constexpr static off_t CACHE_TAIL = 64 * KILOBYTE;
@@ -2088,8 +2172,46 @@ struct PathGraphInputCache
     graph(source), entries(), clock(0),
     max_pairs(std::max(static_cast<size_type>(1),
       std::min(requested_pairs, std::max(static_cast<size_type>(1), source.files())))),
-    window_bytes(0), stats(merge_stats)
+    window_bytes(0), compressed_pair_bytes(0), stats(merge_stats)
   {
+    // A framed reader retains one decoded block. Bound the LRU cardinality by
+    // bytes as well as descriptors, so a large --max-open-files value cannot
+    // multiply the compression block into an unaccounted resident peak.
+    for(size_type file = 0; file < source.files(); file++)
+    {
+      const bool path_framed = CompressedBlockReader::isFramed(source.path_names[file]);
+      const bool rank_framed = CompressedBlockReader::isFramed(source.rank_names[file]);
+      if(path_framed != rank_framed)
+      {
+        throw std::runtime_error(
+          "PathGraphMerger: path/rank shard storage formats differ");
+      }
+      if(path_framed)
+      {
+        size_type pair_bytes = CompressedBlockReader::workingMemoryEstimate(
+          CompressedBlockReader::declaredBlockSize(source.path_names[file])) +
+          CompressedBlockReader::workingMemoryEstimate(
+            CompressedBlockReader::declaredBlockSize(source.rank_names[file]));
+        this->compressed_pair_bytes = std::max(this->compressed_pair_bytes,
+          pair_bytes);
+      }
+    }
+    if(this->compressed_pair_bytes > 0)
+    {
+      if(this->compressed_pair_bytes > byte_budget)
+      {
+        throw std::runtime_error(
+          "PathGraphMerger: compression block exceeds merge memory budget");
+      }
+      this->max_pairs = std::min(this->max_pairs,
+        std::max(static_cast<size_type>(1),
+          byte_budget / this->compressed_pair_bytes));
+      // A generation does not normally mix raw and framed shards. Avoid
+      // allocating raw pread windows in every framed LRU entry.
+      this->window_bytes = 0;
+      this->entries.reserve(this->max_pairs);
+      return;
+    }
     // At most 2 * max_pairs windows can coexist. Reserve at most one quarter
     // of the caller's merge workspace for them, leaving the rest for equal-
     // label groups, range metadata, and phase-specific state.
@@ -2111,12 +2233,13 @@ struct PathGraphInputCache
     off_t path_offset = this->checkedOffset(offset, sizeof(PathNode));
     off_t path_limit = this->checkedOffset(this->graph.path_counts[file],
       sizeof(PathNode));
-    this->readWindow(entry.path, entry.path_window, &node, sizeof(node),
+    this->readWindow(entry.path, entry.compressed_path.get(),
+      entry.path_window, &node, sizeof(node),
       path_offset, path_limit, true);
     if(this->stats != nullptr) { this->stats->path_input_reads++; }
     entry.path_high = std::max(entry.path_high,
       path_offset + static_cast<off_t>(sizeof(node)));
-    this->trim(entry.path, entry.path_high, entry.path_released);
+    if(entry.path >= 0) { this->trim(entry.path, entry.path_high, entry.path_released); }
 
     if(node.ranks() > PathLabel::LABEL_LENGTH + 1)
     {
@@ -2131,12 +2254,13 @@ struct PathGraphInputCache
     off_t rank_offset = this->checkedOffset(node.pointer(), sizeof(PathNode::rank_type));
     off_t rank_limit = this->checkedOffset(this->graph.rank_counts[file],
       sizeof(PathNode::rank_type));
-    this->readWindow(entry.rank, entry.rank_window, labels, rank_bytes,
+    this->readWindow(entry.rank, entry.compressed_rank.get(),
+      entry.rank_window, labels, rank_bytes,
       rank_offset, rank_limit, false);
     if(this->stats != nullptr) { this->stats->rank_input_reads++; }
     entry.rank_high = std::max(entry.rank_high,
       rank_offset + static_cast<off_t>(rank_bytes));
-    this->trim(entry.rank, entry.rank_high, entry.rank_released);
+    if(entry.rank >= 0) { this->trim(entry.rank, entry.rank_high, entry.rank_released); }
   }
 
   void close()
@@ -2164,7 +2288,8 @@ private:
           this->stats->max_open_input_pairs, static_cast<size_type>(this->entries.size()));
         this->stats->max_input_buffer_bytes = std::max(
           this->stats->max_input_buffer_bytes,
-          2 * this->window_bytes * static_cast<size_type>(this->entries.size()));
+          (this->compressed_pair_bytes > 0 ? this->compressed_pair_bytes :
+            2 * this->window_bytes) * static_cast<size_type>(this->entries.size()));
       }
     }
     else
@@ -2175,6 +2300,32 @@ private:
     }
 
     target->reset(file, this->clock);
+    const bool path_framed = CompressedBlockReader::isFramed(
+      this->graph.path_names[file]);
+    const bool rank_framed = CompressedBlockReader::isFramed(
+      this->graph.rank_names[file]);
+    if(path_framed != rank_framed)
+    {
+      throw std::runtime_error(
+        "PathGraphMerger: path/rank shard storage formats differ");
+    }
+    if(path_framed)
+    {
+      target->compressed_path.reset(new CompressedBlockReader(
+        this->graph.path_names[file]));
+      target->compressed_rank.reset(new CompressedBlockReader(
+        this->graph.rank_names[file]));
+      if(target->compressed_path->logicalSize() !=
+           this->graph.path_counts[file] * sizeof(PathNode) ||
+         target->compressed_rank->logicalSize() !=
+           this->graph.rank_counts[file] * sizeof(PathNode::rank_type))
+      {
+        throw std::runtime_error(
+          "PathGraphMerger: compressed shard length does not match metadata");
+      }
+      return *target;
+    }
+
     target->path = ::open(this->graph.path_names[file].c_str(), O_RDONLY);
     if(target->path < 0) { throw std::runtime_error("PathGraphMerger: cannot open path input"); }
     target->rank = ::open(this->graph.rank_names[file].c_str(), O_RDONLY);
@@ -2202,6 +2353,7 @@ private:
       this->discard(entry.rank, entry.rank_released, entry.rank_high);
       ::close(entry.rank); entry.rank = -1;
     }
+    entry.compressed_path.reset(); entry.compressed_rank.reset();
   }
 
   static off_t checkedOffset(size_type records, size_type width)
@@ -2227,8 +2379,9 @@ private:
     }
   }
 
-  void readWindow(int descriptor, Window& window, void* target, size_type bytes,
-    off_t offset, off_t limit, bool path_stream)
+  void readWindow(int descriptor, CompressedBlockReader* compressed,
+    Window& window, void* target, size_type bytes, off_t offset, off_t limit,
+    bool path_stream)
   {
     if(offset < 0 || limit < offset ||
        bytes > static_cast<size_type>(limit - offset))
@@ -2236,6 +2389,16 @@ private:
       throw std::runtime_error("PathGraphMerger: input range is outside its file");
     }
     if(bytes == 0) { return; }
+
+    if(compressed != nullptr)
+    {
+      if(compressed->readAt(static_cast<std::uint64_t>(offset), target, bytes) != bytes)
+      {
+        throw std::runtime_error("PathGraphMerger: truncated compressed input");
+      }
+      if(this->stats != nullptr) { this->stats->direct_input_reads++; }
+      return;
+    }
 
     if(window.data.empty() || bytes > window.data.size())
     {
@@ -3017,6 +3180,28 @@ PathGraph::read(std::vector<PathNode>& paths, std::vector<PathNode::rank_type>& 
 {
   paths.resize(this->path_counts[file]);
   labels.resize(this->rank_counts[file]);
+
+  const bool path_framed = CompressedBlockReader::isFramed(this->path_names[file]);
+  const bool rank_framed = CompressedBlockReader::isFramed(this->rank_names[file]);
+  if(path_framed != rank_framed)
+  {
+    throw std::runtime_error("PathGraph::read(): path/rank storage formats differ");
+  }
+  if(path_framed)
+  {
+    CompressedBlockReader path_file(this->path_names[file]);
+    CompressedBlockReader rank_file(this->rank_names[file]);
+    size_type path_bytes = paths.size() * sizeof(PathNode);
+    size_type rank_bytes = labels.size() * sizeof(PathNode::rank_type);
+    if(path_file.logicalSize() != path_bytes || rank_file.logicalSize() != rank_bytes ||
+       path_file.read(paths.data(), path_bytes) != path_bytes ||
+       rank_file.read(labels.data(), rank_bytes) != rank_bytes)
+    {
+      throw std::runtime_error(
+        "PathGraph::read(): compressed shard length does not match metadata");
+    }
+    return;
+  }
 
   std::ifstream path_file, rank_file;
   this->open(path_file, rank_file, file);

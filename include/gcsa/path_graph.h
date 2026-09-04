@@ -400,7 +400,8 @@ class ExternalPathSortSink
 public:
   ExternalPathSortSink(PathGraph& graph, size_type file,
     size_type byte_budget, size_type fan_in, size_type size_limit,
-    size_type& committed_bytes, ExternalPathSortStats* stats = nullptr);
+    size_type& committed_bytes, ExternalPathSortStats* stats = nullptr,
+    const TempFileCodecParameters& codec = TempFileCodecParameters());
   ~ExternalPathSortSink();
 
   void write(const PathNode& node, const PathNode::rank_type* labels);

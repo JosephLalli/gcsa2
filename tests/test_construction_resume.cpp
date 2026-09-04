@@ -60,6 +60,22 @@ externalParameters(const std::string& workspace, size_type memory_limit)
   return parameters;
 }
 
+bool
+hasWorkspaceArtifact(const std::string& workspace, const std::string& prefix)
+{
+  for(const std::filesystem::directory_entry& entry :
+      std::filesystem::directory_iterator(workspace))
+  {
+    const std::string name = entry.path().filename().string();
+    if(entry.is_regular_file() && name.compare(0, prefix.size(), prefix) == 0 &&
+       entry.path().extension() == ".bin")
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
 } // namespace
 
 int
@@ -130,6 +146,10 @@ main()
     ConstructionParameters parameters = externalParameters(workspace_root,
       external_minimum + 128 * KILOBYTE);
     parameters.setResume();
+    // Cleanup is operational and may be enabled only after an older frontier
+    // already exists. Resumption must catch up without discarding this step's
+    // reusable join tasks.
+    parameters.setCleanObsolete();
     parameters.setStopAfter("final-events");
     bool stopped = false;
     try
@@ -144,6 +164,7 @@ main()
     require(stopped);
     require(std::filesystem::exists(
       std::string(workspace_root) + "/final--events.complete"));
+    require(!hasWorkspaceArtifact(workspace_root, "initial--paths--"));
   }
 
   // A second resume changes the operational RAM ceiling again, restores the

@@ -6,6 +6,7 @@
 
 #include <gcsa/final_events.h>
 
+#include <gcsa/compressed_block.h>
 #include <gcsa/external_sort.h>
 #include <gcsa/internal.h>
 
@@ -135,7 +136,7 @@ checkedBytes(size_type records, size_type width, const std::string& path)
 }
 
 size_type
-rawFileBytes(const std::string& path)
+physicalFileBytes(const std::string& path)
 {
   struct stat status;
   if(::stat(path.c_str(), &status) != 0 || status.st_size < 0)
@@ -150,11 +151,31 @@ rawFileBytes(const std::string& path)
   return static_cast<size_type>(status.st_size);
 }
 
+size_type
+logicalFileBytes(const std::string& path)
+{
+  if(!CompressedBlockReader::isFramed(path)) { return physicalFileBytes(path); }
+  std::uint64_t logical = 0;
+  try
+  {
+    logical = CompressedBlockReader::declaredLogicalSize(path);
+  }
+  catch(const std::runtime_error& error)
+  {
+    throw eventError(error.what(), path);
+  }
+  if(logical > std::numeric_limits<size_type>::max())
+  {
+    throw eventError("framed logical size overflows", path);
+  }
+  return static_cast<size_type>(logical);
+}
+
 void
 requireFileSize(const std::string& path, size_type records, size_type width)
 {
   size_type expected = checkedBytes(records, width, path);
-  size_type observed = rawFileBytes(path);
+  size_type observed = logicalFileBytes(path);
   if(observed != expected)
   {
     throw eventError("event stream has " + std::to_string(observed) +
@@ -166,11 +187,21 @@ class BufferedEventWriter
 {
 public:
   BufferedEventWriter(const std::string& path, size_type buffer_bytes,
-    MemoryBudget& budget, const std::string& task) :
+    MemoryBudget& budget, const std::string& task,
+    const TempFileCodecParameters& codec) :
     path_(path), descriptor_(-1), buffer_(), used_(0), written_(0),
     checksum_(1469598103934665603ULL), cache_released_(0), closed_(false),
-    reservation_()
+    reservation_(), framed_()
   {
+    if(codec.enabled())
+    {
+      const CompressedBlockWriter::Mode mode = CompressedBlockWriter::ZSTD;
+      reservation_ = budget.reserve(CompressedBlockWriter::workingMemoryEstimate(
+        buffer_bytes, mode, codec.level, codec.workers), task);
+      framed_.reset(new CompressedBlockWriter(path, buffer_bytes, mode,
+        codec.level, codec.workers));
+      return;
+    }
     buffer_bytes = std::max(static_cast<size_type>(16), buffer_bytes);
     reservation_ = budget.reserve(buffer_bytes, task);
     buffer_.resize(buffer_bytes);
@@ -209,6 +240,11 @@ public:
   void close()
   {
     if(closed_) { return; }
+    if(framed_)
+    {
+      framed_->finish(); framed_.reset(); closed_ = true;
+      reservation_ = MemoryBudget::Reservation(); return;
+    }
     flush();
     if(::fdatasync(descriptor_) != 0)
     {
@@ -233,11 +269,18 @@ private:
   off_t cache_released_;
   bool closed_;
   MemoryBudget::Reservation reservation_;
+  std::unique_ptr<CompressedBlockWriter> framed_;
 
   void append(const void* source, size_type bytes)
   {
     if(closed_) { throw eventError("write after close", path_); }
     const std::uint8_t* data = static_cast<const std::uint8_t*>(source);
+    if(framed_)
+    {
+      framed_->writeRecord(data, bytes);
+      checksum_ = BuildWorkspace::checksum(data, bytes, checksum_);
+      return;
+    }
     while(bytes > 0)
     {
       size_type count = std::min(bytes, buffer_.size() - used_);
@@ -275,16 +318,31 @@ public:
     const std::string& task) :
     path_(path), descriptor_(-1), width_(width), records_(records), seen_(0),
     buffer_(), buffered_(0), offset_(0), consumed_bytes_(0), cache_released_(0),
-    reservation_()
+    reservation_(), framed_()
   {
     if(width_ == 0) { throw eventError("zero-width event stream", path); }
     requireFileSize(path_, records_, width_);
     size_type capacity = std::max(width_, buffer_bytes - buffer_bytes % width_);
-    reservation_ = budget.reserve(capacity, task);
+    if(CompressedBlockReader::isFramed(path_))
+    {
+      const size_type block = static_cast<size_type>(
+        CompressedBlockReader::declaredBlockSize(path_));
+      const size_type codec_bytes = CompressedBlockReader::workingMemoryEstimate(block);
+      if(codec_bytes > std::numeric_limits<size_type>::max() - capacity)
+      {
+        throw eventError("framed reader memory estimate overflows", path_);
+      }
+      reservation_ = budget.reserve(codec_bytes + capacity, task);
+      framed_.reset(new CompressedBlockReader(path_));
+    }
+    else { reservation_ = budget.reserve(capacity, task); }
     buffer_.resize(capacity);
-    descriptor_ = ::open(path.c_str(), O_RDONLY);
-    if(descriptor_ < 0) { throw eventError("cannot open event stream", path); }
-    adviseSequential(descriptor_);
+    if(!framed_)
+    {
+      descriptor_ = ::open(path.c_str(), O_RDONLY);
+      if(descriptor_ < 0) { throw eventError("cannot open event stream", path); }
+      adviseSequential(descriptor_);
+    }
   }
 
   ~BufferedEventReader()
@@ -334,6 +392,7 @@ private:
   size_type buffered_, offset_, consumed_bytes_;
   off_t cache_released_;
   MemoryBudget::Reservation reservation_;
+  std::unique_ptr<CompressedBlockReader> framed_;
 
   bool next(void* target)
   {
@@ -347,9 +406,17 @@ private:
   {
     size_type remaining = records_ - seen_;
     size_type bytes = std::min(buffer_.size(), checkedBytes(remaining, width_, path_));
-    readAll(descriptor_, buffer_.data(), bytes, path_);
+    if(framed_)
+    {
+      if(framed_->read(buffer_.data(), bytes) != bytes)
+      {
+        throw eventError("short framed event read", path_);
+      }
+    }
+    else { readAll(descriptor_, buffer_.data(), bytes, path_); }
     buffered_ = bytes; offset_ = 0; consumed_bytes_ += bytes;
-    if(static_cast<off_t>(consumed_bytes_) - cache_released_ >= CACHE_FLUSH_BYTES)
+    if(!framed_ &&
+       static_cast<off_t>(consumed_bytes_) - cache_released_ >= CACHE_FLUSH_BYTES)
     {
       off_t discard_end = std::max(cache_released_,
         static_cast<off_t>(consumed_bytes_) - CACHE_TAIL_BYTES);
@@ -397,7 +464,7 @@ checkpointFile(BuildWorkspace& workspace, const ArtifactIdentity& identity,
   // and computes the committed checksum in either case.
   static_cast<void>(sort_order);
   return workspace.adopt_raw_payload(identity, logical_file_id_t(0), shard,
-    path, records, rawFileBytes(path),
+    path, records, physicalFileBytes(path),
     std::max(static_cast<size_type>(1), buffer_bytes), known_checksum);
 }
 
@@ -415,7 +482,15 @@ restoreFile(const BuildWorkspace& workspace, const ArtifactIdentity& identity,
     throw eventError("cannot stat committed event stream", source);
   }
 
-  if(static_cast<std::uintmax_t>(status.st_size) == expected_bytes)
+  if(CompressedBlockReader::isFramed(source))
+  {
+    // Framed payloads have a physical checksum and byte count in the workspace,
+    // but retain the original logical record count for final-event validation.
+    workspace.restore_adopted_payload(identity, logical_file_id_t(0), shard,
+      path, records, static_cast<size_type>(status.st_size),
+      std::max(static_cast<size_type>(1), buffer_bytes), verify_checksum);
+  }
+  else if(static_cast<std::uintmax_t>(status.st_size) == expected_bytes)
   {
     // New workspaces store the raw immutable payload. A normal resume validates
     // task identity and exact length in O(metadata); --verify-workspace asks
@@ -1701,7 +1776,8 @@ struct FinalEventWriter::Impl
   bool finished;
 
   Impl(const FinalEventFiles& files, size_type alphabet_size,
-    size_type buffer_bytes, MemoryBudget& budget) :
+    size_type buffer_bytes, MemoryBudget& budget,
+    const TempFileCodecParameters& requested_codec) :
     sigma(alphabet_size), masks(), edges(), sample_positions(), sample_ids(),
     sample_ends(), occurrences(), redundant(), metadata(), finished(false)
   {
@@ -1711,24 +1787,63 @@ struct FinalEventWriter::Impl
       throw eventError("invalid writer alphabet size");
     }
     metadata.sigma = sigma;
-    masks.reset(new BufferedEventWriter(files.bwt_masks, buffer_bytes, budget,
-      "final-event-bwt-mask"));
+    const size_type streams = sigma + 6;
+    TempFileCodecParameters codec = requested_codec;
+    if(codec.enabled())
+    {
+      const size_type minimum_block = 16;
+      codec.block_size = std::max(minimum_block,
+        std::min(codec.block_size, buffer_bytes));
+      const auto fits = [&](size_type block) -> bool
+      {
+        const size_type one = CompressedBlockWriter::workingMemoryEstimate(
+          block, CompressedBlockWriter::ZSTD, codec.level, codec.workers);
+        // Preserve the final scan's existing half-budget frontier for its two
+        // mutable disk arrays after all simultaneous codec workspaces enter.
+        return one <= budget.available() / (2 * streams);
+      };
+      while(codec.block_size > minimum_block && !fits(codec.block_size))
+      {
+        codec.block_size = std::max(minimum_block, codec.block_size / 2);
+      }
+      if(!fits(codec.block_size))
+      {
+        if(requested_codec.compression == TempCompression::AUTO)
+        {
+          codec.compression = TempCompression::NONE;
+        }
+        else
+        {
+          throw eventError("memory budget cannot admit final-event zstd buffers");
+        }
+      }
+    }
+    masks.reset(new BufferedEventWriter(files.bwt_masks, codec.enabled() ?
+      codec.block_size : buffer_bytes, budget, "final-event-bwt-mask", codec));
     edges.reserve(sigma);
     for(size_type comp = 0; comp < sigma; comp++)
     {
       edges.emplace_back(new BufferedEventWriter(files.edge_destinations[comp],
-        buffer_bytes, budget, "final-event-edge"));
+        codec.enabled() ? codec.block_size : buffer_bytes, budget,
+        "final-event-edge", codec));
     }
     sample_positions.reset(new BufferedEventWriter(files.sample_positions,
-      buffer_bytes, budget, "final-event-sampled-path"));
-    sample_ids.reset(new BufferedEventWriter(files.sample_ids, buffer_bytes,
-      budget, "final-event-sample-id"));
-    sample_ends.reset(new BufferedEventWriter(files.sample_ends, buffer_bytes,
-      budget, "final-event-sample-end"));
-    occurrences.reset(new BufferedEventWriter(files.occurrences, buffer_bytes,
-      budget, "final-event-occurrence"));
-    redundant.reset(new BufferedEventWriter(files.redundant, buffer_bytes,
-      budget, "final-event-redundancy"));
+      codec.enabled() ? codec.block_size : buffer_bytes, budget,
+      "final-event-sampled-path", codec));
+    sample_ids.reset(new BufferedEventWriter(files.sample_ids,
+      codec.enabled() ? codec.block_size : buffer_bytes, budget,
+      "final-event-sample-id", codec));
+    sample_ends.reset(new BufferedEventWriter(files.sample_ends,
+      codec.enabled() ? codec.block_size : buffer_bytes, budget,
+      "final-event-sample-end", codec));
+    occurrences.reset(new BufferedEventWriter(files.occurrences,
+      codec.enabled() ? codec.block_size : buffer_bytes, budget,
+      "final-event-occurrence", codec));
+    // The external sorter consumes this stream before publication. Keep it raw
+    // so the sorted output remains compatible with its fixed-record interface.
+    const TempFileCodecParameters raw_codec;
+    redundant.reset(new BufferedEventWriter(files.redundant,
+      buffer_bytes, budget, "final-event-redundancy", raw_codec));
   }
 
   void closeAll()
@@ -1741,8 +1856,9 @@ struct FinalEventWriter::Impl
 };
 
 FinalEventWriter::FinalEventWriter(const FinalEventFiles& files, size_type sigma,
-  size_type buffer_bytes, MemoryBudget& budget) :
-  impl_(new Impl(files, sigma, buffer_bytes, budget))
+  size_type buffer_bytes, MemoryBudget& budget,
+  const TempFileCodecParameters& codec) :
+  impl_(new Impl(files, sigma, buffer_bytes, budget, codec))
 {
 }
 
@@ -1971,30 +2087,30 @@ checkpointFinalEvents(BuildWorkspace& workspace,
     physical_shard_id_t(0), files.metadata, 1, buffer_bytes, "metadata"));
   artifacts.push_back(checkpointFile(workspace, maskArtifact(),
     physical_shard_id_t(1), files.bwt_masks, metadata.paths, buffer_bytes,
-    "path-rank", checksums == nullptr ? nullptr : &(checksums->bwt_masks)));
+    "path-rank", (checksums == nullptr || CompressedBlockReader::isFramed(files.bwt_masks)) ? nullptr : &(checksums->bwt_masks)));
   for(size_type comp = 0; comp < metadata.sigma; comp++)
   {
     artifacts.push_back(checkpointFile(workspace, edgeArtifact(comp), edgeShard(comp),
       files.edge_destinations[comp], metadata.bwt_counts[comp], buffer_bytes,
-      "source-path-rank", checksums == nullptr ? nullptr :
+      "source-path-rank", (checksums == nullptr || CompressedBlockReader::isFramed(files.edge_destinations[comp])) ? nullptr :
         &(checksums->edge_destinations[comp])));
   }
   artifacts.push_back(checkpointFile(workspace,
     streamArtifact("sampled-paths", "path-rank-u64le-v1"), physical_shard_id_t(2),
     files.sample_positions, metadata.sampled_paths, buffer_bytes, "path-rank",
-    checksums == nullptr ? nullptr : &(checksums->sample_positions)));
+    (checksums == nullptr || CompressedBlockReader::isFramed(files.sample_positions)) ? nullptr : &(checksums->sample_positions)));
   artifacts.push_back(checkpointFile(workspace,
     streamArtifact("sample-ids", "node-id-u64le-v1"), physical_shard_id_t(3),
     files.sample_ids, metadata.sample_ids, buffer_bytes, "sample-order",
-    checksums == nullptr ? nullptr : &(checksums->sample_ids)));
+    (checksums == nullptr || CompressedBlockReader::isFramed(files.sample_ids)) ? nullptr : &(checksums->sample_ids)));
   artifacts.push_back(checkpointFile(workspace,
     streamArtifact("sample-ends", "sample-rank-u64le-v1"), physical_shard_id_t(4),
     files.sample_ends, metadata.sampled_paths, buffer_bytes, "sample-order",
-    checksums == nullptr ? nullptr : &(checksums->sample_ends)));
+    (checksums == nullptr || CompressedBlockReader::isFramed(files.sample_ends)) ? nullptr : &(checksums->sample_ends)));
   artifacts.push_back(checkpointFile(workspace,
     streamArtifact("occurrences", "path-value-u64le-v1"), physical_shard_id_t(5),
     files.occurrences, metadata.occurrence_items, buffer_bytes, "path-rank",
-    checksums == nullptr ? nullptr : &(checksums->occurrences)));
+    (checksums == nullptr || CompressedBlockReader::isFramed(files.occurrences)) ? nullptr : &(checksums->occurrences)));
   artifacts.push_back(checkpointFile(workspace,
     streamArtifact("redundancy", "path-rank-u64le-v1"), physical_shard_id_t(6),
     files.redundant, metadata.redundant, buffer_bytes, "path-rank"));
