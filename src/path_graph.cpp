@@ -3294,6 +3294,7 @@ PathGraph::prune(const LCP& lcp, size_type size_limit,
     node.file = output_file[node.file];
     builder.write(node);
   };
+  ProgressReporter progress("PathGraph::prune()", this->size(), "paths");
   for(range_type range = merger.first(); !(merger.atEnd(range)); range = merger.next())
   {
     SameFromLogicalFile same_from(merger, range);
@@ -3329,7 +3330,9 @@ PathGraph::prune(const LCP& lcp, size_type size_limit,
       }
     }
     builder.graph.range_count++;
+    progress.advance(range.second - range.first + 1);
   }
+  progress.finish();
   merger.close(); builder.close();
   this->clear(); this->swap(builder.graph);
 
@@ -3949,6 +3952,7 @@ MergedGraph::MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper,
   size_type curr_comp = 0;  // Used to transform next.
 
   size_type bytes = 0;
+  ProgressReporter progress("MergedGraph()", source.size(), "paths");
   for(range_type range = merger.first(); !(merger.atEnd(range)); range = merger.next())
   {
     range_type path_lcp = merger.ranges.front().left_lcp; // Write this to the LCP array.
@@ -3981,7 +3985,9 @@ MergedGraph::MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper,
     this->path_count++;
     this->rank_count += curr.node.ranks();
     this->from_count += same_from_set.selected_nodes - 1;
+    progress.advance(range.second - range.first + 1);
   }
+  progress.finish();
   merger.close();
   path_file.close(); rank_file.close(); from_file.close(); lcp_file.close();
 

@@ -4531,6 +4531,11 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
   MemoryBudget memory(parameters.getMemoryLimitBytes(), safety_margin);
   std::vector<ActiveJoinWorker> active;
   active.reserve(concurrency);
+  // Step 4 of a chromosome-scale build spends hours here. Partitions are the
+  // natural progress unit: each is a committed, resumable unit of work, so the
+  // count is meaningful across a resume as well as within one run.
+  ProgressReporter partition_progress("join partitions", partitions.size(),
+    "partitions");
   auto collect_one = [&]()
   {
     if(active.empty()) { return; }
@@ -4621,6 +4626,7 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
     }
     std::remove(result_file.c_str());
     TempFile::remove(worker.task_file);
+    partition_progress.advance();
     active.erase(active.begin());
   };
 
@@ -4677,6 +4683,7 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
         next.rank_count += partition.expected_ranks;
         committed_bytes = checkedJoinAdd(committed_bytes, restored_bytes,
           "committed restored output bytes");
+        partition_progress.advance();
         if(stats != nullptr)
         {
           stats->restored_partitions++;
@@ -4718,6 +4725,7 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
         std::move(reservation));
     }
     while(!active.empty()) { collect_one(); }
+    partition_progress.finish();
   }
   catch(...)
   {
