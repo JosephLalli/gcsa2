@@ -252,6 +252,18 @@ struct LCP
   size_type       kmer_length, total_keys;
   sdsl::wt_blcd<> kmer_lcp; // Faster than proper RMQ for small values.
 
+  /*
+    How often the wavelet tree is actually descended, and over how wide a
+    range. min_lcp()/max_lcp() use quantile_freq(..., 0), which is a range
+    minimum answered by a full-depth top-down descent with no early exit, so
+    the cost is one descent per call regardless of range width. A phase total
+    cannot say whether that descent is the merge's dominant cost; these two
+    counters convert the question into a number. They are diagnostic only and
+    are never serialized.
+  */
+  static std::atomic<size_type> range_minimum_queries;
+  static std::atomic<size_type> range_minimum_span;
+
   LCP();
   LCP(const std::vector<key_type>& keys, size_type _kmer_length);
 

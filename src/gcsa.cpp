@@ -36,6 +36,7 @@
 #include <filesystem>
 #include <fcntl.h>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <random>
 #include <sstream>
@@ -198,6 +199,35 @@ constructionOperationalSettings(const ConstructionParameters& parameters)
   settings["threads"] = std::to_string(omp_get_max_threads());
   return settings;
 }
+
+// A sub-phase timer and I/O probe.
+//
+// The construction path has four timers, and each spans several distinct
+// operations: "Merging" covers the mapper build and the merged-graph merge,
+// "Construction" covers the final-event scan, the redundancy sort and the
+// component build. A phase total therefore cannot say which operation costs
+// what, which is exactly the question an optimization pass has to answer.
+// These probes print under EXTENDED verbosity only and serialize nothing.
+struct SubPhaseProbe
+{
+  std::string name;
+  double start;
+  size_type read_start, write_start;
+
+  explicit SubPhaseProbe(const std::string& phase_name) :
+    name(phase_name), start(readTimer()),
+    read_start(DiskIO::read_volume), write_start(DiskIO::write_volume) { }
+
+  void report() const
+  {
+    if(Verbosity::level < Verbosity::EXTENDED) { return; }
+    std::cerr << "GCSA::GCSA(): subphase " << this->name << ": "
+              << (readTimer() - this->start) << " seconds, "
+              << inGigabytes(DiskIO::read_volume - this->read_start) << " GB read, "
+              << inGigabytes(DiskIO::write_volume - this->write_start) << " GB written"
+              << std::endl;
+  }
+};
 
 void
 stopAfterCommittedPhase(const ConstructionParameters& parameters,
@@ -842,8 +872,29 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
       }
       DiskBackedArray64 previous(previous_name, unique_from_nodes,
         previous_cache, memory, true, 64 * KILOBYTE);
-      DiskBackedArray64 stack(stack_name,
-        checkedProduct(merged_graph.size(), 3, "suffix-tree stack"),
+      // RETIRED, NOT REMOVED: the whole-graph capacity below.
+      //
+      // The array was sized at 3 * merged_graph.size() elements -- 9.59 GB for
+      // chr21 -- and DiskBackedArray64 zero-fills its cache, so it reserved
+      // 8.94 GiB against the budget during the one sub-step that already runs
+      // pinned at the cgroup limit. The traversal cannot use it: it pushes
+      // frames with strictly increasing curr_lcp popped against lcp_array,
+      // which is a ReadBuffer<uint8_t>, so the stack holds at most one frame
+      // per distinct LCP value and the highest index it can touch is
+      // 3 * 255 + 2. The chr21 log confirms it empirically -- "ST stack 1
+      // reads / 1 writes", one 64 KiB block across 399,778,113 paths.
+      //
+      // Set WHOLE_GRAPH_SUFFIX_TREE_STACK to true to restore the old sizing if
+      // a future LCP representation widens past a byte and this bound is ever
+      // suspected; the bound below throws rather than overruns, so the failure
+      // would be loud either way.
+      constexpr bool WHOLE_GRAPH_SUFFIX_TREE_STACK = false;
+      size_type stack_capacity = (WHOLE_GRAPH_SUFFIX_TREE_STACK ?
+        checkedProduct(merged_graph.size(), 3, "suffix-tree stack") :
+        checkedProduct(
+          static_cast<size_type>(std::numeric_limits<std::uint8_t>::max()) + 2,
+          3, "suffix-tree stack"));
+      DiskBackedArray64 stack(stack_name, stack_capacity,
         stack_cache, memory, true, 64 * KILOBYTE);
 
       std::vector<MergedGraphReader> reader(graph.alpha.sigma + 1);
@@ -908,6 +959,14 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
         }
         else
         {
+          // The bounded capacity above assumes one frame per distinct LCP
+          // value. Fail loudly rather than write past the array if a future
+          // LCP representation ever breaks that assumption.
+          if(3 * stack_size + 2 >= stack_capacity)
+          {
+            throw std::runtime_error(
+              "GCSA::GCSA(): suffix-tree stack exceeded its bounded capacity");
+          }
           stack.set(3 * stack_size, curr_lcp);
           stack.set(3 * stack_size + 1, i);
           stack.set(3 * stack_size + 2, i);
@@ -1019,7 +1078,18 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
     {
       throw std::runtime_error("GCSA::GCSA(): final event path count mismatch");
     }
-    sortFinalRedundancy(files, parameters);
+    ExternalFixedRecordSortStats redundancy_sort_stats;
+    SubPhaseProbe redundancy_probe("construct/redundancy-sort");
+    sortFinalRedundancy(files, parameters, &redundancy_sort_stats);
+    redundancy_probe.report();
+    if(Verbosity::level >= Verbosity::EXTENDED)
+    {
+      std::cerr << "GCSA::GCSA(): redundancy sort: "
+                << redundancy_sort_stats.runs << " runs, "
+                << redundancy_sort_stats.merge_passes << " merge passes, "
+                << inGigabytes(redundancy_sort_stats.max_bytes_resident)
+                << " GB resident at peak" << std::endl;
+    }
     writeFinalEventMetadata(files, metadata);
     checkpointFinalEvents(workspace, files, metadata, checkpoint_buffer,
       &event_checksums);
@@ -1407,16 +1477,31 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     // The mapper is read-only and only participates in the final merge and
     // event scan. Build it after doubling rather than carrying it through all
     // generated path generations.
+    SubPhaseProbe mapper_probe("merge/mapper");
     external_preprocessor->buildMapper(mapper);
+    mapper_probe.report();
   }
   size_type merge_buffer = pathMergeInputBudget(parameters, path_graph);
-  PathGraphMergeStats final_merge_stats;
-  MergedGraph merged_graph(path_graph, mapper, lcp,
-    path_graph.remainingLimit(parameters.getLimitBytes()), merge_buffer,
-    &final_merge_stats, parameters.getMaxOpenFiles(),
-    pathMergeInputCacheBudget(parameters, path_graph));
+  size_type merge_cache = pathMergeInputCacheBudget(parameters, path_graph);
   if(Verbosity::level >= Verbosity::EXTENDED)
   {
+    // The two numbers that decide the merge's entire input working set.
+    std::cerr << "GCSA::GCSA(): merge group buffer " << inMegabytes(merge_buffer)
+              << " MB, framed input cache " << inMegabytes(merge_cache)
+              << " MB over " << path_graph.files() << " shard(s)" << std::endl;
+  }
+  PathGraphMergeStats final_merge_stats;
+  SubPhaseProbe merge_probe("merge/merged-graph");
+  MergedGraph merged_graph(path_graph, mapper, lcp,
+    path_graph.remainingLimit(parameters.getLimitBytes()), merge_buffer,
+    &final_merge_stats, parameters.getMaxOpenFiles(), merge_cache);
+  merge_probe.report();
+  if(Verbosity::level >= Verbosity::EXTENDED)
+  {
+    std::cerr << "GCSA::GCSA(): LCP range minima: "
+              << LCP::range_minimum_queries.load() << " wavelet descents over "
+              << LCP::range_minimum_span.load() << " total key positions"
+              << std::endl;
     std::cerr << "MergedGraph: "
               << final_merge_stats.priority_spills << " path-group spills, "
               << final_merge_stats.range_spills << " range spills, "
@@ -1462,9 +1547,11 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
 
     FinalEventFiles event_files(graph.alpha.sigma);
     ExternalFinalScanStats event_stats;
+    SubPhaseProbe events_probe("construct/final-event-scan");
     FinalEventMetadata event_metadata = produceExternalFinalEvents(merged_graph,
       mapper, last_char, from_nodes, from_rank, unique_from_nodes, graph,
       parameters, *workspace, event_files, checkpoint_buffer, &event_stats);
+    events_probe.report();
     stopAfterCommittedPhase(parameters, "final-events");
 
     // No final component needs the construction mapper or mutable scan state.
@@ -1475,13 +1562,17 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     this->header.edges = event_metadata.total_edges;
     if(direct_output != nullptr)
     {
+      SubPhaseProbe store_probe("construct/store-components");
       storeFinalComponents(this->header, graph.alpha, event_files,
         event_metadata, parameters, *direct_output);
+      store_probe.report();
     }
     else
     {
+      SubPhaseProbe build_probe("construct/build-components");
       buildFinalComponents(*this, graph.alpha, event_files, event_metadata,
         parameters);
+      build_probe.report();
     }
     if(event_metadata.occurrence_extra >
        std::numeric_limits<size_type>::max() - event_metadata.paths)
