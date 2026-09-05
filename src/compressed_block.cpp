@@ -147,6 +147,64 @@ syncDirectory(const std::string& filename)
   }
 }
 
+std::size_t
+estimateSum(std::size_t left, std::size_t right)
+{
+  if(left > std::numeric_limits<std::size_t>::max() - right)
+  {
+    throw std::overflow_error("compressed block worker memory estimate overflow");
+  }
+  return left + right;
+}
+
+std::size_t
+estimateProduct(std::size_t count, std::size_t bytes)
+{
+  if(bytes != 0 && count > std::numeric_limits<std::size_t>::max() / bytes)
+  {
+    throw std::overflow_error("compressed block worker memory estimate overflow");
+  }
+  return count * bytes;
+}
+
+// A multi-threaded encoder cuts one compression call into jobs of
+// 1 << max(20, windowLog + 2) bytes, bounded by ZSTD_c_jobSize. The window is
+// the one ZSTD_getCParams() derives for this level and this block, so the job
+// size is known before any context exists.
+std::size_t
+compressionJobBytes(std::size_t block_bytes, int zstd_level)
+{
+  ZSTD_compressionParameters parameters = ZSTD_getCParams(zstd_level,
+    static_cast<unsigned long long>(block_bytes), 0);
+  unsigned job_log = std::max(20u, parameters.windowLog + 2);
+  if(job_log >= 8 * sizeof(std::size_t))
+  {
+    return std::numeric_limits<std::size_t>::max();
+  }
+  std::size_t job_bytes = static_cast<std::size_t>(1) << job_log;
+  ZSTD_bounds bounds = ZSTD_cParam_getBounds(ZSTD_c_jobSize);
+  if(!ZSTD_isError(bounds.error) && bounds.upperBound > 0 &&
+     job_bytes > static_cast<std::size_t>(bounds.upperBound))
+  {
+    job_bytes = static_cast<std::size_t>(bounds.upperBound);
+  }
+  return job_bytes;
+}
+
+// No worker starts before a whole job exists, so a block holding one job keeps
+// one worker busy however many were requested. The writer configures this
+// count rather than the request: the surplus workers would only enlarge the
+// job pool. This also subsumes ZSTDMT_JOBSIZE_MIN, below which zstd disables
+// multi-threading itself, because a job is never smaller than one mebibyte.
+std::size_t
+effectiveCompressionWorkers(std::size_t block_bytes, int zstd_level,
+  std::size_t workers)
+{
+  if(workers <= 1 || block_bytes == 0) { return 1; }
+  std::size_t job_bytes = compressionJobBytes(block_bytes, zstd_level);
+  return std::min(workers, 1 + (block_bytes - 1) / job_bytes);
+}
+
 } // namespace
 
 std::size_t
@@ -175,16 +233,30 @@ CompressedBlockWriter::workingMemoryEstimate(std::size_t block_bytes,
     throw std::overflow_error("compressed block memory estimate overflow");
   }
 
-  // zstd does not expose an estimator for multi-threaded contexts. Charging
-  // each worker (plus a coordinating slot) for the complete single-threaded
-  // peak is deliberately conservative and keeps the byte budget invariant.
-  std::size_t per_worker = block_bytes + output_bytes + context_bytes;
-  std::size_t slots = (mode == ZSTD && workers > 1 ? workers + 1 : 1);
-  if(slots > std::numeric_limits<std::size_t>::max() / per_worker)
+  // The writer holds one uncompressed block and one worst-case output buffer
+  // whatever the worker count: zstd replicates neither per worker.
+  std::size_t total = block_bytes + output_bytes + context_bytes;
+  std::size_t active = (mode == ZSTD ?
+    effectiveCompressionWorkers(block_bytes, zstd_level, workers) : 1);
+  if(active > 1)
   {
-    throw std::overflow_error("compressed block worker memory estimate overflow");
+    // A multi-threaded context adds exactly what ZSTDMT_initCStream_internal()
+    // allocates: one compression context per worker, a round buffer of
+    // workers + 3 jobs, and a pool of at most BUF_POOL_MAX_NB_BUFFERS,
+    // 2 * workers + 3, job output buffers. All three follow the job size
+    // rather than the block size, so they are charged from the level and the
+    // block the encoder will actually be given.
+    std::size_t job_bytes = compressionJobBytes(block_bytes, zstd_level);
+    std::size_t job_output = ZSTD_compressBound(job_bytes);
+    if(job_output < job_bytes)
+    {
+      throw std::overflow_error("compressed block worker memory estimate overflow");
+    }
+    total = estimateSum(total, estimateProduct(active - 1, context_bytes));
+    total = estimateSum(total, estimateProduct(active + 3, job_bytes));
+    total = estimateSum(total, estimateProduct(2 * active + 3, job_output));
   }
-  return slots * per_worker;
+  return total;
 }
 
 std::uint64_t
@@ -234,6 +306,14 @@ CompressedBlockWriter::CompressedBlockWriter(const std::string& filename,
   {
     throw std::invalid_argument("invalid compressed block configuration");
   }
+  // Requesting more workers than this block can occupy allocates a larger job
+  // pool without adding a job. Configure what workingMemoryEstimate() charges,
+  // so the reservation and the encoder cannot drift apart.
+  if(mode == ZSTD)
+  {
+    this->compression_workers =
+      effectiveCompressionWorkers(block_bytes, zstd_level, workers);
+  }
 
   try
   {
@@ -262,9 +342,10 @@ CompressedBlockWriter::CompressedBlockWriter(const std::string& filename,
       {
         throw std::runtime_error("compressed block: invalid zstd compression level");
       }
-      if(workers > 1)
+      if(this->compression_workers > 1)
       {
-        result = ZSTD_CCtx_setParameter(context, ZSTD_c_nbWorkers, workers);
+        result = ZSTD_CCtx_setParameter(context, ZSTD_c_nbWorkers,
+          this->compression_workers);
         if(ZSTD_isError(result))
         {
           throw std::runtime_error(
@@ -279,7 +360,8 @@ CompressedBlockWriter::CompressedBlockWriter(const std::string& filename,
     writeLittle(this->output, HEADER_SIZE);
     writeLittle(this->output, static_cast<std::uint64_t>(block_bytes));
     writeLittle(this->output, static_cast<std::uint32_t>(mode));
-    writeLittle(this->output, static_cast<std::uint32_t>(workers));
+    writeLittle(this->output,
+      static_cast<std::uint32_t>(this->compression_workers));
   }
   catch(...)
   {

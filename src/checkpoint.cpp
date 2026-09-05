@@ -225,6 +225,11 @@ restorePathGraph(const BuildWorkspace& workspace, PathGraph& graph,
   restored.path_count = 0; restored.rank_count = 0;
   restored.range_count = ranges; restored.unique = unique; restored.redundant = redundant;
   restored.unsorted = unsorted; restored.nondeterministic = nondeterministic;
+  // Version 3 records the physical size of every committed shard, so a resumed
+  // run charges the disk limit exactly the bytes the original run did. A
+  // version 2 manifest predates framing; there a shard stores its payload, and
+  // the derived path_storage/rank_storage below are already that size.
+  size_type stored_total = 0;
   for(size_type file = 0; file < files; file++)
   {
     restored.logical_file_ids[file] = logical_file_id_t(
@@ -242,6 +247,12 @@ restorePathGraph(const BuildWorkspace& workspace, PathGraph& graph,
       path_storage = readLittle<std::uint64_t>(metadata, offset);
       rank_storage = readLittle<std::uint64_t>(metadata, offset);
     }
+    if(path_storage > std::numeric_limits<size_type>::max() - rank_storage ||
+       stored_total > std::numeric_limits<size_type>::max() - (path_storage + rank_storage))
+    {
+      throw std::runtime_error("restorePathGraph(): stored shard bytes overflow");
+    }
+    stored_total += path_storage + rank_storage;
     restored.path_count += restored.path_counts[file];
     restored.rank_count += restored.rank_counts[file];
     workspace.restore_adopted_payload(pathIdentity(task, phase, file),
@@ -257,6 +268,7 @@ restorePathGraph(const BuildWorkspace& workspace, PathGraph& graph,
   {
     throw std::runtime_error("restorePathGraph(): checkpoint totals do not match shards");
   }
+  restored.stored_bytes = stored_total;
   restored.delete_files = false;
   graph.clear(); graph.swap(restored);
 }

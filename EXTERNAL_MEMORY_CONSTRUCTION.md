@@ -223,9 +223,16 @@ backward seek simply rereads an evicted page. `posix_fadvise()` is best-effort
 and non-semantic;
 `fdatasync()` is the durability boundary. Pruning and `MergedGraph` now use
 bounded spill structures and byte-sized buffers. Every active framed-stream
-encoder reserves its input block, worst-case output, zstd context, and a
-conservative allowance for each requested zstd worker; framed readers reserve
-encoded and decoded blocks plus decoder context before construction. Final
+encoder reserves its input block, worst-case output, zstd context, and, when the
+block is large enough to occupy more than one zstd job, the workspace a
+multi-threaded context really allocates: one compression context per engaged
+worker, a round buffer of `workers + 3` jobs, and a job-output pool of
+`2 * workers + 3` buffers, all sized from the job rather than the block. A block
+shorter than one job engages one worker whatever was requested, so the writer
+configures and the estimate charges only the usable workers; charging the
+request instead reserved a job pool the encoder never allocated at large blocks
+while under-charging the pool it did allocate at small ones. Framed readers
+reserve encoded and decoded blocks plus decoder context before construction. Final
 mapping/input allocations and some older pruning/merged-graph reservations are
 not all admitted through the process-wide `MemoryBudget`. The in-process token
 budget is therefore not yet an end-to-end RSS ceiling; a hard cgroup remains
@@ -316,7 +323,13 @@ contains the byte-identical version-1 logical header, records, and footer, so
 compression does not change its payload checksum or worker range ABI. `auto`
 uses zstd level 1 when its workspace fits and stores an
 incompressible block raw; under a very small memory budget it falls back to a
-raw stream. Explicit `zstd` instead reports the minimum codec workspace it
+raw stream. A codec's workspace includes the decoder's, not just the encoder's:
+generated path/rank shards are bounded so the next `prune()` (and, after the
+last step, `MergedGraph`) can hold every pair it may open inside its own merge
+budget, and join runs are bounded so `planJoinPartitions()` can admit the run
+and sidecar readers it will need. Both bounds are applied before a stream is
+written, because a block that only the producer can afford commits a generation
+its consumer cannot read. Explicit `zstd` instead reports the minimum codec workspace it
 cannot admit. Compression mode, block size, level, and worker count are
 operational settings and may change on resume. Join child processes clamp
 zstd's internal worker count to their assigned thread share, preventing
@@ -390,7 +403,12 @@ remains more valuable than running two encoders against the same disk.
 
 The current disk guard is exact for generated path/label sinks and deterministic
 join-partition output: it counts committed and pending generation bytes against
-`--disk-limit` and never compares those bytes with RAM. Framed output is admitted
+`--disk-limit` and never compares those bytes with RAM. Those bytes are physical
+throughout. A generation records the installed `st_size` total it was charged,
+and the budget handed to its successor subtracts that value rather than the
+logical `PathGraph::bytes()` payload; the subtraction saturates, so a frontier
+that exceeds the limit produces an explicit refusal instead of an unsigned wrap
+that would leave every later check vacuous. Framed output is admitted
 using a conservative physical peak that includes per-block metadata and the
 temporary index copy present during commit; completed and restored shards then
 replace that reservation with their exact `st_size` totals. The `DiskBudget`
@@ -695,14 +713,14 @@ when its production call path and forced-spill/recovery tests pass.
 | Shared byte-token `MemoryBudget` and statvfs-aware `DiskBudget` | memory primitives, major external-phase byte caps, and framed encoder/decoder/zstd-worker reservations implemented; pruning/merged-graph buffers are byte-bounded but not globally admitted; final-scan readers retire cgroup-charged cache without extra descriptors; mapping/input/library allocations remain outside the shared budget; disk guard uses conservative framed peaks and exact installed sizes for generated path/join volume but not every final/LCP/checkpoint writer |
 | Versioned workspace artifacts, atomic publication, manifest compatibility, recovery tests | phase and join-range checkpoints plus abrupt-exit commit-boundary tests implemented; raw/framed mixed restore and journaled idempotent predecessor/family retirement implemented; transient distribution-run task records pending |
 | Human-readable operational construction parameters | core budget/run, temporary-compression, process-worker, and safe-cleanup controls implemented and parser-tested; checkpoint cadence remains standalone-only |
-| Framed temporary-file compression | versioned independently checksummed zstd/raw blocks, disk-spooled footer index, logical random access, raw fallback, mixed raw/framed join reading, exact primary/sidecar size telemetry, shared-budget admission, and multithreaded zstd contexts implemented for path/rank, fixed-record join-run plus group/detail sidecars, and final-event streams; redundancy, preprocessing, and LCP level files remain raw |
+| Framed temporary-file compression | versioned independently checksummed zstd/raw blocks, disk-spooled footer index, logical random access, raw fallback, mixed raw/framed join reading, exact primary/sidecar size telemetry, shared-budget admission, and multithreaded zstd contexts implemented for path/rank, fixed-record join-run plus group/detail sidecars, and final-event streams; a block is now admitted against its consumer's decode budget as well as its producer's, and the multi-worker estimate charges the job pool zstd actually allocates while clamping workers a block cannot feed; redundancy, preprocessing, and LCP level files remain raw |
 | Bounded external path-label runs and leveled multi-pass merge | versioned grouped/prefix-compressed runs, shared-left-context references, parallel in-place run sorting, rolling cache windows, one-run bypass, direct leveled merge of already-sorted worker shards, and forced multi-pass spilling implemented and tested |
 | Logical/physical `PathGraph` identity in pruning and joining | implemented; pruning coalesces only by logical ID and never treats a physical shard as a semantic input; durable run-set manifest pending |
 | External prefix-doubling join | bounded sort-merge, rolling page-cache windows, compact exact key-group sidecars, RAM-capped persisted 4096-record MSD radix range-pack planning bound to run/sidecar checksums, exact range contracts, recursive two-dimensional heavy-key splitting, blocked nested-loop expansion, and selectable checksum scans implemented and forced-spill tested |
 | Direct join-to-label pipeline | implemented and forced-spill tested; the unsorted generated path/rank pair is no longer materialized |
-| Process worker scheduler and partition resume | implemented with fork-free spawn, global byte admission, immutable-payload semantic range checkpoints, same-filesystem zero-copy restore, and one-/multi-partition tests |
+| Process worker scheduler and partition resume | implemented with fork-free spawn, global byte admission, immutable-payload semantic range checkpoints, same-filesystem zero-copy restore, and one-/multi-partition tests; a restored partition is admitted on the workspace's own record and charged its exact stored size instead of a peak re-derived from the resuming run's codec, and a killed sibling's pid-named label-sort runs are swept, including those of the worker whose failure ends the run |
 | External keys/start nodes/initial paths | implemented with bounded fixed-record runs, global duplicate reduction, streaming support construction, durable key/start checkpoints, and physical initial shards preserving logical IDs; only key LCP support remains resident during doubling, while mapper, last-character, and start-node supports are delayed to merge/final scan |
-| Spillable pruning groups | implemented and forced-spill tested for equal-label priority groups, extended ranges, external same-from sets, and bounded input/output descriptor caches |
+| Spillable pruning groups | implemented and forced-spill tested for equal-label priority groups, extended ranges, external same-from sets, and bounded input/output descriptor caches; framed input pairs are bounded at write time so every shard a merge opens stays resident and each block is decoded once, and a pair committed above the current merge budget is admitted with its overshoot reported rather than refused, because a committed block cannot be renegotiated |
 | Final event/component passes | implemented with one-task immutable-payload event checkpoint, same-filesystem zero-copy restore, spillable mapped start-node sets, disk-backed `prev_occ` and suffix-tree stack, external redundancy sort, streaming fast/sparse BWT, packed-sample-ID, sample-boundary, SadaSparse, and SadaCount serialization, and direct component-at-a-time packing in standalone/vg/autoindex; mid-scan assignment logs pending |
 | Streaming LCP levels and direct packing | implemented and resume-tested with one raw level resident at a time, bounded direct final serialization, atomic publication, and byte-identical legacy output including padding edge cases |
 | External verification | implemented and forced-spill tested with bounded input blocks, external expected/actual occurrence sorts, callback-based locate, and sequential set comparison; resumable runs and parallel label ranges pending |

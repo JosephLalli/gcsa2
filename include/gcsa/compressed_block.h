@@ -16,9 +16,13 @@ class CompressedBlockWriter
 public:
   enum Mode { RAW, ZSTD };
 
-  // The estimate includes one uncompressed block and a conservative zstd output
-  // buffer for every active compression worker, and can be used to reserve
-  // memory before construction.
+  // The estimate includes one uncompressed block, one worst-case zstd output
+  // buffer, and the workspace the encoder will create: a single compression
+  // context when the block holds one zstd job, and otherwise one context per
+  // engaged worker plus the multi-threaded round buffer and job-output pool.
+  // A block shorter than one job engages one worker whatever is requested, so
+  // the writer configures and this function charges only the usable workers.
+  // It can be used to reserve memory before construction.
   static std::size_t workingMemoryEstimate(std::size_t block_bytes, Mode mode,
     int zstd_level = 3, std::size_t compression_workers = 1);
 

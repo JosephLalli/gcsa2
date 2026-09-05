@@ -191,7 +191,7 @@ construction-resume-test: directories $(BUILD_OBJ)/test_construction_resume.o $(
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_construction_resume $(BUILD_OBJ)/test_construction_resume.o $(LIBRARY) $(LIBS)
 	$(BUILD_BIN)/test_construction_resume
 
-$(BUILD_OBJ)/test_path_graph_prune.o:tests/test_path_graph_prune.cpp include/gcsa/path_graph.h
+$(BUILD_OBJ)/test_path_graph_prune.o:tests/test_path_graph_prune.cpp include/gcsa/path_graph.h include/gcsa/compressed_block.h include/gcsa/support.h
 	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
 
 path-graph-prune-test: directories $(BUILD_OBJ)/test_path_graph_prune.o $(LIBRARY)

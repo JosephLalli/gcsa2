@@ -300,13 +300,17 @@ struct PathGraphMergeStats
   size_type path_input_reads, rank_input_reads;
   size_type path_input_refills, rank_input_refills, direct_input_reads;
   size_type max_input_buffer_bytes;
+  // Nonzero when a committed framed shard pair needed more decode workspace
+  // than the merge budget: the pair is admitted anyway, because refusing makes
+  // the workspace unrecoverable, but the overshoot is not silent.
+  size_type oversized_input_pair_bytes;
 
   PathGraphMergeStats() :
     priority_spills(0), range_spills(0), from_set_sorts(0),
     max_open_input_pairs(0), max_open_output_pairs(0),
     path_input_reads(0), rank_input_reads(0),
     path_input_refills(0), rank_input_refills(0), direct_input_reads(0),
-    max_input_buffer_bytes(0) { }
+    max_input_buffer_bytes(0), oversized_input_pair_bytes(0) { }
 };
 
 //------------------------------------------------------------------------------
@@ -335,6 +339,11 @@ struct PathGraph
 
   size_type unique, redundant, unsorted, nondeterministic;
 
+  // Bytes the shard files physically occupy, or UNKNOWN when no producer has
+  // recorded them. Only a producer that can frame its output records a value;
+  // a raw generation occupies exactly bytes(), so UNKNOWN falls back to it.
+  size_type stored_bytes;
+
   bool delete_files;
 
   constexpr static size_type UNKNOWN = ~(size_type)0;
@@ -362,6 +371,34 @@ struct PathGraph
   inline size_type bytes() const
   {
     return this->size() * sizeof(PathNode) + this->ranks() * sizeof(PathNode::rank_type);
+  }
+
+  /*
+    What this generation costs the disk limit. bytes() is the logical
+    PathNode/rank payload, but every generation guard charges what the shards
+    physically occupy: ExternalPathSortSink::finish() and
+    runJoinWorkerPartitions() commit st_size, and framed admission uses
+    externalPathGraphShardPeakBytes(). A framed generation stores a fraction of
+    its payload when the records compress and more than it when they do not, so
+    only this value may be compared with, or subtracted from, a limit. A raw
+    generation stores exactly bytes(), which is what UNKNOWN means.
+  */
+  inline size_type storedBytes() const
+  {
+    return (this->stored_bytes == UNKNOWN ? this->bytes() : this->stored_bytes);
+  }
+
+  /*
+    The disk budget left for the successor generation. This graph survives on
+    disk until the new one is installed, so it is charged first. The
+    subtraction saturates: a frontier that already exceeds the limit leaves
+    nothing for its successor, which the producer refuses explicitly, rather
+    than wrapping into an unbounded budget that makes every later check vacuous.
+  */
+  inline size_type remainingLimit(size_type total_size_limit) const
+  {
+    size_type resident = this->storedBytes();
+    return (resident >= total_size_limit ? 0 : total_size_limit - resident);
   }
 
   /*
@@ -413,6 +450,24 @@ void externalPathGraphSort(PathGraph& graph, size_type file,
 // temporary index copy; raw output is exactly its logical payload size.
 size_type externalPathGraphShardPeakBytes(size_type paths, size_type ranks,
   size_type sort_byte_budget, const TempFileCodecParameters& codec);
+
+// Largest framed block whose decoded working set still lets `pairs` shard pairs
+// stay open at once inside `byte_budget`.
+//
+// The label merge in prune() and MergedGraph reads every open shard
+// sequentially, so a block within this bound is decoded exactly once per pass.
+// A larger one forces the input cache to evict and reconstruct readers, and
+// each miss then decodes whole blocks to deliver one 24-byte PathNode. Choosing
+// a block against the label-sort budget alone is what committed shards the
+// merger could not open at all.
+size_type mergeAdmissibleBlockSize(size_type byte_budget, size_type pairs,
+  size_type requested_block);
+
+// Merge workspace and framed-pair count that prune() and MergedGraph are given
+// for one generation. Producers of generated shards bound their compression
+// block against these, so what one phase commits the next can open.
+size_type pathMergeInputBudget(const ConstructionParameters& parameters);
+size_type pathMergeInputPairs(const ConstructionParameters& parameters);
 
 /*
   A bounded sink for records that are produced incrementally but must become a

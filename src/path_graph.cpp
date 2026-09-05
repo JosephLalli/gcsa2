@@ -1230,6 +1230,47 @@ boundedPathCodec(const TempFileCodecParameters& requested, size_type byte_budget
   return result;
 }
 
+} // anonymous namespace
+
+size_type
+pathMergeInputBudget(const ConstructionParameters& parameters)
+{
+  return std::max(static_cast<size_type>(1),
+    std::min(parameters.getIOBufferSize(),
+      parameters.getMemoryLimitBytes() / 16));
+}
+
+size_type
+pathMergeInputPairs(const ConstructionParameters& parameters)
+{
+  // PathGraph::prune() admits (max_open_files - 2) / 4 pairs; MergedGraph is
+  // never wider. Both keep every admitted pair open for the whole merge.
+  return std::max(static_cast<size_type>(1),
+    (parameters.getMaxOpenFiles() - 2) / 4);
+}
+
+size_type
+mergeAdmissibleBlockSize(size_type byte_budget, size_type pairs,
+  size_type requested_block)
+{
+  if(pairs == 0) { pairs = 1; }
+  // Two decoded blocks and two decoder contexts per open pair.
+  const size_type per_pair_share = byte_budget / (2 * pairs);
+  // ConstructionParameters::setCompressionBlockSize() will not store anything
+  // smaller, so returning less would be silently rounded back up.
+  const size_type minimum_block = 64 * KILOBYTE;
+  size_type block = std::max(minimum_block, requested_block);
+  while(block > minimum_block &&
+        CompressedBlockReader::workingMemoryEstimate(block) > per_pair_share)
+  {
+    block /= 2;
+  }
+  return std::max(minimum_block, std::min(block, requested_block));
+}
+
+namespace
+{
+
 size_type
 pathSortLogicalBytes(size_type records, size_type record_bytes,
   const char* description)
@@ -1731,6 +1772,10 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   }
   std::string old_path = graph.path_names[file], old_rank = graph.rank_names[file];
   graph.path_names[file] = final_path; graph.rank_names[file] = final_rank;
+  // The rewritten pair is raw (writeSortedPathPair above passes a default,
+  // disabled codec), so any total recorded for the previous shards is stale.
+  // Fall back to the logical payload rather than carry a wrong charge.
+  graph.stored_bytes = PathGraph::UNKNOWN;
   if(graph.delete_files)
   {
     TempFile::remove(old_path); TempFile::remove(old_rank);
@@ -2277,6 +2322,7 @@ struct PathGraphInputCache
   const PathGraph& graph;
   std::vector<Entry> entries;
   size_type clock, max_pairs, window_bytes, compressed_pair_bytes;
+  size_type oversized_pair_bytes;
   PathGraphMergeStats* stats;
 
   constexpr static off_t CACHE_TAIL = 64 * KILOBYTE;
@@ -2288,7 +2334,8 @@ struct PathGraphInputCache
     graph(source), entries(), clock(0),
     max_pairs(std::max(static_cast<size_type>(1),
       std::min(requested_pairs, std::max(static_cast<size_type>(1), source.files())))),
-    window_bytes(0), compressed_pair_bytes(0), stats(merge_stats)
+    window_bytes(0), compressed_pair_bytes(0), oversized_pair_bytes(0),
+    stats(merge_stats)
   {
     // A framed reader retains one decoded block. Bound the LRU cardinality by
     // bytes as well as descriptors, so a large --max-open-files value cannot
@@ -2314,10 +2361,18 @@ struct PathGraphInputCache
     }
     if(this->compressed_pair_bytes > 0)
     {
+      // One open pair is the irreducible minimum for a merge, and a committed
+      // block size cannot be renegotiated: the shards on disk declare it, and
+      // no operational flag rewrites them. Refusing here made a workspace
+      // written with a larger block permanently unresumable, so admit the
+      // single pair and report the overshoot instead of aborting. Fresh shards
+      // do not reach this branch, because mergeAdmissibleBlockSize() bounds the
+      // block the writer commits by what this cache can hold.
+      // PathGraphMerger resets *stats after this cache is constructed, so the
+      // value is kept here and copied across once that reset has happened.
       if(this->compressed_pair_bytes > byte_budget)
       {
-        throw std::runtime_error(
-          "PathGraphMerger: compression block exceeds merge memory budget");
+        this->oversized_pair_bytes = this->compressed_pair_bytes;
       }
       this->max_pairs = std::min(this->max_pairs,
         std::max(static_cast<size_type>(1),
@@ -2642,7 +2697,12 @@ PathGraphMerger::PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lc
   input_files(path_graph, stats, max_input_pairs, group_buffer_bytes),
   offsets(path_graph.files()), inputs(path_graph.files())
 {
-  if(stats != nullptr) { *stats = PathGraphMergeStats(); }
+  if(stats != nullptr)
+  {
+    *stats = PathGraphMergeStats();
+    // The input cache is a member, so it was constructed before this reset.
+    stats->oversized_input_pair_bytes = this->input_files.oversized_pair_bytes;
+  }
   for(size_type file = 0; file < path_graph.files(); file++)
   {
     this->offsets[file] = 0;
@@ -2815,6 +2875,7 @@ PathGraph::PathGraph(const InputGraph& source, sdsl::int_vector<0>& distinct_lab
   this->order = source.k(); this->doubling_steps = 0;
   this->unique = UNKNOWN; this->redundant = UNKNOWN;
   this->unsorted = UNKNOWN; this->nondeterministic = UNKNOWN;
+  this->stored_bytes = UNKNOWN;
   this->delete_files = true;
 
   if(source.files() > std::numeric_limits<uint32_t>::max())
@@ -2869,6 +2930,7 @@ PathGraph::PathGraph(size_type file_count, size_type path_order, size_type steps
   logical_file_ids(), physical_shard_ids(),
   path_count(0), rank_count(0), range_count(0), order(path_order), doubling_steps(steps),
   unique(0), redundant(0), unsorted(0), nondeterministic(0),
+  stored_bytes(UNKNOWN),
   delete_files(true)
 {
   if(file_count > std::numeric_limits<uint32_t>::max())
@@ -2893,6 +2955,7 @@ PathGraph::PathGraph(const std::string& path_name, const std::string& rank_name)
   this->order = 0; this->doubling_steps = 0;
   this->unique = 0; this->redundant = 0;
   this->unsorted = 0; this->nondeterministic = 0;
+  this->stored_bytes = UNKNOWN;
   this->delete_files = false;
 
   this->path_names.push_back(path_name);
@@ -2947,6 +3010,7 @@ PathGraph::clear()
   this->order = 0;
   this->unique = UNKNOWN; this->redundant = UNKNOWN;
   this->unsorted = UNKNOWN; this->nondeterministic = UNKNOWN;
+  this->stored_bytes = UNKNOWN;
 }
 
 void
@@ -2969,6 +3033,7 @@ PathGraph::swap(PathGraph& another)
   std::swap(this->redundant, another.redundant);
   std::swap(this->unsorted, another.unsorted);
   std::swap(this->nondeterministic, another.nondeterministic);
+  std::swap(this->stored_bytes, another.stored_bytes);
   std::swap(this->delete_files, another.delete_files);
 }
 
