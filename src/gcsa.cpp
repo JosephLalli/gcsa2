@@ -1246,7 +1246,8 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
       PathGraphMergeStats merge_stats;
       const size_type merge_inputs = path_graph.files();
       path_graph.prune(lcp, path_graph.remainingLimit(parameters.getLimitBytes()),
-        prune_buffer, &merge_stats, parameters.getMaxOpenFiles());
+        prune_buffer, &merge_stats, parameters.getMaxOpenFiles(),
+        pathMergeInputCacheBudget(parameters, path_graph));
       // The merger visits its shards in round-robin label order, so a cache one
       // entry short of the shard count misses on every record rather than on a
       // fraction of them. That cliff is worth a word at the default verbosity:
@@ -1412,7 +1413,8 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   PathGraphMergeStats final_merge_stats;
   MergedGraph merged_graph(path_graph, mapper, lcp,
     path_graph.remainingLimit(parameters.getLimitBytes()), merge_buffer,
-    &final_merge_stats, parameters.getMaxOpenFiles());
+    &final_merge_stats, parameters.getMaxOpenFiles(),
+    pathMergeInputCacheBudget(parameters, path_graph));
   if(Verbosity::level >= Verbosity::EXTENDED)
   {
     std::cerr << "MergedGraph: "

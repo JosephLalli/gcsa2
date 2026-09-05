@@ -381,7 +381,10 @@ static void compare_committed_block_resume(const std::string& base,
   const LCP& lcp, size_type shards, size_type records)
 {
   ConstructionParameters parameters;
-  parameters.setMemoryLimitBytes(size_type(2) << 30);
+  // Large enough that a quarter of it funds every shard's decode workspace,
+  // which is the regime the chr21 resume runs in (23 GiB against 43 shards),
+  // and still small enough that the 64 MiB I/O buffer cannot hold one pair.
+  parameters.setMemoryLimitBytes(size_type(8) << 30);
   parameters.setIOBufferSize(64 * MEGABYTE);
   parameters.setCompressionBlockSize(16 * MEGABYTE);
   const size_type committed_block = parameters.getCompressionBlockSize();
@@ -413,16 +416,23 @@ static void compare_committed_block_resume(const std::string& base,
   build_interleaved_graph(reference, raw_paths, raw_ranks, records, true);
   build_interleaved_graph(framed, framed_paths, framed_ranks, records, true);
 
-  // The workspace the production caller derives for this exact generation.
+  // The two workspaces the production caller derives for this generation. The
+  // group buffer scales with one label range; the input cache scales with the
+  // shard count, and must hold every shard: sharing one number between them is
+  // what left the chr21 resume holding 22 of its 43 committed shards, which
+  // under round-robin label order misses on every record.
   const size_type budget = pathMergeInputBudget(parameters, framed);
+  const size_type cache = pathMergeInputCacheBudget(parameters, framed);
   require(budget >= pair_bytes);
   require(budget <= ceiling);
+  require(cache >= shards * pair_bytes);
+  require(cache <= std::max(pair_bytes, parameters.getMemoryLimitBytes() / 4));
 
   PathGraphMergeStats stats;
   const size_type one_record = sizeof(PathNode) +
     (PathLabel::LABEL_LENGTH + 1) * sizeof(PathNode::rank_type);
   reference.prune(lcp, GIGABYTE, one_record, nullptr, 128);
-  framed.prune(lcp, GIGABYTE, budget, &stats, 128);
+  framed.prune(lcp, GIGABYTE, budget, &stats, 128, cache);
 
   // It finishes, and it finishes with the same index the raw shards produce.
   require(framed.files() == 1);
@@ -433,9 +443,8 @@ static void compare_committed_block_resume(const std::string& base,
   // Every reservation stayed inside the ceiling, and no pair was admitted
   // above the budget it was granted.
   require(stats.oversized_input_pair_bytes == 0);
-  require(stats.max_input_buffer_bytes <= budget);
-  require(stats.max_open_input_pairs >= 1);
-  require(stats.max_open_input_pairs * pair_bytes <= budget);
+  require(stats.max_open_input_pairs == shards);
+  require(stats.max_open_input_pairs * pair_bytes <= cache);
   require(2 * stats.max_open_input_pairs + 2 * stats.max_open_output_pairs + 2 <= 128);
 
   for(size_type s = 0; s < shards; s++)
@@ -579,11 +588,11 @@ int main()
 
   // The configuration that aborted the chr21 v0.10 run: 16 MiB committed
   // blocks and a 64 MiB I/O buffer under a global limit that can afford them.
-  std::vector<key_type> resume_keys(6 * 300 + 2);
+  std::vector<key_type> resume_keys(24 * 60 + 2);
   for(size_type i = 0; i < resume_keys.size(); i++) { resume_keys[i] = i; }
   LCP resume_lcp(resume_keys, 1);
   compare_committed_block_resume(std::string(root) + "/committed", resume_lcp,
-    6, 300);
+    24, 60);
 
   // Use the real construction route so mapper ranks and LCP invariants are
   // validated rather than synthesized by the test.

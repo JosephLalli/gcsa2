@@ -1344,6 +1344,27 @@ pathMergeInputBudget(const ConstructionParameters& parameters,
 }
 
 size_type
+pathMergeInputCacheBudget(const ConstructionParameters& parameters,
+  const PathGraph& source)
+{
+  const size_type pair_bytes = pathGraphFramedPairBytes(source);
+  if(pair_bytes == 0) { return 0; }
+
+  // Ask for every shard. Anything less is not a smaller cache but a broken
+  // one: the merge visits the shards round-robin, so one entry short of the
+  // count misses on every record and each miss decodes whole blocks to deliver
+  // one 24-byte PathNode. A quarter of --memory-limit bounds the request,
+  // which is far more than a sixteenth because this reservation stands alone:
+  // the group buffer, range deque and output cache are sized separately and do
+  // not grow with it.
+  const size_type ceiling = std::max(pair_bytes,
+    parameters.getMemoryLimitBytes() / 4);
+  const size_type files = std::max(static_cast<size_type>(1), source.files());
+  if(pair_bytes > ceiling / files) { return ceiling; }
+  return files * pair_bytes;
+}
+
+size_type
 mergeAdmissibleBlockSize(size_type byte_budget, size_type pairs,
   size_type requested_block)
 {
@@ -2734,7 +2755,8 @@ struct PathGraphMerger
   PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lcp,
     size_type group_buffer_bytes = MEGABYTE,
     PathGraphMergeStats* stats = nullptr,
-    size_type max_input_pairs = 32);
+    size_type max_input_pairs = 32,
+    size_type input_cache_bytes = 0);
   void close();
 
   inline size_type size() const { return this->graph.size(); }
@@ -2784,11 +2806,12 @@ struct PathGraphMerger
 
 PathGraphMerger::PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lcp,
   size_type group_buffer_bytes, PathGraphMergeStats* stats,
-  size_type max_input_pairs) :
+  size_type max_input_pairs, size_type input_cache_bytes) :
   graph(path_graph), lcp(kmer_lcp),
   ranges(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->range_spills))),
   buffer(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->priority_spills))),
-  input_files(path_graph, stats, max_input_pairs, group_buffer_bytes),
+  input_files(path_graph, stats, max_input_pairs,
+    (input_cache_bytes == 0 ? group_buffer_bytes : input_cache_bytes)),
   offsets(path_graph.files()), inputs(path_graph.files())
 {
   if(stats != nullptr)
@@ -3198,7 +3221,7 @@ struct SameFromLogicalFile
 void
 PathGraph::prune(const LCP& lcp, size_type size_limit,
   size_type group_buffer_bytes, PathGraphMergeStats* stats,
-  size_type max_open_files)
+  size_type max_open_files, size_type input_cache_bytes)
 {
   size_type old_path_count = this->size();
 
@@ -3247,7 +3270,8 @@ PathGraph::prune(const LCP& lcp, size_type size_limit,
   size_type input_pairs = pathMergeInputPairs(max_open_files,
     output_logical.size());
 
-  PathGraphMerger merger(*this, lcp, group_buffer_bytes, stats, input_pairs);
+  PathGraphMerger merger(*this, lcp, group_buffer_bytes, stats, input_pairs,
+    input_cache_bytes);
   PathGraphBuilder builder(output_logical.size(), this->k(), this->step(), size_limit,
     group_buffer_bytes, output_pairs, stats);
   builder.graph.logical_file_ids.swap(output_logical);
@@ -3867,7 +3891,8 @@ struct SameFromSet
 
 MergedGraph::MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper,
   const LCP& kmer_lcp, size_type size_limit, size_type group_buffer_bytes,
-  PathGraphMergeStats* stats, size_type max_open_files) :
+  PathGraphMergeStats* stats, size_type max_open_files,
+  size_type input_cache_bytes) :
   path_name(TempFile::getName(PREFIX)), rank_name(TempFile::getName(PREFIX)),
   from_name(TempFile::getName(PREFIX)), lcp_name(TempFile::getName(PREFIX)),
   path_count(0), rank_count(0), from_count(0),
@@ -3909,7 +3934,8 @@ MergedGraph::MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper,
   this->next[mapper.alpha.sigma] = ~(size_type)0;
   this->next_from[mapper.alpha.sigma] = ~(size_type)0;
 
-  PathGraphMerger merger(source, kmer_lcp, group_buffer_bytes, stats, input_pairs);
+  PathGraphMerger merger(source, kmer_lcp, group_buffer_bytes, stats, input_pairs,
+    input_cache_bytes);
   SameFromSet same_from_set(merger, group_buffer_bytes, stats);
   size_type curr_comp = 0;  // Used to transform next.
 
