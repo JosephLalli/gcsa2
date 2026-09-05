@@ -883,8 +883,11 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
 
       PathLabel first, last;
       size_type stack_size = 0;
+      ProgressReporter scan_progress("final event scan",
+        merged_graph.size(), "paths");
       for(size_type i = 0; i < merged_graph.size(); i++, reader[0].advance())
       {
+        scan_progress.advance();
         // Close any predecessor spill reader retained by the preceding path
         // before current-set collection can invoke the external sorter.
         pred_from.clear();
@@ -1037,6 +1040,7 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
       }
       for(MergedGraphReader& current : reader) { current.close(); }
       lcp_array.close();
+      scan_progress.finish();
       previous.flush(false); stack.flush(false);
       if(stats != nullptr)
       {
