@@ -2360,15 +2360,20 @@ constexpr std::uint32_t JOIN_PLAN_VERSION = 3;
 // side, and four plan representations. Sidecar writers inherit the run's block
 // size, so one codec describes all six readers.
 size_type
-joinRunPlanMinimumBudget(const TempFileCodecParameters& codec)
+joinPlanMinimumBudget(size_type reader_codec_bytes)
 {
-  size_type readers = checkedJoinMultiply(6, joinRunReaderMemory(codec),
-    "join planner reader workspaces");
-  size_type minimum = checkedJoinAdd(JOIN_PLAN_RUNTIME_OVERHEAD, readers,
-    "compressed join planner minimum");
+  size_type minimum = checkedJoinAdd(JOIN_PLAN_RUNTIME_OVERHEAD,
+    reader_codec_bytes, "compressed join planner minimum");
   return checkedJoinAdd(minimum,
     4 * (JOIN_PLAN_FIXED_BYTES + JOIN_PLAN_PACK_BYTES),
     "minimum join plan representations");
+}
+
+size_type
+joinRunPlanMinimumBudget(const TempFileCodecParameters& codec)
+{
+  return joinPlanMinimumBudget(checkedJoinMultiply(6, joinRunReaderMemory(codec),
+    "join planner reader workspaces"));
 }
 
 struct JoinKeySample
@@ -3142,11 +3147,7 @@ planJoinPartitions(const JoinRun& left_run, const JoinRun& right_run,
     checkedJoinAdd(joinSidecarReaderMemory(left_run), joinSidecarReaderMemory(right_run),
       "join planner sidecar reader workspaces"),
     "join planner codec workspaces");
-  size_type minimum_planner = checkedJoinAdd(JOIN_PLAN_RUNTIME_OVERHEAD,
-    reader_codec_bytes, "compressed join planner minimum");
-  minimum_planner = checkedJoinAdd(minimum_planner,
-    4 * (JOIN_PLAN_FIXED_BYTES + JOIN_PLAN_PACK_BYTES),
-    "minimum join plan representations");
+  size_type minimum_planner = joinPlanMinimumBudget(reader_codec_bytes);
   if(memory_budget < minimum_planner)
   {
     throw joinError("join planner budget cannot admit both compressed run readers");
