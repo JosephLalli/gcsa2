@@ -1252,6 +1252,13 @@ pathMergeOutputPairs(size_type max_open_files, size_type logical_inputs)
 }
 
 size_type
+pathMergeCeilingBudget(const ConstructionParameters& parameters)
+{
+  return std::max(static_cast<size_type>(1),
+    parameters.getMemoryLimitBytes() / 16);
+}
+
+size_type
 pathMergeInputPairs(size_type max_open_files, size_type logical_inputs)
 {
   // Whatever the output cache cannot occupy belongs to the input side, capped
@@ -1309,28 +1316,31 @@ pathMergeInputBudget(const ConstructionParameters& parameters,
 {
   const size_type requested = pathMergeInputBudget(parameters);
   const size_type pair_bytes = pathGraphFramedPairBytes(source);
-  if(pair_bytes <= requested) { return requested; }
+  if(pair_bytes == 0) { return requested; }
 
   // --io-buffer-size sizes stream buffers; it was never a memory ceiling, and
-  // no entry point above this library exposes it. A committed shard, by
-  // contrast, declares its own block size in its header, and one decoded path
-  // block plus one decoded rank block is the irreducible cost of opening that
-  // pair: it cannot be subdivided the way an oversized request normally is.
-  // Raise the buffer to that cost, but never past the sixteenth of
-  // --memory-limit this buffer has always been bounded by, because the merger
-  // holds a range deque, a priority group, and an output cache of the same
-  // size beside it.
-  const size_type ceiling = std::max(static_cast<size_type>(1),
-    parameters.getMemoryLimitBytes() / 16);
-  if(pair_bytes > ceiling)
+  // no entry point above this library exposes it, so a generation whose blocks
+  // were committed by an earlier configuration could not ask for more. Derive
+  // the workspace from the global memory goal instead: reserve enough for one
+  // legal unit of progress -- one decoded path block plus one decoded rank
+  // block, which is the irreducible cost of opening a committed pair and
+  // cannot be subdivided the way an oversized request normally is -- and then
+  // grow toward holding every shard the merge may open, because a cache one
+  // entry short of the shard count misses on every record. A sixteenth of
+  // --memory-limit remains the bound, since the merger keeps a range deque, a
+  // priority group and an output cache of the same size beside this one.
+  const size_type ceiling = pathMergeCeilingBudget(parameters);
+  const size_type pairs = std::max(static_cast<size_type>(1),
+    std::min(pathMergeInputPairs(parameters), source.files()));
+  size_type wanted = (pair_bytes > ceiling / pairs ? ceiling : pairs * pair_bytes);
+  size_type budget = std::max(requested, std::min(wanted, ceiling));
+  if(budget < pair_bytes)
   {
-    throw std::runtime_error(
-      "PathGraph: opening one committed compressed shard pair needs " +
-      std::to_string(pair_bytes) + " bytes of decode workspace; resume this"
-      " workspace with a memory limit of at least " +
-      std::to_string(16 * pair_bytes) + " bytes");
+    // One pair still fits the ceiling: take it, so the merge can make progress
+    // at reduced concurrency instead of refusing.
+    budget = std::min(pair_bytes, ceiling);
   }
-  return pair_bytes;
+  return budget;
 }
 
 size_type

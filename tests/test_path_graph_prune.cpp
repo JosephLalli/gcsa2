@@ -369,6 +369,82 @@ static void compare_wide_logical_input(const std::string& base, const LCP& lcp,
   }
 }
 
+// The v0.10 chr21 failure, reduced: shards committed with 16 MiB blocks, the
+// default 64 MiB --io-buffer-size, several shards, and a global memory limit
+// small enough that the two decode workspaces do not fit the I/O buffer.
+//
+// The merge workspace must come from the global budget rather than being
+// capped by --io-buffer-size, so that one legal unit of progress -- one
+// decoded path block plus one decoded rank block -- is always reservable.
+// Concurrency is what gives way when the budget is tight, never the build.
+static void compare_committed_block_resume(const std::string& base,
+  const LCP& lcp, size_type shards, size_type records)
+{
+  ConstructionParameters parameters;
+  parameters.setMemoryLimitBytes(size_type(2) << 30);
+  parameters.setIOBufferSize(64 * MEGABYTE);
+  parameters.setCompressionBlockSize(16 * MEGABYTE);
+  const size_type committed_block = parameters.getCompressionBlockSize();
+  const size_type pair_bytes =
+    2 * CompressedBlockReader::workingMemoryEstimate(committed_block);
+  const size_type ceiling = pathMergeCeilingBudget(parameters);
+
+  // The shape of the failure: the I/O buffer cannot hold one pair, the global
+  // budget can. Nothing below depends on the arithmetic staying exactly here,
+  // but the test is pointless if the fixture stops reproducing it.
+  require(pair_bytes > pathMergeInputBudget(parameters));
+  require(pair_bytes <= ceiling);
+
+  std::vector<std::string> raw_paths, raw_ranks, framed_paths, framed_ranks;
+  for(size_type s = 0; s < shards; s++)
+  {
+    const std::string tag = std::to_string(s);
+    raw_paths.push_back(base + ".raw." + tag + ".path");
+    raw_ranks.push_back(base + ".raw." + tag + ".rank");
+    framed_paths.push_back(base + ".framed." + tag + ".path");
+    framed_ranks.push_back(base + ".framed." + tag + ".rank");
+    write_interleaved_shard(raw_paths[s], raw_ranks[s], shards, s, records, 0);
+    write_interleaved_shard(framed_paths[s], framed_ranks[s], shards, s, records,
+      committed_block);
+  }
+
+  PathGraph reference(raw_paths[0], raw_ranks[0]);
+  PathGraph framed(framed_paths[0], framed_ranks[0]);
+  build_interleaved_graph(reference, raw_paths, raw_ranks, records, true);
+  build_interleaved_graph(framed, framed_paths, framed_ranks, records, true);
+
+  // The workspace the production caller derives for this exact generation.
+  const size_type budget = pathMergeInputBudget(parameters, framed);
+  require(budget >= pair_bytes);
+  require(budget <= ceiling);
+
+  PathGraphMergeStats stats;
+  const size_type one_record = sizeof(PathNode) +
+    (PathLabel::LABEL_LENGTH + 1) * sizeof(PathNode::rank_type);
+  reference.prune(lcp, GIGABYTE, one_record, nullptr, 128);
+  framed.prune(lcp, GIGABYTE, budget, &stats, 128);
+
+  // It finishes, and it finishes with the same index the raw shards produce.
+  require(framed.files() == 1);
+  require(framed.size() == reference.size());
+  require(contents(reference.path_names[0]) == contents(framed.path_names[0]));
+  require(contents(reference.rank_names[0]) == contents(framed.rank_names[0]));
+
+  // Every reservation stayed inside the ceiling, and no pair was admitted
+  // above the budget it was granted.
+  require(stats.oversized_input_pair_bytes == 0);
+  require(stats.max_input_buffer_bytes <= budget);
+  require(stats.max_open_input_pairs >= 1);
+  require(stats.max_open_input_pairs * pair_bytes <= budget);
+  require(2 * stats.max_open_input_pairs + 2 * stats.max_open_output_pairs + 2 <= 128);
+
+  for(size_type s = 0; s < shards; s++)
+  {
+    std::remove(raw_paths[s].c_str()); std::remove(raw_ranks[s].c_str());
+    std::remove(framed_paths[s].c_str()); std::remove(framed_ranks[s].c_str());
+  }
+}
+
 static void write_merged_fixture(const std::string& name)
 {
   Alphabet alpha;
@@ -500,6 +576,14 @@ int main()
   for(size_type i = 0; i < wide_keys.size(); i++) { wide_keys[i] = i; }
   LCP wide_lcp(wide_keys, 1);
   compare_wide_logical_input(std::string(root) + "/wide", wide_lcp, 40, 200);
+
+  // The configuration that aborted the chr21 v0.10 run: 16 MiB committed
+  // blocks and a 64 MiB I/O buffer under a global limit that can afford them.
+  std::vector<key_type> resume_keys(6 * 300 + 2);
+  for(size_type i = 0; i < resume_keys.size(); i++) { resume_keys[i] = i; }
+  LCP resume_lcp(resume_keys, 1);
+  compare_committed_block_resume(std::string(root) + "/committed", resume_lcp,
+    6, 300);
 
   // Use the real construction route so mapper ranks and LCP invariants are
   // validated rather than synthesized by the test.
