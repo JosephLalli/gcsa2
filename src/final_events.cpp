@@ -1966,7 +1966,8 @@ FinalEventWriter::checksums() const
 
 void
 sortFinalRedundancy(FinalEventFiles& files,
-  const ConstructionParameters& parameters)
+  const ConstructionParameters& parameters,
+  ExternalFixedRecordSortStats* stats)
 {
   std::string sorted = TempFile::getName("gcsa_final_redundant_sorted");
   try
@@ -1982,7 +1983,7 @@ sortFinalRedundancy(FinalEventFiles& files,
     size_type fan_in = std::min(parameters.getMergeFanIn(),
       (parameters.getMaxOpenFiles() - sorter_descriptors) / 2);
     ExternalFixedRecordSorter::sort(files.redundant, sorted, 8, budget,
-      fan_in, compareEncoded64);
+      fan_in, compareEncoded64, stats);
     TempFile::remove(files.redundant); files.redundant = sorted;
   }
   catch(...)

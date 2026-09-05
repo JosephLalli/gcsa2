@@ -7,6 +7,7 @@
 #ifndef GCSA_FINAL_EVENTS_H
 #define GCSA_FINAL_EVENTS_H
 
+#include <gcsa/external_sort.h>
 #include <gcsa/gcsa.h>
 #include <gcsa/resources.h>
 #include <gcsa/workspace.h>
@@ -155,8 +156,11 @@ private:
 };
 
 // Sort the (potentially nonmonotone) redundancy positions externally.
+// stats is optional and diagnostic: run count, merge passes and peak resident
+// bytes are what decide whether this sort is worth replacing.
 void sortFinalRedundancy(FinalEventFiles& files,
-  const ConstructionParameters& parameters);
+  const ConstructionParameters& parameters,
+  ExternalFixedRecordSortStats* stats = nullptr);
 
 // Write/read and validate the small versioned metadata record.
 void writeFinalEventMetadata(const FinalEventFiles& files,
