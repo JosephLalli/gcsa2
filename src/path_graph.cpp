@@ -1241,13 +1241,45 @@ pathMergeInputBudget(const ConstructionParameters& parameters)
 }
 
 size_type
+pathMergeOutputPairs(size_type max_open_files, size_type logical_inputs)
+{
+  // Two descriptors for the possible spill files, then two per cache entry.
+  // The output cache can never occupy more entries than there are logical
+  // outputs, and prune() emits exactly one per logical input.
+  const size_type cache_pairs = (max_open_files < 6 ? 2 : (max_open_files - 2) / 2);
+  return std::max(static_cast<size_type>(1),
+    std::min(logical_inputs, cache_pairs / 2));
+}
+
+size_type
+pathMergeInputPairs(size_type max_open_files, size_type logical_inputs)
+{
+  // Whatever the output cache cannot occupy belongs to the input side, capped
+  // by the narrower final merge so that one committed block size serves both.
+  // Both merges keep every admitted pair open for a whole pass and visit the
+  // shards in round-robin label order, the access pattern an LRU degrades to a
+  // 100% miss rate on the moment it holds fewer pairs than there are shards.
+  // Splitting the allowance evenly instead left prune() 31 pairs for the 62
+  // shards compaction had retained, and every 24-byte PathNode then cost a
+  // whole block decode. MergedGraph spends fourteen descriptors on its four
+  // sequential outputs, two spill files, and the two-way SameFromSet sorter.
+  if(max_open_files < 16) { return 1; }
+  const size_type cache_pairs = (max_open_files - 2) / 2;
+  return std::max(static_cast<size_type>(1),
+    std::min(cache_pairs - pathMergeOutputPairs(max_open_files, logical_inputs),
+      (max_open_files - 14) / 2));
+}
+
+size_type
 pathMergeInputPairs(const ConstructionParameters& parameters)
 {
-  // PathGraph::prune() admits (max_open_files - 2) / 4 pairs; MergedGraph is
-  // never wider. Both keep every admitted pair open for the whole merge.
-  return std::max(static_cast<size_type>(1),
-    (parameters.getMaxOpenFiles() - 2) / 4);
+  // One logical input is the widest case: every further one claims an output
+  // entry. Producers need that upper bound, because a block small enough for
+  // it is small enough for every narrower merge.
+  return pathMergeInputPairs(parameters.getMaxOpenFiles(),
+    static_cast<size_type>(1));
 }
+
 
 size_type
 mergeAdmissibleBlockSize(size_type byte_budget, size_type pairs,
@@ -3108,17 +3140,12 @@ PathGraph::prune(const LCP& lcp, size_type size_limit,
 {
   size_type old_path_count = this->size();
 
-  // Each live input or output pair consumes two descriptors. Split the global
-  // descriptor allowance evenly so neither side scales with shard count.
+  // Each live input or output pair consumes two descriptors. Neither side may
+  // scale with shard count, but the two sides do not need equal shares.
   if(max_open_files < 6)
   {
     throw std::runtime_error("PathGraph::prune(): max-open-files must be at least 6");
   }
-  // The priority group and range deque may each own one spill descriptor.
-  // The remaining allowance is shared by two caches with two descriptors per
-  // entry, so 4 * pair_limit + 2 never exceeds max_open_files.
-  size_type pair_limit = std::max(static_cast<size_type>(1),
-    (max_open_files - 2) / 4);
 
   // The merger visits all input shards in global label order. We can therefore
   // project that stream directly onto one output shard per semantic input: each
@@ -3145,9 +3172,22 @@ PathGraph::prune(const LCP& lcp, size_type size_limit,
     output_file[file] = result.first->second;
   }
 
-  PathGraphMerger merger(*this, lcp, group_buffer_bytes, stats, pair_limit);
+  // The priority group and range deque may each own one spill descriptor; the
+  // rest is shared by two caches with two descriptors per entry. An even split
+  // spends half of it on output entries nothing will occupy, because there is
+  // one output per logical input, and starves the side that does scale with
+  // shard count. That is not a fairness question: the merger visits the input
+  // shards in round-robin label order, so an input cache one entry short of
+  // the shard count misses on every record, and a framed miss decodes whole
+  // blocks to deliver one 24-byte PathNode.
+  size_type output_pairs = pathMergeOutputPairs(max_open_files,
+    output_logical.size());
+  size_type input_pairs = pathMergeInputPairs(max_open_files,
+    output_logical.size());
+
+  PathGraphMerger merger(*this, lcp, group_buffer_bytes, stats, input_pairs);
   PathGraphBuilder builder(output_logical.size(), this->k(), this->step(), size_limit,
-    group_buffer_bytes, pair_limit, stats);
+    group_buffer_bytes, output_pairs, stats);
   builder.graph.logical_file_ids.swap(output_logical);
   builder.graph.physical_shard_ids.swap(output_physical);
   auto write_output = [&](PriorityNode node)

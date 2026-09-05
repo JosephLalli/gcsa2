@@ -187,9 +187,12 @@ static void write_interleaved_shard(const std::string& path_name,
   if(block_bytes != 0) { framed_paths->finish(); framed_ranks->finish(); }
 }
 
+// single_logical is the shape compactLogicalJoinShards() leaves behind: many
+// physical shards of one named source graph, and therefore one prune() output.
 static void build_interleaved_graph(PathGraph& graph,
   const std::vector<std::string>& path_names,
-  const std::vector<std::string>& rank_names, size_type records)
+  const std::vector<std::string>& rank_names, size_type records,
+  bool single_logical = false)
 {
   graph.order = 1;
   graph.logical_file_ids[0] = logical_file_id_t(0);
@@ -201,7 +204,7 @@ static void build_interleaved_graph(PathGraph& graph,
     graph.rank_names.push_back(rank_names[s]);
     graph.path_counts.push_back(records);
     graph.rank_counts.push_back(2 * records);
-    graph.logical_file_ids.push_back(logical_file_id_t(s));
+    graph.logical_file_ids.push_back(logical_file_id_t(single_logical ? 0 : s));
     graph.physical_shard_ids.push_back(physical_shard_id_t(100 + s));
   }
   graph.path_count = path_names.size() * records;
@@ -288,6 +291,81 @@ static void compare_framed_prune(const std::string& base, const LCP& lcp,
     std::remove(raw_paths[s].c_str()); std::remove(raw_ranks[s].c_str());
     std::remove(framed_paths[s].c_str()); std::remove(framed_ranks[s].c_str());
     std::remove(legacy_paths[s].c_str()); std::remove(legacy_ranks[s].c_str());
+  }
+}
+
+// One logical input over many physical shards, which is what the post-join
+// compactor retains and what prune() then has to merge.
+//
+// prune() emits one output shard per logical input, so an even split of the
+// descriptor allowance reserved half of it for output entries nothing occupies
+// and left the input cache (max_open_files - 2) / 4 pairs: 31 at the shipped
+// 128, for a shard set compaction sizes at up to (max_open_files - 4) / 2.
+// The merger visits the shards in round-robin label order, exactly the access
+// pattern LRU degrades to a 100% miss rate on, so one entry short of the shard
+// count made every read evict. A framed miss then decodes a whole block to
+// deliver one 24-byte PathNode, and a raw miss rereads the window.
+static void compare_wide_logical_input(const std::string& base, const LCP& lcp,
+  size_type shards, size_type records)
+{
+  ConstructionParameters parameters;
+  parameters.setMemoryLimitBytes(size_type(2) << 30);
+  const size_type budget = pathMergeInputBudget(parameters);
+  const size_type block = mergeAdmissibleBlockSize(budget,
+    pathMergeInputPairs(parameters), parameters.getCompressionBlockSize());
+
+  std::vector<std::string> raw_paths, raw_ranks, framed_paths, framed_ranks;
+  for(size_type s = 0; s < shards; s++)
+  {
+    const std::string tag = std::to_string(s);
+    raw_paths.push_back(base + ".raw." + tag + ".path");
+    raw_ranks.push_back(base + ".raw." + tag + ".rank");
+    framed_paths.push_back(base + ".framed." + tag + ".path");
+    framed_ranks.push_back(base + ".framed." + tag + ".rank");
+    write_interleaved_shard(raw_paths[s], raw_ranks[s], shards, s, records, 0);
+    write_interleaved_shard(framed_paths[s], framed_ranks[s], shards, s, records,
+      block);
+  }
+
+  PathGraph reference(raw_paths[0], raw_ranks[0]);
+  PathGraph framed(framed_paths[0], framed_ranks[0]);
+  build_interleaved_graph(reference, raw_paths, raw_ranks, records, true);
+  build_interleaved_graph(framed, framed_paths, framed_ranks, records, true);
+  const size_type logical_bytes = reference.bytes();
+
+  PathGraphMergeStats raw_stats, framed_stats;
+  size_type raw_read = DiskIO::read_volume;
+  reference.prune(lcp, GIGABYTE, budget, &raw_stats, 128);
+  raw_read = DiskIO::read_volume - raw_read;
+  size_type framed_read = DiskIO::read_volume;
+  framed.prune(lcp, GIGABYTE, budget, &framed_stats, 128);
+  framed_read = DiskIO::read_volume - framed_read;
+
+  // One logical input means one output shard, and compression must not change
+  // what pruning produces.
+  require(reference.files() == 1); require(framed.files() == 1);
+  require(framed.size() == reference.size());
+  require(contents(reference.path_names[0]) == contents(framed.path_names[0]));
+  require(contents(reference.rank_names[0]) == contents(framed.rank_names[0]));
+
+  // Every shard stays open, on one output entry plus two spill descriptors.
+  require(raw_stats.max_open_output_pairs == 1);
+  require(framed_stats.max_open_output_pairs == 1);
+  require(raw_stats.max_open_input_pairs == shards);
+  require(framed_stats.max_open_input_pairs == shards);
+  require(2 * framed_stats.max_open_input_pairs +
+    2 * framed_stats.max_open_output_pairs + 2 <= 128);
+  require(framed_stats.oversized_input_pair_bytes == 0);
+  require(framed_stats.max_input_buffer_bytes <= budget);
+
+  // The merge therefore costs its own logical bytes, not one block per record.
+  require(raw_read <= 2 * logical_bytes);
+  require(framed_read <= 2 * logical_bytes);
+
+  for(size_type s = 0; s < shards; s++)
+  {
+    std::remove(raw_paths[s].c_str()); std::remove(raw_ranks[s].c_str());
+    std::remove(framed_paths[s].c_str()); std::remove(framed_ranks[s].c_str());
   }
 }
 
@@ -415,6 +493,13 @@ int main()
   for(size_type i = 0; i < framed_keys.size(); i++) { framed_keys[i] = i; }
   LCP framed_lcp(framed_keys, 1);
   compare_framed_prune(std::string(root) + "/framed", framed_lcp, 3, 200);
+
+  // Compaction leaves one logical input spread over many shards, and the merge
+  // must hold all of them open rather than a quarter of the allowance.
+  std::vector<key_type> wide_keys(40 * 200 + 2);
+  for(size_type i = 0; i < wide_keys.size(); i++) { wide_keys[i] = i; }
+  LCP wide_lcp(wide_keys, 1);
+  compare_wide_logical_input(std::string(root) + "/wide", wide_lcp, 40, 200);
 
   // Use the real construction route so mapper ranks and LCP invariants are
   // validated rather than synthesized by the test.
