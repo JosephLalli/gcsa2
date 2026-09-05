@@ -1217,11 +1217,9 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     std::string task = doublingTask(step);
     if(!(restored_prune && step == first_step))
     {
-      size_type prune_buffer = std::max(static_cast<size_type>(1),
-        std::min(parameters.getIOBufferSize(),
-          parameters.getMemoryLimitBytes() / 16));
+      size_type prune_buffer = pathMergeInputBudget(parameters);
       PathGraphMergeStats merge_stats;
-      path_graph.prune(lcp, parameters.getLimitBytes() - path_graph.bytes(),
+      path_graph.prune(lcp, path_graph.remainingLimit(parameters.getLimitBytes()),
         prune_buffer, &merge_stats, parameters.getMaxOpenFiles());
       if(Verbosity::level >= Verbosity::EXTENDED)
       {
@@ -1253,7 +1251,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     {
       ExternalPathJoinStats join_stats;
       externalPathGraphExtend(path_graph,
-        parameters.getLimitBytes() - path_graph.bytes(), parameters, &join_stats,
+        path_graph.remainingLimit(parameters.getLimitBytes()), parameters, &join_stats,
         workspace.get(), task);
       if(Verbosity::level >= Verbosity::EXTENDED)
       {
@@ -1325,7 +1323,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     }
     else
     {
-      path_graph.extend(parameters.getLimitBytes() - path_graph.bytes(),
+      path_graph.extend(path_graph.remainingLimit(parameters.getLimitBytes()),
         parameters.getMemoryLimitBytes());
     }
     if(workspace)
@@ -1370,12 +1368,10 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     // generated path generations.
     external_preprocessor->buildMapper(mapper);
   }
-  size_type merge_buffer = std::max(static_cast<size_type>(1),
-    std::min(parameters.getIOBufferSize(),
-      parameters.getMemoryLimitBytes() / 16));
+  size_type merge_buffer = pathMergeInputBudget(parameters);
   PathGraphMergeStats final_merge_stats;
   MergedGraph merged_graph(path_graph, mapper, lcp,
-    parameters.getLimitBytes() - path_graph.bytes(), merge_buffer,
+    path_graph.remainingLimit(parameters.getLimitBytes()), merge_buffer,
     &final_merge_stats, parameters.getMaxOpenFiles());
   if(Verbosity::level >= Verbosity::EXTENDED)
   {

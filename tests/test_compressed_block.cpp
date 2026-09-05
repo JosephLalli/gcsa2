@@ -149,9 +149,19 @@ main()
     std::vector<std::uint8_t> observed(zeros.size());
     require(input.read(observed.data(), observed.size()) == observed.size());
     require(observed == zeros);
+    // zstd starts no worker before a whole job exists, and a job is never
+    // smaller than one mebibyte, so a 128 KiB block runs single-threaded
+    // whatever is requested. Charging the request would reserve a job pool the
+    // encoder never allocates.
     require(CompressedBlockWriter::workingMemoryEstimate(128 * 1024,
-      CompressedBlockWriter::ZSTD, 1, 2) >
+      CompressedBlockWriter::ZSTD, 1, 2) ==
       CompressedBlockWriter::workingMemoryEstimate(128 * 1024,
+        CompressedBlockWriter::ZSTD, 1, 1));
+    // A block that does hold several jobs engages them, and is charged for the
+    // per-worker contexts, round buffer and job-output pool they allocate.
+    require(CompressedBlockWriter::workingMemoryEstimate(16 * 1024 * 1024,
+      CompressedBlockWriter::ZSTD, 1, 4) >
+      CompressedBlockWriter::workingMemoryEstimate(16 * 1024 * 1024,
         CompressedBlockWriter::ZSTD, 1, 1));
     CompressedBlockWriter copy(parallel_copy, 128 * 1024,
       CompressedBlockWriter::ZSTD, 1, 2);

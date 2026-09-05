@@ -1,9 +1,12 @@
 #include <gcsa/path_graph.h>
+#include <gcsa/compressed_block.h>
+#include <gcsa/support.h>
 
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <set>
 #include <string>
 #include <unistd.h>
@@ -141,6 +144,153 @@ static void compare_delayed_spill(const std::string& base, const LCP& lcp)
   std::remove(spilled_path.c_str()); std::remove(spilled_rank.c_str());
 }
 
+// Shard s holds record i with first label shards * i + s, so a label merge
+// alternates shards on every record. With fewer admitted pairs than shards,
+// every read evicts and the framed branch re-decodes a whole block per record.
+static void write_interleaved_shard(const std::string& path_name,
+  const std::string& rank_name, size_type shards, size_type shard,
+  size_type records, size_type block_bytes)
+{
+  std::ofstream raw_paths, raw_ranks;
+  std::unique_ptr<CompressedBlockWriter> framed_paths, framed_ranks;
+  if(block_bytes == 0)
+  {
+    raw_paths.open(path_name.c_str(), std::ios_base::binary);
+    raw_ranks.open(rank_name.c_str(), std::ios_base::binary);
+  }
+  else
+  {
+    framed_paths.reset(new CompressedBlockWriter(path_name, block_bytes,
+      CompressedBlockWriter::ZSTD));
+    framed_ranks.reset(new CompressedBlockWriter(rank_name, block_bytes,
+      CompressedBlockWriter::ZSTD));
+  }
+  for(size_type i = 0; i < records; i++)
+  {
+    PathNode node;
+    node.from = 1 + shards * i + shard; node.to = i + 1; node.fields = 0;
+    node.setPredecessors(1); node.setOrder(1); node.setLCP(1);
+    node.setPointer(2 * i);
+    PathNode::rank_type label[2] = {
+      static_cast<PathNode::rank_type>(shards * i + shard), 9 };
+    if(block_bytes == 0)
+    {
+      raw_paths.write(reinterpret_cast<const char*>(&node), sizeof(node));
+      raw_ranks.write(reinterpret_cast<const char*>(label), sizeof(label));
+    }
+    else
+    {
+      framed_paths->writeRecord(&node, sizeof(node));
+      framed_ranks->writeRecord(label, sizeof(label));
+    }
+  }
+  if(block_bytes != 0) { framed_paths->finish(); framed_ranks->finish(); }
+}
+
+static void build_interleaved_graph(PathGraph& graph,
+  const std::vector<std::string>& path_names,
+  const std::vector<std::string>& rank_names, size_type records)
+{
+  graph.order = 1;
+  graph.logical_file_ids[0] = logical_file_id_t(0);
+  graph.physical_shard_ids[0] = physical_shard_id_t(100);
+  graph.path_counts[0] = records; graph.rank_counts[0] = 2 * records;
+  for(size_type s = 1; s < path_names.size(); s++)
+  {
+    graph.path_names.push_back(path_names[s]);
+    graph.rank_names.push_back(rank_names[s]);
+    graph.path_counts.push_back(records);
+    graph.rank_counts.push_back(2 * records);
+    graph.logical_file_ids.push_back(logical_file_id_t(s));
+    graph.physical_shard_ids.push_back(physical_shard_id_t(100 + s));
+  }
+  graph.path_count = path_names.size() * records;
+  graph.rank_count = 2 * path_names.size() * records;
+}
+
+// Framed shards must survive the prune that reads them, and must cost what
+// their payload costs.
+//
+// The block a generation commits is chosen by the producer, but it is admitted
+// by this consumer: PathGraphInputCache holds two decoded blocks and two
+// decoder contexts per open pair inside pathMergeInputBudget(). Sizing the
+// block against the label-sort budget alone committed shards the merger could
+// not open at all, and even when one pair did fit, admitting fewer pairs than
+// shards made every read evict and re-decode.
+static void compare_framed_prune(const std::string& base, const LCP& lcp,
+  size_type shards, size_type records)
+{
+  ConstructionParameters parameters;
+  parameters.setMemoryLimitBytes(size_type(2) << 30);
+  const size_type budget = pathMergeInputBudget(parameters);
+  const size_type pairs = pathMergeInputPairs(parameters);
+  const size_type requested = parameters.getCompressionBlockSize();
+  const size_type admitted = mergeAdmissibleBlockSize(budget, pairs, requested);
+
+  // The clamp must leave room for every pair the merger may hold open, and
+  // must not silently disable compression to get there.
+  require(admitted <= requested);
+  require(pairs * 2 * CompressedBlockReader::workingMemoryEstimate(admitted) <= budget);
+
+  std::vector<std::string> raw_paths, raw_ranks, framed_paths, framed_ranks;
+  std::vector<std::string> legacy_paths, legacy_ranks;
+  for(size_type s = 0; s < shards; s++)
+  {
+    const std::string tag = std::to_string(s);
+    raw_paths.push_back(base + ".raw." + tag + ".path");
+    raw_ranks.push_back(base + ".raw." + tag + ".rank");
+    framed_paths.push_back(base + ".framed." + tag + ".path");
+    framed_ranks.push_back(base + ".framed." + tag + ".rank");
+    legacy_paths.push_back(base + ".legacy." + tag + ".path");
+    legacy_ranks.push_back(base + ".legacy." + tag + ".rank");
+    write_interleaved_shard(raw_paths[s], raw_ranks[s], shards, s, records, 0);
+    write_interleaved_shard(framed_paths[s], framed_ranks[s], shards, s, records,
+      admitted);
+    // A workspace committed before the block was bounded keeps its own block,
+    // and no operational flag can rewrite it.
+    write_interleaved_shard(legacy_paths[s], legacy_ranks[s], shards, s, records,
+      requested);
+  }
+
+  PathGraph reference(raw_paths[0], raw_ranks[0]);
+  PathGraph framed(framed_paths[0], framed_ranks[0]);
+  PathGraph legacy(legacy_paths[0], legacy_ranks[0]);
+  build_interleaved_graph(reference, raw_paths, raw_ranks, records);
+  build_interleaved_graph(framed, framed_paths, framed_ranks, records);
+  build_interleaved_graph(legacy, legacy_paths, legacy_ranks, records);
+
+  PathGraphMergeStats raw_stats, framed_stats, legacy_stats;
+  reference.prune(lcp, GIGABYTE, budget, &raw_stats, 128);
+  framed.prune(lcp, GIGABYTE, budget, &framed_stats, 128);
+  // Refusing here would make an already-committed workspace unresumable, so
+  // the oversized pair is admitted and reported instead.
+  legacy.prune(lcp, GIGABYTE, budget, &legacy_stats, 128);
+
+  require(framed.files() == reference.files());
+  require(framed.size() == reference.size());
+  require(legacy.size() == reference.size());
+  for(size_type file = 0; file < reference.files(); file++)
+  {
+    require(contents(reference.path_names[file]) == contents(framed.path_names[file]));
+    require(contents(reference.rank_names[file]) == contents(framed.rank_names[file]));
+    require(contents(reference.path_names[file]) == contents(legacy.path_names[file]));
+  }
+
+  // Every shard stays open, so each block is decoded once instead of once per
+  // record, and the framed merge is no worse than the raw one it replaced.
+  require(framed_stats.max_open_input_pairs == shards);
+  require(framed_stats.max_open_input_pairs == raw_stats.max_open_input_pairs);
+  require(framed_stats.oversized_input_pair_bytes == 0);
+  require(legacy_stats.oversized_input_pair_bytes > budget);
+
+  for(size_type s = 0; s < shards; s++)
+  {
+    std::remove(raw_paths[s].c_str()); std::remove(raw_ranks[s].c_str());
+    std::remove(framed_paths[s].c_str()); std::remove(framed_ranks[s].c_str());
+    std::remove(legacy_paths[s].c_str()); std::remove(legacy_ranks[s].c_str());
+  }
+}
+
 static void write_merged_fixture(const std::string& name)
 {
   Alphabet alpha;
@@ -258,6 +408,13 @@ int main()
   require(shard_stats.max_open_output_pairs < shards.size());
   require(2 * shard_stats.max_open_input_pairs +
     2 * shard_stats.max_open_output_pairs + 2 <= 8);
+
+  // A generated generation is framed by default, and the next prune has to be
+  // able to open it.
+  std::vector<key_type> framed_keys(3 * 200 + 2);
+  for(size_type i = 0; i < framed_keys.size(); i++) { framed_keys[i] = i; }
+  LCP framed_lcp(framed_keys, 1);
+  compare_framed_prune(std::string(root) + "/framed", framed_lcp, 3, 200);
 
   // Use the real construction route so mapper ranks and LCP invariants are
   // validated rather than synthesized by the test.

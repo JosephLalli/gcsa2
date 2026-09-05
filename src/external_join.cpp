@@ -15,6 +15,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
 #include <limits>
@@ -1260,9 +1261,12 @@ joinRunSortMinimumBudget(const TempFileCodecParameters& codec)
     joinRunWriterExtra(codec), "minimum compressed join sorter budget");
 }
 
+// Defined below, with the plan representation constants it depends on.
+size_type joinRunPlanMinimumBudget(const TempFileCodecParameters& codec);
+
 TempFileCodecParameters
 boundedJoinRunCodec(const TempFileCodecParameters& requested,
-  size_type join_sort_budget)
+  size_type join_sort_budget, size_type planner_budget)
 {
   if(!requested.enabled()) { return requested; }
   TempFileCodecParameters result = requested;
@@ -1277,7 +1281,18 @@ boundedJoinRunCodec(const TempFileCodecParameters& requested,
       result.block_size = block_bytes;
       // This is the join sorter's own phase share. The concurrently active
       // label sorter has an independent reservation outside this ceiling.
-      return joinRunSortMinimumBudget(result) <= join_sort_budget;
+      if(joinRunSortMinimumBudget(result) > join_sort_budget) { return false; }
+      // With process workers the runs this block produces are consumed by
+      // planJoinPartitions(), which opens two run readers and four sidecar
+      // readers against the whole memory budget. Admitting a block the sorter
+      // fits but the planner does not built every run and sidecar and then
+      // threw them away, and AUTO never reached the raw fallback because
+      // halving moved both minima together. Require the consumer's minimum
+      // here, so the block shrinks (or AUTO degrades to raw) before any run is
+      // written.
+      if(planner_budget > 0 &&
+         joinRunPlanMinimumBudget(result) > planner_budget) { return false; }
+      return true;
     }
     catch(const std::exception&)
     {
@@ -2339,6 +2354,22 @@ constexpr size_type JOIN_PLAN_RUNTIME_OVERHEAD = 6 * JOIN_IO_BUFFER_BYTES +
   2 * JOIN_PLAN_SAMPLE_RECORDS * sizeof(node_type) + 64 * KILOBYTE;
 constexpr std::uint64_t JOIN_PLAN_MAGIC = 0x334e4c5044534347ULL; // "GCSDPLN3"
 constexpr std::uint32_t JOIN_PLAN_VERSION = 3;
+
+// The budget planJoinPartitions() insists on before it will read a pair of
+// compressed runs: two run readers, a summary and a detail sidecar reader per
+// side, and four plan representations. Sidecar writers inherit the run's block
+// size, so one codec describes all six readers.
+size_type
+joinRunPlanMinimumBudget(const TempFileCodecParameters& codec)
+{
+  size_type readers = checkedJoinMultiply(6, joinRunReaderMemory(codec),
+    "join planner reader workspaces");
+  size_type minimum = checkedJoinAdd(JOIN_PLAN_RUNTIME_OVERHEAD, readers,
+    "compressed join planner minimum");
+  return checkedJoinAdd(minimum,
+    4 * (JOIN_PLAN_FIXED_BYTES + JOIN_PLAN_PACK_BYTES),
+    "minimum join plan representations");
+}
 
 struct JoinKeySample
 {
@@ -4223,6 +4254,23 @@ checkpointJoinPartition(BuildWorkspace& workspace, const std::string& task,
   workspace.commit_task(task, "join-partition", artifacts);
 }
 
+// Exact committed size of one checkpointed partition, before restoring it. The
+// disk guard reserves those bytes first, because the cross-filesystem fallback
+// in restore_adopted_payload() copies the pair instead of linking it.
+size_type
+restoredJoinPartitionBytes(const BuildWorkspace& workspace,
+  const std::string& task, logical_file_id_t logical)
+{
+  return checkedJoinAdd(
+    storedJoinBytes(workspace.artifact_path(
+      joinPartitionArtifact(task, "paths", "path-nodes-v1"), logical,
+      physical_shard_id_t(0))),
+    storedJoinBytes(workspace.artifact_path(
+      joinPartitionArtifact(task, "ranks", "path-ranks-v1"), logical,
+      physical_shard_id_t(0))),
+    "restored worker output bytes");
+}
+
 void
 restoreJoinPartition(const BuildWorkspace& workspace, const std::string& task,
   logical_file_id_t logical, const JoinPartition& partition,
@@ -4369,6 +4417,45 @@ allocateConcurrentPathBudgets(const ConstructionParameters& parameters,
   return ConcurrentPathBudgets(sort_bytes, join_bytes);
 }
 
+// A worker killed by SIGTERM runs no destructors, so the static TempFile
+// handler that would remove its label-sort runs never executes and those files
+// outlive the build: they carry the dead child's pid and a worker-local
+// counter, so neither the coordinator's own handler nor BuildWorkspace's
+// recovery sweep (which knows only .partial, .index. and uncommitted .bin
+// names) can name them. TempFile::getName() composes every temporary as
+// <dir>/<part>_<host>_<pid>_<counter> with <part> always beginning "gcsa", so
+// the reaped pid identifies exactly this child's files. Call this only after
+// waitpid() has returned for the pid: the files were created before the kill,
+// and no live sibling can own a name carrying it.
+void
+removeWorkerTemporaries(const std::string& directory, pid_t pid)
+{
+  if(directory.empty() || pid <= 0) { return; }
+  char hostname[32];
+  if(::gethostname(hostname, sizeof(hostname)) != 0) { return; }
+  hostname[sizeof(hostname) - 1] = 0;
+  const std::string suffix = std::string("_") + hostname + "_" +
+    std::to_string(static_cast<long long>(pid)) + "_";
+  DIR* handle = ::opendir(directory.c_str());
+  if(handle == nullptr) { return; }
+  for(dirent* entry = ::readdir(handle); entry != nullptr; entry = ::readdir(handle))
+  {
+    const std::string name(entry->d_name);
+    if(name.compare(0, 4, "gcsa") != 0) { continue; }
+    const size_t at = name.rfind(suffix);
+    if(at == std::string::npos || at + suffix.size() >= name.size()) { continue; }
+    // Everything after the pid must be the decimal counter, so a longer pid
+    // that merely ends in these digits cannot match.
+    bool counter = true;
+    for(size_t i = at + suffix.size(); i < name.size(); i++)
+    {
+      if(name[i] < '0' || name[i] > '9') { counter = false; break; }
+    }
+    if(counter) { std::remove((directory + "/" + name).c_str()); }
+  }
+  ::closedir(handle);
+}
+
 void
 runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
   logical_file_id_t logical, const std::vector<JoinPartition>& partitions,
@@ -4441,9 +4528,15 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
     pid_t waited;
     do { waited = ::waitpid(worker.pid, &status, 0); }
     while(waited < 0 && errno == EINTR);
+    const pid_t reaped = worker.pid;
     worker.pid = -1;
     if(waited < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != EXIT_SUCCESS)
     {
+      // This child is the one that aborts the build, and it is already reaped,
+      // so the catch(...) below skips it: its pid is cleared and its guard is
+      // pid > 0. Sweep here, or the worker whose failure ends the run is the
+      // one worker whose label-sort runs are certain to be left behind.
+      removeWorkerTemporaries(TempFile::temp_dir, reaped);
       throw joinError("external join worker failed", worker.task_file);
     }
     // The completed child no longer owns a working set. Return its tokens
@@ -4472,7 +4565,8 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
     if(result.stored_bytes != actual_stored_bytes ||
        result.stored_bytes > worker.maximum_stored_bytes)
     {
-      throw joinError("worker stored output exceeds its admitted peak", result_file);
+      throw joinError("worker stored output exceeds the peak admitted for the"
+        " configured temporary-compression settings", result_file);
     }
     if(workspace != nullptr && !worker.checkpoint_name.empty())
     {
@@ -4537,6 +4631,29 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
         // Do not overlap restore buffers with fully admitted child working
         // sets. Completed tasks are cheap to restore and never respawn.
         while(!active.empty()) { collect_one(); }
+        // A restored shard was written by an earlier run, whose codec is an
+        // operational setting and may differ from this one. Its physical size
+        // therefore says nothing about this run's admitted peak: a framed pair
+        // committed under zstd is larger than the raw payload that peak
+        // describes when the resuming run uses --temp-compression none, and
+        // AUTO reduces to NONE on its own under a smaller sort budget. The
+        // artifact is authenticated against the workspace's own completion
+        // record by restoreJoinPartition() (exact committed length, and the
+        // payload checksum under --verify-workspace), so only disk accounting
+        // is left: charge the guard the exact stored size, reserved before the
+        // restore because its cross-filesystem fallback copies those bytes.
+        const size_type restored_bytes = restoredJoinPartitionBytes(*workspace,
+          partition_checkpoint, logical);
+        if(restored_bytes > size_limit ||
+           committed_bytes > size_limit - restored_bytes)
+        {
+          throw joinError("restored join partition does not fit the configured"
+            " disk limit: it stores " + std::to_string(restored_bytes) +
+            " bytes under the temporary compression of the run that committed"
+            " it, and --disk-limit leaves " +
+            std::to_string(size_limit - std::min(committed_bytes, size_limit)) +
+            " bytes", partition_checkpoint);
+        }
         restoreJoinPartition(*workspace, partition_checkpoint, logical, partition,
           next.path_names[shard], next.rank_names[shard], checkpoint_buffer);
         validateWorkerOutput(next.path_names[shard],
@@ -4547,14 +4664,6 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
         next.rank_counts[shard] = partition.expected_ranks;
         next.path_count += partition.expected_paths;
         next.rank_count += partition.expected_ranks;
-        const size_type restored_bytes = checkedJoinAdd(
-          storedJoinBytes(next.path_names[shard]),
-          storedJoinBytes(next.rank_names[shard]),
-          "restored worker output bytes");
-        if(restored_bytes > peak_output_bytes)
-        {
-          throw joinError("restored worker output exceeds its admitted peak");
-        }
         committed_bytes = checkedJoinAdd(committed_bytes, restored_bytes,
           "committed restored output bytes");
         if(stats != nullptr)
@@ -4607,6 +4716,7 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
       {
         ::kill(worker.pid, SIGTERM);
         while(::waitpid(worker.pid, nullptr, 0) < 0 && errno == EINTR) { }
+        removeWorkerTemporaries(TempFile::temp_dir, worker.pid);
       }
       std::string result_file = worker.task_file + ".result";
       std::remove(result_file.c_str());
@@ -4632,9 +4742,26 @@ externalPathJoinMinimumBudget()
 
 void
 externalPathGraphExtend(PathGraph& graph, size_type size_limit,
-  const ConstructionParameters& parameters, ExternalPathJoinStats* stats,
+  const ConstructionParameters& requested_parameters, ExternalPathJoinStats* stats,
   BuildWorkspace* workspace, const std::string& checkpoint_task)
 {
+  // Everything this generation writes is read back by the next prune(), and
+  // after the last step by MergedGraph, through an input cache that keeps at
+  // most pathMergeInputPairs() framed pairs open inside pathMergeInputBudget()
+  // bytes. The sinks below would otherwise size their compression block
+  // against the label-sort budget alone, which is larger by orders of
+  // magnitude: at the shipped defaults that committed 16 MiB-block shards
+  // needing 67.3 MB for one decoded pair against a 64 MiB ceiling, so the next
+  // prune could not open its own input and the workspace became unresumable.
+  // Clamping here rather than in the caller keeps the bound with the code that
+  // writes the shards, so every entry point (vg index, vg autoindex,
+  // build_gcsa, and the tests) gets it.
+  ConstructionParameters parameters = requested_parameters;
+  parameters.setCompressionBlockSize(mergeAdmissibleBlockSize(
+    pathMergeInputBudget(requested_parameters),
+    pathMergeInputPairs(requested_parameters),
+    requested_parameters.getCompressionBlockSize()));
+
   if(stats != nullptr) { *stats = ExternalPathJoinStats(); }
   if(graph.logical_file_ids.size() != graph.files() ||
      graph.physical_shard_ids.size() != graph.files())
@@ -4663,7 +4790,8 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
       parameters.getJoinPartitionSize(memory_budget));
   }
   TempFileCodecParameters join_codec = boundedJoinRunCodec(
-    parameters.getTempFileCodecParameters(), maximum_distribution_sort);
+    parameters.getTempFileCodecParameters(), maximum_distribution_sort,
+    (parameters.getProcessWorkers() > 1 ? memory_budget : 0));
   if(maximum_distribution_sort < joinRunSortMinimumBudget(join_codec))
   {
     throw joinError("distribution sort cap is below the join-run minimum");
@@ -4798,6 +4926,12 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
   MemoryBudget compaction_memory(memory_budget, memory_budget / 16);
   compactLogicalJoinShards(next, size_limit, parameters, label_fan_in,
     compaction_memory, committed_bytes, stats);
+  // Every sink, worker and restored partition charged this generation its
+  // installed st_size, and compaction subtracted only what it actually
+  // unlinked. That total, not the logical payload, is what the next
+  // generation's disk budget must be reduced by. A failed unlink leaves the
+  // charge in place, which over-reserves rather than over-admits.
+  next.stored_bytes = committed_bytes;
   graph.clear(); graph.swap(next);
 }
 
