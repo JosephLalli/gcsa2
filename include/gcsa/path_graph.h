@@ -452,6 +452,12 @@ size_type pathMergeOutputPairs(size_type max_open_files, size_type logical_input
 size_type pathMergeInputPairs(size_type max_open_files, size_type logical_inputs);
 size_type pathMergeInputPairs(const ConstructionParameters& parameters);
 
+// The ceiling that workspace may grow to: a sixteenth of --memory-limit, the
+// share this buffer has always been bounded by. Producers size their block
+// against this rather than against --io-buffer-size, which sizes stream
+// buffers and which no entry point above this library exposes.
+size_type pathMergeCeilingBudget(const ConstructionParameters& parameters);
+
 // The same workspace for a generation that already exists. A committed shard
 // declares its own block size and nothing rewrites it, so this raises the
 // buffer to hold one decoded path/rank pair of source. --memory-limit remains

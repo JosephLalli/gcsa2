@@ -4768,8 +4768,12 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
   // writes the shards, so every entry point (vg index, vg autoindex,
   // build_gcsa, and the tests) gets it.
   ConstructionParameters parameters = requested_parameters;
+  // Size against the ceiling the merge workspace may grow to, not against
+  // --io-buffer-size: the consumer raises its buffer to hold what is actually
+  // committed, so bounding the block by a stream-buffer setting would shrink
+  // it for no reason and cost compression ratio at every later generation.
   parameters.setCompressionBlockSize(mergeAdmissibleBlockSize(
-    pathMergeInputBudget(requested_parameters),
+    pathMergeCeilingBudget(requested_parameters),
     pathMergeInputPairs(requested_parameters),
     requested_parameters.getCompressionBlockSize()));
 
