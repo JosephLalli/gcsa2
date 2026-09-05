@@ -1244,8 +1244,23 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     {
       size_type prune_buffer = pathMergeInputBudget(parameters, path_graph);
       PathGraphMergeStats merge_stats;
+      const size_type merge_inputs = path_graph.files();
       path_graph.prune(lcp, path_graph.remainingLimit(parameters.getLimitBytes()),
         prune_buffer, &merge_stats, parameters.getMaxOpenFiles());
+      // The merger visits its shards in round-robin label order, so a cache one
+      // entry short of the shard count misses on every record rather than on a
+      // fraction of them. That cliff is worth a word at the default verbosity:
+      // it is invisible in the output and the remedy is one flag.
+      if(merge_stats.max_open_input_pairs < merge_inputs &&
+         Verbosity::level >= Verbosity::BASIC)
+      {
+        std::cerr << "PathGraph::prune(): warning: only "
+                  << merge_stats.max_open_input_pairs << " of " << merge_inputs
+                  << " input shards fit --max-open-files "
+                  << parameters.getMaxOpenFiles()
+                  << "; the merge will reread the rest. Raise --max-open-files"
+                  << " to about " << (4 * merge_inputs + 2) << "." << std::endl;
+      }
       if(Verbosity::level >= Verbosity::EXTENDED)
       {
         std::cerr << "PathGraph::prune(): "
