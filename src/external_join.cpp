@@ -3839,11 +3839,22 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
   {
     return; // Compaction is optional; the existing LABEL streams are valid.
   }
+  // Retain no more shards than the downstream label merges can hold open at
+  // once. prune() and MergedGraph read every retained shard in round-robin
+  // label order, so an input cache one entry short of the shard count misses
+  // on every record, and each framed miss decodes whole blocks for one 24-byte
+  // PathNode. The old target counted descriptors this function does not own:
+  // it kept up to (max_open_files - 4) / 2 shards per logical input while
+  // prune() was admitting a quarter of that. pathMergeInputPairs() is the same
+  // bound both merges size their input caches by and mergeAdmissibleBlockSize()
+  // sizes the committed block by, so retaining against it keeps the three
+  // consistent.
+  const size_type target_pairs = std::max(static_cast<size_type>(1),
+    pathMergeInputPairs(parameters.getMaxOpenFiles(), groups.size()) /
+      groups.size());
   bool needs_merge = false;
   for(const auto& group : groups)
   {
-    size_type target_pairs = std::max(static_cast<size_type>(1),
-      (parameters.getMaxOpenFiles() - 4) / (2 * groups.size()));
     if(group.second.size() > target_pairs) { needs_merge = true; break; }
   }
   if(!needs_merge) { return; }
@@ -4090,11 +4101,10 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
       continue;
     }
     // Keep a bounded downstream frontier: one path/rank pair per retained
-    // stream, divided fairly among logical groups. The batch width is then
-    // derived from the group size and that target, but never exceeds the
-    // reader/descriptor limit.
-    const size_type target_pairs = std::max(static_cast<size_type>(1),
-      (parameters.getMaxOpenFiles() - 4) / (2 * groups.size()));
+    // stream, divided fairly among logical groups. target_pairs is the shared
+    // bound computed above, so the retention test and the batching cannot
+    // drift apart. The batch width is then derived from the group size and
+    // that target, but never exceeds the reader/descriptor limit.
     PathGraph current(0, source.k(), source.step()); current.delete_files = false;
     std::vector<size_type> origin;
     for(size_type source_file : shards)

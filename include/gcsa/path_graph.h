@@ -440,10 +440,16 @@ size_type externalPathGraphShardPeakBytes(size_type paths, size_type ranks,
 size_type mergeAdmissibleBlockSize(size_type byte_budget, size_type pairs,
   size_type requested_block);
 
-// Merge workspace and framed-pair count that prune() and MergedGraph are given
-// for one generation. Producers of generated shards bound their compression
-// block against these, so what one phase commits the next can open.
+// Merge workspace, and the framed pair counts prune() and MergedGraph divide
+// their --max-open-files allowance into for `logical_inputs` logical inputs.
+// Producers of generated shards bound their compression block against these,
+// and the post-join compactor retains no more shards than the input count, so
+// what one phase commits the next can open: both merges visit their shards in
+// round-robin label order, and a cache one entry short of the shard count
+// misses on every record.
 size_type pathMergeInputBudget(const ConstructionParameters& parameters);
+size_type pathMergeOutputPairs(size_type max_open_files, size_type logical_inputs);
+size_type pathMergeInputPairs(size_type max_open_files, size_type logical_inputs);
 size_type pathMergeInputPairs(const ConstructionParameters& parameters);
 
 /*
