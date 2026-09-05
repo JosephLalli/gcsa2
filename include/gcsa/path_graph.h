@@ -387,10 +387,16 @@ struct PathGraph
   // Keep a bounded resident window while pruning one potentially very large
   // equal-label range. The default is deliberately small enough that the
   // external route cannot retain an adversarial range in RAM.
+  // input_cache_bytes is the reservation for decoded framed input blocks. It
+  // is separate from group_buffer_bytes because the two scale with different
+  // things: the equal-label group and range deque with one label range, the
+  // input cache with the shard count. Zero means "share group_buffer_bytes",
+  // which is what a raw generation wants.
   void prune(const LCP& lcp, size_type size_limit,
     size_type group_buffer_bytes = MEGABYTE,
     PathGraphMergeStats* stats = nullptr,
-    size_type max_open_files = 128);
+    size_type max_open_files = 128,
+    size_type input_cache_bytes = 0);
   void extend(size_type size_limit, size_type memory_limit);
 
   void debugExtend();
@@ -457,6 +463,16 @@ size_type pathMergeInputPairs(const ConstructionParameters& parameters);
 // against this rather than against --io-buffer-size, which sizes stream
 // buffers and which no entry point above this library exposes.
 size_type pathMergeCeilingBudget(const ConstructionParameters& parameters);
+
+// Reservation for decoded framed input blocks while merging `source`. Every
+// shard a merge opens stays open for the whole pass and they are visited in
+// round-robin label order, so a cache one entry short of the shard count
+// misses on every record: this asks for the whole shard set, not a share of
+// it. It is deliberately separate from the equal-label group buffer, which
+// scales with one label range rather than with the number of shards, so
+// funding the cache does not multiply three unrelated structures.
+size_type pathMergeInputCacheBudget(const ConstructionParameters& parameters,
+  const PathGraph& source);
 
 // The same workspace for a generation that already exists. A committed shard
 // declares its own block size and nothing rewrites it, so this raises the
@@ -594,7 +610,8 @@ struct MergedGraph
     const LCP& kmer_lcp, size_type size_limit,
     size_type group_buffer_bytes = MEGABYTE,
     PathGraphMergeStats* stats = nullptr,
-    size_type max_open_files = 128);
+    size_type max_open_files = 128,
+    size_type input_cache_bytes = 0);
   ~MergedGraph();
 
   void clear();
