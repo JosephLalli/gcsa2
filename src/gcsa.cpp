@@ -1217,7 +1217,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     std::string task = doublingTask(step);
     if(!(restored_prune && step == first_step))
     {
-      size_type prune_buffer = pathMergeInputBudget(parameters);
+      size_type prune_buffer = pathMergeInputBudget(parameters, path_graph);
       PathGraphMergeStats merge_stats;
       path_graph.prune(lcp, path_graph.remainingLimit(parameters.getLimitBytes()),
         prune_buffer, &merge_stats, parameters.getMaxOpenFiles());
@@ -1368,7 +1368,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     // generated path generations.
     external_preprocessor->buildMapper(mapper);
   }
-  size_type merge_buffer = pathMergeInputBudget(parameters);
+  size_type merge_buffer = pathMergeInputBudget(parameters, path_graph);
   PathGraphMergeStats final_merge_stats;
   MergedGraph merged_graph(path_graph, mapper, lcp,
     path_graph.remainingLimit(parameters.getLimitBytes()), merge_buffer,

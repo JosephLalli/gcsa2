@@ -329,7 +329,10 @@ last step, `MergedGraph`) can hold every pair it may open inside its own merge
 budget, and join runs are bounded so `planJoinPartitions()` can admit the run
 and sidecar readers it will need. Both bounds are applied before a stream is
 written, because a block that only the producer can afford commits a generation
-its consumer cannot read. Explicit `zstd` instead reports the minimum codec workspace it
+its consumer cannot read. A generation committed before those bounds existed
+keeps its own block: the merge buffer is then raised to hold one decoded pair of
+it, and a workspace whose block needs more than a sixteenth of `--memory-limit`
+is refused with the limit it does need rather than silently over-allocated. Explicit `zstd` instead reports the minimum codec workspace it
 cannot admit. Compression mode, block size, level, and worker count are
 operational settings and may change on resume. Join child processes clamp
 zstd's internal worker count to their assigned thread share, preventing

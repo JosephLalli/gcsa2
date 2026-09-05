@@ -1259,6 +1259,58 @@ pathMergeInputPairs(const ConstructionParameters& parameters)
 
 
 size_type
+pathGraphFramedPairBytes(const PathGraph& source)
+{
+  size_type result = 0;
+  for(size_type file = 0; file < source.files(); file++)
+  {
+    size_type pair_bytes = 0;
+    if(CompressedBlockReader::isFramed(source.path_names[file]))
+    {
+      pair_bytes += CompressedBlockReader::workingMemoryEstimate(
+        CompressedBlockReader::declaredBlockSize(source.path_names[file]));
+    }
+    if(CompressedBlockReader::isFramed(source.rank_names[file]))
+    {
+      pair_bytes += CompressedBlockReader::workingMemoryEstimate(
+        CompressedBlockReader::declaredBlockSize(source.rank_names[file]));
+    }
+    result = std::max(result, pair_bytes);
+  }
+  return result;
+}
+
+size_type
+pathMergeInputBudget(const ConstructionParameters& parameters,
+  const PathGraph& source)
+{
+  const size_type requested = pathMergeInputBudget(parameters);
+  const size_type pair_bytes = pathGraphFramedPairBytes(source);
+  if(pair_bytes <= requested) { return requested; }
+
+  // --io-buffer-size sizes stream buffers; it was never a memory ceiling, and
+  // no entry point above this library exposes it. A committed shard, by
+  // contrast, declares its own block size in its header, and one decoded path
+  // block plus one decoded rank block is the irreducible cost of opening that
+  // pair: it cannot be subdivided the way an oversized request normally is.
+  // Raise the buffer to that cost, but never past the sixteenth of
+  // --memory-limit this buffer has always been bounded by, because the merger
+  // holds a range deque, a priority group, and an output cache of the same
+  // size beside it.
+  const size_type ceiling = std::max(static_cast<size_type>(1),
+    parameters.getMemoryLimitBytes() / 16);
+  if(pair_bytes > ceiling)
+  {
+    throw std::runtime_error(
+      "PathGraph: opening one committed compressed shard pair needs " +
+      std::to_string(pair_bytes) + " bytes of decode workspace; resume this"
+      " workspace with a memory limit of at least " +
+      std::to_string(16 * pair_bytes) + " bytes");
+  }
+  return pair_bytes;
+}
+
+size_type
 mergeAdmissibleBlockSize(size_type byte_budget, size_type pairs,
   size_type requested_block)
 {

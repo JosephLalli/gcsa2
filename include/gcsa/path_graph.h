@@ -452,6 +452,14 @@ size_type pathMergeOutputPairs(size_type max_open_files, size_type logical_input
 size_type pathMergeInputPairs(size_type max_open_files, size_type logical_inputs);
 size_type pathMergeInputPairs(const ConstructionParameters& parameters);
 
+// The same workspace for a generation that already exists. A committed shard
+// declares its own block size and nothing rewrites it, so this raises the
+// buffer to hold one decoded path/rank pair of source. --memory-limit remains
+// the ceiling: a workspace whose block needs more than a sixteenth of it is
+// reported with the limit it does need, not silently over-allocated.
+size_type pathMergeInputBudget(const ConstructionParameters& parameters,
+  const PathGraph& source);
+
 /*
   A bounded sink for records that are produced incrementally but must become a
   label-sorted PathGraph shard. Full buffers are sorted into immutable runs;
