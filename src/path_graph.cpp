@@ -395,8 +395,17 @@ struct PathGraphOutputCache
     graph(target), entries(), clock(0),
     max_pairs(std::max(static_cast<size_type>(1), std::min(requested_pairs,
       total_buffer_bytes / minimumPairBytes()))),
+    // Cap the per-pair staging buffer. With output_pairs == 1 -- prune's normal
+    // case -- total_buffer_bytes / max_pairs is the entire group buffer, and
+    // these pages are genuinely written, so the whole share was resident. Once
+    // the framed-codec path makes pathMergeInputBudget reach memory_limit/16
+    // (1.44 GiB at the chr21 configuration) that one number is handed to four
+    // independent structures which each size themselves from all of it.
+    // Sequential writes saturate well below the flush watermark, past which the
+    // pages are released anyway, so the watermark is the natural ceiling.
     pair_buffer_bytes(std::max(minimumPairBytes(),
-      total_buffer_bytes / this->max_pairs)), stats(merge_stats)
+      std::min(static_cast<size_type>(CACHE_FLUSH_BYTES),
+        total_buffer_bytes / this->max_pairs))), stats(merge_stats)
   {
     this->entries.reserve(this->max_pairs);
   }
