@@ -213,14 +213,31 @@ struct SortPlan
   // permutation of their offsets, which drops the offset array and removes an
   // indirect call to two random offsets from every comparison.
   bool total_order;
+  // Set only when the declared order is one run formation can implement with an
+  // inlined comparison at this record width. Never widens what the sorter
+  // accepts: an unsupported order or width simply keeps the comparator.
+  bool ascending_u64;
 };
 
 SortPlan
 makePlan(size_type record_bytes, size_type byte_budget, size_type requested_fan_in,
-  bool total_order = false)
+  bool total_order = false,
+  ExternalFixedRecordSorter::RecordOrder order =
+    ExternalFixedRecordSorter::RecordOrder::COMPARATOR)
 {
   if(record_bytes == 0) { fail("record width must be nonzero"); }
   total_order = total_order && canSortInPlace(record_bytes);
+  // The fast path needs the records sorted in place as scalars, so it is
+  // available exactly where the in-place path is, at eight bytes, on a
+  // little-endian host.
+  bool ascending_u64 = false;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  ascending_u64 = total_order &&
+    order == ExternalFixedRecordSorter::RecordOrder::ASCENDING_U64 &&
+    record_bytes == sizeof(std::uint64_t);
+#else
+  static_cast<void>(order);
+#endif
   if(byte_budget < ExternalFixedRecordSorter::minimumBudget(record_bytes))
   {
     fail("byte budget is too small");
@@ -251,7 +268,7 @@ makePlan(size_type record_bytes, size_type byte_budget, size_type requested_fan_
   if(run_records == 0) { fail("byte budget cannot hold one sortable record"); }
 
   return { record_bytes, byte_budget, fan_in, run_records, merge_records,
-    output_bytes, total_order };
+    output_bytes, total_order, ascending_u64 };
 }
 
 struct RunReader
@@ -358,6 +375,15 @@ sortRecordsInPlace(std::uint8_t* records, size_type count, const SortPlan& plan,
   const ExternalFixedRecordSorter::Comparator& compare)
 {
   if(count < 2) { return; }
+  if(plan.ascending_u64)
+  {
+    // No call back into the caller at all: std::less on a scalar, which inlines
+    // and vectorises. Identical ordering to a comparator that decodes the same
+    // eight bytes as a little-endian unsigned value.
+    std::uint64_t* values = reinterpret_cast<std::uint64_t*>(records);
+    std::sort(values, values + count);
+    return;
+  }
   switch(plan.record_bytes / sizeof(std::uint64_t))
   {
     case 1: sortAsWords<1>(records, count, compare); return;
@@ -727,12 +753,12 @@ void
 ExternalFixedRecordSorter::sort(const std::string& input_name,
   const std::string& output_name, size_type record_bytes, size_type byte_budget,
   size_type requested_fan_in, const Comparator& compare,
-  ExternalFixedRecordSortStats* stats, bool total_order)
+  ExternalFixedRecordSortStats* stats, bool total_order, RecordOrder order)
 {
   if(!compare) { fail("missing comparator"); }
   if(stats != nullptr) { *stats = ExternalFixedRecordSortStats(); }
   SortPlan plan = makePlan(record_bytes, byte_budget, requested_fan_in,
-    total_order);
+    total_order, order);
   std::string run = sortToRun(input_name, plan, compare, stats);
   if(run.empty()) { writeEmpty(output_name); return; }
   installRun(run, output_name);
@@ -742,12 +768,12 @@ void
 ExternalFixedRecordSorter::sortAndReduce(const std::string& input_name,
   const std::string& output_name, size_type record_bytes, size_type byte_budget,
   size_type requested_fan_in, const Comparator& compare, const Reducer& reducer,
-  ExternalFixedRecordSortStats* stats, bool total_order)
+  ExternalFixedRecordSortStats* stats, bool total_order, RecordOrder order)
 {
   if(!compare || !reducer) { fail("missing comparator or reducer"); }
   if(stats != nullptr) { *stats = ExternalFixedRecordSortStats(); }
   SortPlan plan = makePlan(record_bytes, byte_budget, requested_fan_in,
-    total_order);
+    total_order, order);
   std::string run = sortToRun(input_name, plan, compare, stats);
   if(run.empty()) { writeEmpty(output_name); return; }
   try

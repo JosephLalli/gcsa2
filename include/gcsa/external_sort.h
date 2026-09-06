@@ -45,6 +45,26 @@ public:
   typedef std::function<int(const void*, const void*)> Comparator;
 
   /*
+    A comparator reaches run formation as a std::function, so every comparison
+    is a type-erased indirect call the compiler cannot inline. Run formation is
+    n log n in the record count, so that constant lands on the largest sorts in
+    the build: the chr21 redundancy sort alone is 563,772,793 records, about
+    1.6e10 comparisons, and it grows with the graph.
+
+    A caller whose ordering is one this class can implement directly may say so,
+    and run formation then sorts with an inlined std::less instead of calling
+    back at all. The comparator is still required and still used everywhere else
+    -- the merge, the reducer's grouping, and any width the fast path does not
+    cover -- so declaring an order is an optimisation, never a substitute.
+
+    ASCENDING_U64 means: the records are eight bytes and the comparator orders
+    them by their little-endian unsigned 64-bit value. That is what
+    compareEncoded64 computes explicitly, and what a native load computes on a
+    little-endian host; the fast path is compiled out on a big-endian one.
+  */
+  enum class RecordOrder { COMPARATOR, ASCENDING_U64 };
+
+  /*
     The reducer is called once for each sorted input record. first_in_group and
     last_in_group delimit comparator-equal records. It may keep bounded state
     for the current group and write an arbitrary result to output. This makes
@@ -74,7 +94,8 @@ public:
   static void sort(const std::string& input_name, const std::string& output_name,
     size_type record_bytes, size_type byte_budget, size_type requested_fan_in,
     const Comparator& compare, ExternalFixedRecordSortStats* stats = nullptr,
-    bool total_order = false);
+    bool total_order = false,
+    RecordOrder order = RecordOrder::COMPARATOR);
 
   // Sort and consume equal-key groups while writing output_name. The reducer,
   // not this class, defines the resulting output record format.
@@ -82,7 +103,8 @@ public:
     const std::string& output_name, size_type record_bytes,
     size_type byte_budget, size_type requested_fan_in,
     const Comparator& compare, const Reducer& reducer,
-    ExternalFixedRecordSortStats* stats = nullptr, bool total_order = false);
+    ExternalFixedRecordSortStats* stats = nullptr, bool total_order = false,
+    RecordOrder order = RecordOrder::COMPARATOR);
 };
 
 } // namespace gcsa

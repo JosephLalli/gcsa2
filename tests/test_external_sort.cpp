@@ -180,6 +180,47 @@ int main()
     std::remove(permuted_reduced.c_str()); std::remove(in_place_reduced.c_str());
   }
 
+  // Declaring ASCENDING_U64 must not change a byte: the fast path sorts the
+  // same eight-byte records as scalars instead of calling the comparator, so
+  // its output has to match the comparator path exactly, and must also match a
+  // caller that declares the order but whose width the fast path rejects.
+  {
+    const std::string u64_input = std::string(root) + "/u64.bin";
+    const std::string via_cmp = std::string(root) + "/u64-cmp.bin";
+    const std::string via_fast = std::string(root) + "/u64-fast.bin";
+    std::vector<std::uint64_t> values;
+    for(std::uint64_t i = 0; i < 5000; i++)
+    {
+      values.push_back((1181783497276652981ULL * (i + 1)) ^ (i << 17));
+    }
+    {
+      std::ofstream out(u64_input.c_str(), std::ios_base::binary);
+      out.write(reinterpret_cast<const char*>(values.data()),
+        values.size() * sizeof(std::uint64_t));
+    }
+    auto compare_u64 = [](const void* left, const void* right)
+    {
+      std::uint64_t a, b;
+      std::memcpy(&a, left, sizeof(a)); std::memcpy(&b, right, sizeof(b));
+      return (a < b ? -1 : (a > b ? 1 : 0));
+    };
+    const size_type u64_budget =
+      ExternalFixedRecordSorter::minimumBudget(sizeof(std::uint64_t)) * 4;
+    ExternalFixedRecordSorter::sort(u64_input, via_cmp, sizeof(std::uint64_t),
+      u64_budget, 2, compare_u64, nullptr, true,
+      ExternalFixedRecordSorter::RecordOrder::COMPARATOR);
+    ExternalFixedRecordSorter::sort(u64_input, via_fast, sizeof(std::uint64_t),
+      u64_budget, 2, compare_u64, nullptr, true,
+      ExternalFixedRecordSorter::RecordOrder::ASCENDING_U64);
+    require(readBytes(via_cmp) == readBytes(via_fast));
+    std::sort(values.begin(), values.end());
+    std::string sorted_bytes(reinterpret_cast<const char*>(values.data()),
+      values.size() * sizeof(std::uint64_t));
+    require(readBytes(via_fast) == sorted_bytes);
+    std::remove(u64_input.c_str()); std::remove(via_cmp.c_str());
+    std::remove(via_fast.c_str());
+  }
+
   // A width the in-place sorter cannot handle falls back to the permutation.
   {
     const std::string odd_input = std::string(root) + "/odd.bin";

@@ -3851,7 +3851,8 @@ struct SameFromSet
         },
         [&count](const void* record, bool first, bool, std::ostream& stream) {
           if(first) { stream.write(reinterpret_cast<const char*>(record), sizeof(node_type)); count++; }
-        }, nullptr, true);
+        }, nullptr, true,
+        ExternalFixedRecordSorter::RecordOrder::ASCENDING_U64);
     }
     catch(...)
     {

@@ -363,7 +363,8 @@ ExternalInputPreprocessor::prepare()
       [](const void* value, bool first, bool, std::ostream& output)
       {
         if(first) { output.write(reinterpret_cast<const char*>(value), sizeof(node_type)); }
-      }, &this->stats_.start_sort, true);
+      }, &this->stats_.start_sort, true,
+      ExternalFixedRecordSorter::RecordOrder::ASCENDING_U64);
     TempFile::remove(key_source);
     TempFile::remove(start_source);
   }
