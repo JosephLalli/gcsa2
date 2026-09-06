@@ -6,6 +6,8 @@
 */
 
 #include <gcsa/path_graph.h>
+
+#include <thread>
 #include <gcsa/path_graph_external.h>
 #include <gcsa/compressed_block.h>
 #include <gcsa/resources.h>
@@ -2085,6 +2087,56 @@ private:
   size_type rank_buffer_first, rank_buffer_records;
   std::unique_ptr<CompressedBlockReader> compressed_path, compressed_rank;
 };
+
+
+/*
+  FORK: the two distribution scans of a logical group are independent.
+
+  scanJoinSide builds its own PathShardReader per shard, reads a const
+  PathGraph, writes its own sorter, and counts its own `ordinal` from zero. So
+  RIGHT_BY_FROM and LEFT_BY_TO produce byte-identical JoinRuns whichever order
+  they run in, or if they run at once. The only shared mutable state is the
+  statistics pointer.
+
+  That matters because distribution is serial and precedes the worker phase
+  entirely: measured on chr2's step-1 join, one core at 0.784 utilisation
+  produced 13.2 MB/s while the device sat at 1.6% and 95 cores idled.
+  --gcsa-process-workers does not apply until distribution has finished.
+
+  Each side therefore gets its own statistics object, merged here. Adding every
+  field is correct rather than merely convenient: a field neither scan touches
+  is zero in both copies. The scans touch left_records / right_records (one
+  each, disjoint) and, through ExternalJoinSorter, initial_runs and
+  join_parallel_sorts. The six fields below are maxima or phase settings, not
+  counts, so they take the larger value instead.
+*/
+void
+mergeJoinScanStats(ExternalPathJoinStats& into, const ExternalPathJoinStats& from)
+{
+  static_assert(sizeof(ExternalPathJoinStats) % sizeof(size_type) == 0,
+    "ExternalPathJoinStats must be a flat block of size_type counters");
+  // Capture the six non-additive fields before the sweep, because the sweep
+  // covers every field and would otherwise leave them holding into + from.
+  const size_type max_records = into.max_records_resident;
+  const size_type max_bytes = into.max_bytes_resident;
+  const size_type radix_bits = into.radix_plan_max_bits;
+  const size_type distribution_budget = into.distribution_sort_budget;
+  const size_type label_budget = into.label_sort_budget;
+  const size_type block_budget = into.join_block_budget;
+
+  size_type* d = reinterpret_cast<size_type*>(&into);
+  const size_type* s = reinterpret_cast<const size_type*>(&from);
+  const size_type fields = sizeof(ExternalPathJoinStats) / sizeof(size_type);
+  for(size_type i = 0; i < fields; i++) { d[i] += s[i]; }
+
+  into.max_records_resident = std::max(max_records, from.max_records_resident);
+  into.max_bytes_resident = std::max(max_bytes, from.max_bytes_resident);
+  into.radix_plan_max_bits = std::max(radix_bits, from.radix_plan_max_bits);
+  into.distribution_sort_budget =
+    std::max(distribution_budget, from.distribution_sort_budget);
+  into.label_sort_budget = std::max(label_budget, from.label_sort_budget);
+  into.join_block_budget = std::max(block_budget, from.join_block_budget);
+}
 
 void
 scanJoinSide(const PathGraph& graph, const std::vector<size_type>& shards,
@@ -4870,17 +4922,67 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
   {
     logical_file_id_t logical = group.first;
 
-    ExternalJoinSorter right_sorter(logical, RIGHT_BY_FROM,
-      distribution_sort_budget,
-      join_fan_in, parameters.getVerifyWorkspace(), stats, join_codec);
-    scanJoinSide(graph, group.second, logical, RIGHT_BY_FROM, right_sorter, stats);
-    JoinRun right = right_sorter.finish();
+    // Both sides at once when the budget admits two sorters; otherwise the
+    // original sequence, because halving each side's run space to buy
+    // concurrency would trade fewer, larger runs for more merge passes.
+    const bool concurrent_scan =
+      (checkedJoinAdd(2 * distribution_sort_budget, source_codec_bytes,
+        "concurrent distribution scan peak") <= memory_budget);
+    JoinRun right, left;
+    if(concurrent_scan)
+    {
+      ExternalPathJoinStats right_stats, left_stats;
+      ExternalPathJoinStats* right_out = (stats != nullptr ? &right_stats : nullptr);
+      ExternalPathJoinStats* left_out = (stats != nullptr ? &left_stats : nullptr);
+      std::exception_ptr right_error, left_error;
+      {
+        ExternalJoinSorter right_sorter(logical, RIGHT_BY_FROM,
+          distribution_sort_budget,
+          join_fan_in, parameters.getVerifyWorkspace(), right_out, join_codec);
+        ExternalJoinSorter left_sorter(logical, LEFT_BY_TO,
+          distribution_sort_budget,
+          join_fan_in, parameters.getVerifyWorkspace(), left_out, join_codec);
+        std::thread right_thread([&]()
+        {
+          try
+          {
+            scanJoinSide(graph, group.second, logical, RIGHT_BY_FROM,
+              right_sorter, right_out);
+          }
+          catch(...) { right_error = std::current_exception(); }
+        });
+        try
+        {
+          scanJoinSide(graph, group.second, logical, LEFT_BY_TO,
+            left_sorter, left_out);
+        }
+        catch(...) { left_error = std::current_exception(); }
+        right_thread.join();
+        if(right_error) { std::rethrow_exception(right_error); }
+        if(left_error) { std::rethrow_exception(left_error); }
+        right = right_sorter.finish();
+        left = left_sorter.finish();
+      }
+      if(stats != nullptr)
+      {
+        mergeJoinScanStats(*stats, right_stats);
+        mergeJoinScanStats(*stats, left_stats);
+      }
+    }
+    else
+    {
+      ExternalJoinSorter right_sorter(logical, RIGHT_BY_FROM,
+        distribution_sort_budget,
+        join_fan_in, parameters.getVerifyWorkspace(), stats, join_codec);
+      scanJoinSide(graph, group.second, logical, RIGHT_BY_FROM, right_sorter, stats);
+      right = right_sorter.finish();
 
-    ExternalJoinSorter left_sorter(logical, LEFT_BY_TO,
-      distribution_sort_budget,
-      join_fan_in, parameters.getVerifyWorkspace(), stats, join_codec);
-    scanJoinSide(graph, group.second, logical, LEFT_BY_TO, left_sorter, stats);
-    JoinRun left = left_sorter.finish();
+      ExternalJoinSorter left_sorter(logical, LEFT_BY_TO,
+        distribution_sort_budget,
+        join_fan_in, parameters.getVerifyWorkspace(), stats, join_codec);
+      scanJoinSide(graph, group.second, logical, LEFT_BY_TO, left_sorter, stats);
+      left = left_sorter.finish();
+    }
 
     if(stats != nullptr && source_codec_bytes > 0)
     {
