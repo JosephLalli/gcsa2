@@ -65,5 +65,27 @@ int main()
   try { parameters.setTempCompression("gzip"); }
   catch(const std::invalid_argument&) { invalid = true; }
   require(invalid);
+  // The disk ceiling depends on the route, and the two setters may be called
+  // in either order, so re-clamping must make them commute.
+  {
+    ConstructionParameters external;
+    external.setWorkDirectory("/tmp/gcsa-limit-probe");
+    external.setLimit(65536);                      // 64 TiB, above the release cap
+    require(external.getLimitBytes() == 65536 * GIGABYTE);
+
+    ConstructionParameters reordered;
+    reordered.setLimit(65536);                     // clamped to the release cap
+    require(reordered.getLimitBytes() == ConstructionParameters::ABSOLUTE_LIMIT * GIGABYTE);
+    reordered.setWorkDirectory("/tmp/gcsa-limit-probe");
+    reordered.setLimit(65536);                     // now the external cap applies
+    require(reordered.getLimitBytes() == 65536 * GIGABYTE);
+
+    ConstructionParameters legacy;
+    legacy.setWorkDirectory("/tmp/gcsa-limit-probe");
+    legacy.setLimit(65536);
+    legacy.setWorkDirectory("");                   // leaving the external route
+    require(legacy.getLimitBytes() == ConstructionParameters::ABSOLUTE_LIMIT * GIGABYTE);
+  }
+
   return 0;
 }

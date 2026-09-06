@@ -64,9 +64,13 @@ struct ConstructionParameters
   constexpr static size_type DOUBLING_STEPS        = 4;
   constexpr static size_type MAX_STEPS             = 4;
   constexpr static size_type SIZE_LIMIT            = 2048;   // Gigabytes.
-  // The disk-first route may intentionally use tens or hundreds of terabytes.
-  // Keep a generous overflow guard instead of the historical 16 TiB ceiling.
-  constexpr static size_type ABSOLUTE_LIMIT        = 1048576;  // Gigabytes (1 PiB).
+  // The release ceiling, which still governs the in-memory route: that route
+  // holds the construction in RAM, so a disk budget beyond this is not a
+  // configuration it can honour.
+  constexpr static size_type ABSOLUTE_LIMIT        = 16384;    // Gigabytes (16 TiB).
+  // The disk-first route may intentionally use tens or hundreds of terabytes,
+  // so it gets its own ceiling rather than raising the release one for both.
+  constexpr static size_type EXTERNAL_ABSOLUTE_LIMIT = 1048576; // Gigabytes (1 PiB).
   constexpr static size_type MEMORY_LIMIT          = 1024;   // Gigabytes.
   constexpr static size_type ABSOLUTE_MEMORY_LIMIT = 8192;   // Gigabytes.
   constexpr static size_type SAMPLE_PERIOD         = 64;
@@ -165,6 +169,12 @@ struct ConstructionParameters
   // implementations. A workspace is semantic state; the remaining knobs below
   // are operational and may change when a build is resumed.
   bool externalMemory() const { return !(this->work_directory.empty()); }
+
+  // The disk ceiling that applies to the selected route.
+  size_type absoluteLimitGigabytes() const
+  {
+    return (this->externalMemory() ? EXTERNAL_ABSOLUTE_LIMIT : ABSOLUTE_LIMIT);
+  }
 
   size_type doubling_steps;
   size_type size_limit;

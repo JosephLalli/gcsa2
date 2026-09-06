@@ -12,6 +12,7 @@ constexpr size_type ConstructionParameters::DOUBLING_STEPS;
 constexpr size_type ConstructionParameters::MAX_STEPS;
 constexpr size_type ConstructionParameters::SIZE_LIMIT;
 constexpr size_type ConstructionParameters::ABSOLUTE_LIMIT;
+constexpr size_type ConstructionParameters::EXTERNAL_ABSOLUTE_LIMIT;
 constexpr size_type ConstructionParameters::MEMORY_LIMIT;
 constexpr size_type ConstructionParameters::ABSOLUTE_MEMORY_LIMIT;
 constexpr size_type ConstructionParameters::SAMPLE_PERIOD;
@@ -113,13 +114,13 @@ ConstructionParameters::setSteps(size_type steps)
 void
 ConstructionParameters::setLimit(size_type gigabytes)
 {
-  this->size_limit = Range::bound(gigabytes, 1, ABSOLUTE_LIMIT) * GIGABYTE;
+  this->size_limit = Range::bound(gigabytes, 1, this->absoluteLimitGigabytes()) * GIGABYTE;
 }
 
 void
 ConstructionParameters::setLimitBytes(size_type bytes)
 {
-  this->size_limit = Range::bound(bytes, 1, ABSOLUTE_LIMIT * GIGABYTE);
+  this->size_limit = Range::bound(bytes, 1, this->absoluteLimitGigabytes() * GIGABYTE);
 }
 
 void
@@ -161,6 +162,12 @@ ConstructionParameters::setWorkDirectory(const std::string& directory)
   {
     this->work_directory.pop_back();
   }
+  // Selecting a route changes which ceiling applies, and nothing requires the
+  // limit to be set after the work directory. Re-clamp so the two setters
+  // commute: entering the external route may raise the ceiling, and leaving it
+  // must lower an over-large limit back to what the in-memory route can hold.
+  this->size_limit = Range::bound(this->size_limit, GIGABYTE,
+    this->absoluteLimitGigabytes() * GIGABYTE);
 }
 
 void ConstructionParameters::setResume(bool value) { this->resume = value; }
