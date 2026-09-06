@@ -1092,6 +1092,164 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
 
 //------------------------------------------------------------------------------
 
+//------------------------------------------------------------------------------
+
+/*
+  FORK: reporting for the external route.
+
+  These were 120 lines inline in GCSA::GCSA, where they were 22% of a 672-line
+  constructor and hid its control flow. Each one only reads a statistics struct
+  and writes to std::cerr, so lifting them changes nothing and lets the
+  constructor read as a sequence of phases again. Each keeps its own verbosity
+  guard so the call site is a single unconditional line.
+*/
+
+void
+reportPruneMergeStats(const PathGraphMergeStats& merge_stats)
+{
+  if(Verbosity::level >= Verbosity::EXTENDED)
+  {
+    std::cerr << "PathGraph::prune(): "
+              << merge_stats.priority_spills << " path-group spills, "
+              << merge_stats.range_spills << " range spills, "
+              << merge_stats.max_open_input_pairs << " input pairs and "
+              << merge_stats.max_open_output_pairs << " output pairs open at peak; "
+              << merge_stats.path_input_refills << "/"
+              << merge_stats.rank_input_refills << " path/rank window refills for "
+              << merge_stats.path_input_reads << " paths using "
+              << formatBytes(merge_stats.max_input_buffer_bytes)
+              << " of bounded input windows"
+              << std::endl;
+  }
+}
+
+
+void
+reportJoinStats(const ExternalPathJoinStats& join_stats)
+{
+  if(Verbosity::level >= Verbosity::EXTENDED)
+  {
+    std::cerr << "externalPathGraphExtend(): "
+              << join_stats.left_records << " left, "
+              << join_stats.right_records << " right, "
+              << join_stats.generated_records << " generated, "
+              << join_stats.sorted_bypass << " bypassed" << std::endl;
+    std::cerr << "externalPathGraphExtend(): "
+              << join_stats.initial_runs << " join runs, "
+              << join_stats.merge_operations << " join merges, "
+              << join_stats.join_partitions << " join partitions, "
+              << join_stats.worker_processes << " worker processes, "
+              << join_stats.restored_partitions << " restored partitions, "
+              << join_stats.recursive_splits << " recursive splits, "
+              << join_stats.label_sort_runs << " label runs, "
+              << join_stats.label_merge_passes << " label merge passes, "
+              << join_stats.blocked_key_groups << " blocked key groups" << std::endl;
+    std::cerr << "externalPathGraphExtend(): "
+              << join_stats.join_parallel_sorts << " parallel join sorts, "
+              << join_stats.label_parallel_sorts << " parallel label sorts" << std::endl;
+    std::cerr << "externalPathGraphExtend(): phase budgets: distribution "
+              << formatBytes(join_stats.distribution_sort_budget)
+              << "; concurrent label sort "
+              << formatBytes(join_stats.label_sort_budget) << " + join block "
+              << formatBytes(join_stats.join_block_budget) << std::endl;
+    std::cerr << "externalPathGraphExtend(): sampled "
+              << join_stats.sampled_plan_records << " join keys into "
+              << join_stats.radix_plan_bins << " MSD range packs ("
+              << join_stats.radix_plan_splits << " radix splits, "
+              << join_stats.radix_plan_capped << " budget-capped plans, "
+              << join_stats.radix_boundary_flushes << " exact boundary flushes, "
+              << join_stats.restored_radix_plans << " restored plans)" << std::endl;
+    std::cerr << "externalPathGraphExtend(): streamed "
+              << join_stats.direct_label_records << " records directly to label runs; avoided "
+              << formatBytes(join_stats.intermediate_path_bytes_avoided)
+              << " of intermediate path/rank I/O per direction" << std::endl;
+    std::cerr << "externalPathGraphExtend(): emitted "
+              << join_stats.grouped_expansion_records
+              << " compact left-context references across transient run passes; avoided "
+              << formatBytes(join_stats.expansion_context_bytes_saved)
+              << " of transient run payload" << std::endl;
+    if(join_stats.join_run_logical_bytes > 0)
+    {
+      double ratio = static_cast<double>(join_stats.join_run_stored_bytes) /
+        static_cast<double>(join_stats.join_run_logical_bytes);
+      std::cerr << "externalPathGraphExtend(): stored "
+                << formatBytes(join_stats.join_run_stored_bytes) << " for "
+                << formatBytes(join_stats.join_run_logical_bytes)
+                << " of logical fixed-record join runs ("
+                << join_stats.compressed_join_runs << " compressed runs, "
+                << ratio << " stored/logical)" << std::endl;
+    }
+    if(join_stats.join_sidecar_logical_bytes > 0)
+    {
+      double ratio = static_cast<double>(join_stats.join_sidecar_stored_bytes) /
+        static_cast<double>(join_stats.join_sidecar_logical_bytes);
+      std::cerr << "externalPathGraphExtend(): stored "
+                << formatBytes(join_stats.join_sidecar_stored_bytes) << " for "
+                << formatBytes(join_stats.join_sidecar_logical_bytes)
+                << " of logical join group/detail sidecars ("
+                << join_stats.compressed_join_sidecars << " compressed sidecars, "
+                << ratio << " stored/logical)" << std::endl;
+    }
+    std::cerr << "externalPathGraphExtend(): maximum bounded workspace "
+              << formatBytes(join_stats.max_bytes_resident) << " ("
+              << join_stats.max_records_resident << " records)" << std::endl;
+  }
+}
+
+
+void
+reportFinalMergeStats(const PathGraphMergeStats& final_merge_stats)
+{
+  if(Verbosity::level >= Verbosity::EXTENDED)
+  {
+    std::cerr << "GCSA::GCSA(): LCP range minima: "
+              << LCP::range_minimum_queries.load() << " wavelet descents over "
+              << LCP::range_minimum_span.load() << " total key positions"
+              << std::endl;
+    std::cerr << "MergedGraph: "
+              << final_merge_stats.priority_spills << " path-group spills, "
+              << final_merge_stats.range_spills << " range spills, "
+              << final_merge_stats.from_set_sorts << " external from-set sorts and "
+              << final_merge_stats.max_open_input_pairs << " input pairs open at peak; "
+              << final_merge_stats.path_input_refills << "/"
+              << final_merge_stats.rank_input_refills
+              << " path/rank window refills for "
+              << final_merge_stats.path_input_reads << " paths using "
+              << formatBytes(final_merge_stats.max_input_buffer_bytes)
+              << " of bounded input windows"
+              << std::endl;
+  }
+}
+
+
+void
+reportFinalEventStats(const FinalEventMetadata& event_metadata,
+  const ExternalFinalScanStats& event_stats)
+{
+  if(Verbosity::level >= Verbosity::EXTENDED)
+  {
+    std::cerr << "GCSA::GCSA(): final events "
+              << (event_stats.restored ? "restored" : "produced") << ", "
+              << event_metadata.total_edges << " edges, "
+              << event_metadata.sample_ids << " sample ids, "
+              << event_metadata.occurrence_items << " nonzero occurrence events, "
+              << event_metadata.redundant << " redundancy events" << std::endl;
+    if(!event_stats.restored)
+    {
+      std::cerr << "GCSA::GCSA(): disk caches: prev-occ "
+                << event_stats.previous_occurrences.block_reads << " reads / "
+                << event_stats.previous_occurrences.block_writes << " writes; ST stack "
+                << event_stats.suffix_tree_stack.block_reads << " reads / "
+                << event_stats.suffix_tree_stack.block_writes << " writes" << std::endl;
+      std::cerr << "GCSA::GCSA(): final start-node sets: "
+                << event_stats.from_node_spills << " spills, maximum "
+                << event_stats.maximum_from_nodes << " unique nodes" << std::endl;
+    }
+  }
+}
+
+//------------------------------------------------------------------------------
+
 GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
   GCSA(graph, parameters, nullptr)
 {
@@ -1319,20 +1477,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
                   << "; the merge will reread the rest. Raise --max-open-files"
                   << " to about " << (4 * merge_inputs + 2) << "." << std::endl;
       }
-      if(Verbosity::level >= Verbosity::EXTENDED)
-      {
-        std::cerr << "PathGraph::prune(): "
-                  << merge_stats.priority_spills << " path-group spills, "
-                  << merge_stats.range_spills << " range spills, "
-                  << merge_stats.max_open_input_pairs << " input pairs and "
-                  << merge_stats.max_open_output_pairs << " output pairs open at peak; "
-                  << merge_stats.path_input_refills << "/"
-                  << merge_stats.rank_input_refills << " path/rank window refills for "
-                  << merge_stats.path_input_reads << " paths using "
-                  << formatBytes(merge_stats.max_input_buffer_bytes)
-                  << " of bounded input windows"
-                  << std::endl;
-      }
+      reportPruneMergeStats(merge_stats);
       if(workspace)
       {
         checkpointPathGraph(*workspace, path_graph, task, "prune", checkpoint_buffer);
@@ -1351,73 +1496,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
       externalPathGraphExtend(path_graph,
         path_graph.remainingLimit(parameters.getLimitBytes()), parameters, &join_stats,
         workspace.get(), task);
-      if(Verbosity::level >= Verbosity::EXTENDED)
-      {
-        std::cerr << "externalPathGraphExtend(): "
-                  << join_stats.left_records << " left, "
-                  << join_stats.right_records << " right, "
-                  << join_stats.generated_records << " generated, "
-                  << join_stats.sorted_bypass << " bypassed" << std::endl;
-        std::cerr << "externalPathGraphExtend(): "
-                  << join_stats.initial_runs << " join runs, "
-                  << join_stats.merge_operations << " join merges, "
-                  << join_stats.join_partitions << " join partitions, "
-                  << join_stats.worker_processes << " worker processes, "
-                  << join_stats.restored_partitions << " restored partitions, "
-                  << join_stats.recursive_splits << " recursive splits, "
-                  << join_stats.label_sort_runs << " label runs, "
-                  << join_stats.label_merge_passes << " label merge passes, "
-                  << join_stats.blocked_key_groups << " blocked key groups" << std::endl;
-        std::cerr << "externalPathGraphExtend(): "
-                  << join_stats.join_parallel_sorts << " parallel join sorts, "
-                  << join_stats.label_parallel_sorts << " parallel label sorts" << std::endl;
-        std::cerr << "externalPathGraphExtend(): phase budgets: distribution "
-                  << formatBytes(join_stats.distribution_sort_budget)
-                  << "; concurrent label sort "
-                  << formatBytes(join_stats.label_sort_budget) << " + join block "
-                  << formatBytes(join_stats.join_block_budget) << std::endl;
-        std::cerr << "externalPathGraphExtend(): sampled "
-                  << join_stats.sampled_plan_records << " join keys into "
-                  << join_stats.radix_plan_bins << " MSD range packs ("
-                  << join_stats.radix_plan_splits << " radix splits, "
-                  << join_stats.radix_plan_capped << " budget-capped plans, "
-                  << join_stats.radix_boundary_flushes << " exact boundary flushes, "
-                  << join_stats.restored_radix_plans << " restored plans)" << std::endl;
-        std::cerr << "externalPathGraphExtend(): streamed "
-                  << join_stats.direct_label_records << " records directly to label runs; avoided "
-                  << formatBytes(join_stats.intermediate_path_bytes_avoided)
-                  << " of intermediate path/rank I/O per direction" << std::endl;
-        std::cerr << "externalPathGraphExtend(): emitted "
-                  << join_stats.grouped_expansion_records
-                  << " compact left-context references across transient run passes; avoided "
-                  << formatBytes(join_stats.expansion_context_bytes_saved)
-                  << " of transient run payload" << std::endl;
-        if(join_stats.join_run_logical_bytes > 0)
-        {
-          double ratio = static_cast<double>(join_stats.join_run_stored_bytes) /
-            static_cast<double>(join_stats.join_run_logical_bytes);
-          std::cerr << "externalPathGraphExtend(): stored "
-                    << formatBytes(join_stats.join_run_stored_bytes) << " for "
-                    << formatBytes(join_stats.join_run_logical_bytes)
-                    << " of logical fixed-record join runs ("
-                    << join_stats.compressed_join_runs << " compressed runs, "
-                    << ratio << " stored/logical)" << std::endl;
-        }
-        if(join_stats.join_sidecar_logical_bytes > 0)
-        {
-          double ratio = static_cast<double>(join_stats.join_sidecar_stored_bytes) /
-            static_cast<double>(join_stats.join_sidecar_logical_bytes);
-          std::cerr << "externalPathGraphExtend(): stored "
-                    << formatBytes(join_stats.join_sidecar_stored_bytes) << " for "
-                    << formatBytes(join_stats.join_sidecar_logical_bytes)
-                    << " of logical join group/detail sidecars ("
-                    << join_stats.compressed_join_sidecars << " compressed sidecars, "
-                    << ratio << " stored/logical)" << std::endl;
-        }
-        std::cerr << "externalPathGraphExtend(): maximum bounded workspace "
-                  << formatBytes(join_stats.max_bytes_resident) << " ("
-                  << join_stats.max_records_resident << " records)" << std::endl;
-      }
+      reportJoinStats(join_stats);
     }
     else
     {
@@ -1483,25 +1562,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     path_graph.remainingLimit(parameters.getLimitBytes()), merge_buffer,
     &final_merge_stats, parameters.getMaxOpenFiles(), merge_cache);
   merge_probe.report();
-  if(Verbosity::level >= Verbosity::EXTENDED)
-  {
-    std::cerr << "GCSA::GCSA(): LCP range minima: "
-              << LCP::range_minimum_queries.load() << " wavelet descents over "
-              << LCP::range_minimum_span.load() << " total key positions"
-              << std::endl;
-    std::cerr << "MergedGraph: "
-              << final_merge_stats.priority_spills << " path-group spills, "
-              << final_merge_stats.range_spills << " range spills, "
-              << final_merge_stats.from_set_sorts << " external from-set sorts and "
-              << final_merge_stats.max_open_input_pairs << " input pairs open at peak; "
-              << final_merge_stats.path_input_refills << "/"
-              << final_merge_stats.rank_input_refills
-              << " path/rank window refills for "
-              << final_merge_stats.path_input_reads << " paths using "
-              << formatBytes(final_merge_stats.max_input_buffer_bytes)
-              << " of bounded input windows"
-              << std::endl;
-  }
+  reportFinalMergeStats(final_merge_stats);
   this->header.path_nodes = merged_graph.size();
   this->header.order = merged_graph.k();
   path_graph.clear();
@@ -1574,26 +1635,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     final_sample_count = event_metadata.sample_ids;
     final_sampled_positions = event_metadata.sampled_paths;
 
-    if(Verbosity::level >= Verbosity::EXTENDED)
-    {
-      std::cerr << "GCSA::GCSA(): final events "
-                << (event_stats.restored ? "restored" : "produced") << ", "
-                << event_metadata.total_edges << " edges, "
-                << event_metadata.sample_ids << " sample ids, "
-                << event_metadata.occurrence_items << " nonzero occurrence events, "
-                << event_metadata.redundant << " redundancy events" << std::endl;
-      if(!event_stats.restored)
-      {
-        std::cerr << "GCSA::GCSA(): disk caches: prev-occ "
-                  << event_stats.previous_occurrences.block_reads << " reads / "
-                  << event_stats.previous_occurrences.block_writes << " writes; ST stack "
-                  << event_stats.suffix_tree_stack.block_reads << " reads / "
-                  << event_stats.suffix_tree_stack.block_writes << " writes" << std::endl;
-        std::cerr << "GCSA::GCSA(): final start-node sets: "
-                  << event_stats.from_node_spills << " spills, maximum "
-                  << event_stats.maximum_from_nodes << " unique nodes" << std::endl;
-      }
-    }
+    reportFinalEventStats(event_metadata, event_stats);
   }
   else
   {
