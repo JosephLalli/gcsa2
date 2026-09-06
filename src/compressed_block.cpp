@@ -26,6 +26,29 @@ constexpr std::uint32_t FORMAT_VERSION = 2;
 // (path_sort_run.cpp:32-33, external_sort.cpp, internal.h).
 constexpr std::uint64_t BLOCK_CACHE_TAIL_BYTES = 64 * MEGABYTE;
 constexpr std::uint64_t BLOCK_CACHE_FLUSH_BYTES = 512 * MEGABYTE;
+
+/*
+  RETIRED, NOT REMOVED: re-hashing every delivered byte for a whole-stream
+  digest.
+
+  loadBlock already verifies each decoded block against its own stored checksum
+  and cross-checks block extents against the on-disk index, so every byte handed
+  to a caller has been verified once. read() then hashed the same bytes a second
+  time to reproduce the footer's whole-stream digest. checksum() is byte-serial
+  FNV-1a with the multiply on the loop-carried dependency chain, roughly 4-5
+  cycles per byte or ~0.7 GB/s, and the chr21 merge alone reads 104.53 GB
+  through this path -- about 300 s of hashing of which half is the duplicate.
+  Every other framed reader in the build pays the same rate.
+
+  What the second pass detected and the first does not: a reordering of whole
+  blocks that preserved every individual block checksum AND the index. Nothing
+  in the fork produces such a file; it would take a deliberate edit.
+
+  Set VERIFY_WHOLE_STREAM_CHECKSUM to true to restore it. Do NOT substitute a
+  faster digest: the value is stored in the footer, so changing it changes the
+  artifact format and breaks resume for committed workspaces.
+*/
+constexpr bool VERIFY_WHOLE_STREAM_CHECKSUM = false;
 constexpr std::uint32_t HEADER_SIZE = 32;
 constexpr std::uint32_t FOOTER_SIZE = 56;
 constexpr std::uint32_t RAW_BLOCK = 0;
@@ -879,7 +902,8 @@ CompressedBlockReader::loadBlock(std::size_t block)
 void
 CompressedBlockReader::checkSequentialChecksum()
 {
-  if(this->sequential && this->sequential_bytes == this->logical_bytes &&
+  if(VERIFY_WHOLE_STREAM_CHECKSUM &&
+     this->sequential && this->sequential_bytes == this->logical_bytes &&
      this->sequential_checksum != this->whole_checksum)
   {
     throw std::runtime_error("compressed block: stream checksum failure");
@@ -906,7 +930,7 @@ CompressedBlockReader::read(void* data, std::size_t bytes)
       this->current.size() - this->current_offset);
     std::memcpy(output + copied,
       this->current.data() + this->current_offset, chunk);
-    if(this->sequential)
+    if(VERIFY_WHOLE_STREAM_CHECKSUM && this->sequential)
     {
       this->sequential_checksum = checksum(
         this->current.data() + this->current_offset, chunk,
