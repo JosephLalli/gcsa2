@@ -1919,6 +1919,20 @@ template<class Element>
 struct SpillableGroup
 {
   std::vector<Element> memory;
+  /*
+    Index of the first live element in `memory`. seek() used to erase the dead
+    prefix, and because Element (PriorityNode, 96 bytes) is not trivially
+    copyable, vector::erase moves element by element rather than issuing one
+    memmove -- once per output range, of order 400 million times in MergedGraph
+    alone. Release popped from a deque's front; a deque is unavailable here
+    because flush() hands memory.data() to a bulk write. Advancing a head and
+    compacting only when the dead prefix passes half the buffer makes it
+    amortised O(1) per element.
+
+    Invariant: `head` is zero whenever the group has spilled, because flush()
+    clears the buffer and resets it. Only the resident branches add it.
+  */
+  size_type head;
   std::string          filename;
   int                  file;
   size_type            elements, disk_elements, offset, file_begin;
@@ -1927,7 +1941,7 @@ struct SpillableGroup
   mutable std::vector<Element> read_cache;
   size_type*           spill_counter;
 
-  SpillableGroup(size_type limit, size_type* counter = nullptr) : file(-1), elements(0), disk_elements(0), offset(0), file_begin(0),
+  SpillableGroup(size_type limit, size_type* counter = nullptr) : head(0), file(-1), elements(0), disk_elements(0), offset(0), file_begin(0),
     byte_limit(std::max(2 * static_cast<size_type>(sizeof(Element)), limit)),
     write_bytes(this->byte_limit / 2), read_bytes(this->byte_limit - this->write_bytes), advised_write(0), cache_offset(0),
     spill_counter(counter)
@@ -1945,7 +1959,8 @@ struct SpillableGroup
 
   void push_back(const Element& value)
   {
-    if(!this->spilled() && (this->memory.size() + 1) * sizeof(Element) > this->byte_limit)
+    if(!this->spilled() &&
+       (this->liveSize() + 1) * sizeof(Element) > this->byte_limit)
     {
       this->filename = TempFile::getName("gcsa_prune_group");
       this->file = ::open(this->filename.c_str(), O_CREAT | O_TRUNC | O_RDWR, 0600);
@@ -1968,13 +1983,13 @@ struct SpillableGroup
     }
     this->memory.push_back(value);
     this->elements++;
-    if(this->spilled() && this->memory.size() * sizeof(Element) >= this->write_bytes) { this->flush(); }
+    if(this->spilled() && this->liveSize() * sizeof(Element) >= this->write_bytes) { this->flush(); }
   }
 
   Element get(size_type i) const
   {
     if(i < this->offset || i >= this->elements) { throw std::out_of_range("PathGraph::prune(): spill index"); }
-    if(!this->spilled()) { return this->memory[i - this->offset]; }
+    if(!this->spilled()) { return this->memory[this->head + i - this->offset]; }
     if(i >= this->disk_elements) { return this->memory[i - this->disk_elements]; }
     if(i < this->cache_offset || i >= this->cache_offset + this->read_cache.size())
     {
@@ -1989,19 +2004,27 @@ struct SpillableGroup
   void set(size_type i, const Element& value)
   {
     if(i < this->offset || i >= this->elements) { throw std::out_of_range("PathGraph::prune(): spill index"); }
-    if(!this->spilled()) { this->memory[i - this->offset] = value; return; }
+    if(!this->spilled()) { this->memory[this->head + i - this->offset] = value; return; }
     if(i >= this->disk_elements) { this->memory[i - this->disk_elements] = value; return; }
     this->flush(); this->write(&value, 1, i);
     if(::fdatasync(this->file) != 0) { throw std::runtime_error("PathGraph::prune(): spill sync failed"); }
     this->discard(i, 1); sdsl::util::clear(this->read_cache);
   }
 
+  size_type liveSize() const { return this->memory.size() - this->head; }
+
   void seek(size_type i)
   {
     if(i > this->elements) { throw std::out_of_range("PathGraph::prune(): spill seek"); }
     if(!this->spilled())
     {
-      this->memory.erase(this->memory.begin(), this->memory.begin() + (i - this->offset));
+      this->head += (i - this->offset);
+      if(this->head > this->memory.size() / 2)
+      {
+        this->memory.erase(this->memory.begin(),
+          this->memory.begin() + this->head);
+        this->head = 0;
+      }
     }
     this->offset = i;
   }
@@ -2010,7 +2033,8 @@ struct SpillableGroup
   {
     if(this->file >= 0) { ::close(this->file); this->file = -1; }
     if(!this->filename.empty()) { TempFile::remove(this->filename); this->filename.clear(); }
-    sdsl::util::clear(this->memory); sdsl::util::clear(this->read_cache);
+    sdsl::util::clear(this->memory); this->head = 0;
+    sdsl::util::clear(this->read_cache);
     this->elements = 0; this->disk_elements = 0; this->offset = 0; this->file_begin = 0;
     this->advised_write = 0; this->cache_offset = 0;
   }
@@ -2018,9 +2042,14 @@ struct SpillableGroup
 private:
   void flush()
   {
-    if(this->memory.empty()) { return; }
-    this->write(this->memory.data(), this->memory.size(), this->disk_elements);
-    this->disk_elements += this->memory.size(); sdsl::util::clear(this->memory);
+    if(this->liveSize() == 0)
+    {
+      sdsl::util::clear(this->memory); this->head = 0; return;
+    }
+    this->write(this->memory.data() + this->head, this->liveSize(),
+      this->disk_elements);
+    this->disk_elements += this->liveSize();
+    sdsl::util::clear(this->memory); this->head = 0;
     this->memory.reserve(std::max(static_cast<size_type>(1), this->write_bytes / sizeof(Element)));
     if(::fdatasync(this->file) != 0) { throw std::runtime_error("PathGraph::prune(): spill sync failed"); }
     this->discard(this->advised_write, this->disk_elements - this->advised_write);
@@ -3772,14 +3801,32 @@ struct SameFromSet
     size_type records = Range::length(range);
     if(records <= this->memory_records)
     {
+      // Release (origin/master:src/path_graph.cpp:1100-1109) collapsed adjacent
+      // runs while gathering and sorted only if more than one distinct value
+      // survived. The fork dropped both. With 266,602,272 additional start
+      // nodes over 399,778,113 final paths, a large share of ranges hold a
+      // single distinct start node and take the zero-sort path. The result is
+      // the same sorted unique set either way: adjacent collapsing cannot
+      // remove a distinct value, and the sort/unique below still runs whenever
+      // more than one survives.
       this->scratch.clear();
+      node_type prev = ~static_cast<node_type>(0);
       for(size_type i = range.first; i <= range.second; i++)
       {
-        this->scratch.push_back(this->merger.buffer.get(i).node.from);
+        node_type curr = this->merger.buffer.get(i).node.from;
+        if(curr != prev) { this->scratch.push_back(curr); prev = curr; }
       }
-      std::sort(this->scratch.begin(), this->scratch.end());
-      this->scratch.erase(std::unique(this->scratch.begin(), this->scratch.end()),
-        this->scratch.end());
+      if(this->scratch.size() > 1)
+      {
+        std::sort(this->scratch.begin(), this->scratch.end());
+        this->scratch.erase(std::unique(this->scratch.begin(), this->scratch.end()),
+          this->scratch.end());
+      }
+      if(this->stats != nullptr)
+      {
+        this->stats->max_from_set_nodes = std::max(this->stats->max_from_set_nodes,
+          this->scratch.size());
+      }
       return Result(this->scratch.size());
     }
 

@@ -293,13 +293,20 @@ struct PathGraphMergeStats
   // than the merge budget: the pair is admitted anyway, because refusing makes
   // the workspace unrecoverable, but the overshoot is not silent.
   size_type oversized_input_pair_bytes;
+  // SameFromSet's resident peak. Its only previous instrumentation was
+  // from_set_sorts, which counts the external fallback and so reports zero on
+  // every run that never spilled -- telling you nothing about how close the
+  // set came. Its capacity is a share of the merge budget rather than a bound,
+  // so the peak is what says whether that share is defensible.
+  size_type max_from_set_nodes;
 
   PathGraphMergeStats() :
     priority_spills(0), range_spills(0), from_set_sorts(0),
     max_open_input_pairs(0), max_open_output_pairs(0),
     path_input_reads(0), rank_input_reads(0),
     path_input_refills(0), rank_input_refills(0), direct_input_reads(0),
-    max_input_buffer_bytes(0), oversized_input_pair_bytes(0) { }
+    max_input_buffer_bytes(0), oversized_input_pair_bytes(0),
+    max_from_set_nodes(0) { }
 };
 
 //------------------------------------------------------------------------------

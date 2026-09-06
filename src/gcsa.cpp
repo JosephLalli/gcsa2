@@ -1249,7 +1249,8 @@ reportFinalMergeStats(const PathGraphMergeStats& final_merge_stats)
     std::cerr << "MergedGraph: "
               << final_merge_stats.priority_spills << " path-group spills, "
               << final_merge_stats.range_spills << " range spills, "
-              << final_merge_stats.from_set_sorts << " external from-set sorts and "
+              << final_merge_stats.from_set_sorts << " external from-set sorts (peak "
+              << final_merge_stats.max_from_set_nodes << " resident nodes) and "
               << final_merge_stats.max_open_input_pairs << " input pairs open at peak; "
               << final_merge_stats.path_input_refills << "/"
               << final_merge_stats.rank_input_refills
