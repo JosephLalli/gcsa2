@@ -922,30 +922,6 @@ LCPArray::LCPArray(const InputGraph& graph, const ConstructionParameters& parame
     std::exit(EXIT_FAILURE);
   }
 
-  if(parameters.externalMemory())
-  {
-    const size_type byte_budget = streamingBudget(parameters);
-    if(byte_budget < 2)
-    {
-      throw std::runtime_error("external LCP construction requires at least two bytes of stream budget");
-    }
-    const size_type leaf_bytes = rawFileSize(graph.lcp_name);
-    const std::uint64_t leaf_checksum = rawFileChecksum(graph.lcp_name,
-      leaf_bytes, byte_budget);
-    const std::string workspace_directory = parameters.getWorkDirectory() + "/lcp-levels";
-    BuildWorkspace::Settings semantic = lcpSemanticSettings(parameters.getLCPBranching(),
-      leaf_bytes, leaf_checksum);
-    BuildWorkspace::OpenMode mode = (parameters.getResume() &&
-      hasWorkspaceManifest(workspace_directory) ? BuildWorkspace::RESUME :
-      BuildWorkspace::NEW_WORKSPACE);
-    BuildWorkspace workspace(workspace_directory, semantic,
-      lcpOperationalSettings(byte_budget), mode);
-    LCPArray streamed(graph.lcp_name, parameters.getLCPBranching(), byte_budget,
-      &workspace);
-    this->swap(streamed);
-    return;
-  }
-
   std::ifstream in(graph.lcp_name, std::ios_base::binary);
   if(!in)
   {

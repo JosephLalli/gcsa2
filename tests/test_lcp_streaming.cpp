@@ -129,26 +129,28 @@ legacyLCP(const std::string& leaf_filename, size_type branching)
   return result;
 }
 
+void externalStore(const std::string& leaf_filename,
+  const std::string& work_directory, const std::string& output_filename,
+  size_type branching, bool resume = false);
+
 LCPArray
 externalLCP(const std::string& leaf_filename, const std::string& work_directory,
   size_type branching, bool resume = false)
 {
-  ConstructionParameters parameters;
-  parameters.setLCPBranching(branching);
-  parameters.setWorkDirectory(work_directory);
-  parameters.setMemoryLimitBytes(2);
-  parameters.setIOBufferSize(2);
-  if(resume) { parameters.setResume(); }
-  InputGraph graph({ "tests/cycle.gcsa2" }, false, parameters);
-  graph.lcp_name = leaf_filename;
-  LCPArray result(graph, parameters);
-  graph.lcp_name.clear();
+  // Build through the path production uses. Every caller outside this file
+  // -- build_gcsa and both vg entry points -- branches at the call site and
+  // reaches the streamed construction through buildAndStore, so exercising
+  // the constructor here tested a route nothing shipped.
+  std::string published = work_directory + "/streamed-lcp.tmp";
+  externalStore(leaf_filename, work_directory, published, branching, resume);
+  LCPArray result = load(published);
+  std::remove(published.c_str());
   return result;
 }
 
 void
 externalStore(const std::string& leaf_filename, const std::string& work_directory,
-  const std::string& output_filename, size_type branching, bool resume = false)
+  const std::string& output_filename, size_type branching, bool resume)
 {
   ConstructionParameters parameters;
   parameters.setLCPBranching(branching);
