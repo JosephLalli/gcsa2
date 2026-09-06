@@ -889,11 +889,18 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
       // suspected; the bound below throws rather than overruns, so the failure
       // would be loud either way.
       constexpr bool WHOLE_GRAPH_SUFFIX_TREE_STACK = false;
+      // Derive the bound from the LCP stream's own element type rather than a
+      // literal, so widening that stream widens this with it. MergedGraph
+      // writes the array as SequentialRecordWriter<merged_lcp_type> and the
+      // scan below reads it as ReadBuffer<merged_lcp_type>; curr_lcp is one
+      // such value plus one, so the distinct values are [0, max + 1] and the
+      // stack holds one frame of three elements for each.
+      typedef std::uint8_t merged_lcp_type;
+      constexpr size_type distinct_lcp_values =
+        static_cast<size_type>(std::numeric_limits<merged_lcp_type>::max()) + 2;
       size_type stack_capacity = (WHOLE_GRAPH_SUFFIX_TREE_STACK ?
         checkedProduct(merged_graph.size(), 3, "suffix-tree stack") :
-        checkedProduct(
-          static_cast<size_type>(std::numeric_limits<std::uint8_t>::max()) + 2,
-          3, "suffix-tree stack"));
+        checkedProduct(distinct_lcp_values, 3, "suffix-tree stack"));
       DiskBackedArray64 stack(stack_name, stack_capacity,
         stack_cache, memory, true, 64 * KILOBYTE);
 
@@ -903,7 +910,7 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
       {
         reader[comp + 1].init(merged_graph, comp, reader_buffer, true);
       }
-      ReadBuffer<uint8_t> lcp_array;
+      ReadBuffer<merged_lcp_type> lcp_array;
       lcp_array.open(merged_graph.lcp_name, reader_buffer, true);
 
       PathLabel first, last;
