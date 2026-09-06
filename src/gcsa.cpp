@@ -722,6 +722,38 @@ checkedProduct(size_type first, size_type second, const std::string& label)
 }
 
 /*
+  FORK: sizing a final-scan stream buffer.
+
+  All three of the final scan's buffer sizes -- readers, writers and the
+  start-node sets -- are getIOBufferSize() unless the budget is too small to
+  afford it. That was sixty lines of nested max/min a reader had to evaluate by
+  hand to discover it is a constant. The share test states it instead: above a
+  comfortable budget it passes and the answer is the target; only a tight budget
+  falls through to the arithmetic.
+
+  Substituting the chr21 configuration, the fall-through binds below roughly
+  6.4 GiB available for readers, 1.63 GiB for writers and 1 GiB for the node
+  sets -- so on every run this subsystem has actually been used for, the answer
+  is the constant. The arithmetic is not dead, though: it is the only thing that
+  lets a deliberately tight --gcsa-memory-limit run proceed instead of failing
+  its reservation, which is the case the whole subsystem exists to serve. Hence
+  a branch rather than a deletion.
+
+  The tight branch is the original expression verbatim, and the ample branch is
+  what that expression returns whenever `share >= target` and the target clears
+  the floor, so this cannot change a size on any budget.
+*/
+size_type
+finalScanBuffer(size_type target, size_type minimum, size_type available,
+  size_type streams_sharing)
+{
+  size_type share = available /
+    std::max(static_cast<size_type>(1), streams_sharing);
+  if(share >= target && target >= minimum) { return target; }
+  return std::max(minimum, std::min(target, share));
+}
+
+/*
   Scan the final MergedGraph once and publish compact immutable events. This is
   intentionally one atomic task: prev_occ and the suffix-tree traversal stack
   are mutable disk arrays, and a mid-scan checkpoint would require a committed,
@@ -782,8 +814,7 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
     std::min(parameters.getIOBufferSize(), parameters.getSortRunSize()));
   size_type node_set_cap = (memory.available() - non_set_minimum) / 2;
   size_type node_set_budget = std::min(node_set_cap,
-    std::max(minimum_node_set,
-      std::min(desired_node_set, memory.available() / 16)));
+    finalScanBuffer(desired_node_set, minimum_node_set, memory.available(), 16));
 
   // ExternalFixedRecordSorter owns two descriptors per merge input and four
   // fixed descriptors. The predecessor set may be sorted while the current
@@ -814,19 +845,15 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
       // asynchronous refill vector. Admit both windows only after the two
       // persistent start-node workspaces, so later writer reservations cannot
       // wait on memory that this single-threaded phase will never release.
-      size_type reader_buffer = std::max(minimum_reader,
-        std::min(parameters.getIOBufferSize(),
-          memory.available() /
-          std::max(static_cast<size_type>(1), 4 * reader_streams)));
+      size_type reader_buffer = finalScanBuffer(parameters.getIOBufferSize(),
+        minimum_reader, memory.available(), 4 * reader_streams);
       size_type reader_reservation_bytes = checkedProduct(2 * reader_streams,
         reader_buffer, "final reader reservation");
       MemoryBudget::Reservation reader_reservation = memory.reserve(
         reader_reservation_bytes, "final-merged-graph-readers");
 
-      size_type writer_buffer = std::max(static_cast<size_type>(16),
-        std::min(parameters.getIOBufferSize(),
-          memory.available() /
-          std::max(static_cast<size_type>(1), 2 * writer_streams)));
+      size_type writer_buffer = finalScanBuffer(parameters.getIOBufferSize(),
+        static_cast<size_type>(16), memory.available(), 2 * writer_streams);
       if(checkedProduct(writer_streams, writer_buffer,
           "final writer reservation") > memory.available())
       {

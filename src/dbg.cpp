@@ -1,4 +1,5 @@
 #include <gcsa/dbg.h>
+#include <gcsa/internal.h>
 
 #include <fstream>
 #include <stdexcept>
@@ -16,8 +17,12 @@ scanKeys(const std::string& name, size_type expected_records,
   size_type buffer_bytes, const Callback& callback)
 {
   if(buffer_bytes < sizeof(key_type)) { buffer_bytes = sizeof(key_type); }
+  // Clamp to the records that exist. expected_records is already in hand and is
+  // validated against below, so a 64 MiB buffer_bytes was value-initialising
+  // 64 MiB twice per DeBruijnGraph for a stream that may hold far less.
   size_type records_per_block = std::max(static_cast<size_type>(1),
-    buffer_bytes / sizeof(key_type));
+    std::min(buffer_bytes / sizeof(key_type),
+      std::max(static_cast<size_type>(1), expected_records)));
   std::ifstream input;
   input.rdbuf()->pubsetbuf(nullptr, 0);
   input.open(name.c_str(), std::ios_base::binary);
@@ -27,8 +32,7 @@ scanKeys(const std::string& name, size_type expected_records,
   while(seen < expected_records)
   {
     size_type count = std::min(records_per_block, expected_records - seen);
-    input.read(reinterpret_cast<char*>(buffer.data()), count * sizeof(key_type));
-    if(input.gcount() != static_cast<std::streamsize>(count * sizeof(key_type)))
+    if(!DiskIO::read(input, buffer.data(), count))
     {
       throw std::runtime_error("DeBruijnGraph: truncated key stream " + name);
     }

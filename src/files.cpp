@@ -472,8 +472,11 @@ InputGraph::scanKMerBlocks(size_type file, size_type byte_budget,
       {
         size_type count = std::min(remaining, records_per_block);
         block.resize(count);
-        input.read(reinterpret_cast<char*>(block.data()), count * sizeof(KMer));
-        if(input.gcount() != static_cast<std::streamsize>(count * sizeof(KMer)))
+        // Credit the read, as InputGraph::read() does for the same bytes.
+        // scanKMerBlocks replaced a readBinary path that used DiskIO::read, so
+        // the external route's reported read total silently excluded the entire
+        // k-mer input scan.
+        if(!DiskIO::read(input, block.data(), count))
         {
           std::cerr << "InputGraph::scanKMerBlocks(): Unexpected EOF" << std::endl;
           std::exit(EXIT_FAILURE);

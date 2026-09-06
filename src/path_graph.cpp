@@ -2426,9 +2426,17 @@ struct PathGraphInputCache
 
   const PathGraph& graph;
   std::vector<Entry> entries;
+  // Logical shard -> index into `entries`, or NO_ENTRY. get() ran a linear scan
+  // of the open shards on every record; with ~30 resident pairs and 1.2e9 paths
+  // through the merge that is of order 3e10 comparisons, and it grows with the
+  // shard count, so it degrades exactly as the input gets larger. Indices rather
+  // than pointers because emplace_back may reallocate `entries`.
+  std::vector<size_type> file_to_entry;
   size_type clock, max_pairs, window_bytes, compressed_pair_bytes;
   size_type oversized_pair_bytes;
   PathGraphMergeStats* stats;
+
+  constexpr static size_type NO_ENTRY = ~static_cast<size_type>(0);
 
   constexpr static off_t CACHE_TAIL = 64 * KILOBYTE;
   constexpr static size_type MIN_WINDOW = 4 * KILOBYTE;
@@ -2436,7 +2444,7 @@ struct PathGraphInputCache
 
   PathGraphInputCache(const PathGraph& source, PathGraphMergeStats* merge_stats,
     size_type requested_pairs, size_type byte_budget) :
-    graph(source), entries(), clock(0),
+    graph(source), entries(), file_to_entry(source.files(), NO_ENTRY), clock(0),
     max_pairs(std::max(static_cast<size_type>(1),
       std::min(requested_pairs, std::max(static_cast<size_type>(1), source.files())))),
     window_bytes(0), compressed_pair_bytes(0), oversized_pair_bytes(0),
@@ -2543,20 +2551,27 @@ struct PathGraphInputCache
   {
     for(Entry& entry : this->entries) { this->close(entry); }
     this->entries.clear();
+    // The index map must die with the entries it points into.
+    std::fill(this->file_to_entry.begin(), this->file_to_entry.end(), NO_ENTRY);
   }
 
 private:
   Entry& get(size_type file)
   {
     this->clock++;
-    for(Entry& entry : this->entries)
+    if(file < this->file_to_entry.size() &&
+       this->file_to_entry[file] != NO_ENTRY)
     {
-      if(entry.file == file) { entry.stamp = this->clock; return entry; }
+      Entry& entry = this->entries[this->file_to_entry[file]];
+      entry.stamp = this->clock;
+      return entry;
     }
 
     Entry* target = nullptr;
+    size_type target_index = 0;
     if(this->entries.size() < this->max_pairs)
     {
+      target_index = this->entries.size();
       this->entries.emplace_back(this->window_bytes); target = &(this->entries.back());
       if(this->stats != nullptr)
       {
@@ -2570,12 +2585,21 @@ private:
     }
     else
     {
-      target = &(*std::min_element(this->entries.begin(), this->entries.end(),
-        [](const Entry& left, const Entry& right) { return left.stamp < right.stamp; }));
+      auto victim = std::min_element(this->entries.begin(), this->entries.end(),
+        [](const Entry& left, const Entry& right) { return left.stamp < right.stamp; });
+      target_index = static_cast<size_type>(victim - this->entries.begin());
+      target = &(*victim);
+      // Drop the evicted shard's mapping before the entry is repurposed.
+      if(target->file != PathGraph::UNKNOWN &&
+         target->file < this->file_to_entry.size())
+      {
+        this->file_to_entry[target->file] = NO_ENTRY;
+      }
       this->close(*target);
     }
 
     target->reset(file, this->clock);
+    if(file < this->file_to_entry.size()) { this->file_to_entry[file] = target_index; }
     const bool path_framed = CompressedBlockReader::isFramed(
       this->graph.path_names[file]);
     const bool rank_framed = CompressedBlockReader::isFramed(
