@@ -32,6 +32,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <gcsa/path_graph_external.h>
 #include <gcsa/algorithms.h>
 #include <gcsa/path_graph.h>
 

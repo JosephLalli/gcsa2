@@ -1,4 +1,5 @@
 #include <gcsa/algorithms.h>
+#include <gcsa/path_graph_external.h>
 #include <gcsa/files.h>
 #include <gcsa/gcsa.h>
 #include <gcsa/lcp.h>

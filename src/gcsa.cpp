@@ -1,4 +1,5 @@
 #include <gcsa/algorithms.h>
+#include <gcsa/path_graph_external.h>
 #include <gcsa/checkpoint.h>
 #include <gcsa/disk_array.h>
 #include <gcsa/external_preprocessing.h>

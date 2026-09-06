@@ -1,4 +1,5 @@
 #include <gcsa/path_graph.h>
+#include <gcsa/path_graph_external.h>
 
 #include <algorithm>
 #include <cstdlib>

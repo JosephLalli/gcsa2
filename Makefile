@@ -107,7 +107,7 @@ workspace-test: directories $(BUILD_OBJ)/test_workspace.o $(BUILD_OBJ)/resources
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_workspace $(BUILD_OBJ)/test_workspace.o $(BUILD_OBJ)/resources.o $(BUILD_OBJ)/workspace.o -pthread
 	$(BUILD_BIN)/test_workspace
 
-$(BUILD_OBJ)/test_external_path_sort.o:tests/test_external_path_sort.cpp include/gcsa/path_graph.h
+$(BUILD_OBJ)/test_external_path_sort.o:tests/test_external_path_sort.cpp include/gcsa/path_graph.h include/gcsa/path_graph_external.h
 	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
 
 external-path-sort-test: directories $(BUILD_OBJ)/test_external_path_sort.o $(LIBRARY)
@@ -163,7 +163,7 @@ disk-array-test: directories $(BUILD_OBJ)/test_disk_array.o $(LIBRARY)
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_disk_array $(BUILD_OBJ)/test_disk_array.o $(LIBRARY) $(LIBS)
 	$(BUILD_BIN)/test_disk_array
 
-$(BUILD_OBJ)/test_external_join.o:tests/test_external_join.cpp include/gcsa/path_graph.h
+$(BUILD_OBJ)/test_external_join.o:tests/test_external_join.cpp include/gcsa/path_graph.h include/gcsa/path_graph_external.h
 	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
 
 external-join-test: directories $(BUILD_OBJ)/test_external_join.o $(LIBRARY)
@@ -191,7 +191,7 @@ construction-resume-test: directories $(BUILD_OBJ)/test_construction_resume.o $(
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_construction_resume $(BUILD_OBJ)/test_construction_resume.o $(LIBRARY) $(LIBS)
 	$(BUILD_BIN)/test_construction_resume
 
-$(BUILD_OBJ)/test_path_graph_prune.o:tests/test_path_graph_prune.cpp include/gcsa/path_graph.h include/gcsa/compressed_block.h include/gcsa/support.h
+$(BUILD_OBJ)/test_path_graph_prune.o:tests/test_path_graph_prune.cpp include/gcsa/path_graph.h include/gcsa/path_graph_external.h include/gcsa/compressed_block.h include/gcsa/support.h
 	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
 
 path-graph-prune-test: directories $(BUILD_OBJ)/test_path_graph_prune.o $(LIBRARY)

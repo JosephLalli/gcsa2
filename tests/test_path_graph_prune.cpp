@@ -1,4 +1,5 @@
 #include <gcsa/path_graph.h>
+#include <gcsa/path_graph_external.h>
 #include <gcsa/compressed_block.h>
 #include <gcsa/support.h>
 
