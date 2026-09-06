@@ -100,7 +100,6 @@ main(int argc, char** argv)
     std::cerr << "External-memory options (sizes accept K/M/G/T and KiB/GiB forms):" << std::endl;
     std::cerr << "      --work-dir PATH            durable construction workspace" << std::endl;
     std::cerr << "      --resume                   resume compatible committed phases" << std::endl;
-    std::cerr << "      --keep-work                retain workspace after success" << std::endl;
     std::cerr << "      --memory-limit SIZE        aggregate external-construction working-set target" << std::endl;
     std::cerr << "                                 (RAM/HDD tradeoff; not a hard whole-process cap)" << std::endl;
     std::cerr << "                                 (default " << formatBytes(ConstructionParameters::MEMORY_LIMIT * GIGABYTE) << ")" << std::endl;
@@ -120,7 +119,6 @@ main(int argc, char** argv)
     std::cerr << "      --verify-workspace         verify payload checksums on reuse" << std::endl;
     std::cerr << "      --clean-obsolete           remove eligible predecessor artifacts" << std::endl;
     std::cerr << "      --stop-after PHASE         stop after a committed phase" << std::endl;
-    std::cerr << "      --allow-path-explosion     permit growth up to the disk ceiling" << std::endl;
     std::cerr << std::endl;
     std::exit(EXIT_SUCCESS);
   }
@@ -132,11 +130,11 @@ main(int argc, char** argv)
   ConstructionParameters parameters;
   enum LongOption
   {
-    OPT_WORK_DIR = 1000, OPT_RESUME, OPT_KEEP_WORK, OPT_MEMORY_LIMIT,
+    OPT_WORK_DIR = 1000, OPT_RESUME, OPT_MEMORY_LIMIT,
     OPT_DISK_LIMIT, OPT_IO_BUFFER, OPT_SORT_RUN, OPT_JOIN_PARTITION,
     OPT_MERGE_FAN_IN, OPT_MAX_OPEN_FILES, OPT_CHECKPOINT_RECORDS,
     OPT_CHECKPOINT_BYTES, OPT_VERIFY_WORKSPACE, OPT_CLEAN_OBSOLETE,
-    OPT_STOP_AFTER, OPT_ALLOW_PATH_EXPLOSION, OPT_PROCESS_WORKERS,
+    OPT_STOP_AFTER, OPT_PROCESS_WORKERS,
     OPT_TEMP_COMPRESSION, OPT_COMPRESSION_BLOCK_SIZE,
     OPT_COMPRESSION_WORKERS, OPT_COMPRESSION_LEVEL
   };
@@ -144,7 +142,6 @@ main(int argc, char** argv)
   {
     { "work-dir", required_argument, nullptr, OPT_WORK_DIR },
     { "resume", no_argument, nullptr, OPT_RESUME },
-    { "keep-work", no_argument, nullptr, OPT_KEEP_WORK },
     { "memory-limit", required_argument, nullptr, OPT_MEMORY_LIMIT },
     { "disk-limit", required_argument, nullptr, OPT_DISK_LIMIT },
     { "io-buffer-size", required_argument, nullptr, OPT_IO_BUFFER },
@@ -162,7 +159,6 @@ main(int argc, char** argv)
     { "verify-workspace", no_argument, nullptr, OPT_VERIFY_WORKSPACE },
     { "clean-obsolete", no_argument, nullptr, OPT_CLEAN_OBSOLETE },
     { "stop-after", required_argument, nullptr, OPT_STOP_AFTER },
-    { "allow-path-explosion", no_argument, nullptr, OPT_ALLOW_PATH_EXPLOSION },
     { "output", required_argument, nullptr, 'o' },
     { "threads", required_argument, nullptr, 'T' },
     { nullptr, 0, nullptr, 0 }
@@ -204,8 +200,6 @@ main(int argc, char** argv)
       parameters.setWorkDirectory(optarg); break;
     case OPT_RESUME:
       parameters.setResume(); break;
-    case OPT_KEEP_WORK:
-      parameters.setKeepWork(); break;
     case OPT_MEMORY_LIMIT:
       parameters.setMemoryLimitBytes(parseBytes(optarg)); break;
     case OPT_DISK_LIMIT:
@@ -240,8 +234,6 @@ main(int argc, char** argv)
       parameters.setCleanObsolete(); break;
     case OPT_STOP_AFTER:
       parameters.setStopAfter(optarg); break;
-    case OPT_ALLOW_PATH_EXPLOSION:
-      parameters.setAllowPathExplosion(); break;
     case '?':
       std::exit(EXIT_FAILURE);
     default:

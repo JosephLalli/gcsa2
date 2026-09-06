@@ -31,7 +31,7 @@ int main()
   parameters.setMaxOpenFiles(1);
   require(parameters.getMaxOpenFiles() == ConstructionParameters::MIN_OPEN_FILES);
   parameters.setWorkDirectory("/tmp/example.gcsa-work/");
-  parameters.setResume(); parameters.setKeepWork();
+  parameters.setResume();
   parameters.setLimitBytes(parseBytes("40T"));
   parameters.setIOBufferSize(parseBytes("64M"));
   parameters.setSortRunSize(parseBytes("4G"));
@@ -49,7 +49,7 @@ int main()
   parameters.setWorkerExecutable("/tmp/build_gcsa");
   require(parameters.externalMemory());
   require(parameters.getWorkDirectory() == "/tmp/example.gcsa-work");
-  require(parameters.getResume() && parameters.getKeepWork());
+  require(parameters.getResume());
   require(parameters.getMemoryLimitBytes() == 96 * GIGABYTE);
   require(parameters.getLimitBytes() == 40 * KILOBYTE * GIGABYTE);
   require(parameters.getMergeFanIn() == 32 && parameters.getMaxOpenFiles() == 96);

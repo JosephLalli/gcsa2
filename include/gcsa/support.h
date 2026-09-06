@@ -105,10 +105,8 @@ struct ConstructionParameters
   void setLCPBranching(size_type factor);
   void setWorkDirectory(const std::string& directory);
   void setResume(bool value = true);
-  void setKeepWork(bool value = true);
   void setVerifyWorkspace(bool value = true);
   void setCleanObsolete(bool value = true);
-  void setAllowPathExplosion(bool value = true);
   void setIOBufferSize(size_type bytes);
   void setSortRunSize(size_type bytes);
   void setJoinPartitionSize(size_type bytes);
@@ -132,10 +130,8 @@ struct ConstructionParameters
   size_type getLCPBranching() const { return this->lcp_branching; }
   const std::string& getWorkDirectory() const { return this->work_directory; }
   bool getResume() const { return this->resume; }
-  bool getKeepWork() const { return this->keep_work; }
   bool getVerifyWorkspace() const { return this->verify_workspace; }
   bool getCleanObsolete() const { return this->clean_obsolete; }
-  bool getAllowPathExplosion() const { return this->allow_path_explosion; }
   size_type getIOBufferSize() const { return this->io_buffer_size; }
   // With no expert override, derive phase workspace from the aggregate memory
   // goal. Sorting receives 3/4 and join blocking 1/4 because the direct
@@ -183,7 +179,7 @@ struct ConstructionParameters
   size_type lcp_branching;
 
   std::string work_directory;
-  bool resume, keep_work, verify_workspace, clean_obsolete, allow_path_explosion;
+  bool resume, verify_workspace, clean_obsolete;
   size_type io_buffer_size, sort_run_size, join_partition_size;
   size_type merge_fan_in, max_open_files;
   size_type process_workers;

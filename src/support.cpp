@@ -81,8 +81,8 @@ ConstructionParameters::ConstructionParameters() :
   doubling_steps(DOUBLING_STEPS), size_limit(SIZE_LIMIT * GIGABYTE),
   memory_limit(MEMORY_LIMIT * GIGABYTE), sample_period(SAMPLE_PERIOD),
   lcp_branching(LCP_BRANCHING),
-  resume(false), keep_work(false), verify_workspace(false), clean_obsolete(false),
-  allow_path_explosion(false), io_buffer_size(IO_BUFFER_SIZE),
+  resume(false), verify_workspace(false), clean_obsolete(false),
+  io_buffer_size(IO_BUFFER_SIZE),
   sort_run_size(SORT_RUN_SIZE), join_partition_size(JOIN_PARTITION_SIZE),
   merge_fan_in(MERGE_FAN_IN), max_open_files(MAX_OPEN_FILES),
   process_workers(PROCESS_WORKERS),
@@ -171,10 +171,8 @@ ConstructionParameters::setWorkDirectory(const std::string& directory)
 }
 
 void ConstructionParameters::setResume(bool value) { this->resume = value; }
-void ConstructionParameters::setKeepWork(bool value) { this->keep_work = value; }
 void ConstructionParameters::setVerifyWorkspace(bool value) { this->verify_workspace = value; }
 void ConstructionParameters::setCleanObsolete(bool value) { this->clean_obsolete = value; }
-void ConstructionParameters::setAllowPathExplosion(bool value) { this->allow_path_explosion = value; }
 
 void
 ConstructionParameters::setIOBufferSize(size_type bytes)
