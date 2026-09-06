@@ -471,6 +471,10 @@ verifyIndex(const GCSA& index, const LCPArray* lcp, const InputGraph& graph,
       }
     };
 
+    // No total order for these three: compareExternalVerifyRecords orders on
+    // (label, from), and the reducer keeps only the first record of a group, so
+    // which of several keys sharing a label and a from node survives depends on
+    // the tie-break.
     ExternalFixedRecordSortStats pass_stats;
     ExternalFixedRecordSorter::sortAndReduce(source, expected, sizeof(ExternalVerifyRecord),
       byte_budget, merge_fan_in, compareExternalVerifyRecords,

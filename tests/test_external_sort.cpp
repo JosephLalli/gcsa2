@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <string>
 #include <unistd.h>
@@ -40,6 +41,30 @@ int compareRecord(const void* left, const void* right)
   const Record& a = *static_cast<const Record*>(left);
   const Record& b = *static_cast<const Record*>(right);
   return (a.value < b.value ? -1 : (a.value > b.value ? 1 : 0));
+}
+
+std::string readBytes(const std::string& name)
+{
+  std::ifstream input(name.c_str(), std::ios_base::binary);
+  return std::string(std::istreambuf_iterator<char>(input),
+    std::istreambuf_iterator<char>());
+}
+
+// A record whose comparator is a total order but whose width is not a whole
+// number of 64-bit words. The sorter must ignore the declaration rather than
+// mis-sort, so the flag stays an optimisation and never a correctness input.
+struct OddRecord
+{
+  std::uint32_t key;
+  std::uint8_t  tag;
+};
+
+int compareOddRecord(const void* left, const void* right)
+{
+  const OddRecord& a = *static_cast<const OddRecord*>(left);
+  const OddRecord& b = *static_cast<const OddRecord*>(right);
+  if(a.key != b.key) { return (a.key < b.key ? -1 : 1); }
+  return (a.tag < b.tag ? -1 : (a.tag > b.tag ? 1 : 0));
 }
 
 std::vector<Record> readRecords(const std::string& name)
@@ -116,6 +141,81 @@ int main()
     require(summaries[i].count == expected[summaries[i].key].count);
   }
   require(reduce_stats.runs > 2 && reduce_stats.max_bytes_resident <= budget);
+
+  // Declaring a total order is an optimisation, never a change of result: the
+  // same comparator must produce the same bytes with and without it. Run
+  // formation is the only thing that differs, so a budget small enough to force
+  // several runs is what actually exercises the difference.
+  {
+    const std::string permuted = std::string(root) + "/permuted.bin";
+    const std::string in_place = std::string(root) + "/in-place.bin";
+    ExternalFixedRecordSortStats permuted_stats, in_place_stats;
+    ExternalFixedRecordSorter::sort(input, permuted, sizeof(Record), budget, 2,
+      compareRecord, &permuted_stats, false);
+    ExternalFixedRecordSorter::sort(input, in_place, sizeof(Record), budget, 2,
+      compareRecord, &in_place_stats, true);
+    require(readBytes(permuted) == readBytes(in_place));
+    require(permuted_stats.runs > 2);
+    // Sixteen-byte records, so dropping the eight-byte offset per record buys
+    // half again as many records per run.
+    require(in_place_stats.runs < permuted_stats.runs);
+    require(in_place_stats.max_bytes_resident <= budget);
+
+    // sortAndReduce sees the same equal-key groups either way. Reducing on the
+    // key alone while sorting on the whole record is exactly the case the flag
+    // is meant to survive: groups are formed by the comparator that was passed.
+    const std::string permuted_reduced = std::string(root) + "/permuted-reduced.bin";
+    const std::string in_place_reduced = std::string(root) + "/in-place-reduced.bin";
+    auto count_groups = [](const void* value, bool first, bool, std::ostream& stream)
+    {
+      if(first) { stream.write(static_cast<const char*>(value), sizeof(Record)); }
+    };
+    ExternalFixedRecordSorter::sortAndReduce(input, permuted_reduced, sizeof(Record),
+      budget, 2, compareRecord, count_groups, nullptr, false);
+    ExternalFixedRecordSorter::sortAndReduce(input, in_place_reduced, sizeof(Record),
+      budget, 2, compareRecord, count_groups, nullptr, true);
+    require(readBytes(permuted_reduced) == readBytes(in_place_reduced));
+
+    std::remove(permuted.c_str()); std::remove(in_place.c_str());
+    std::remove(permuted_reduced.c_str()); std::remove(in_place_reduced.c_str());
+  }
+
+  // A width the in-place sorter cannot handle falls back to the permutation.
+  {
+    const std::string odd_input = std::string(root) + "/odd.bin";
+    const std::string odd_sorted = std::string(root) + "/odd-sorted.bin";
+    std::vector<OddRecord> odd;
+    for(std::uint32_t i = 0; i < 400; i++)
+    {
+      OddRecord record = {};
+      record.key = (53 * i + 7) % 29;
+      record.tag = static_cast<std::uint8_t>(i % 251);
+      odd.push_back(record);
+    }
+    {
+      std::ofstream odd_output(odd_input.c_str(), std::ios_base::binary);
+      for(const OddRecord& record : odd)
+      {
+        odd_output.write(reinterpret_cast<const char*>(&record), sizeof(record));
+      }
+    }
+    const size_type odd_budget =
+      ExternalFixedRecordSorter::minimumBudget(sizeof(OddRecord)) * 3;
+    ExternalFixedRecordSorter::sort(odd_input, odd_sorted, sizeof(OddRecord),
+      odd_budget, 2, compareOddRecord, nullptr, true);
+    std::sort(odd.begin(), odd.end(), [](const OddRecord& a, const OddRecord& b)
+      { return compareOddRecord(&a, &b) < 0; });
+    std::ifstream odd_input_stream(odd_sorted.c_str(), std::ios_base::binary);
+    OddRecord observed;
+    for(size_type i = 0; i < odd.size(); i++)
+    {
+      require(static_cast<bool>(odd_input_stream.read(
+        reinterpret_cast<char*>(&observed), sizeof(observed))));
+      require(observed.key == odd[i].key && observed.tag == odd[i].tag);
+    }
+    require(!odd_input_stream.read(reinterpret_cast<char*>(&observed), sizeof(observed)));
+    std::remove(odd_input.c_str()); std::remove(odd_sorted.c_str());
+  }
 
   bool rejected = false;
   try

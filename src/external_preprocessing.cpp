@@ -335,6 +335,9 @@ ExternalInputPreprocessor::prepare()
       keys.close(); starts.close();
     }
 
+    // No total order here: compareKeyLabel orders on the label alone, so keys
+    // that differ in their predecessor/successor bits compare equal and the
+    // sorter's input-order tie-break is observable.
     key_type merged_key = 0;
     ExternalFixedRecordSorter::sortAndReduce(key_source, this->key_name_,
       sizeof(key_type), this->sortBudget(), this->parameters_.getMergeFanIn(),
@@ -352,7 +355,7 @@ ExternalInputPreprocessor::prepare()
       [](const void* value, bool first, bool, std::ostream& output)
       {
         if(first) { output.write(reinterpret_cast<const char*>(value), sizeof(node_type)); }
-      }, &this->stats_.start_sort);
+      }, &this->stats_.start_sort, true);
     TempFile::remove(key_source);
     TempFile::remove(start_source);
   }
@@ -520,7 +523,7 @@ ExternalInputPreprocessor::buildInitialPathGraph(PathGraph& result)
       ExternalFixedRecordSortStats kmer_stats;
       ExternalFixedRecordSorter::sort(raw_name, sorted_name,
         sizeof(InitialKMerRecord), sort_budget, this->parameters_.getMergeFanIn(),
-        compareInitialKMer, &kmer_stats);
+        compareInitialKMer, &kmer_stats, true);
       this->stats_.logical_kmer_sorts++;
 
       // Mapping uses two bounded readers and two bounded path/rank writers.

@@ -55,10 +55,26 @@ public:
 
   static size_type minimumBudget(size_type record_bytes);
 
+  /*
+    total_order asserts that compare returns zero only for byte-identical
+    records. Run formation may then sort the records in place rather than a
+    permutation of their offsets. It is safe exactly when the comparator
+    inspects the whole record: no equal-but-distinct records exist, so the
+    input-order tie-break it drops cannot be observed in the output. Leave it
+    false for a comparator that orders on a key only.
+
+    Two things improve. Every comparison loses an indirect call to two random
+    offsets. And the offset array, which is as large as the data for an
+    eight-byte record, is not allocated: an input that fits in one run holds
+    only its own bytes, while an input that does not gets more records per run
+    out of the same budget, so fewer runs and fewer merge passes.
+  */
+
   // Sort fixed-width binary records from input_name into output_name.
   static void sort(const std::string& input_name, const std::string& output_name,
     size_type record_bytes, size_type byte_budget, size_type requested_fan_in,
-    const Comparator& compare, ExternalFixedRecordSortStats* stats = nullptr);
+    const Comparator& compare, ExternalFixedRecordSortStats* stats = nullptr,
+    bool total_order = false);
 
   // Sort and consume equal-key groups while writing output_name. The reducer,
   // not this class, defines the resulting output record format.
@@ -66,7 +82,7 @@ public:
     const std::string& output_name, size_type record_bytes,
     size_type byte_budget, size_type requested_fan_in,
     const Comparator& compare, const Reducer& reducer,
-    ExternalFixedRecordSortStats* stats = nullptr);
+    ExternalFixedRecordSortStats* stats = nullptr, bool total_order = false);
 };
 
 } // namespace gcsa

@@ -8,6 +8,7 @@
 #include <gcsa/internal.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -189,16 +190,37 @@ outputBufferBytes(size_type available, size_type record_bytes)
   return std::max(record_bytes, result - result % record_bytes);
 }
 
+// Widths the run sorter can order without a permutation. A record that is a
+// whole number of 64-bit words can be sorted as a word tuple; anything else
+// keeps the offset array, so the plan must agree with this predicate or the
+// budget it hands out would be wrong.
+constexpr size_type MAX_IN_PLACE_WORDS = 4;
+
+bool
+canSortInPlace(size_type record_bytes)
+{
+  return (record_bytes % sizeof(std::uint64_t) == 0 &&
+    record_bytes / sizeof(std::uint64_t) >= 1 &&
+    record_bytes / sizeof(std::uint64_t) <= MAX_IN_PLACE_WORDS);
+}
+
 struct SortPlan
 {
   size_type record_bytes, budget, fan_in, run_records, merge_records;
   size_type run_output_bytes;
+  // Set when the caller has declared that comparator equality implies byte
+  // equality. Run formation can then sort the records themselves instead of a
+  // permutation of their offsets, which drops the offset array and removes an
+  // indirect call to two random offsets from every comparison.
+  bool total_order;
 };
 
 SortPlan
-makePlan(size_type record_bytes, size_type byte_budget, size_type requested_fan_in)
+makePlan(size_type record_bytes, size_type byte_budget, size_type requested_fan_in,
+  bool total_order = false)
 {
   if(record_bytes == 0) { fail("record width must be nonzero"); }
+  total_order = total_order && canSortInPlace(record_bytes);
   if(byte_budget < ExternalFixedRecordSorter::minimumBudget(record_bytes))
   {
     fail("byte budget is too small");
@@ -219,15 +241,17 @@ makePlan(size_type record_bytes, size_type byte_budget, size_type requested_fan_
   size_type merge_records = merge_space / ((fan_in + 1) * record_bytes);
   if(merge_records == 0) { fail("byte budget cannot buffer a merge"); }
 
-  // Run formation stores record bytes and an offset permutation. The output
-  // staging buffer is explicitly included because its pages coexist with the
-  // sorted run until the run has been completely emitted.
+  // Run formation stores record bytes, plus an offset permutation unless the
+  // caller declared a total order. The output staging buffer is explicitly
+  // included because its pages coexist with the sorted run until the run has
+  // been completely emitted.
   size_type run_space = available - output_bytes;
-  size_type run_records = run_space / (record_bytes + sizeof(size_type));
+  size_type run_records = run_space /
+    (total_order ? record_bytes : record_bytes + sizeof(size_type));
   if(run_records == 0) { fail("byte budget cannot hold one sortable record"); }
 
   return { record_bytes, byte_budget, fan_in, run_records, merge_records,
-    output_bytes };
+    output_bytes, total_order };
 }
 
 struct RunReader
@@ -311,10 +335,71 @@ struct HeapCompare
   }
 };
 
+// The comparator still receives the addresses of whole records, so its
+// semantics are unchanged; only the permutation goes away. std::array is
+// trivially copyable and padding-free, so the tuple and the record have the
+// same object representation.
+template<size_type WORDS>
+void
+sortAsWords(std::uint8_t* records, size_type count,
+  const ExternalFixedRecordSorter::Comparator& compare)
+{
+  typedef std::array<std::uint64_t, WORDS> word_record;
+  word_record* values = reinterpret_cast<word_record*>(records);
+  std::sort(values, values + count,
+    [&compare](const word_record& left, const word_record& right)
+    {
+      return compare(&left, &right) < 0;
+    });
+}
+
+void
+sortRecordsInPlace(std::uint8_t* records, size_type count, const SortPlan& plan,
+  const ExternalFixedRecordSorter::Comparator& compare)
+{
+  if(count < 2) { return; }
+  switch(plan.record_bytes / sizeof(std::uint64_t))
+  {
+    case 1: sortAsWords<1>(records, count, compare); return;
+    case 2: sortAsWords<2>(records, count, compare); return;
+    case 3: sortAsWords<3>(records, count, compare); return;
+    case 4: sortAsWords<4>(records, count, compare); return;
+    default: fail("in-place sort was planned for an unsupported record width");
+  }
+}
+
 std::string
 makeRunName()
 {
   return TempFile::getName("gcsa_fixed_sort_run");
+}
+
+// Write `count` records that are already in sorted order in `records`.
+std::string
+writeSortedRun(const std::uint8_t* records, size_type count,
+  const SortPlan& plan, const std::string& name)
+{
+  std::ofstream output;
+  output.rdbuf()->pubsetbuf(nullptr, 0);
+  output.open(name.c_str(), std::ios_base::binary | std::ios_base::trunc);
+  if(!output) { fail("cannot create run " + name); }
+  CacheDescriptor cache(name, O_RDWR);
+  off_t written = 0, cache_released = 0;
+  // Already in order, so the staging buffer of the permuting overload is not
+  // needed; the run is emitted straight out of the sort buffer in chunks no
+  // larger than the output allowance that budget reserved.
+  size_type remaining = checkedByteOffset(count, plan.record_bytes);
+  const std::uint8_t* cursor = records;
+  while(remaining > 0)
+  {
+    size_type chunk = std::min(remaining, plan.run_output_bytes);
+    writeBytes(output, cursor, chunk, name);
+    written += static_cast<off_t>(chunk);
+    cursor += chunk; remaining -= chunk;
+    trimWrittenCache(output, cache.value, written, cache_released, false, name);
+  }
+  trimWrittenCache(output, cache.value, written, cache_released, true, name);
+  return name;
 }
 
 std::string
@@ -503,7 +588,10 @@ sortToRun(const std::string& input_name, const SortPlan& plan,
     size_type buffer_records = (SORT_RUNS_AT_PLANNED_CAPACITY ?
       plan.run_records : count);
     std::vector<std::uint8_t> records(buffer_records * plan.record_bytes);
-    std::vector<size_type> order(buffer_records);
+    // The permutation exists so that comparator-equal records keep their input
+    // order. A caller that declared a total order has no equal-but-distinct
+    // records, so the array preserves an order that cannot be observed.
+    std::vector<size_type> order(plan.total_order ? 0 : buffer_records);
     input.read(reinterpret_cast<char*>(records.data()), count * plan.record_bytes);
     if(input.gcount() != static_cast<std::streamsize>(count * plan.record_bytes))
     {
@@ -513,19 +601,30 @@ sortToRun(const std::string& input_name, const SortPlan& plan,
     input_bytes += checkedByteOffset(count, plan.record_bytes);
     trimReadCache(input_cache.value, input_bytes, input_cache_released,
       count == remaining);
-    std::iota(order.begin(), order.begin() + count, 0);
-    std::sort(order.begin(), order.begin() + count,
-      [&records, &plan, &compare](size_type left, size_type right)
-      {
-        int result = compare(records.data() + left * plan.record_bytes,
-          records.data() + right * plan.record_bytes);
-        return (result != 0 ? result < 0 : left < right);
-      });
-    // Account what was actually allocated for this run.
-    updateStats(stats, buffer_records,
-      FIXED_BYTES + buffer_records * (plan.record_bytes + sizeof(size_type)) +
-      plan.run_output_bytes);
-    std::string run = writeSortedRun(records.data(), order, count, plan, makeRunName());
+    std::string run;
+    if(plan.total_order)
+    {
+      sortRecordsInPlace(records.data(), count, plan, compare);
+      updateStats(stats, buffer_records,
+        FIXED_BYTES + buffer_records * plan.record_bytes + plan.run_output_bytes);
+      run = writeSortedRun(records.data(), count, plan, makeRunName());
+    }
+    else
+    {
+      std::iota(order.begin(), order.begin() + count, 0);
+      std::sort(order.begin(), order.begin() + count,
+        [&records, &plan, &compare](size_type left, size_type right)
+        {
+          int result = compare(records.data() + left * plan.record_bytes,
+            records.data() + right * plan.record_bytes);
+          return (result != 0 ? result < 0 : left < right);
+        });
+      // Account what was actually allocated for this run.
+      updateStats(stats, buffer_records,
+        FIXED_BYTES + buffer_records * (plan.record_bytes + sizeof(size_type)) +
+        plan.run_output_bytes);
+      run = writeSortedRun(records.data(), order, count, plan, makeRunName());
+    }
     if(stats != nullptr) { stats->runs++; }
     std::vector<std::uint8_t>().swap(records);
     std::vector<size_type>().swap(order);
@@ -628,11 +727,12 @@ void
 ExternalFixedRecordSorter::sort(const std::string& input_name,
   const std::string& output_name, size_type record_bytes, size_type byte_budget,
   size_type requested_fan_in, const Comparator& compare,
-  ExternalFixedRecordSortStats* stats)
+  ExternalFixedRecordSortStats* stats, bool total_order)
 {
   if(!compare) { fail("missing comparator"); }
   if(stats != nullptr) { *stats = ExternalFixedRecordSortStats(); }
-  SortPlan plan = makePlan(record_bytes, byte_budget, requested_fan_in);
+  SortPlan plan = makePlan(record_bytes, byte_budget, requested_fan_in,
+    total_order);
   std::string run = sortToRun(input_name, plan, compare, stats);
   if(run.empty()) { writeEmpty(output_name); return; }
   installRun(run, output_name);
@@ -642,11 +742,12 @@ void
 ExternalFixedRecordSorter::sortAndReduce(const std::string& input_name,
   const std::string& output_name, size_type record_bytes, size_type byte_budget,
   size_type requested_fan_in, const Comparator& compare, const Reducer& reducer,
-  ExternalFixedRecordSortStats* stats)
+  ExternalFixedRecordSortStats* stats, bool total_order)
 {
   if(!compare || !reducer) { fail("missing comparator or reducer"); }
   if(stats != nullptr) { *stats = ExternalFixedRecordSortStats(); }
-  SortPlan plan = makePlan(record_bytes, byte_budget, requested_fan_in);
+  SortPlan plan = makePlan(record_bytes, byte_budget, requested_fan_in,
+    total_order);
   std::string run = sortToRun(input_name, plan, compare, stats);
   if(run.empty()) { writeEmpty(output_name); return; }
   try

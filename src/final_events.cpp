@@ -1354,7 +1354,7 @@ struct SpillableNodeSet::Impl
             output.write(static_cast<const char*>(record), sizeof(node_type));
             unique_values++;
           }
-        });
+        }, nullptr, true);
     }
     catch(...)
     {
@@ -1982,8 +1982,10 @@ sortFinalRedundancy(FinalEventFiles& files,
     }
     size_type fan_in = std::min(parameters.getMergeFanIn(),
       (parameters.getMaxOpenFiles() - sorter_descriptors) / 2);
+    // compareEncoded64 decodes the whole eight-byte record, so equal implies
+    // byte-identical and the run may be sorted in place.
     ExternalFixedRecordSorter::sort(files.redundant, sorted, 8, budget,
-      fan_in, compareEncoded64, stats);
+      fan_in, compareEncoded64, stats, true);
     TempFile::remove(files.redundant); files.redundant = sorted;
   }
   catch(...)
