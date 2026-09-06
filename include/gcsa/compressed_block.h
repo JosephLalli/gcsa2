@@ -64,6 +64,7 @@ class CompressedBlockReader
 {
 public:
   explicit CompressedBlockReader(const std::string& filename);
+  ~CompressedBlockReader();
   static bool isFramed(const std::string& filename);
   // Reads and validates only the fixed header; it does not allocate or decode
   // a data block. Schedulers use this before admitting a reader task.
@@ -89,6 +90,7 @@ private:
   void indexEntry(std::uint64_t block, std::uint64_t& physical,
     std::uint64_t& logical);
   void checkSequentialChecksum();
+  void releaseConsumedCache(std::uint64_t physical_offset);
   std::ifstream input;
   std::vector<std::uint8_t> current;
   std::size_t current_block, current_offset;
@@ -96,6 +98,13 @@ private:
   std::uint64_t logical_bytes, physical_bytes, record_count, whole_checksum;
   std::uint64_t sequential_bytes, sequential_checksum;
   bool sequential;
+  // Framed streams were the only readers in the codebase without the
+  // release-behind discipline that workspace, external_sort, path_sort_run and
+  // internal.h all share, so their clean pages stayed charged to the cgroup for
+  // the life of the phase. The descriptor exists only to issue the advice; all
+  // reading still goes through `input`.
+  int cache_descriptor;
+  std::uint64_t cache_released;
 };
 
 } // namespace gcsa

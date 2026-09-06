@@ -22,6 +22,10 @@ constexpr std::uint64_t FOOTER_MAGIC = 0x3152544f4f464347ULL;
 constexpr std::uint64_t FNV_OFFSET = 1469598103934665603ULL;
 constexpr std::uint32_t BLOCK_MAGIC = 0x314b4c42U;
 constexpr std::uint32_t FORMAT_VERSION = 2;
+// Same release-behind thresholds the other bounded streams use
+// (path_sort_run.cpp:32-33, external_sort.cpp, internal.h).
+constexpr std::uint64_t BLOCK_CACHE_TAIL_BYTES = 64 * MEGABYTE;
+constexpr std::uint64_t BLOCK_CACHE_FLUSH_BYTES = 512 * MEGABYTE;
 constexpr std::uint32_t HEADER_SIZE = 32;
 constexpr std::uint32_t FOOTER_SIZE = 56;
 constexpr std::uint32_t RAW_BLOCK = 0;
@@ -644,12 +648,15 @@ CompressedBlockReader::CompressedBlockReader(const std::string& filename) :
   current_offset(0), index_offset(0), block_count(0), block_size(0),
   current_logical(0), logical_bytes(0), physical_bytes(0), record_count(0),
   whole_checksum(0), sequential_bytes(0), sequential_checksum(FNV_OFFSET),
-  sequential(true)
+  sequential(true), cache_descriptor(-1), cache_released(0)
 {
   if(!this->input)
   {
     throw std::runtime_error("compressed block: open failure");
   }
+  // Best-effort: a stream that cannot be reopened simply keeps its pages, which
+  // is the behaviour every framed reader had before.
+  this->cache_descriptor = ::open(filename.c_str(), O_RDONLY);
   if(readLittle<std::uint64_t>(this->input, "header") != FILE_MAGIC ||
      readLittle<std::uint32_t>(this->input, "header") != FORMAT_VERSION ||
      readLittle<std::uint32_t>(this->input, "header") != HEADER_SIZE)
@@ -762,6 +769,34 @@ CompressedBlockReader::indexEntry(std::uint64_t block,
   }
 }
 
+CompressedBlockReader::~CompressedBlockReader()
+{
+  if(this->cache_descriptor >= 0) { ::close(this->cache_descriptor); }
+}
+
+/*
+  Release the pages of blocks already consumed, keeping a tail so a reader that
+  steps back within the current window still hits cache. Only a stream that has
+  read strictly forward is eligible: `sequential` is cleared by any backward or
+  random seek, and the final event scan does seek backward.
+*/
+void
+CompressedBlockReader::releaseConsumedCache(std::uint64_t physical_offset)
+{
+#if defined(POSIX_FADV_DONTNEED)
+  if(this->cache_descriptor < 0 || !this->sequential) { return; }
+  if(physical_offset < this->cache_released + BLOCK_CACHE_FLUSH_BYTES) { return; }
+  std::uint64_t discard_end = physical_offset - BLOCK_CACHE_TAIL_BYTES;
+  if(discard_end <= this->cache_released) { return; }
+  static_cast<void>(::posix_fadvise(this->cache_descriptor,
+    static_cast<off_t>(this->cache_released),
+    static_cast<off_t>(discard_end - this->cache_released), POSIX_FADV_DONTNEED));
+  this->cache_released = discard_end;
+#else
+  static_cast<void>(physical_offset);
+#endif
+}
+
 void
 CompressedBlockReader::loadBlock(std::size_t block)
 {
@@ -836,6 +871,9 @@ CompressedBlockReader::loadBlock(std::size_t block)
   this->current_block = block;
   this->current_offset = 0;
   this->current_logical = logical;
+  // Everything before the next block's offset has been consumed by a strictly
+  // forward reader.
+  this->releaseConsumedCache(next_physical);
 }
 
 void

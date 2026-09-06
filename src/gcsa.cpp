@@ -733,7 +733,6 @@ FinalEventMetadata
 produceExternalFinalEvents(const MergedGraph& merged_graph,
   const DeBruijnGraph& mapper, const sdsl::int_vector<0>& last_char,
   const sdsl::sd_vector<>& from_nodes,
-  const sdsl::sd_vector<>::rank_1_type& from_rank,
   size_type unique_from_nodes, const InputGraph& graph,
   const ConstructionParameters& parameters, BuildWorkspace& workspace,
   FinalEventFiles& files, size_type checkpoint_buffer,
@@ -963,7 +962,12 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
         curr_from.rewind();
         while(curr_from.next(node))
         {
-          if(node >= from_nodes.size() || !from_nodes[node])
+          // sd_vector::operator[] performs its own select_0 and backward scan,
+          // and rank_support_sd::rank performs another, so testing membership
+          // and then taking the rank costs two descents for one lookup.
+          // successor(i) yields both: its one_iterator dereferences to
+          // (rank, position). ValueIndex::find uses the same idiom.
+          if(node >= from_nodes.size())
           {
             throw std::runtime_error(
               "GCSA::GCSA(): start node " + Node::decode(node) +
@@ -971,7 +975,16 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
               ") is absent from the external start-node index of universe " +
               std::to_string(from_nodes.size()));
           }
-          size_type rank = from_rank(node);
+          auto occurrence = from_nodes.successor(node);
+          if(occurrence->second != node)
+          {
+            throw std::runtime_error(
+              "GCSA::GCSA(): start node " + Node::decode(node) +
+              " (encoded " + std::to_string(node) +
+              ") is absent from the external start-node index of universe " +
+              std::to_string(from_nodes.size()));
+          }
+          size_type rank = occurrence->first;
           size_type prior = previous.get(rank);
           if(prior > 0)
           {
@@ -1586,18 +1599,18 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   {
     // These supports are only used by the final event scan. Delaying them until
     // after PathGraph/LCP release avoids retaining four key/start-proportional
-    // structures during prefix doubling. from_rank must be initialized after
-    // the sd_vector reaches its final address.
+    // structures during prefix doubling. The external scan takes its start-node
+    // ranks from sd_vector::successor, so it needs no rank support at all --
+    // only the legacy route below builds one.
     external_preprocessor->buildLastCharacters(last_char);
     external_preprocessor->buildStartNodes(from_nodes);
     unique_from_nodes = external_preprocessor->startNodeCount();
-    sdsl::util::init_support(from_rank, &(from_nodes));
 
     FinalEventFiles event_files(graph.alpha.sigma);
     ExternalFinalScanStats event_stats;
     SubPhaseProbe events_probe("construct/final-event-scan");
     FinalEventMetadata event_metadata = produceExternalFinalEvents(merged_graph,
-      mapper, last_char, from_nodes, from_rank, unique_from_nodes, graph,
+      mapper, last_char, from_nodes, unique_from_nodes, graph,
       parameters, *workspace, event_files, checkpoint_buffer, &event_stats);
     events_probe.report();
     stopAfterCommittedPhase(parameters, "final-events");
