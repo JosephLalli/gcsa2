@@ -260,9 +260,17 @@ LCP::min_lcp(const PathNode& a, const PathNode& b,
   {
     size_type left = a.firstLabel(lcp.first, a_labels) + 1;
     size_type right = std::min((size_type)(b.lastLabel(lcp.first, b_labels)), this->total_keys - 1);
-    LCP::range_minimum_queries.fetch_add(1, std::memory_order_relaxed);
-    LCP::range_minimum_span.fetch_add(
-      (right >= left ? right - left + 1 : 0), std::memory_order_relaxed);
+    // Diagnostic only, and on the library's hottest loop: 753 M descents in a
+    // chr21 merge, where two relaxed fetch_adds measured 3.46 s against plain
+    // increments. Gate them on the verbosity that prints them, so a production
+    // run pays one well-predicted branch and the measurement is still there
+    // when it is asked for.
+    if(Verbosity::level >= Verbosity::EXTENDED)
+    {
+      LCP::range_minimum_queries.fetch_add(1, std::memory_order_relaxed);
+      LCP::range_minimum_span.fetch_add(
+        (right >= left ? right - left + 1 : 0), std::memory_order_relaxed);
+    }
     lcp.second = sdsl::quantile_freq(this->kmer_lcp, left, right, 0).first;
   }
   return lcp;
@@ -282,9 +290,17 @@ LCP::max_lcp(const PathNode& a, const PathNode& b,
   {
     size_type left = a.lastLabel(lcp.first, a_labels) + 1;
     size_type right = b.firstLabel(lcp.first, b_labels);
-    LCP::range_minimum_queries.fetch_add(1, std::memory_order_relaxed);
-    LCP::range_minimum_span.fetch_add(
-      (right >= left ? right - left + 1 : 0), std::memory_order_relaxed);
+    // Diagnostic only, and on the library's hottest loop: 753 M descents in a
+    // chr21 merge, where two relaxed fetch_adds measured 3.46 s against plain
+    // increments. Gate them on the verbosity that prints them, so a production
+    // run pays one well-predicted branch and the measurement is still there
+    // when it is asked for.
+    if(Verbosity::level >= Verbosity::EXTENDED)
+    {
+      LCP::range_minimum_queries.fetch_add(1, std::memory_order_relaxed);
+      LCP::range_minimum_span.fetch_add(
+        (right >= left ? right - left + 1 : 0), std::memory_order_relaxed);
+    }
     lcp.second = sdsl::quantile_freq(this->kmer_lcp, left, right, 0).first;
   }
   return lcp;
@@ -696,19 +712,6 @@ void
 PathGraphBuilder::close()
 {
   this->output_files.close();
-}
-
-inline void
-writePath(PathNode& path, const PathNode::rank_type* labels,
-  WriteBuffer<PathNode>& path_file, WriteBuffer<PathNode::rank_type>& rank_file)
-{
-  size_type old_ptr = path.pointer();
-  size_type limit = old_ptr + path.ranks();
-
-  path.setPointer(rank_file.size());
-  path_file.push_back(path);
-
-  for(size_type i = old_ptr; i < limit; i++) { rank_file.push_back(labels[i]); }
 }
 
 void

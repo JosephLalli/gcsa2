@@ -101,7 +101,7 @@ namespace
 {
 
 const size_type EXTERNAL_VERIFY_BUDGET = 64 * MEGABYTE;
-const size_type EXTERNAL_VERIFY_FAN_IN = 2;
+const size_type EXTERNAL_VERIFY_FAN_IN = ConstructionParameters::MERGE_FAN_IN;
 const off_t VERIFY_CACHE_TAIL = 64 * MEGABYTE;
 const off_t VERIFY_CACHE_FLUSH = 512 * MEGABYTE;
 
@@ -300,8 +300,14 @@ verifyIndexMinimumBudget()
 bool
 verifyIndex(const GCSA& index, const LCPArray* lcp, const InputGraph& graph)
 {
-  return verifyIndex(index, lcp, graph, EXTERNAL_VERIFY_BUDGET,
-    EXTERNAL_VERIFY_FAN_IN);
+  // The release entry point keeps the release implementation: it is the
+  // parallel in-memory verifier, and InputGraph::build() already refuses a
+  // graph too large for it on the route that reaches this overload. Both
+  // external callers branch on externalMemory() and pass a budget explicitly,
+  // so re-pointing this at the single-threaded external verifier only cost
+  // the legacy route its threads -- including in upstream's own t/06 tests.
+  std::vector<KMer> kmers; graph.read(kmers);
+  return verifyIndex(index, lcp, kmers, graph.k(), graph.mapping);
 }
 
 bool
