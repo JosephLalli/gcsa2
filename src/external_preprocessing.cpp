@@ -5,6 +5,7 @@
 */
 
 #include <gcsa/external_preprocessing.h>
+#include <gcsa/internal.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -78,6 +79,7 @@ public:
       this->flush();
       output_.write(reinterpret_cast<const char*>(record), bytes);
       if(!output_) { throw std::runtime_error("external preprocessing: cannot write " + name_); }
+      DiskIO::write_volume += bytes;
       return;
     }
     if(used_ + bytes > buffer_.size()) { this->flush(); }
@@ -95,6 +97,7 @@ public:
     if(used_ == 0) { return; }
     output_.write(reinterpret_cast<const char*>(buffer_.data()), used_);
     if(!output_) { throw std::runtime_error("external preprocessing: cannot write " + name_); }
+    DiskIO::write_volume += used_;
     used_ = 0;
   }
 
@@ -141,6 +144,7 @@ public:
       {
         throw std::runtime_error("external preprocessing: truncated stream " + name_);
       }
+      DiskIO::read_volume += count * record_bytes_;
       records_ = count; offset_ = 0; remaining_ -= count;
     }
     std::memcpy(record, buffer_.data() + offset_ * record_bytes_, record_bytes_);
@@ -232,7 +236,11 @@ checkpointStream(BuildWorkspace& workspace, const ArtifactIdentity& identity,
   {
     input.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
     std::streamsize bytes = input.gcount();
-    if(bytes > 0) { writer.write(buffer.data(), static_cast<size_type>(bytes)); }
+    if(bytes > 0)
+    {
+      DiskIO::read_volume += static_cast<size_type>(bytes);
+      writer.write(buffer.data(), static_cast<size_type>(bytes));
+    }
   }
   if(!input.eof()) { throw std::runtime_error("external preprocessing: failed while checkpointing " + name); }
   return writer.finish(records);
