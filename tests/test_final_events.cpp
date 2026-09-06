@@ -190,6 +190,32 @@ GCSA legacyEquivalent(const Alphabet& alphabet)
   return expected;
 }
 
+// Build through the path production uses -- storeFinalComponents publishes a
+// .gcsa and GCSA::load() reads it -- then hand back the loaded index. The
+// resident assembler these tests used to call was a second implementation of
+// this against a different sink, reachable from nothing that ships.
+GCSA
+buildViaStore(const Alphabet& alphabet, const FinalEventFiles& files,
+  const FinalEventMetadata& metadata, const ConstructionParameters& parameters,
+  size_type path_nodes, size_type edges, size_type order)
+{
+  GCSAHeader header;
+  header.path_nodes = path_nodes; header.edges = edges; header.order = order;
+  std::string published = TempFile::getName("gcsa_final_components_test");
+  GCSA result;
+  try
+  {
+    storeFinalComponents(header, alphabet, files, metadata, parameters, published);
+    if(!sdsl::load_from_file(result, published))
+    {
+      throw std::runtime_error("buildViaStore(): cannot load the published index");
+    }
+  }
+  catch(...) { TempFile::remove(published); throw; }
+  TempFile::remove(published);
+  return result;
+}
+
 } // namespace
 
 int main()
@@ -511,9 +537,8 @@ int main()
   require(legacy_metadata.sample_ids == metadata.sample_ids);
   legacy_restored.clear();
 
-  GCSA observed;
-  observed.header.path_nodes = 4; observed.header.edges = 6; observed.header.order = 8;
-  buildFinalComponents(observed, alphabet, restored, restored_metadata, parameters);
+  GCSA observed = buildViaStore(alphabet, restored, restored_metadata,
+    parameters, 4, 6, 8);
   require(observed.extra_pointers.count(0, 0) == 2);
   require(observed.extra_pointers.count(1, 1) == 0);
   require(observed.extra_pointers.count(2, 2) == 20);
@@ -566,11 +591,8 @@ int main()
   FinalEventMetadata compressed_restored_metadata;
   require(restoreFinalEvents(compressed_workspace, compressed_restored,
     compressed_restored_metadata, 4, alphabet.sigma, 64, true));
-  GCSA compressed_observed;
-  compressed_observed.header.path_nodes = 4; compressed_observed.header.edges = 6;
-  compressed_observed.header.order = 8;
-  buildFinalComponents(compressed_observed, alphabet, compressed_restored,
-    compressed_restored_metadata, compressed_parameters);
+  GCSA compressed_observed = buildViaStore(alphabet, compressed_restored,
+    compressed_restored_metadata, compressed_parameters, 4, 6, 8);
   std::ostringstream compressed_bytes;
   compressed_observed.serialize(compressed_bytes);
   require(compressed_bytes.str() == expected_bytes.str());
@@ -808,11 +830,9 @@ int main()
 
   const auto rejects = [&](const FinalEventMetadata& candidate_metadata)
   {
-    GCSA candidate;
     try
     {
-      buildFinalComponents(candidate, alphabet, restored, candidate_metadata,
-        parameters);
+      buildViaStore(alphabet, restored, candidate_metadata, parameters, 4, 6, 8);
     }
     catch(const std::runtime_error&) { return true; }
     return false;
@@ -844,7 +864,7 @@ int main()
   // Raw truncation is rejected before SDSL sees an inconsistent universe.
   require(::truncate(restored.occurrences.c_str(), 16) == 0);
   bool rejected = false;
-  try { buildFinalComponents(observed, alphabet, restored, restored_metadata, parameters); }
+  try { buildViaStore(alphabet, restored, restored_metadata, parameters, 4, 6, 8); }
   catch(const std::runtime_error&) { rejected = true; }
   require(rejected);
 

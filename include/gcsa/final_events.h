@@ -220,16 +220,6 @@ void serializeRedundantPointers(std::ostream& out,
   const ConstructionParameters& parameters);
 
 /*
-  Build the existing GCSA members serially from event streams. This preserves
-  the public .gcsa format and the historical fast/sparse BWT asymmetry. Final
-  compressed members remain resident in the GCSA object, but raw component
-  arrays no longer coexist with one another.
-*/
-void buildFinalComponents(GCSA& index, const Alphabet& source_alphabet,
-  const FinalEventFiles& files, const FinalEventMetadata& metadata,
-  const ConstructionParameters& parameters);
-
-/*
   Serialize final components directly from immutable event streams. Members
   are constructed and released in GCSA::load() order, so this avoids retaining
   the completed index during final file publication. The result has the normal

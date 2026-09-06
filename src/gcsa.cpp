@@ -1555,10 +1555,13 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     }
     else
     {
-      SubPhaseProbe build_probe("construct/build-components");
-      buildFinalComponents(*this, graph.alpha, event_files, event_metadata,
-        parameters);
-      build_probe.report();
+      // The external route publishes its components straight to the output
+      // file; it has never had a resident assembler that ships. Every
+      // production caller reaches it through GCSA::buildAndStore, so a null
+      // target here is a programming error rather than a configuration.
+      throw std::invalid_argument(
+        "GCSA::GCSA(): external-memory construction requires a publication"
+        " target; use GCSA::buildAndStore()");
     }
     if(event_metadata.occurrence_extra >
        std::numeric_limits<size_type>::max() - event_metadata.paths)

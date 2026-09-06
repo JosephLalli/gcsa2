@@ -174,15 +174,17 @@ main()
       external_minimum + 64 * KILOBYTE);
     parameters.setResume();
     InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
-    GCSA index(graph, parameters);
-    // Production builds the external LCP through buildAndStore, not through
-    // the constructor: build_gcsa and both vg entry points branch at the call
-    // site. Exercise the path that ships, then load what it published.
+    // Production builds both external products through buildAndStore, not
+    // through the constructors: build_gcsa and both vg entry points branch at
+    // the call site. Exercise the paths that ship, then load what they
+    // published.
+    const std::string external_gcsa = external_prefix + GCSA::EXTENSION;
     const std::string external_lcp = external_prefix + LCPArray::EXTENSION;
+    GCSA::buildAndStore(graph, parameters, external_gcsa);
     LCPArray::buildAndStore(graph, parameters, external_lcp);
+    GCSA index; require(sdsl::load_from_file(index, external_gcsa));
     LCPArray lcp; require(sdsl::load_from_file(lcp, external_lcp));
     require(verifyIndex(index, &lcp, graph));
-    require(sdsl::store_to_file(index, external_prefix + GCSA::EXTENSION));
   }
 
   require(readFile(legacy_prefix + GCSA::EXTENSION) ==
