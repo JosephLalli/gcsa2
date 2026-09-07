@@ -10,12 +10,45 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <vector>
 
 using namespace gcsa;
 
 static void require(bool value) { if(!value) { std::abort(); } }
+
+// A framed reader must consume one descriptor, not an istream descriptor plus
+// a second pread/cache-advice descriptor. Lowering the process ceiling makes
+// that resource contract executable: the 40-pair fixture below fits with one
+// descriptor per stream and deterministically fails with two.
+class ScopedFileLimit
+{
+public:
+  explicit ScopedFileLimit(rlim_t ceiling) : original(), changed(false)
+  {
+    require(::getrlimit(RLIMIT_NOFILE, &(this->original)) == 0);
+    if(this->original.rlim_cur > ceiling)
+    {
+      struct rlimit limited = this->original;
+      limited.rlim_cur = ceiling;
+      require(::setrlimit(RLIMIT_NOFILE, &limited) == 0);
+      this->changed = true;
+    }
+  }
+
+  ~ScopedFileLimit()
+  {
+    if(this->changed)
+    {
+      require(::setrlimit(RLIMIT_NOFILE, &(this->original)) == 0);
+    }
+  }
+
+private:
+  struct rlimit original;
+  bool changed;
+};
 
 static void write_input(const std::string& path_name, const std::string& rank_name,
   size_type records, node_type from)
@@ -370,6 +403,77 @@ static void compare_wide_logical_input(const std::string& base, const LCP& lcp,
   }
 }
 
+// Exercise the path merger across several blocks per stream. The pooled
+// constructor queues block 0 for every resident path/rank reader, while exact
+// cursor reads queue each following block without changing merge order.
+static void compare_prefetched_multiblock(const std::string& base,
+  const LCP& lcp, size_type shards, size_type records)
+{
+  const size_type block = 4 * KILOBYTE;
+  const size_type job =
+    CompressedBlockReader::prefetchWorkingMemoryEstimate(block);
+  const size_type pair_bytes = 2 *
+    CompressedBlockReader::workingMemoryEstimate(block);
+  const size_type cache = shards * pair_bytes + 8 * job;
+
+  std::vector<std::string> raw_paths, raw_ranks, framed_paths, framed_ranks;
+  size_type expected_blocks = 0;
+  for(size_type s = 0; s < shards; ++s)
+  {
+    const std::string tag = std::to_string(s);
+    raw_paths.push_back(base + ".raw." + tag + ".path");
+    raw_ranks.push_back(base + ".raw." + tag + ".rank");
+    framed_paths.push_back(base + ".framed." + tag + ".path");
+    framed_ranks.push_back(base + ".framed." + tag + ".rank");
+    write_interleaved_shard(raw_paths[s], raw_ranks[s], shards, s, records, 0);
+    write_interleaved_shard(framed_paths[s], framed_ranks[s], shards, s,
+      records, block);
+    CompressedBlockReader paths(framed_paths[s]);
+    CompressedBlockReader ranks(framed_ranks[s]);
+    expected_blocks += paths.blocks() + ranks.blocks();
+  }
+
+  PathGraph reference(raw_paths[0], raw_ranks[0]);
+  PathGraph framed(framed_paths[0], framed_ranks[0]);
+  // Keep distinct logical inputs and physical shard identities here. The pool
+  // must be observational even when prune projects the global merge into
+  // several semantic outputs, not only for the common one-logical-input case.
+  build_interleaved_graph(reference, raw_paths, raw_ranks, records);
+  build_interleaved_graph(framed, framed_paths, framed_ranks, records);
+  const size_type logical_input_bytes = framed.bytes();
+
+  reference.prune(lcp, GIGABYTE, MEGABYTE, nullptr, 128);
+  PathGraphMergeStats stats;
+  framed.prune(lcp, GIGABYTE, MEGABYTE, &stats, 128, cache);
+
+  require(framed.files() == reference.files());
+  require(framed.size() == reference.size());
+  for(size_type file = 0; file < reference.files(); ++file)
+  {
+    require(reference.logicalFile(file) == framed.logicalFile(file));
+    require(reference.physicalShard(file) == framed.physicalShard(file));
+    require(contents(reference.path_names[file]) == contents(framed.path_names[file]));
+    require(contents(reference.rank_names[file]) == contents(framed.rank_names[file]));
+  }
+  require(stats.max_open_input_pairs == shards);
+  require(stats.prefetch_workers > 0 && stats.prefetch_workers <= 8);
+  require(stats.prefetch_submitted > 2 * shards);
+  require(stats.prefetch_consumed + stats.prefetch_synchronous_blocks ==
+    expected_blocks);
+  require(stats.prefetch_ready_hits + stats.prefetch_waits ==
+    stats.prefetch_consumed);
+  require(stats.prefetch_physical_bytes > 0);
+  require(stats.prefetch_decoded_bytes == logical_input_bytes);
+  require(stats.max_prefetch_bytes <= cache - shards * pair_bytes);
+  require(stats.max_input_buffer_bytes <= cache);
+
+  for(size_type s = 0; s < shards; ++s)
+  {
+    std::remove(raw_paths[s].c_str()); std::remove(raw_ranks[s].c_str());
+    std::remove(framed_paths[s].c_str()); std::remove(framed_ranks[s].c_str());
+  }
+}
+
 // The v0.10 chr21 failure, reduced: shards committed with 16 MiB blocks, the
 // default 64 MiB --io-buffer-size, several shards, and a global memory limit
 // small enough that the two decode workspaces do not fit the I/O buffer.
@@ -446,6 +550,15 @@ static void compare_committed_block_resume(const std::string& base,
   require(stats.oversized_input_pair_bytes == 0);
   require(stats.max_open_input_pairs == shards);
   require(stats.max_open_input_pairs * pair_bytes <= cache);
+  require(stats.prefetch_workers > 0 && stats.prefetch_workers <= 8);
+  require(stats.prefetch_submitted == 2 * shards);
+  require(stats.prefetch_consumed + stats.prefetch_synchronous_blocks ==
+    2 * shards);
+  require(stats.prefetch_ready_hits + stats.prefetch_waits ==
+    stats.prefetch_consumed);
+  require(stats.prefetch_physical_bytes > 0);
+  require(stats.max_prefetch_bytes <= cache - shards * pair_bytes);
+  require(stats.max_input_buffer_bytes <= cache);
   require(2 * stats.max_open_input_pairs + 2 * stats.max_open_output_pairs + 2 <= 128);
 
   for(size_type s = 0; s < shards; s++)
@@ -585,7 +698,21 @@ int main()
   std::vector<key_type> wide_keys(40 * 200 + 2);
   for(size_type i = 0; i < wide_keys.size(); i++) { wide_keys[i] = i; }
   LCP wide_lcp(wide_keys, 1);
-  compare_wide_logical_input(std::string(root) + "/wide", wide_lcp, 40, 200);
+  {
+    ScopedFileLimit descriptor_limit(128);
+    compare_wide_logical_input(std::string(root) + "/wide", wide_lcp, 40, 200);
+  }
+
+  // The shared pool must also hand off later blocks, not just overlap the
+  // initial shard heads. Make the concurrency requirement explicit instead
+  // of inheriting a potentially single-threaded test environment.
+  int previous_threads = omp_get_max_threads();
+  omp_set_num_threads(std::max(9, previous_threads));
+  std::vector<key_type> prefetch_keys(6 * 1000 + 2);
+  for(size_type i = 0; i < prefetch_keys.size(); i++) { prefetch_keys[i] = i; }
+  LCP prefetch_lcp(prefetch_keys, 1);
+  compare_prefetched_multiblock(std::string(root) + "/prefetch",
+    prefetch_lcp, 6, 1000);
 
   // The configuration that aborted the chr21 v0.10 run: 16 MiB committed
   // blocks and a 64 MiB I/O buffer under a global limit that can afford them.
@@ -594,6 +721,7 @@ int main()
   LCP resume_lcp(resume_keys, 1);
   compare_committed_block_resume(std::string(root) + "/committed", resume_lcp,
     24, 60);
+  omp_set_num_threads(previous_threads);
 
   // Use the real construction route so mapper ranks and LCP invariants are
   // validated rather than synthesized by the test.

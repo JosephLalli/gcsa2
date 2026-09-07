@@ -84,10 +84,12 @@ size_type pathMergeCeilingBudget(const ConstructionParameters& parameters);
 // Reservation for decoded framed input blocks while merging `source`. Every
 // shard a merge opens stays open for the whole pass and they are visited in
 // round-robin label order, so a cache one entry short of the shard count
-// misses on every record: this asks for the whole shard set, not a share of
-// it. It is deliberately separate from the equal-label group buffer, which
-// scales with one label range rather than with the number of shards, so
-// funding the cache does not multiply three unrelated structures.
+// misses on every record: resident shard pairs are funded first. Any room
+// left under the independent quarter-memory ceiling is available to the
+// shared read/decode prefetch pool; prefetch is disabled rather than evicting
+// a resident pair when there is no surplus. The cache is deliberately
+// separate from the equal-label group buffer, which scales with one label
+// range rather than with the number of shards.
 size_type pathMergeInputCacheBudget(const ConstructionParameters& parameters,
   const PathGraph& source);
 

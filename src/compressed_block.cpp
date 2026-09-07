@@ -5,10 +5,18 @@
 #include <zstd.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <exception>
 #include <fcntl.h>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <unistd.h>
 
 namespace gcsa
@@ -109,15 +117,42 @@ streamPosition(std::ostream& output)
 }
 
 void
-readExact(std::istream& input, void* data, std::size_t bytes,
-  const char* context)
+preadExactCounted(int descriptor, void* data, std::size_t bytes,
+  std::uint64_t offset, const char* context)
 {
-  input.read(reinterpret_cast<char*>(data), bytes);
-  DiskIO::read_volume += static_cast<std::size_t>(input.gcount());
-  if(input.gcount() != static_cast<std::streamsize>(bytes))
+  if(descriptor < 0 ||
+     offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
+     bytes > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) - offset)
   {
-    throw std::runtime_error(std::string("compressed block: truncated ") + context);
+    throw std::runtime_error(std::string("compressed block: invalid ") + context +
+      " offset");
   }
+  std::uint8_t* output = static_cast<std::uint8_t*>(data);
+  std::size_t done = 0;
+  while(done < bytes)
+  {
+    ssize_t result = ::pread(descriptor, output + done, bytes - done,
+      static_cast<off_t>(offset + done));
+    if(result < 0 && errno == EINTR) { continue; }
+    if(result <= 0)
+    {
+      throw std::runtime_error(std::string("compressed block: truncated ") + context);
+    }
+    done += static_cast<std::size_t>(result);
+    DiskIO::read_volume += static_cast<size_type>(result);
+  }
+}
+
+template<class Value>
+Value
+readLittleMemory(const std::uint8_t* bytes)
+{
+  Value value = 0;
+  for(std::size_t i = 0; i < sizeof(Value); ++i)
+  {
+    value |= static_cast<Value>(bytes[i]) << (8 * i);
+  }
+  return value;
 }
 
 std::string
@@ -666,20 +701,580 @@ CompressedBlockReader::workingMemoryEstimate(std::size_t block_bytes)
   return 2 * block_bytes + context_bytes;
 }
 
+std::size_t
+CompressedBlockReader::prefetchWorkingMemoryEstimate(std::size_t block_bytes)
+{
+  // The fixed header is read into a stack buffer. The reservation covers the
+  // encoded payload, decoded payload, and zstd's one-shot decoder context.
+  return CompressedBlockReader::workingMemoryEstimate(block_bytes);
+}
+
+CompressedBlockPrefetchPool::Stats::Stats() :
+  submitted(0), completed(0), consumed(0), ready_hits(0),
+  waits(0), wait_nanoseconds(0), synchronous_blocks(0),
+  cancelled(0), errors(0), physical_bytes(0), decoded_bytes(0),
+  current_bytes(0), peak_bytes(0), worker_threads(0)
+{
+}
+
+struct CompressedBlockPrefetchPool::State
+{
+  enum Status { QUEUED, RUNNING, READY, FAILED, CANCELLED };
+
+  struct Entry
+  {
+    std::uint64_t owner, block, block_size;
+    int descriptor;
+    std::uint64_t physical, logical, next_physical, next_logical;
+    std::size_t reservation;
+    Status status;
+    bool cancel_requested, cancellation_counted, physical_accounted;
+    std::uint64_t physical_read;
+    std::vector<std::uint8_t> data;
+    std::exception_ptr error;
+
+    Entry(std::uint64_t reader, std::uint64_t block_id, int input,
+      std::uint64_t declared_block_size, std::uint64_t physical_offset,
+      std::uint64_t logical_offset, std::uint64_t next_physical_offset,
+      std::uint64_t next_logical_offset, std::size_t bytes) :
+      owner(reader), block(block_id), block_size(declared_block_size),
+      descriptor(input), physical(physical_offset), logical(logical_offset),
+      next_physical(next_physical_offset), next_logical(next_logical_offset),
+      reservation(bytes), status(QUEUED), cancel_requested(false),
+      cancellation_counted(false), physical_accounted(false),
+      physical_read(0), data(), error()
+    {
+    }
+  };
+
+  std::size_t limit, used, peak;
+  std::uint64_t next_owner;
+  bool stopping;
+  Stats counters;
+  std::deque<std::shared_ptr<Entry>> queue;
+  std::map<std::uint64_t, std::shared_ptr<Entry>> owners;
+  std::vector<std::thread> worker_threads;
+  mutable std::mutex mutex;
+  std::condition_variable work, changed;
+
+  State(std::size_t maximum_bytes, std::size_t workers) :
+    limit(maximum_bytes), used(0), peak(0), next_owner(1), stopping(false),
+    counters(), queue(), owners(), worker_threads(), mutex(), work(), changed()
+  {
+    this->counters.worker_threads = workers;
+    try
+    {
+      for(std::size_t i = 0; i < workers; ++i)
+      {
+        this->worker_threads.push_back(std::thread(&State::run, this));
+      }
+    }
+    catch(...)
+    {
+      {
+        std::lock_guard<std::mutex> lock(this->mutex);
+        this->stopping = true; this->work.notify_all();
+      }
+      for(std::thread& worker : this->worker_threads)
+      {
+        if(worker.joinable()) { worker.join(); }
+      }
+      throw;
+    }
+  }
+
+  static void preadExact(int descriptor, void* target, std::size_t bytes,
+    std::uint64_t offset, std::uint64_t& physical_read)
+  {
+    std::uint8_t* output = static_cast<std::uint8_t*>(target);
+    std::size_t done = 0;
+    while(done < bytes)
+    {
+      ssize_t result = ::pread(descriptor, output + done, bytes - done,
+        static_cast<off_t>(offset + done));
+      if(result < 0 && errno == EINTR) { continue; }
+      if(result <= 0)
+      {
+        throw std::runtime_error("compressed block prefetch: truncated block");
+      }
+      done += static_cast<std::size_t>(result);
+      physical_read += static_cast<std::uint64_t>(result);
+    }
+  }
+
+  template<class Value>
+  static Value readMemory(const std::uint8_t*& cursor,
+    const std::uint8_t* limit)
+  {
+    if(static_cast<std::size_t>(limit - cursor) < sizeof(Value))
+    {
+      throw std::runtime_error("compressed block prefetch: truncated header");
+    }
+    Value result = 0;
+    for(std::size_t i = 0; i < sizeof(Value); ++i)
+    {
+      result |= static_cast<Value>(cursor[i]) << (8 * i);
+    }
+    cursor += sizeof(Value);
+    return result;
+  }
+
+  static std::vector<std::uint8_t> decode(const Entry& entry,
+    std::uint64_t& physical_read)
+  {
+    if(entry.descriptor < 0 || entry.next_physical <= entry.physical ||
+       entry.next_logical <= entry.logical ||
+       entry.next_physical - entry.physical < BLOCK_HEADER_SIZE)
+    {
+      throw std::runtime_error("compressed block prefetch: invalid extent");
+    }
+
+    std::uint8_t header[BLOCK_HEADER_SIZE];
+    preadExact(entry.descriptor, header, sizeof(header), entry.physical,
+      physical_read);
+    const std::uint8_t* cursor = header;
+    const std::uint8_t* header_limit = header + sizeof(header);
+    std::uint32_t magic = readMemory<std::uint32_t>(cursor, header_limit);
+    std::uint32_t codec = readMemory<std::uint32_t>(cursor, header_limit);
+    std::uint64_t records = readMemory<std::uint64_t>(cursor, header_limit);
+    std::uint64_t raw_bytes = readMemory<std::uint64_t>(cursor, header_limit);
+    std::uint64_t stored_bytes = readMemory<std::uint64_t>(cursor, header_limit);
+    std::uint64_t expected_checksum =
+      readMemory<std::uint64_t>(cursor, header_limit);
+
+    bool valid_codec_extent =
+      (codec == RAW_BLOCK && stored_bytes == raw_bytes) ||
+      (codec == ZSTD_BLOCK && stored_bytes < raw_bytes);
+    if(magic != BLOCK_MAGIC || !valid_codec_extent || records == 0 ||
+       raw_bytes == 0 || raw_bytes > entry.block_size || records > raw_bytes ||
+       raw_bytes > std::numeric_limits<std::size_t>::max() ||
+       stored_bytes > std::numeric_limits<std::size_t>::max() ||
+       stored_bytes != entry.next_physical - entry.physical - BLOCK_HEADER_SIZE ||
+       raw_bytes != entry.next_logical - entry.logical)
+    {
+      throw std::runtime_error("compressed block prefetch: invalid block header");
+    }
+
+    std::vector<std::uint8_t> encoded(static_cast<std::size_t>(stored_bytes));
+    preadExact(entry.descriptor, encoded.data(), encoded.size(),
+      entry.physical + BLOCK_HEADER_SIZE, physical_read);
+    std::vector<std::uint8_t> decoded(static_cast<std::size_t>(raw_bytes));
+    if(codec == RAW_BLOCK)
+    {
+      decoded.swap(encoded);
+    }
+    else
+    {
+      std::size_t result = ZSTD_decompress(decoded.data(), decoded.size(),
+        encoded.data(), encoded.size());
+      if(ZSTD_isError(result) || result != decoded.size())
+      {
+        throw std::runtime_error("compressed block prefetch: zstd decompression failed");
+      }
+    }
+    if(checksum(decoded.data(), decoded.size()) != expected_checksum)
+    {
+      throw std::runtime_error("compressed block prefetch: block checksum failure");
+    }
+    return decoded;
+  }
+
+  bool runnable() const
+  {
+    for(const std::shared_ptr<Entry>& entry : this->queue)
+    {
+      if(!(entry->cancel_requested) && entry->status == QUEUED &&
+         entry->reservation <= this->limit - this->used)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  std::deque<std::shared_ptr<Entry>>::iterator nextRunnable()
+  {
+    return std::find_if(this->queue.begin(), this->queue.end(),
+      [&](const std::shared_ptr<Entry>& entry)
+      {
+        return !(entry->cancel_requested) && entry->status == QUEUED &&
+          entry->reservation <= this->limit - this->used;
+      });
+  }
+
+  void countCancellation(const std::shared_ptr<Entry>& entry)
+  {
+    if(!(entry->cancellation_counted))
+    {
+      entry->cancellation_counted = true;
+      ++this->counters.cancelled;
+    }
+  }
+
+  std::uint64_t claimPhysical(const std::shared_ptr<Entry>& entry)
+  {
+    if(entry->physical_accounted) { return 0; }
+    entry->physical_accounted = true;
+    return entry->physical_read;
+  }
+
+  void run()
+  {
+    for(;;)
+    {
+      std::shared_ptr<Entry> entry;
+      {
+        std::unique_lock<std::mutex> lock(this->mutex);
+        this->work.wait(lock,
+          [&]() { return this->stopping || this->runnable(); });
+        if(this->stopping) { return; }
+        auto next = this->nextRunnable();
+        if(next == this->queue.end()) { continue; }
+        entry = *next; this->queue.erase(next);
+        entry->status = RUNNING;
+        this->used += entry->reservation;
+        this->peak = std::max(this->peak, this->used);
+      }
+
+      std::vector<std::uint8_t> decoded;
+      std::exception_ptr error;
+      std::uint64_t physical_read = 0;
+      try
+      {
+        decoded = State::decode(*entry, physical_read);
+      }
+      catch(...)
+      {
+        error = std::current_exception();
+      }
+
+      std::unique_lock<std::mutex> lock(this->mutex);
+      entry->physical_read = physical_read;
+      this->counters.physical_bytes += physical_read;
+      if(!error)
+      {
+        ++this->counters.completed;
+        this->counters.decoded_bytes += decoded.size();
+      }
+
+      if(entry->cancel_requested || this->stopping)
+      {
+        // Free the decoded allocation before releasing its reservation and
+        // waking another worker. This keeps the byte limit true even during
+        // cancellation.
+        lock.unlock();
+        std::vector<std::uint8_t>().swap(decoded);
+        lock.lock();
+        this->used -= entry->reservation;
+        entry->reservation = 0; entry->status = CANCELLED;
+        this->countCancellation(entry);
+        auto found = this->owners.find(entry->owner);
+        if(!this->stopping && found != this->owners.end() &&
+           found->second == entry)
+        {
+          this->owners.erase(found);
+        }
+      }
+      else if(error)
+      {
+        this->used -= entry->reservation;
+        entry->reservation = 0; entry->status = FAILED;
+        entry->error = error; ++this->counters.errors;
+      }
+      else
+      {
+        std::size_t cached_bytes = decoded.capacity();
+        if(cached_bytes > entry->reservation)
+        {
+          this->used -= entry->reservation;
+          entry->reservation = 0; entry->status = FAILED;
+          entry->error = std::make_exception_ptr(std::runtime_error(
+            "compressed block prefetch: decoded allocation exceeds reservation"));
+          ++this->counters.errors;
+        }
+        else
+        {
+          this->used -= entry->reservation - cached_bytes;
+          entry->reservation = cached_bytes;
+          entry->data.swap(decoded); entry->status = READY;
+        }
+      }
+      this->changed.notify_all(); this->work.notify_all();
+      // Drop the worker's ownership while the state mutex is still held. The
+      // queue/owner map retains live entries, and cancelled entries can be
+      // destroyed here without racing a consumer's final shared_ptr release.
+      entry.reset();
+    }
+  }
+
+  void shutdown()
+  {
+    {
+      std::lock_guard<std::mutex> lock(this->mutex);
+      this->stopping = true;
+      for(auto& item : this->owners)
+      {
+        item.second->cancel_requested = true;
+      }
+      this->work.notify_all(); this->changed.notify_all();
+    }
+    for(std::thread& worker : this->worker_threads)
+    {
+      if(worker.joinable()) { worker.join(); }
+    }
+
+    std::uint64_t physical = 0;
+    {
+      std::lock_guard<std::mutex> lock(this->mutex);
+      for(auto& item : this->owners)
+      {
+        std::shared_ptr<Entry> entry = item.second;
+        this->countCancellation(entry);
+        physical += this->claimPhysical(entry);
+        std::vector<std::uint8_t>().swap(entry->data);
+      }
+      this->owners.clear(); this->queue.clear(); this->used = 0;
+    }
+    DiskIO::read_volume += static_cast<size_type>(physical);
+  }
+};
+
+CompressedBlockPrefetchPool::CompressedBlockPrefetchPool(
+  std::size_t maximum_bytes, std::size_t worker_threads) : state()
+{
+  if(maximum_bytes == 0 || worker_threads == 0)
+  {
+    throw std::invalid_argument("invalid compressed block prefetch pool");
+  }
+  this->state.reset(new State(maximum_bytes, worker_threads));
+}
+
+CompressedBlockPrefetchPool::~CompressedBlockPrefetchPool()
+{
+  if(this->state) { this->state->shutdown(); }
+}
+
+std::size_t
+CompressedBlockPrefetchPool::memoryLimit() const
+{
+  return this->state->limit;
+}
+
+std::size_t
+CompressedBlockPrefetchPool::usedBytes() const
+{
+  std::lock_guard<std::mutex> lock(this->state->mutex);
+  return this->state->used;
+}
+
+std::size_t
+CompressedBlockPrefetchPool::workers() const
+{
+  return this->state->worker_threads.size();
+}
+
+CompressedBlockPrefetchPool::Stats
+CompressedBlockPrefetchPool::stats() const
+{
+  std::lock_guard<std::mutex> lock(this->state->mutex);
+  Stats result = this->state->counters;
+  result.current_bytes = this->state->used;
+  result.peak_bytes = this->state->peak;
+  return result;
+}
+
+std::uint64_t
+CompressedBlockPrefetchPool::registerReader()
+{
+  std::lock_guard<std::mutex> lock(this->state->mutex);
+  if(this->state->stopping || this->state->next_owner == 0)
+  {
+    throw std::runtime_error("compressed block prefetch: owner space exhausted");
+  }
+  return this->state->next_owner++;
+}
+
+bool
+CompressedBlockPrefetchPool::submit(std::uint64_t owner, std::uint64_t block,
+  int descriptor, std::uint64_t block_size, std::uint64_t physical,
+  std::uint64_t logical, std::uint64_t next_physical,
+  std::uint64_t next_logical)
+{
+  if(block_size > std::numeric_limits<std::size_t>::max()) { return false; }
+  std::size_t reservation =
+    CompressedBlockReader::prefetchWorkingMemoryEstimate(
+      static_cast<std::size_t>(block_size));
+  std::lock_guard<std::mutex> lock(this->state->mutex);
+  if(this->state->stopping || descriptor < 0 || reservation > this->state->limit)
+  {
+    return false;
+  }
+  auto found = this->state->owners.find(owner);
+  if(found != this->state->owners.end())
+  {
+    if(found->second->block == block) { return true; }
+    throw std::logic_error("compressed block prefetch: reader queued two blocks");
+  }
+  std::shared_ptr<State::Entry> entry(new State::Entry(owner, block,
+    descriptor, block_size, physical, logical, next_physical, next_logical,
+    reservation));
+  this->state->owners[owner] = entry;
+  this->state->queue.push_back(entry);
+  ++this->state->counters.submitted;
+  this->state->work.notify_one();
+  return true;
+}
+
+bool
+CompressedBlockPrefetchPool::take(std::uint64_t owner, std::uint64_t block,
+  std::vector<std::uint8_t>& result)
+{
+  std::uint64_t physical = 0;
+  std::exception_ptr error;
+  bool waited = false, ready = false;
+  std::chrono::steady_clock::time_point wait_start;
+  {
+    std::unique_lock<std::mutex> lock(this->state->mutex);
+    auto found = this->state->owners.find(owner);
+    if(found == this->state->owners.end()) { return false; }
+    std::shared_ptr<State::Entry> entry = found->second;
+    if(entry->block != block)
+    {
+      throw std::logic_error("compressed block prefetch: unexpected block");
+    }
+    if(entry->status == State::QUEUED)
+    {
+      // A speculative job that has not started must never block the serial
+      // merge behind cached work for another shard. Remove it and use the
+      // reader's already-reserved synchronous workspace.
+      auto queued = std::find(this->state->queue.begin(),
+        this->state->queue.end(), entry);
+      if(queued != this->state->queue.end()) { this->state->queue.erase(queued); }
+      entry->cancel_requested = true; entry->status = State::CANCELLED;
+      this->state->countCancellation(entry);
+      this->state->owners.erase(found);
+      this->state->changed.notify_all();
+      return false;
+    }
+    ready = (entry->status == State::READY);
+    if(entry->status == State::RUNNING)
+    {
+      waited = true; wait_start = std::chrono::steady_clock::now();
+      this->state->changed.wait(lock,
+        [&]() { return entry->status != State::RUNNING; });
+    }
+    if(waited)
+    {
+      std::uint64_t elapsed = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - wait_start).count());
+      ++this->state->counters.waits;
+      this->state->counters.wait_nanoseconds += elapsed;
+    }
+    if(entry->status == State::READY)
+    {
+      if(ready) { ++this->state->counters.ready_hits; }
+      result.swap(entry->data);
+      this->state->used -= entry->reservation;
+      entry->reservation = 0;
+      ++this->state->counters.consumed;
+    }
+    else if(entry->status == State::FAILED)
+    {
+      error = entry->error;
+    }
+    else
+    {
+      return false;
+    }
+    physical = this->state->claimPhysical(entry);
+    this->state->owners.erase(owner);
+    this->state->work.notify_all();
+  }
+  DiskIO::read_volume += static_cast<size_type>(physical);
+  if(error) { std::rethrow_exception(error); }
+  return true;
+}
+
+void
+CompressedBlockPrefetchPool::cancel(std::uint64_t owner)
+{
+  if(owner == 0) { return; }
+  std::shared_ptr<State::Entry> entry;
+  std::uint64_t physical = 0;
+  {
+    std::unique_lock<std::mutex> lock(this->state->mutex);
+    auto found = this->state->owners.find(owner);
+    if(found == this->state->owners.end()) { return; }
+    entry = found->second; entry->cancel_requested = true;
+    if(entry->status == State::QUEUED)
+    {
+      auto queued = std::find(this->state->queue.begin(),
+        this->state->queue.end(), entry);
+      if(queued != this->state->queue.end()) { this->state->queue.erase(queued); }
+      entry->status = State::CANCELLED;
+      this->state->countCancellation(entry);
+      this->state->owners.erase(found);
+    }
+    else if(entry->status == State::RUNNING)
+    {
+      this->state->changed.wait(lock, [&]()
+      {
+        return this->state->owners.find(owner) == this->state->owners.end();
+      });
+    }
+    else
+    {
+      std::vector<std::uint8_t>().swap(entry->data);
+      this->state->used -= entry->reservation;
+      entry->reservation = 0; entry->status = State::CANCELLED;
+      this->state->countCancellation(entry);
+      this->state->owners.erase(found);
+    }
+    physical = this->state->claimPhysical(entry);
+    this->state->work.notify_all(); this->state->changed.notify_all();
+  }
+  DiskIO::read_volume += static_cast<size_type>(physical);
+}
+
+void
+CompressedBlockPrefetchPool::recordSynchronous(
+  std::uint64_t physical_bytes, std::uint64_t decoded_bytes)
+{
+  std::lock_guard<std::mutex> lock(this->state->mutex);
+  ++this->state->counters.synchronous_blocks;
+  this->state->counters.physical_bytes += physical_bytes;
+  this->state->counters.decoded_bytes += decoded_bytes;
+}
+
 CompressedBlockReader::CompressedBlockReader(const std::string& filename) :
+  CompressedBlockReader(filename,
+    std::shared_ptr<CompressedBlockPrefetchPool>(), false)
+{
+}
+
+CompressedBlockReader::CompressedBlockReader(const std::string& filename,
+  const std::shared_ptr<CompressedBlockPrefetchPool>& pool) :
+  CompressedBlockReader(filename, pool, static_cast<bool>(pool))
+{
+}
+
+CompressedBlockReader::CompressedBlockReader(const std::string& filename,
+  const std::shared_ptr<CompressedBlockPrefetchPool>& pool,
+  bool defer_first_block) :
   input(filename, std::ios::binary), current(), current_block(0),
   current_offset(0), index_offset(0), block_count(0), block_size(0),
   current_logical(0), logical_bytes(0), physical_bytes(0), record_count(0),
   whole_checksum(0), sequential_bytes(0), sequential_checksum(FNV_OFFSET),
-  sequential(true), cache_descriptor(-1), cache_released(0)
+  sequential(true), cache_descriptor(-1), cache_released(0),
+  prefetch_pool(pool), prefetch_owner(0), extent_cached(false),
+  cached_extent_block(0), cached_physical(0), cached_logical(0),
+  cached_next_physical(0), cached_next_logical(0)
 {
   if(!this->input)
   {
     throw std::runtime_error("compressed block: open failure");
   }
-  // Best-effort: a stream that cannot be reopened simply keeps its pages, which
-  // is the behaviour every framed reader had before.
-  this->cache_descriptor = ::open(filename.c_str(), O_RDONLY);
   if(readLittle<std::uint64_t>(this->input, "header") != FILE_MAGIC ||
      readLittle<std::uint32_t>(this->input, "header") != FORMAT_VERSION ||
      readLittle<std::uint32_t>(this->input, "header") != HEADER_SIZE)
@@ -757,8 +1352,138 @@ CompressedBlockReader::CompressedBlockReader(const std::string& filename) :
     {
       throw std::runtime_error("compressed block: invalid last index");
     }
-    this->loadBlock(0);
   }
+
+  // Do not retain a second descriptor merely to support positional reads and
+  // cache advice. Close the metadata stream first, then use one raw descriptor
+  // for every operation after construction.
+  this->input.close();
+  this->cache_descriptor = ::open(filename.c_str(), O_RDONLY);
+  if(this->cache_descriptor < 0)
+  {
+    throw std::runtime_error("compressed block: descriptor open failure");
+  }
+#if defined(POSIX_FADV_SEQUENTIAL)
+  static_cast<void>(::posix_fadvise(this->cache_descriptor, 0, 0,
+    POSIX_FADV_SEQUENTIAL));
+#endif
+
+  try
+  {
+    if(this->block_count > 0)
+    {
+      if(defer_first_block && this->prefetch_pool)
+      {
+        this->prefetch_owner = this->prefetch_pool->registerReader();
+        this->prefetchBlock(0);
+      }
+      else
+      {
+        this->loadBlock(0);
+      }
+    }
+  }
+  catch(...)
+  {
+    if(this->prefetch_pool && this->prefetch_owner != 0)
+    {
+      this->prefetch_pool->cancel(this->prefetch_owner);
+      this->prefetch_owner = 0;
+    }
+    ::close(this->cache_descriptor); this->cache_descriptor = -1;
+    throw;
+  }
+}
+
+void
+CompressedBlockReader::prefetchBlock(std::size_t block)
+{
+  if(!(this->prefetch_pool) || this->prefetch_owner == 0 ||
+     block >= this->block_count)
+  {
+    return;
+  }
+  std::uint64_t physical, logical;
+  std::uint64_t next_physical, next_logical;
+  this->blockExtent(block, physical, logical, next_physical, next_logical);
+  this->prefetch_pool->submit(this->prefetch_owner, block,
+    this->cache_descriptor, this->block_size, physical, logical,
+    next_physical, next_logical);
+}
+
+void
+CompressedBlockReader::resetPrefetch()
+{
+  if(!(this->prefetch_pool)) { return; }
+  if(this->prefetch_owner != 0)
+  {
+    this->prefetch_pool->cancel(this->prefetch_owner);
+  }
+  this->extent_cached = false;
+  this->prefetch_owner = this->prefetch_pool->registerReader();
+}
+
+void
+CompressedBlockReader::blockExtent(std::size_t block,
+  std::uint64_t& physical, std::uint64_t& logical,
+  std::uint64_t& next_physical, std::uint64_t& next_logical)
+{
+  if(block >= this->block_count)
+  {
+    throw std::out_of_range("compressed block extent past end");
+  }
+  if(this->extent_cached && this->cached_extent_block == block)
+  {
+    physical = this->cached_physical; logical = this->cached_logical;
+    next_physical = this->cached_next_physical;
+    next_logical = this->cached_next_logical;
+    return;
+  }
+
+  // Fetch enough consecutive entries to validate both boundaries and their
+  // predecessor relation in one syscall. The hot sequential path caches this
+  // extent from prefetch submission until the block is consumed.
+  const std::uint64_t first = (block == 0 ? block : block - 1);
+  const std::uint64_t last = std::min<std::uint64_t>(
+    this->block_count - 1, block + 1);
+  const std::size_t entries = static_cast<std::size_t>(last - first + 1);
+  std::uint8_t encoded[3 * INDEX_ENTRY_SIZE];
+  preadExactCounted(this->cache_descriptor, encoded,
+    entries * INDEX_ENTRY_SIZE, this->index_offset + first * INDEX_ENTRY_SIZE,
+    "offset index extent");
+
+  std::uint64_t entry_physical[3], entry_logical[3];
+  for(std::size_t i = 0; i < entries; ++i)
+  {
+    const std::uint8_t* entry = encoded + i * INDEX_ENTRY_SIZE;
+    entry_physical[i] = readLittleMemory<std::uint64_t>(entry);
+    entry_logical[i] = readLittleMemory<std::uint64_t>(
+      entry + sizeof(std::uint64_t));
+    if(entry_physical[i] < HEADER_SIZE ||
+       entry_physical[i] >= this->index_offset ||
+       entry_logical[i] > this->logical_bytes ||
+       (i > 0 && (entry_physical[i] <= entry_physical[i - 1] ||
+         entry_logical[i] <= entry_logical[i - 1])))
+    {
+      throw std::runtime_error("compressed block: invalid offset index extent");
+    }
+  }
+
+  const std::size_t current = static_cast<std::size_t>(block - first);
+  physical = entry_physical[current]; logical = entry_logical[current];
+  if(block + 1 < this->block_count)
+  {
+    next_physical = entry_physical[current + 1];
+    next_logical = entry_logical[current + 1];
+  }
+  else
+  {
+    next_physical = this->index_offset; next_logical = this->logical_bytes;
+  }
+  this->extent_cached = true; this->cached_extent_block = block;
+  this->cached_physical = physical; this->cached_logical = logical;
+  this->cached_next_physical = next_physical;
+  this->cached_next_logical = next_logical;
 }
 
 void
@@ -769,10 +1494,23 @@ CompressedBlockReader::indexEntry(std::uint64_t block,
   {
     throw std::out_of_range("compressed block index past end");
   }
-  this->input.clear();
-  this->input.seekg(this->index_offset + block * INDEX_ENTRY_SIZE);
-  physical = readLittle<std::uint64_t>(this->input, "offset index");
-  logical = readLittle<std::uint64_t>(this->input, "offset index");
+  const std::uint64_t entry_offset =
+    this->index_offset + block * INDEX_ENTRY_SIZE;
+  if(this->cache_descriptor >= 0)
+  {
+    std::uint8_t entry[INDEX_ENTRY_SIZE];
+    preadExactCounted(this->cache_descriptor, entry, sizeof(entry),
+      entry_offset, "offset index");
+    physical = readLittleMemory<std::uint64_t>(entry);
+    logical = readLittleMemory<std::uint64_t>(entry + sizeof(std::uint64_t));
+  }
+  else
+  {
+    this->input.clear();
+    this->input.seekg(entry_offset);
+    physical = readLittle<std::uint64_t>(this->input, "offset index");
+    logical = readLittle<std::uint64_t>(this->input, "offset index");
+  }
   if(physical < HEADER_SIZE || physical >= this->index_offset ||
      logical > this->logical_bytes)
   {
@@ -780,11 +1518,24 @@ CompressedBlockReader::indexEntry(std::uint64_t block,
   }
   if(block > 0)
   {
-    this->input.seekg(this->index_offset + (block - 1) * INDEX_ENTRY_SIZE);
-    std::uint64_t previous_physical =
-      readLittle<std::uint64_t>(this->input, "offset index");
-    std::uint64_t previous_logical =
-      readLittle<std::uint64_t>(this->input, "offset index");
+    std::uint64_t previous_offset =
+      this->index_offset + (block - 1) * INDEX_ENTRY_SIZE;
+    std::uint64_t previous_physical, previous_logical;
+    if(this->cache_descriptor >= 0)
+    {
+      std::uint8_t entry[INDEX_ENTRY_SIZE];
+      preadExactCounted(this->cache_descriptor, entry, sizeof(entry),
+        previous_offset, "offset index");
+      previous_physical = readLittleMemory<std::uint64_t>(entry);
+      previous_logical = readLittleMemory<std::uint64_t>(
+        entry + sizeof(std::uint64_t));
+    }
+    else
+    {
+      this->input.seekg(previous_offset);
+      previous_physical = readLittle<std::uint64_t>(this->input, "offset index");
+      previous_logical = readLittle<std::uint64_t>(this->input, "offset index");
+    }
     if(physical <= previous_physical || logical <= previous_logical)
     {
       throw std::runtime_error("compressed block: unordered index");
@@ -794,6 +1545,11 @@ CompressedBlockReader::indexEntry(std::uint64_t block,
 
 CompressedBlockReader::~CompressedBlockReader()
 {
+  if(this->prefetch_pool && this->prefetch_owner != 0)
+  {
+    this->prefetch_pool->cancel(this->prefetch_owner);
+    this->prefetch_owner = 0;
+  }
   if(this->cache_descriptor >= 0) { ::close(this->cache_descriptor); }
 }
 
@@ -833,25 +1589,49 @@ CompressedBlockReader::loadBlock(std::size_t block)
   }
 
   std::uint64_t physical, logical;
-  std::uint64_t next_physical = this->index_offset;
-  std::uint64_t next_logical = this->logical_bytes;
-  this->indexEntry(block, physical, logical);
-  if(block + 1 < this->block_count)
+  std::uint64_t next_physical, next_logical;
+  this->blockExtent(block, physical, logical, next_physical, next_logical);
+
+  if(this->prefetch_pool && this->prefetch_owner != 0)
   {
-    this->indexEntry(block + 1, next_physical, next_logical);
+    // The old block has been consumed. Release it before taking the new block,
+    // then transfer the cached allocation directly into the reader while the
+    // pool lock is held. When take() releases pool capacity, the allocation is
+    // already covered by this reader's separately reserved current-block
+    // workspace; there is no unaccounted pool-to-reader handoff interval.
+    std::vector<std::uint8_t>().swap(this->current);
+    if(this->prefetch_pool->take(this->prefetch_owner, block, this->current))
+    {
+      if(this->current.empty() || this->current.size() != next_logical - logical)
+      {
+        throw std::runtime_error("compressed block: invalid prefetched block");
+      }
+      this->current_block = block;
+      this->current_offset = 0;
+      this->current_logical = logical;
+      this->extent_cached = false;
+      this->releaseConsumedCache(next_physical);
+      if(this->sequential && block + 1 < this->block_count)
+      {
+        this->prefetchBlock(block + 1);
+      }
+      return;
+    }
   }
-  this->input.clear();
-  this->input.seekg(physical);
-  if(readLittle<std::uint32_t>(this->input, "block") != BLOCK_MAGIC)
+
+  std::uint8_t header[BLOCK_HEADER_SIZE];
+  preadExactCounted(this->cache_descriptor, header, sizeof(header), physical,
+    "block header");
+  if(readLittleMemory<std::uint32_t>(header) != BLOCK_MAGIC)
   {
     throw std::runtime_error("compressed block: invalid block header");
   }
-  std::uint32_t codec = readLittle<std::uint32_t>(this->input, "block");
-  std::uint64_t records = readLittle<std::uint64_t>(this->input, "block");
-  std::uint64_t raw_bytes = readLittle<std::uint64_t>(this->input, "block");
-  std::uint64_t stored_bytes = readLittle<std::uint64_t>(this->input, "block");
+  std::uint32_t codec = readLittleMemory<std::uint32_t>(header + 4);
+  std::uint64_t records = readLittleMemory<std::uint64_t>(header + 8);
+  std::uint64_t raw_bytes = readLittleMemory<std::uint64_t>(header + 16);
+  std::uint64_t stored_bytes = readLittleMemory<std::uint64_t>(header + 24);
   std::uint64_t expected_checksum =
-    readLittle<std::uint64_t>(this->input, "block");
+    readLittleMemory<std::uint64_t>(header + 32);
   bool valid_codec_extent =
     (codec == RAW_BLOCK && stored_bytes == raw_bytes) ||
     (codec == ZSTD_BLOCK && stored_bytes < raw_bytes);
@@ -868,7 +1648,8 @@ CompressedBlockReader::loadBlock(std::size_t block)
   }
 
   std::vector<std::uint8_t> encoded(static_cast<std::size_t>(stored_bytes));
-  readExact(this->input, encoded.data(), encoded.size(), "block payload");
+  preadExactCounted(this->cache_descriptor, encoded.data(), encoded.size(),
+    physical + BLOCK_HEADER_SIZE, "block payload");
   this->current.resize(static_cast<std::size_t>(raw_bytes));
   if(codec == RAW_BLOCK)
   {
@@ -891,12 +1672,23 @@ CompressedBlockReader::loadBlock(std::size_t block)
   {
     throw std::runtime_error("compressed block: block checksum failure");
   }
+  if(this->prefetch_pool)
+  {
+    this->prefetch_pool->recordSynchronous(
+      next_physical - physical, raw_bytes);
+  }
   this->current_block = block;
   this->current_offset = 0;
   this->current_logical = logical;
+  this->extent_cached = false;
   // Everything before the next block's offset has been consumed by a strictly
   // forward reader.
   this->releaseConsumedCache(next_physical);
+  if(this->prefetch_pool && this->sequential &&
+     block + 1 < this->block_count)
+  {
+    this->prefetchBlock(block + 1);
+  }
 }
 
 void
@@ -919,6 +1711,11 @@ CompressedBlockReader::read(void* data, std::size_t bytes)
   }
   std::uint8_t* output = static_cast<std::uint8_t*>(data);
   std::size_t copied = 0;
+  if(bytes > 0 && this->current.empty() &&
+     this->current_block < this->block_count)
+  {
+    this->loadBlock(this->current_block);
+  }
   while(copied < bytes && this->current_block < this->block_count)
   {
     if(this->current_offset == this->current.size())
@@ -948,6 +1745,9 @@ std::size_t
 CompressedBlockReader::readAt(std::uint64_t offset, void* data,
   std::size_t bytes)
 {
+  std::uint64_t cursor = (this->current_block < this->block_count ?
+    this->current_logical + this->current_offset : this->logical_bytes);
+  if(offset == cursor) { return this->read(data, bytes); }
   this->seekUncompressedByte(offset);
   return this->read(data, bytes);
 }
@@ -959,6 +1759,7 @@ CompressedBlockReader::seekBlock(std::uint64_t block)
   {
     throw std::out_of_range("compressed block seek past end");
   }
+  this->resetPrefetch();
   this->sequential = (block == 0);
   this->sequential_bytes = 0;
   this->sequential_checksum = FNV_OFFSET;
@@ -972,8 +1773,12 @@ CompressedBlockReader::seekUncompressedByte(std::uint64_t offset)
   {
     throw std::out_of_range("compressed block seek past end");
   }
+  std::uint64_t cursor = (this->current_block < this->block_count ?
+    this->current_logical + this->current_offset : this->logical_bytes);
+  if(offset == cursor) { return; }
   if(offset == this->logical_bytes)
   {
+    this->resetPrefetch();
     this->sequential = false;
     this->loadBlock(this->block_count);
     return;
@@ -982,6 +1787,7 @@ CompressedBlockReader::seekUncompressedByte(std::uint64_t offset)
      offset >= this->current_logical &&
      offset < this->current_logical + this->current.size())
   {
+    if(this->sequential) { this->resetPrefetch(); }
     this->sequential = this->sequential && (offset == this->sequential_bytes);
     this->current_offset = offset - this->current_logical;
     return;
@@ -998,6 +1804,7 @@ CompressedBlockReader::seekUncompressedByte(std::uint64_t offset)
   }
   std::uint64_t physical, logical;
   this->indexEntry(low, physical, logical);
+  this->resetPrefetch();
   this->sequential = (offset == 0);
   this->sequential_bytes = 0;
   this->sequential_checksum = FNV_OFFSET;

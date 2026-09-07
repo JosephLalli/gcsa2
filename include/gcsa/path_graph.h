@@ -289,6 +289,19 @@ struct PathGraphMergeStats
   size_type path_input_reads, rank_input_reads;
   size_type path_input_refills, rank_input_refills, direct_input_reads;
   size_type max_input_buffer_bytes;
+  // The framed-input pipeline reports both work and stalls. Physical bytes
+  // are stored frame bytes requested through this path (not block-device
+  // sectors, because the data may be served by the page cache); decoded bytes
+  // are successful decode work, including a speculative block later
+  // cancelled. A consumed block is either ready immediately or makes the
+  // merge wait for a decode already in flight. Synchronous blocks are the safe
+  // fallback when the decode-buffer-bounded pool cannot admit a block.
+  size_type prefetch_workers;
+  size_type prefetch_submitted, prefetch_completed, prefetch_consumed;
+  size_type prefetch_ready_hits, prefetch_waits, prefetch_synchronous_blocks;
+  size_type prefetch_cancelled, prefetch_errors;
+  size_type prefetch_physical_bytes, prefetch_decoded_bytes;
+  size_type prefetch_wait_nanoseconds, max_prefetch_bytes;
   // Nonzero when a committed framed shard pair needed more decode workspace
   // than the merge budget: the pair is admitted anyway, because refusing makes
   // the workspace unrecoverable, but the overshoot is not silent.
@@ -305,7 +318,13 @@ struct PathGraphMergeStats
     max_open_input_pairs(0), max_open_output_pairs(0),
     path_input_reads(0), rank_input_reads(0),
     path_input_refills(0), rank_input_refills(0), direct_input_reads(0),
-    max_input_buffer_bytes(0), oversized_input_pair_bytes(0),
+    max_input_buffer_bytes(0),
+    prefetch_workers(0), prefetch_submitted(0), prefetch_completed(0),
+    prefetch_consumed(0), prefetch_ready_hits(0), prefetch_waits(0),
+    prefetch_synchronous_blocks(0), prefetch_cancelled(0),
+    prefetch_errors(0), prefetch_physical_bytes(0),
+    prefetch_decoded_bytes(0), prefetch_wait_nanoseconds(0),
+    max_prefetch_bytes(0), oversized_input_pair_bytes(0),
     max_from_set_nodes(0) { }
 };
 

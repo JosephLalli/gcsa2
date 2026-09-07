@@ -1,12 +1,14 @@
 #include <gcsa/compressed_block.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <limits.h>
@@ -93,6 +95,54 @@ main()
     input.seekBlock(2);
     require(input.read(&byte, 1) == 1 && byte == data[28]);
     require(input.readAt(4, &byte, 1) == 1 && byte == data[4]);
+  }
+  // Multiple readers share fixed workers and a single byte bound. Block 0 is
+  // queued by the pooled constructor, allowing a caller such as the path
+  // merger to open all shard streams before it consumes their heads.
+  {
+    const std::size_t job =
+      CompressedBlockReader::prefetchWorkingMemoryEstimate(16);
+    std::shared_ptr<CompressedBlockPrefetchPool> pool(
+      new CompressedBlockPrefetchPool(2 * job, 2));
+    {
+      CompressedBlockReader first_input(first, pool);
+      CompressedBlockReader second_input(first, pool);
+      for(std::size_t attempt = 0; attempt < 1000 &&
+          pool->stats().completed < 2; ++attempt)
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      require(pool->stats().completed >= 2);
+
+      std::vector<std::uint8_t> first_observed(data.size());
+      for(std::size_t offset = 0; offset < data.size(); offset += 7)
+      {
+        std::size_t bytes = std::min<std::size_t>(7, data.size() - offset);
+        require(first_input.readAt(offset, first_observed.data() + offset,
+          bytes) == bytes);
+      }
+      std::vector<std::uint8_t> second_observed(data.size());
+      require(second_input.read(second_observed.data(), second_observed.size()) ==
+        second_observed.size());
+      require(first_observed == data); require(second_observed == data);
+
+      // Loading block 0 queues block 1. A nonsequential seek cancels that one
+      // speculative block and falls back to the ordinary seekable reader.
+      CompressedBlockReader random_input(first, pool);
+      std::uint8_t byte;
+      require(random_input.read(&byte, 1) == 1 && byte == data[0]);
+      require(random_input.readAt(50, &byte, 1) == 1 && byte == data[50]);
+
+      CompressedBlockPrefetchPool::Stats stats = pool->stats();
+      require(stats.worker_threads == 2);
+      require(stats.submitted >= 3); require(stats.completed >= 2);
+      require(stats.consumed >= 2); require(stats.ready_hits >= 2);
+      require(stats.cancelled >= 1); require(stats.synchronous_blocks >= 1);
+      require(stats.physical_bytes > 0); require(stats.decoded_bytes > 0);
+      require(stats.peak_bytes <= pool->memoryLimit());
+      require(pool->usedBytes() <= pool->memoryLimit());
+    }
+    require(pool->usedBytes() == 0);
   }
   require(readAll(first).size() <=
     CompressedBlockWriter::maximumTemporaryBytes(data.size(), 7, 16));
@@ -202,6 +252,32 @@ main()
     output.write(reinterpret_cast<const char*>(corrupt.data()), corrupt.size());
   }
   require(rejected(second));
+  // The deferred constructor must surface corruption found by a worker, retain
+  // no failed cache allocation, and close its sole descriptor during unwind.
+  {
+    const std::size_t job =
+      CompressedBlockReader::prefetchWorkingMemoryEstimate(16);
+    std::shared_ptr<CompressedBlockPrefetchPool> pool(
+      new CompressedBlockPrefetchPool(job, 1));
+    bool did_reject = false;
+    try
+    {
+      CompressedBlockReader input(second, pool);
+      for(std::size_t attempt = 0; attempt < 1000 &&
+          pool->stats().errors == 0; ++attempt)
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      std::uint8_t byte;
+      static_cast<void>(input.read(&byte, 1));
+    }
+    catch(const std::runtime_error&)
+    {
+      did_reject = true;
+    }
+    require(did_reject); require(pool->stats().errors == 1);
+    require(pool->usedBytes() == 0);
+  }
 
   // The writer only labels a block as zstd when it is smaller than the raw
   // payload. Reject an inconsistent extent before allocating the payload.

@@ -1349,18 +1349,15 @@ pathMergeInputCacheBudget(const ConstructionParameters& parameters,
   const size_type pair_bytes = pathGraphFramedPairBytes(source);
   if(pair_bytes == 0) { return 0; }
 
-  // Ask for every shard. Anything less is not a smaller cache but a broken
-  // one: the merge visits the shards round-robin, so one entry short of the
-  // count misses on every record and each miss decodes whole blocks to deliver
-  // one 24-byte PathNode. A quarter of --memory-limit bounds the request,
-  // which is far more than a sixteenth because this reservation stands alone:
-  // the group buffer, range deque and output cache are sized separately and do
-  // not grow with it.
-  const size_type ceiling = std::max(pair_bytes,
-    parameters.getMemoryLimitBytes() / 4);
-  const size_type files = std::max(static_cast<size_type>(1), source.files());
-  if(pair_bytes > ceiling / files) { return ceiling; }
-  return files * pair_bytes;
+  // Ask for every resident shard pair first. Anything less is not a smaller
+  // cache but a broken one: the merge visits the shards round-robin, so one
+  // entry short of the count misses on every record. The remainder of this
+  // independent quarter-memory ceiling is a capacity, not an eager
+  // allocation: PathGraphInputCache gives it to a shared block prefetch pool,
+  // which uses only what its one-block-per-reader queue can keep productive.
+  // If the pairs themselves consume the ceiling, prefetch simply receives no
+  // bytes and the previous synchronous behavior remains intact.
+  return std::max(pair_bytes, parameters.getMemoryLimitBytes() / 4);
 }
 
 size_type
@@ -2406,10 +2403,10 @@ private:
 };
 
 /*
-  Keep a fixed number of path/rank descriptor pairs and read one current head
-  synchronously. This removes the former two 1 MiB buffers, two descriptors,
-  and two reader threads per physical shard. The heap still owns one compact
-  PriorityNode per shard because exact k-way merge ordering requires a head.
+  Keep a fixed number of path/rank descriptor pairs. Framed readers share one
+  bounded prefetch/decode pool; raw readers retain the synchronous windowed
+  path. The heap still owns one compact PriorityNode per shard because exact
+  k-way merge ordering requires a head.
 */
 struct PathGraphInputCache
 {
@@ -2471,22 +2468,26 @@ struct PathGraphInputCache
   // than pointers because emplace_back may reallocate `entries`.
   std::vector<size_type> file_to_entry;
   size_type clock, max_pairs, window_bytes, compressed_pair_bytes;
+  size_type minimum_prefetch_job_bytes;
   size_type oversized_pair_bytes;
   PathGraphMergeStats* stats;
+  std::shared_ptr<CompressedBlockPrefetchPool> prefetch_pool;
 
   constexpr static size_type NO_ENTRY = ~static_cast<size_type>(0);
 
   constexpr static off_t CACHE_TAIL = 64 * KILOBYTE;
   constexpr static size_type MIN_WINDOW = 4 * KILOBYTE;
   constexpr static size_type MAX_WINDOW = 64 * KILOBYTE;
+  constexpr static size_type MAX_PREFETCH_WORKERS = 8;
 
   PathGraphInputCache(const PathGraph& source, PathGraphMergeStats* merge_stats,
     size_type requested_pairs, size_type byte_budget) :
     graph(source), entries(), file_to_entry(source.files(), NO_ENTRY), clock(0),
     max_pairs(std::max(static_cast<size_type>(1),
       std::min(requested_pairs, std::max(static_cast<size_type>(1), source.files())))),
-    window_bytes(0), compressed_pair_bytes(0), oversized_pair_bytes(0),
-    stats(merge_stats)
+    window_bytes(0), compressed_pair_bytes(0),
+    minimum_prefetch_job_bytes(PathGraph::UNKNOWN), oversized_pair_bytes(0),
+    stats(merge_stats), prefetch_pool()
   {
     // A framed reader retains one decoded block. Bound the LRU cardinality by
     // bytes as well as descriptors, so a large --max-open-files value cannot
@@ -2502,12 +2503,18 @@ struct PathGraphInputCache
       }
       if(path_framed)
       {
+        size_type path_block = CompressedBlockReader::declaredBlockSize(
+          source.path_names[file]);
+        size_type rank_block = CompressedBlockReader::declaredBlockSize(
+          source.rank_names[file]);
         size_type pair_bytes = CompressedBlockReader::workingMemoryEstimate(
-          CompressedBlockReader::declaredBlockSize(source.path_names[file])) +
-          CompressedBlockReader::workingMemoryEstimate(
-            CompressedBlockReader::declaredBlockSize(source.rank_names[file]));
+          path_block) + CompressedBlockReader::workingMemoryEstimate(rank_block);
         this->compressed_pair_bytes = std::max(this->compressed_pair_bytes,
           pair_bytes);
+        this->minimum_prefetch_job_bytes = std::min(
+          this->minimum_prefetch_job_bytes,
+          std::min(CompressedBlockReader::prefetchWorkingMemoryEstimate(path_block),
+            CompressedBlockReader::prefetchWorkingMemoryEstimate(rank_block)));
       }
     }
     if(this->compressed_pair_bytes > 0)
@@ -2532,6 +2539,25 @@ struct PathGraphInputCache
       // allocating raw pread windows in every framed LRU entry.
       this->window_bytes = 0;
       this->entries.reserve(this->max_pairs);
+      size_type resident_bytes = byte_budget;
+      if(this->compressed_pair_bytes <= byte_budget / this->max_pairs)
+      {
+        resident_bytes = this->compressed_pair_bytes * this->max_pairs;
+      }
+      size_type prefetch_bytes = (byte_budget > resident_bytes ?
+        byte_budget - resident_bytes : 0);
+      size_type available_threads = static_cast<size_type>(omp_get_max_threads());
+      size_type requested_workers = (available_threads > 1 ?
+        std::min(MAX_PREFETCH_WORKERS, available_threads - 1) : 0);
+      if(requested_workers > 0 &&
+         this->minimum_prefetch_job_bytes != PathGraph::UNKNOWN &&
+         prefetch_bytes >= this->minimum_prefetch_job_bytes)
+      {
+        size_type workers = std::min(requested_workers,
+          prefetch_bytes / this->minimum_prefetch_job_bytes);
+        this->prefetch_pool.reset(new CompressedBlockPrefetchPool(
+          prefetch_bytes, workers));
+      }
       return;
     }
     // At most 2 * max_pairs windows can coexist. Reserve at most one quarter
@@ -2547,6 +2573,22 @@ struct PathGraphInputCache
   }
 
   ~PathGraphInputCache() { this->close(); }
+
+  // When every shard pair fits, open all pooled readers before consuming the
+  // first heap head. Their deferred block-0 jobs then form large, independent
+  // preads instead of a constructor-time sequence of read/decode stalls.
+  void prime()
+  {
+    if(!(this->prefetch_pool) || this->max_pairs < this->graph.files()) { return; }
+    if(this->stats != nullptr)
+    {
+      this->stats->prefetch_workers = this->prefetch_pool->workers();
+    }
+    for(size_type file = 0; file < this->graph.files(); ++file)
+    {
+      static_cast<void>(this->get(file));
+    }
+  }
 
   void read(size_type file, size_type offset, PathNode& node,
     PathNode::rank_type* labels)
@@ -2588,9 +2630,11 @@ struct PathGraphInputCache
   void close()
   {
     for(Entry& entry : this->entries) { this->close(entry); }
+    this->refreshPrefetchStats();
     this->entries.clear();
     // The index map must die with the entries it points into.
     std::fill(this->file_to_entry.begin(), this->file_to_entry.end(), NO_ENTRY);
+    this->prefetch_pool.reset();
   }
 
 private:
@@ -2649,10 +2693,20 @@ private:
     }
     if(path_framed)
     {
-      target->compressed_path.reset(new CompressedBlockReader(
-        this->graph.path_names[file]));
-      target->compressed_rank.reset(new CompressedBlockReader(
-        this->graph.rank_names[file]));
+      if(this->prefetch_pool)
+      {
+        target->compressed_path.reset(new CompressedBlockReader(
+          this->graph.path_names[file], this->prefetch_pool));
+        target->compressed_rank.reset(new CompressedBlockReader(
+          this->graph.rank_names[file], this->prefetch_pool));
+      }
+      else
+      {
+        target->compressed_path.reset(new CompressedBlockReader(
+          this->graph.path_names[file]));
+        target->compressed_rank.reset(new CompressedBlockReader(
+          this->graph.rank_names[file]));
+      }
       if(target->compressed_path->logicalSize() !=
            this->graph.path_counts[file] * sizeof(PathNode) ||
          target->compressed_rank->logicalSize() !=
@@ -2692,6 +2746,36 @@ private:
       ::close(entry.rank); entry.rank = -1;
     }
     entry.compressed_path.reset(); entry.compressed_rank.reset();
+  }
+
+  void refreshPrefetchStats()
+  {
+    if(this->stats == nullptr || !(this->prefetch_pool)) { return; }
+    CompressedBlockPrefetchPool::Stats pool = this->prefetch_pool->stats();
+    this->stats->prefetch_workers = pool.worker_threads;
+    this->stats->prefetch_submitted = pool.submitted;
+    this->stats->prefetch_completed = pool.completed;
+    this->stats->prefetch_consumed = pool.consumed;
+    this->stats->prefetch_ready_hits = pool.ready_hits;
+    this->stats->prefetch_waits = pool.waits;
+    this->stats->prefetch_synchronous_blocks = pool.synchronous_blocks;
+    this->stats->prefetch_cancelled = pool.cancelled;
+    this->stats->prefetch_errors = pool.errors;
+    this->stats->prefetch_physical_bytes = pool.physical_bytes;
+    this->stats->prefetch_decoded_bytes = pool.decoded_bytes;
+    this->stats->prefetch_wait_nanoseconds = pool.wait_nanoseconds;
+    this->stats->max_prefetch_bytes = pool.peak_bytes;
+    size_type resident = this->compressed_pair_bytes;
+    if(resident > 0 && this->stats->max_open_input_pairs <=
+       std::numeric_limits<size_type>::max() / resident)
+    {
+      resident *= this->stats->max_open_input_pairs;
+      if(pool.peak_bytes <= std::numeric_limits<size_type>::max() - resident)
+      {
+        this->stats->max_input_buffer_bytes = std::max(
+          this->stats->max_input_buffer_bytes, resident + pool.peak_bytes);
+      }
+    }
   }
 
   static off_t checkedOffset(size_type records, size_type width)
@@ -2784,6 +2868,7 @@ private:
 constexpr off_t PathGraphInputCache::CACHE_TAIL;
 constexpr size_type PathGraphInputCache::MIN_WINDOW;
 constexpr size_type PathGraphInputCache::MAX_WINDOW;
+constexpr size_type PathGraphInputCache::MAX_PREFETCH_WORKERS;
 
 /*
   This structure reads a buffered stream of PriorityNodes in sorted order and outputs a
@@ -2872,6 +2957,7 @@ PathGraphMerger::PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lc
     // The input cache is a member, so it was constructed before this reset.
     stats->oversized_input_pair_bytes = this->input_files.oversized_pair_bytes;
   }
+  this->input_files.prime();
   for(size_type file = 0; file < path_graph.files(); file++)
   {
     this->offsets[file] = 0;

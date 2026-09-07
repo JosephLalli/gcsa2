@@ -1160,6 +1160,27 @@ reportPruneMergeStats(const PathGraphMergeStats& merge_stats)
               << formatBytes(merge_stats.max_input_buffer_bytes)
               << " of bounded input windows"
               << std::endl;
+    if(merge_stats.prefetch_workers > 0)
+    {
+      std::cerr << "PathGraph::prune(): framed prefetch: "
+                << merge_stats.prefetch_workers << " workers, "
+                << merge_stats.prefetch_consumed << "/"
+                << merge_stats.prefetch_submitted << " blocks consumed/submitted ("
+                << merge_stats.prefetch_completed << " completed, "
+                << merge_stats.prefetch_ready_hits << " ready, "
+                << merge_stats.prefetch_waits << " waited, "
+                << merge_stats.prefetch_synchronous_blocks << " synchronous, "
+                << merge_stats.prefetch_cancelled << " cancelled, "
+                << merge_stats.prefetch_errors << " errors), "
+                << formatBytes(merge_stats.prefetch_physical_bytes)
+                << " stored bytes requested -> "
+                << formatBytes(merge_stats.prefetch_decoded_bytes)
+                << " successfully decoded work, "
+                << (static_cast<double>(merge_stats.prefetch_wait_nanoseconds) / 1.0e9)
+                << " seconds waiting, peak "
+                << formatBytes(merge_stats.max_prefetch_bytes)
+                << std::endl;
+    }
   }
 }
 
@@ -1259,6 +1280,30 @@ reportFinalMergeStats(const PathGraphMergeStats& final_merge_stats)
               << formatBytes(final_merge_stats.max_input_buffer_bytes)
               << " of bounded input windows"
               << std::endl;
+    if(final_merge_stats.prefetch_workers > 0)
+    {
+      std::cerr << "MergedGraph: framed prefetch: "
+                << final_merge_stats.prefetch_workers << " workers, "
+                << final_merge_stats.prefetch_consumed << "/"
+                << final_merge_stats.prefetch_submitted
+                << " blocks consumed/submitted ("
+                << final_merge_stats.prefetch_completed << " completed, "
+                << final_merge_stats.prefetch_ready_hits << " ready, "
+                << final_merge_stats.prefetch_waits << " waited, "
+                << final_merge_stats.prefetch_synchronous_blocks
+                << " synchronous, "
+                << final_merge_stats.prefetch_cancelled << " cancelled, "
+                << final_merge_stats.prefetch_errors << " errors), "
+                << formatBytes(final_merge_stats.prefetch_physical_bytes)
+                << " stored bytes requested -> "
+                << formatBytes(final_merge_stats.prefetch_decoded_bytes)
+                << " successfully decoded work, "
+                << (static_cast<double>(final_merge_stats.prefetch_wait_nanoseconds) /
+                    1.0e9)
+                << " seconds waiting, peak "
+                << formatBytes(final_merge_stats.max_prefetch_bytes)
+                << std::endl;
+    }
   }
 }
 
