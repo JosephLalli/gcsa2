@@ -4564,6 +4564,8 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
     std::max(static_cast<size_type>(KILOBYTE), worker_reservation / 8));
 
   size_type planned_bytes = 0;
+  size_type largest_peak = 0, largest_paths = 0, largest_ranks = 0;
+  size_type planned_paths = 0, planned_ranks = 0;
   for(const JoinPartition& partition : partitions)
   {
     const size_type peak_bytes = externalPathGraphShardPeakBytes(
@@ -4571,14 +4573,57 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
       sort_budget, worker_codec);
     planned_bytes = checkedJoinAdd(planned_bytes, peak_bytes,
       "all worker peak output bytes");
+    planned_paths = checkedJoinAdd(planned_paths, partition.expected_paths,
+      "all partition expected paths");
+    planned_ranks = checkedJoinAdd(planned_ranks, partition.expected_ranks,
+      "all partition expected ranks");
+    if(peak_bytes > largest_peak)
+    {
+      largest_peak = peak_bytes;
+      largest_paths = partition.expected_paths;
+      largest_ranks = partition.expected_ranks;
+    }
     if(partition.expected_ranks > (static_cast<size_type>(1) << 40))
     {
       throw joinError("one join partition exceeds the 40-bit rank pointer range");
     }
   }
+
+  /*
+    Report the plan whether or not it fits. planned_bytes sums, over every
+    partition, the peak its output pair can reach -- so it is the disk the next
+    generation needs, not a transient figure. That sum was invisible until it
+    was too large, and the throw alone could not distinguish "raise
+    --gcsa-disk-limit by this much" from "the per-partition estimate is wrong".
+  */
+  if(Verbosity::level >= Verbosity::EXTENDED)
+  {
+    std::cerr << "externalPathGraphExtend(): partition plan: "
+              << partitions.size() << " partitions, " << planned_paths
+              << " paths and " << planned_ranks << " ranks, planning "
+              << formatBytes(planned_bytes)
+              << " against a remaining disk limit of " << formatBytes(size_limit)
+              << " (" << formatBytes(committed_bytes) << " already committed)"
+              << std::endl;
+    std::cerr << "externalPathGraphExtend(): largest partition plans "
+              << formatBytes(largest_peak) << " for " << largest_paths
+              << " paths and " << largest_ranks << " ranks; mean "
+              << formatBytes(planned_bytes /
+                   std::max(static_cast<size_type>(1), partitions.size()))
+              << " per partition" << std::endl;
+  }
   if(planned_bytes > size_limit || committed_bytes > size_limit - planned_bytes)
   {
-    throw joinError("configured disk limit exceeded by deterministic partition plan");
+    // Report the arithmetic. Without it an operator cannot tell whether to
+    // raise --gcsa-disk-limit, and by how much, or whether the plan itself is
+    // pathological -- the difference between a one-flag fix and a bug.
+    throw joinError("configured disk limit exceeded by deterministic partition plan"
+      ": " + std::to_string(partitions.size()) + " partitions plan " +
+      formatBytes(planned_bytes) + " (largest " + formatBytes(largest_peak) +
+      ", mean " + formatBytes(planned_bytes /
+        std::max(static_cast<size_type>(1), partitions.size())) + "), " +
+      formatBytes(committed_bytes) + " already committed, against a remaining "
+      "limit of " + formatBytes(size_limit));
   }
 
   MemoryBudget memory(parameters.getMemoryLimitBytes(), safety_margin);
