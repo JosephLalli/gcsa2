@@ -855,6 +855,60 @@ generated path, merge levels, worker count, filesystem throughput/PSI, and
 total `(bytes read + bytes written) / source byte`. Whole-genome runtime should
 not be extrapolated until the projected resident floor fits the selected cap.
 
+### The path merge is serial, and why it need not be
+
+`MergedGraph::MergedGraph` (`src/path_graph.cpp:4052`) is the last single-
+threaded phase of any size. Measured on the chr21 gate fixture at 96 threads, it
+reduced 1,208,172,107 paths in about 26 minutes at 0.50 cores while the step-4
+join partitioned the same data across 241 workers in 5m29s. The gap is not I/O:
+the framed prefetch reported 6,238 of 6,279 blocks already resident, 41 waits,
+zero synchronous fetches and zero errors, so reads are effectively free and the
+phase is idle waiting on its own emit loop.
+
+Four values are carried between iterations, and each is written into the output
+rather than merely observed. `rank_count` becomes the pointer stored in every
+`PathNode` via `setPointer`, so record N's stored value depends on the ranks of
+records 0..N-1. `path_count` is the ordinal written into `from_file` records and
+into the `next` transform. `from_count` feeds `next_from` the same way.
+`path_lcp` is the LCP against the preceding record, which is pairwise-adjacent
+across the whole stream. `curr_comp` looks like a fifth but is not: it is
+monotone in `firstLabel(0)` and a partition can binary-search its own starting
+value out of `next`.
+
+None of these prevent partitioning, because all are prefix computations. Split
+the sorted path space into P disjoint key ranges, merge each independently with
+counters based at zero, prefix-sum the per-partition totals, and re-base the
+stored pointers as the partition outputs are concatenated in key order. The
+partition boundaries are exact rather than approximate: the merge is a stable
+merge of sorted inputs, so for a split key K the number of paths preceding K is
+the sum over input files of the count of records below K in that file, and
+`PathGraphInputCache::read` is addressed by record ordinal rather than by byte,
+so those per-file counts are a binary search over an existing API. Only the P-1
+cross-boundary LCP values need the serial pass, computed from each partition's
+first record.
+
+This is the same shape the join already uses -- `sampleJoinKeys`
+(`src/external_join.cpp:2498`) samples 8,192 keys into MSD range packs, with
+`"MSD range packs do not tile the join-key space"` as an explicit invariant --
+and the same shape `PhaseUnfolder` uses on the `vg` side, where workers mint
+duplicate ids locally and a serial pass in component order re-bases them.
+
+Two costs are not yet accounted and must be before this is attempted. Each
+partition needs its own `PathGraphMerger`, whose `ranges` deque and `buffer`
+group are both sized from `group_buffer_bytes`; P mergers therefore multiply the
+merge reservation or divide it and spill more, and the phase allocator has no
+term for that today. And the change moves pointer values in the output, so it
+requires its own byte-identity gate against a serial run -- the chr21 fixture
+digests `297f5fe840f7ec48337c97eacdc00c0f` and
+`6fc46b008b54f34cc30dcbb812807a9a` are the reference, and both the `.gcsa` and
+the `.lcp` must match, since a wrong re-base can leave a self-consistent index
+whose pointers are uniformly shifted.
+
+Not implemented. Recorded here because the measurement that motivates it -- the
+prefetch hit rate that rules out I/O -- is only available while a run is in
+flight, and because the enabling primitive is easy to miss: reads are already
+ordinal-addressed, so no new seek layer is required.
+
 ## Build, test, and usage
 
 From the containing `vg` checkout, use its local toolchain wrapper. The GCSA2
