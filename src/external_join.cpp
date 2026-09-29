@@ -27,6 +27,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <spawn.h>
 #include <stdexcept>
@@ -3244,6 +3245,11 @@ decodeJoinRadixPlan(const std::vector<std::uint8_t>& payload,
   return result;
 }
 
+// The planners of one logical input's key ranges run at once. Each reads its
+// own runs and sidecars; the workspace is the one thing they share, and it
+// has no locking of its own, so every restore or commit of a plan holds this.
+std::mutex join_plan_workspace_mutex;
+
 JoinRadixPlan
 loadOrCreateJoinRadixPlan(const JoinFileReader& left,
   const JoinFileReader& right, const JoinRun& left_run, const JoinRun& right_run,
@@ -3261,6 +3267,7 @@ loadOrCreateJoinRadixPlan(const JoinFileReader& left,
   {
     task = joinRadixPlanTaskName(checkpoint_task, logical, target_bytes,
       serialized_limit, left.checksum(), right.checksum());
+    std::lock_guard<std::mutex> lock(join_plan_workspace_mutex);
     if(workspace->task_completed(task, "join-plan"))
     {
       result = decodeJoinRadixPlan(workspace->read_artifact_payload(
@@ -3279,6 +3286,7 @@ loadOrCreateJoinRadixPlan(const JoinFileReader& left,
       std::vector<std::uint8_t> payload = encodeJoinRadixPlan(result, logical,
         target_bytes, left.size(), right.size(), left.checksum(), right.checksum());
       ArtifactIdentity identity = joinRadixPlanArtifact(task);
+      std::lock_guard<std::mutex> lock(join_plan_workspace_mutex);
       BuildWorkspace::ArtifactWriter writer = workspace->open_artifact(identity,
         logical, physical_shard_id_t(0), "msd-key-prefix", "all");
       writer.write(payload.data(), payload.size());
@@ -5637,11 +5645,63 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
 
     if(parameters.getProcessWorkers() > 1)
     {
-      for(RangeJoin& job : jobs)
+      // Plan the ranges at once. A planner holds two run readers, four sidecar
+      // readers and up to four plan representations; that footprint, not the
+      // budget each planner is given for its plan size, bounds how many run,
+      // so a plan's serialized limit and task name do not depend on the count.
+      size_type planner_codec_bytes = 0;
+      for(const RangeJoin& job : jobs)
       {
-        job.partitions = planJoinPartitions(job.left, job.right,
-          logical, parameters.getCheckpointBytes(), memory_budget,
-          parameters.getVerifyWorkspace(), stats, workspace, checkpoint_task);
+        planner_codec_bytes = std::max(planner_codec_bytes,
+          checkedJoinAdd(joinRunReaderPairMemory(job.left, job.right),
+            checkedJoinAdd(joinSidecarReaderMemory(job.left),
+              joinSidecarReaderMemory(job.right), "planner sidecar readers"),
+            "planner readers"));
+      }
+      // The same bound loadOrCreateJoinRadixPlan() reports for one planner.
+      const size_type planner_bytes = std::max(static_cast<size_type>(1),
+        saturatingPlanAdd(saturatingPlanAdd(JOIN_PLAN_RUNTIME_OVERHEAD, planner_codec_bytes),
+          saturatingPlanMultiply(4, joinPlanSerializedLimit(memory_budget, planner_codec_bytes))));
+      const size_type planners = std::max(static_cast<size_type>(1),
+        std::min(std::min(jobs.size(), thread_limit), memory_budget / planner_bytes));
+      std::vector<ExternalPathJoinStats> plan_stats(jobs.size());
+      std::vector<std::exception_ptr> plan_errors(jobs.size());
+      std::atomic<size_type> next_job(0);
+      auto plan = [&]()
+      {
+        for(size_type j = next_job++; j < jobs.size(); j = next_job++)
+        {
+          try
+          {
+            jobs[j].partitions = planJoinPartitions(jobs[j].left, jobs[j].right,
+              logical, parameters.getCheckpointBytes(), memory_budget,
+              parameters.getVerifyWorkspace(),
+              (stats != nullptr ? &plan_stats[j] : nullptr), workspace, checkpoint_task);
+          }
+          catch(...) { plan_errors[j] = std::current_exception(); }
+        }
+      };
+      std::vector<std::thread> planner_threads;
+      try { for(size_type t = 1; t < planners; t++) { planner_threads.emplace_back(plan); } }
+      catch(const std::system_error&) { }
+      plan();
+      for(std::thread& thread : planner_threads) { thread.join(); }
+      for(const std::exception_ptr& error : plan_errors)
+      {
+        if(error)
+        {
+          for(RangeJoin& job : jobs) { removeJoinRun(job.left); removeJoinRun(job.right); }
+          std::rethrow_exception(error);
+        }
+      }
+      if(stats != nullptr)
+      {
+        for(const ExternalPathJoinStats& plan_stat : plan_stats)
+        {
+          mergeJoinScanStats(*stats, plan_stat);
+        }
+        stats->max_bytes_resident = std::max(stats->max_bytes_resident,
+          std::min(memory_budget, saturatingPlanMultiply(planners, planner_bytes)));
       }
       // A range whose right records are all unsorted and unmatched plans one
       // partition that emits nothing. The serial route still runs it, and
