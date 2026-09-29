@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <filesystem>
 #include <limits>
@@ -734,6 +735,90 @@ int main(int argc, char** argv)
   externalPathGraphExtend(separated, GIGABYTE, parameters);
   require(separated.files() == 2);
   require(separated.size() == 2); // Only the already-sorted bypass paths remain.
+
+  // Join workers leave many physical shards per logical input, and compaction
+  // merges them in batches. With threads to spare, the batches of a pass run
+  // at once: the published frontier must be the one the serial loop publishes,
+  // stream for stream, and the step must report that the batches overlapped.
+  // Stored bytes are not compared, because a concurrent writer compresses in
+  // its own thread rather than with the configured zstd workers.
+  {
+    ConstructionParameters compaction_parameters;
+    compaction_parameters.setMemoryLimitBytes(2 * GIGABYTE);
+    compaction_parameters.setTempCompression("zstd");
+    compaction_parameters.setCompressionBlockSize(KILOBYTE);
+    compaction_parameters.setCompressionWorkers(2);
+    const size_type logical_inputs = 2, records = 50;
+    const size_type target = pathMergeInputPairs(compaction_parameters.getMaxOpenFiles(),
+      logical_inputs) / logical_inputs;
+    // Several multi-shard batches per logical input, and a trailing singleton.
+    const size_type shards = 4 * target + 1;
+    const size_type label_fan_in = std::min(compaction_parameters.getMergeFanIn(),
+      compaction_parameters.getMaxOpenFiles() - 1);
+    auto build_shards = [&](PathGraph& graph, const std::string& tag)
+    {
+      for(size_type logical = 0; logical < logical_inputs; logical++)
+      {
+        for(size_type shard = 0; shard < shards; shard++)
+        {
+          const std::string name = base + ".compaction." + tag + "." +
+            std::to_string(logical) + "." + std::to_string(shard);
+          std::vector<TestRecord> shard_records;
+          for(size_type i = 0; i < records; i++)
+          {
+            shard_records.push_back({ i + 1, i + 2, static_cast<byte_type>(1),
+              static_cast<PathNode::rank_type>((i * shards + shard) * logical_inputs + logical + 1),
+              false });
+          }
+          writePathPair(name + ".path", name + ".rank", shard_records);
+          appendShard(graph, name + ".path", name + ".rank",
+            logical_file_id_t(logical), physical_shard_id_t(logical * shards + shard));
+        }
+      }
+    };
+    PathGraph serial_graph(0, 2, 1), concurrent_graph(0, 2, 1);
+    build_shards(serial_graph, "serial");
+    build_shards(concurrent_graph, "concurrent");
+    ExternalPathJoinStats serial_stats, concurrent_stats;
+    size_type serial_committed = 0, concurrent_committed = 0;
+    MemoryBudget serial_memory(compaction_parameters.getMemoryLimitBytes(),
+      compaction_parameters.getMemoryLimitBytes() / 16);
+    MemoryBudget concurrent_memory(compaction_parameters.getMemoryLimitBytes(),
+      compaction_parameters.getMemoryLimitBytes() / 16);
+    omp_set_num_threads(1);
+    compactLogicalJoinShards(serial_graph, GIGABYTE, compaction_parameters,
+      label_fan_in, serial_memory, serial_committed, &serial_stats);
+    omp_set_num_threads(4);
+    compactLogicalJoinShards(concurrent_graph, GIGABYTE, compaction_parameters,
+      label_fan_in, concurrent_memory, concurrent_committed, &concurrent_stats);
+    omp_set_num_threads(1);
+    require(serial_stats.compaction_batches > logical_inputs);
+    require(serial_stats.compaction_concurrency == 1);
+    require(concurrent_stats.compaction_batches == serial_stats.compaction_batches);
+    require(concurrent_stats.compaction_concurrency > 1);
+    require(concurrent_stats.max_bytes_resident <= compaction_parameters.getMemoryLimitBytes());
+    require(serial_graph.files() == concurrent_graph.files());
+    require(serial_graph.files() <= target * logical_inputs);
+    require(serial_graph.path_count == concurrent_graph.path_count);
+    require(serial_graph.rank_count == concurrent_graph.rank_count);
+    require(serial_graph.path_count == logical_inputs * shards * records);
+    require(labelSorted(concurrent_graph));
+    for(size_type file = 0; file < serial_graph.files(); file++)
+    {
+      require(serial_graph.logicalFile(file) == concurrent_graph.logicalFile(file));
+      require(serial_graph.physicalShard(file) == concurrent_graph.physicalShard(file));
+      require(serial_graph.path_counts[file] == concurrent_graph.path_counts[file]);
+      require(serial_graph.rank_counts[file] == concurrent_graph.rank_counts[file]);
+      std::vector<PathNode> serial_paths, concurrent_paths;
+      std::vector<PathNode::rank_type> serial_ranks, concurrent_ranks;
+      serial_graph.read(serial_paths, serial_ranks, file);
+      concurrent_graph.read(concurrent_paths, concurrent_ranks, file);
+      require(serial_paths.size() == concurrent_paths.size());
+      require(std::memcmp(serial_paths.data(), concurrent_paths.data(),
+        serial_paths.size() * sizeof(PathNode)) == 0);
+      require(serial_ranks == concurrent_ranks);
+    }
+  }
 
   std::remove(combined_path.c_str()); std::remove(combined_rank.c_str());
   std::remove(left_path.c_str()); std::remove(left_rank.c_str());

@@ -1207,7 +1207,9 @@ reportJoinStats(const ExternalPathJoinStats& join_stats)
               << join_stats.blocked_key_groups << " blocked key groups" << std::endl;
     std::cerr << "externalPathGraphExtend(): "
               << join_stats.join_parallel_sorts << " parallel join sorts, "
-              << join_stats.label_parallel_sorts << " parallel label sorts" << std::endl;
+              << join_stats.label_parallel_sorts << " parallel label sorts, "
+              << join_stats.compaction_batches << " compaction batches ("
+              << join_stats.compaction_concurrency << " at once)" << std::endl;
     std::cerr << "externalPathGraphExtend(): phase budgets: distribution "
               << formatBytes(join_stats.distribution_sort_budget)
               << "; concurrent label sort "

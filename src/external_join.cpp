@@ -14,13 +14,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <dirent.h>
+#include <exception>
 #include <fcntl.h>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -29,6 +32,7 @@
 #include <stdexcept>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <system_error>
 #include <unistd.h>
 
 extern char** environ;
@@ -3788,6 +3792,8 @@ pathPairPeakForCodec(size_type paths, size_type ranks,
   return result;
 }
 
+} // namespace
+
 // Workers deliberately produce independent physical shards. Before exposing a
 // generation, collapse those shards per logical input so downstream mergers do
 // not allocate one pair of buffered readers (and FDs) for every partition.
@@ -3960,8 +3966,36 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
     }
   };
 
-  auto merge_batch = [&](const PathGraph& input, const std::vector<size_type>& shards,
-    PathGraph& output, logical_file_id_t logical, size_type& next_physical) -> bool
+  // What one merged batch installed. A serial batch applies it as soon as it
+  // returns; concurrent batches apply theirs in batch order once all have
+  // finished, so the frontier and the disk charge come out as the serial loop
+  // leaves them. Names are recorded before either rename, so a failed install
+  // is still owned by the generation cleanup.
+  struct BatchResult
+  {
+    std::vector<std::string> outputs;
+    std::vector<size_type> charges;
+    size_type paths = 0, ranks = 0, stored = 0;
+  };
+  auto register_outputs = [&](const BatchResult& result)
+  {
+    new_outputs.insert(new_outputs.end(), result.outputs.begin(), result.outputs.end());
+  };
+  auto apply_batch = [&](const BatchResult& result, PathGraph& output)
+  {
+    for(size_type i = 0; i < result.charges.size(); i++)
+    {
+      new_output_charges[result.outputs[i]] = result.charges[i];
+    }
+    output.path_count += result.paths; output.rank_count += result.ranks;
+    staged_committed = checkedJoinAdd(staged_committed, result.stored,
+      "committed stored output bytes");
+  };
+  const size_type pointer_limit = (static_cast<size_type>(1) << 40);
+  // Peak physical bytes of merging these shards, and the number of output
+  // pairs the 40-bit rank pointers split the result into.
+  auto batch_peak = [&](const PathGraph& input, const std::vector<size_type>& shards,
+    size_type& output_pairs) -> size_type
   {
     size_type paths = 0, ranks = 0;
     for(size_type shard : shards)
@@ -3969,16 +4003,20 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
       paths = checkedJoinAdd(paths, input.path_counts[shard], "logical merge path count");
       ranks = checkedJoinAdd(ranks, input.rank_counts[shard], "logical merge rank count");
     }
-    const size_type pointer_limit = (static_cast<size_type>(1) << 40);
     const size_type rank_capacity = pointer_limit - PathLabel::LABEL_LENGTH;
-    const size_type output_pairs = (ranks == 0 ? 1 :
-      1 + (ranks - 1) / rank_capacity);
-    const size_type peak_output_bytes = pathPairPeakForCodec(paths, ranks,
-      output_pairs, output_codec);
-    if(peak_output_bytes > size_limit ||
-       staged_committed > size_limit - peak_output_bytes)
+    output_pairs = (ranks == 0 ? 1 : 1 + (ranks - 1) / rank_capacity);
+    return pathPairPeakForCodec(paths, ranks, output_pairs, output_codec);
+  };
+
+  auto merge_batch = [&](const PathGraph& input, const std::vector<size_type>& shards,
+    PathGraph& output, const std::function<size_type()>& next_output,
+    const TempFileCodecParameters& codec, BatchResult& result)
+  {
+    size_type paths = 0, ranks = 0;
+    for(size_type shard : shards)
     {
-      return false; // Preserve the original bounded streams when duplication will not fit.
+      paths = checkedJoinAdd(paths, input.path_counts[shard], "logical merge path count");
+      ranks = checkedJoinAdd(ranks, input.rank_counts[shard], "logical merge rank count");
     }
     int path_fd = -1, rank_fd = -1;
     std::unique_ptr<CompressedBlockWriter> compressed_path, compressed_rank;
@@ -4002,37 +4040,36 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
       // Register both final names before either rename. If the second install
       // fails after the first succeeds, generation rollback still owns the
       // partially installed pair.
-      new_outputs.push_back(output.path_names[file]); new_outputs.push_back(output.rank_names[file]);
+      result.outputs.push_back(output.path_names[file]); result.outputs.push_back(output.rank_names[file]);
       const size_type stored_path_bytes = storedJoinBytes(partial_path);
       const size_type stored_rank_bytes = storedJoinBytes(partial_rank);
-      new_output_charges[output.path_names[file]] = stored_path_bytes;
-      new_output_charges[output.rank_names[file]] = stored_rank_bytes;
+      result.charges.push_back(stored_path_bytes); result.charges.push_back(stored_rank_bytes);
       if(::rename(partial_path.c_str(), output.path_names[file].c_str()) != 0 ||
          ::rename(partial_rank.c_str(), output.rank_names[file].c_str()) != 0)
       {
         throw joinError("cannot install logical merge output");
       }
       output.path_counts[file] = written_paths; output.rank_counts[file] = written_ranks;
-      output.path_count += written_paths; output.rank_count += written_ranks;
+      result.paths += written_paths; result.ranks += written_ranks;
       const size_type output_bytes = checkedJoinAdd(stored_path_bytes,
         stored_rank_bytes, "stored logical-merge output bytes");
-      staged_committed = checkedJoinAdd(staged_committed, output_bytes,
+      result.stored = checkedJoinAdd(result.stored, output_bytes,
         "committed stored output bytes");
     };
     auto open_output = [&]()
     {
-      file = appendOutputShard(output, logical, physical_shard_id_t(next_physical++));
+      file = next_output();
       partial_path = output.path_names[file] + ".partial";
       partial_rank = output.rank_names[file] + ".partial";
       std::remove(partial_path.c_str()); std::remove(partial_rank.c_str());
-      if(output_codec.enabled())
+      if(codec.enabled())
       {
         compressed_path.reset(new CompressedBlockWriter(partial_path,
-          output_codec.block_size, CompressedBlockWriter::ZSTD,
-          output_codec.level, output_codec.workers));
+          codec.block_size, CompressedBlockWriter::ZSTD,
+          codec.level, codec.workers));
         compressed_rank.reset(new CompressedBlockWriter(partial_rank,
-          output_codec.block_size, CompressedBlockWriter::ZSTD,
-          output_codec.level, output_codec.workers));
+          codec.block_size, CompressedBlockWriter::ZSTD,
+          codec.level, codec.workers));
         written_paths = 0; written_ranks = 0;
         return;
       }
@@ -4125,7 +4162,6 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
       {
         throw joinError("logical shard merge output count mismatch");
       }
-      return true;
     }
     catch(...)
     {
@@ -4136,6 +4172,50 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
       throw;
     }
   };
+
+  // The batches of one pass read disjoint shards and write their own outputs,
+  // so they can run at once. They do when every batch fits in one output pair
+  // (its name can then be allocated up front), when the disk limit admits every
+  // batch's peak together (the serial loop, which charges actual stored bytes,
+  // would then admit each batch as well), and when the budget admits more than
+  // one set of readers. A concurrent writer compresses in its own thread, so
+  // the batches together stay within the configured thread count.
+  const size_type thread_limit = static_cast<size_type>(std::max(1, omp_get_max_threads()));
+  TempFileCodecParameters concurrent_codec = output_codec;
+  concurrent_codec.workers = 1;
+  const size_type concurrent_writer_bytes = (concurrent_codec.enabled() ?
+    checkedJoinMultiply(2, CompressedBlockWriter::workingMemoryEstimate(
+      concurrent_codec.block_size, CompressedBlockWriter::ZSTD,
+      concurrent_codec.level, concurrent_codec.workers),
+      "concurrent logical merge writer bytes") :
+    2 * JOIN_IO_BUFFER_BYTES);
+  auto concurrent_batches = [&](const PathGraph& input,
+    const std::vector<std::vector<size_type>>& batches, size_type batch_width,
+    size_type& per_batch_bytes) -> size_type
+  {
+    size_type merges = 0, peak_sum = 0;
+    for(const std::vector<size_type>& batch : batches)
+    {
+      if(batch.size() == 1) { continue; }
+      size_type output_pairs = 0;
+      const size_type peak = batch_peak(input, batch, output_pairs);
+      if(output_pairs != 1 || peak > size_limit) { return static_cast<size_type>(1); }
+      peak_sum = checkedJoinAdd(peak_sum, peak, "concurrent logical merge peak bytes");
+      merges++;
+    }
+    if(merges < 2 || thread_limit < 2 || staged_committed > size_limit ||
+       peak_sum > size_limit - staged_committed)
+    {
+      return static_cast<size_type>(1);
+    }
+    per_batch_bytes = checkedJoinAdd(concurrent_writer_bytes,
+      checkedJoinMultiply(batch_width, reader_bytes, "concurrent logical merge reader bytes"),
+      "concurrent logical merge batch bytes");
+    const size_type by_memory = 1 + static_cast<size_type>(memory.available()) / per_batch_bytes;
+    return std::min(std::min(merges, thread_limit), by_memory);
+  };
+  size_type merged_batches = 0, max_concurrency = 0;
+  size_type peak_records = merge_fan_in, peak_bytes = merge_reservation;
 
   PathGraph compacted(0, source.k(), source.step());
   compacted.delete_files = false; // It borrows retained source aliases until commit.
@@ -4175,26 +4255,111 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
       batch_width = std::min(batch_width, merge_fan_in);
       PathGraph pass(0, source.k(), source.step()); pass.delete_files = false;
       std::vector<size_type> next_origin;
+      std::vector<std::vector<size_type>> batches;
       for(size_type first = 0; first < current.files(); first += batch_width)
       {
         size_type last = std::min(current.files(), first + batch_width);
-        if(last - first == 1)
-        {
-          size_type file = first;
-          pass.path_names.push_back(current.path_names[file]); pass.rank_names.push_back(current.rank_names[file]);
-          pass.path_counts.push_back(current.path_counts[file]); pass.rank_counts.push_back(current.rank_counts[file]);
-          pass.logical_file_ids.push_back(logical); pass.physical_shard_ids.push_back(current.physical_shard_ids[file]);
-          pass.path_count += current.path_counts[file]; pass.rank_count += current.rank_counts[file];
-          next_origin.push_back(origin[file]); continue;
-        }
         std::vector<size_type> batch;
         for(size_type file = first; file < last; file++) { batch.push_back(file); }
-        if(!merge_batch(current, batch, pass, logical, next_physical)) { return; }
-        for(size_type file = first; file < last; file++)
+        batches.push_back(batch);
+      }
+      auto pass_through = [&](size_type file)
+      {
+        pass.path_names.push_back(current.path_names[file]); pass.rank_names.push_back(current.rank_names[file]);
+        pass.path_counts.push_back(current.path_counts[file]); pass.rank_counts.push_back(current.rank_counts[file]);
+        pass.logical_file_ids.push_back(logical); pass.physical_shard_ids.push_back(current.physical_shard_ids[file]);
+        pass.path_count += current.path_counts[file]; pass.rank_count += current.rank_counts[file];
+        next_origin.push_back(origin[file]);
+      };
+      auto retire_batch = [&](const std::vector<size_type>& batch)
+      {
+        for(size_type file : batch)
         {
           if(origin[file] != std::numeric_limits<size_type>::max()) { obsolete.push_back(origin[file]); }
         }
         next_origin.push_back(std::numeric_limits<size_type>::max());
+      };
+      size_type per_batch_bytes = 0;
+      const size_type concurrency = concurrent_batches(current, batches, batch_width,
+        per_batch_bytes);
+      if(concurrency > 1)
+      {
+        // Name every output here, in batch order: TempFile is not thread-safe,
+        // and this is the order in which the serial loop allocates physical ids.
+        const size_type unnamed = std::numeric_limits<size_type>::max();
+        std::vector<size_type> output_file(batches.size(), unnamed);
+        for(size_type i = 0; i < batches.size(); i++)
+        {
+          if(batches[i].size() == 1) { pass_through(batches[i].front()); continue; }
+          output_file[i] = appendOutputShard(pass, logical, physical_shard_id_t(next_physical++));
+          retire_batch(batches[i]);
+        }
+        // merge_reservation already covers one batch.
+        MemoryBudget::Reservation concurrent_memory = memory.reserve(
+          checkedJoinMultiply(concurrency - 1, per_batch_bytes, "concurrent logical merge bytes"),
+          "logical-shard-merge-concurrent");
+        std::vector<BatchResult> results(batches.size());
+        std::vector<std::exception_ptr> errors(batches.size());
+        std::atomic<size_type> next_batch(0);
+        auto run = [&]()
+        {
+          for(size_type i = next_batch++; i < batches.size(); i = next_batch++)
+          {
+            if(output_file[i] == unnamed) { continue; }
+            try
+            {
+              bool opened = false;
+              merge_batch(current, batches[i], pass, [&]() -> size_type
+              {
+                if(opened) { throw joinError("concurrent logical merge needs a second output pair"); }
+                opened = true; return output_file[i];
+              }, concurrent_codec, results[i]);
+            }
+            catch(...) { errors[i] = std::current_exception(); }
+          }
+        };
+        std::vector<std::thread> threads;
+        // A thread that cannot start leaves its batches to the others: the
+        // shared queue, not the thread count, decides which batches run.
+        try { for(size_type t = 1; t < concurrency; t++) { threads.emplace_back(run); } }
+        catch(const std::system_error&) { }
+        run();
+        for(std::thread& thread : threads) { thread.join(); }
+        for(const BatchResult& result : results) { register_outputs(result); }
+        for(const std::exception_ptr& error : errors) { if(error) { std::rethrow_exception(error); } }
+        for(size_type i = 0; i < batches.size(); i++)
+        {
+          if(output_file[i] != unnamed) { apply_batch(results[i], pass); merged_batches++; }
+        }
+        max_concurrency = std::max(max_concurrency, concurrency);
+        peak_records = std::max(peak_records, concurrency * batch_width);
+        peak_bytes = std::max(peak_bytes, merge_reservation + (concurrency - 1) * per_batch_bytes);
+      }
+      else
+      {
+        for(const std::vector<size_type>& batch : batches)
+        {
+          if(batch.size() == 1) { pass_through(batch.front()); continue; }
+          size_type output_pairs = 0;
+          const size_type peak_output_bytes = batch_peak(current, batch, output_pairs);
+          if(peak_output_bytes > size_limit ||
+             staged_committed > size_limit - peak_output_bytes)
+          {
+            return; // Preserve the original bounded streams when duplication will not fit.
+          }
+          BatchResult result;
+          try
+          {
+            merge_batch(current, batch, pass, [&]() -> size_type
+            {
+              return appendOutputShard(pass, logical, physical_shard_id_t(next_physical++));
+            }, output_codec, result);
+          }
+          catch(...) { register_outputs(result); throw; }
+          register_outputs(result); apply_batch(result, pass);
+          retire_batch(batch);
+          merged_batches++; max_concurrency = std::max(max_concurrency, static_cast<size_type>(1));
+        }
       }
       current.swap(pass); current.delete_files = false;
       origin.swap(next_origin);
@@ -4245,11 +4410,15 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
   committed_bytes = staged_committed;
   if(stats != nullptr)
   {
-    stats->max_records_resident = std::max(stats->max_records_resident, merge_fan_in);
-    stats->max_bytes_resident = std::max(stats->max_bytes_resident,
-      merge_reservation);
+    stats->max_records_resident = std::max(stats->max_records_resident, peak_records);
+    stats->max_bytes_resident = std::max(stats->max_bytes_resident, peak_bytes);
+    stats->compaction_batches += merged_batches;
+    stats->compaction_concurrency = std::max(stats->compaction_concurrency, max_concurrency);
   }
 }
+
+namespace
+{
 
 std::string
 joinPartitionTaskName(const std::string& generation,

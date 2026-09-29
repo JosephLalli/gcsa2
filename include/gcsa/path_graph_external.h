@@ -18,6 +18,7 @@
 #define GCSA_PATH_GRAPH_EXTERNAL_H
 
 #include <gcsa/path_graph.h>
+#include <gcsa/resources.h>
 
 namespace gcsa
 {
@@ -166,6 +167,8 @@ struct ExternalPathJoinStats
   // label sorting and join blocking are concurrent and must sum to the limit.
   size_type distribution_sort_budget, label_sort_budget, join_block_budget;
   size_type max_records_resident, max_bytes_resident;
+  // Post-join compaction: merged batches, and the most that ran at once.
+  size_type compaction_batches, compaction_concurrency;
 
   ExternalPathJoinStats() :
     left_records(0), right_records(0), sorted_bypass(0), generated_records(0),
@@ -184,7 +187,8 @@ struct ExternalPathJoinStats
     join_sidecar_logical_bytes(0), join_sidecar_stored_bytes(0),
     compressed_join_sidecars(0),
     distribution_sort_budget(0), label_sort_budget(0), join_block_budget(0),
-    max_records_resident(0), max_bytes_resident(0) { }
+    max_records_resident(0), max_bytes_resident(0),
+    compaction_batches(0), compaction_concurrency(0) { }
 };
 
 // Prefix doubling with a bounded external sort-merge join. Input shards with
@@ -193,6 +197,14 @@ size_type externalPathJoinMinimumBudget();
 void externalPathGraphExtend(PathGraph& graph, size_type size_limit,
   const ConstructionParameters& parameters, ExternalPathJoinStats* stats = nullptr,
   BuildWorkspace* workspace = nullptr, const std::string& checkpoint_task = std::string());
+
+// Collapses the join workers' physical shards per logical input to at most the
+// pairs the next merge holds open. externalPathGraphExtend() calls it after the
+// joins; it is declared for the tests of its concurrent batches.
+void compactLogicalJoinShards(PathGraph& source, size_type size_limit,
+  const ConstructionParameters& parameters, size_type label_fan_in,
+  MemoryBudget& memory, size_type& committed_bytes,
+  ExternalPathJoinStats* stats);
 
 // Hidden child-process entry point used by build_gcsa and vg. The task file is
 // versioned and contains immutable run ranges plus unique output paths.
