@@ -764,8 +764,18 @@ Label-sort runs group shared left contexts and prefix-compress labels, but a
 deeper reference representation spanning the pre-sort join stream remains an
 optional compaction rather than a feasibility dependency.
 Final component construction is serial and the ordered event scan resumes only
-at its task boundary. Process workers currently accelerate independent join
-ranges only. Even with these limitations, preprocessing and prefix doubling no
+at its task boundary. Process workers accelerate independent join ranges, and
+post-join compaction runs the batches of a pass on up to `-t` threads when each
+batch fits one output pair and the disk and memory budgets admit them together.
+On the chr21 k32 fixture (2026-09-28, 200 GiB goal, `-t 24`) that took step-4
+compaction from 682.8 s to 82.4 s (48 batches, 24 at once) with the reference
+`.gcsa` and `.lcp` digests unchanged. When the budget admits two distribution
+sorters the two join sides are scanned concurrently, but each side's sort,
+record encoding and write happen in `ExternalJoinSorter::finish()`, which still
+runs one side after the other; on the same fixture the concurrent scan left
+distribution within run-to-run variation. That path also calls
+`TempFile::getName()` from both scan threads whenever a side's buffer fills
+mid-scan, and `TempFile` is not thread-safe. Even with these limitations, preprocessing and prefix doubling no
 longer require a logical chromosome, physical shard, join key, equal-label prune
 group, same-from set, or generated label run to fit in RAM, and LCP no longer
 retains all raw hierarchy levels. One final path's mapped start-node set is also
