@@ -135,6 +135,10 @@ public:
   static std::size_t prefetchWorkingMemoryEstimate(std::size_t block_bytes);
   std::size_t read(void* data, std::size_t bytes);
   std::size_t readAt(std::uint64_t offset, void* data, std::size_t bytes);
+  // A sequential reader normally advises the kernel to drop the pages of
+  // blocks it has consumed. Several readers scanning one stream at once must
+  // not: the leader would evict what the others are about to read.
+  void retainPageCache() { this->retain_cache = true; }
   void seekUncompressedByte(std::uint64_t offset);
   void seekBlock(std::uint64_t block);
   std::uint64_t blocks() const { return block_count; }
@@ -172,6 +176,7 @@ private:
   // stream still costs exactly one descriptor.
   int cache_descriptor;
   std::uint64_t cache_released;
+  bool retain_cache;
   std::shared_ptr<CompressedBlockPrefetchPool> prefetch_pool;
   std::uint64_t prefetch_owner;
   bool extent_cached;

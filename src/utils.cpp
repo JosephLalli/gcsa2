@@ -31,6 +31,7 @@
 #include <cmath>
 #include <iomanip>
 #include <limits>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -231,6 +232,11 @@ namespace TempFile
   const std::string DEFAULT_TEMP_DIR = ".";
   std::string temp_dir = DEFAULT_TEMP_DIR;
 
+  // Guards counter, temp_dir and the handler's set: the external join names
+  // temporaries from several threads at once. Defined before the handler so
+  // it is still alive when the handler's destructor runs at exit.
+  std::mutex mutex;
+
   // By storing the filenames in a static object, we can delete the remaining
   // temporary files when std::exit() is called.
   struct Handler
@@ -238,6 +244,7 @@ namespace TempFile
     std::set<std::string> filenames;
     ~Handler()
     {
+      std::lock_guard<std::mutex> lock(mutex);
       for(auto& filename : this->filenames)
       {
         std::remove(filename.c_str());
@@ -248,6 +255,7 @@ namespace TempFile
   void
   setDirectory(const std::string& directory)
   {
+    std::lock_guard<std::mutex> lock(mutex);
     if(directory.empty()) { temp_dir = DEFAULT_TEMP_DIR; }
     else if(directory[directory.length() - 1] != '/') { temp_dir = directory; }
     else { temp_dir = directory.substr(0, directory.length() - 1); }
@@ -259,6 +267,7 @@ namespace TempFile
     char hostname[32];
     gethostname(hostname, 32); hostname[31] = 0;
 
+    std::lock_guard<std::mutex> lock(mutex);
     std::string filename = temp_dir + '/' + name_part + '_'
       + std::string(hostname) + '_'
       + sdsl::util::to_string(sdsl::util::pid()) + '_'
@@ -275,6 +284,7 @@ namespace TempFile
     if(!(filename.empty()))
     {
       std::remove(filename.c_str());
+      std::lock_guard<std::mutex> lock(mutex);
       handler.filenames.erase(filename);
       filename.clear();
     }
@@ -282,6 +292,7 @@ namespace TempFile
 
   void
   forget() {
+    std::lock_guard<std::mutex> lock(mutex);
     handler.filenames.clear();
     counter = 0;
   }

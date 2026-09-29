@@ -1773,12 +1773,16 @@ mergeJoinRuns(const std::vector<JoinRun>& inputs, logical_file_id_t logical,
 class ExternalJoinSorter
 {
 public:
+  // A sorter owned by one of several concurrent range workers sorts on its own
+  // thread: the workers are the parallelism, and an OpenMP team per worker
+  // would oversubscribe the configured thread count.
   ExternalJoinSorter(logical_file_id_t logical, JoinKeyKind kind,
     size_type byte_budget, size_type requested_fan_in, bool verify_payloads,
-    ExternalPathJoinStats* stats, const TempFileCodecParameters& run_codec) :
+    ExternalPathJoinStats* stats, const TempFileCodecParameters& run_codec,
+    bool parallel_sort = true) :
     logical_id(logical), key_kind(kind), budget(byte_budget), fan_in(0),
-    run_records(0), verify_runs(verify_payloads), statistics(stats),
-    codec(run_codec)
+    run_records(0), verify_runs(verify_payloads), parallel_sorting(parallel_sort),
+    statistics(stats), codec(run_codec)
   {
     if(this->budget < joinRunSortMinimumBudget(this->codec))
     {
@@ -1864,7 +1868,8 @@ private:
     // Sorting is in-place inside the run's existing byte reservation. Large
     // runs use the construction thread pool; tiny runs stay sequential to
     // avoid making forced-spill tests and small indexes pay team startup cost.
-    if(this->buffer.size() >= JOIN_PARALLEL_SORT_MIN_RECORDS && omp_get_max_threads() > 1)
+    if(this->parallel_sorting && this->buffer.size() >= JOIN_PARALLEL_SORT_MIN_RECORDS &&
+       omp_get_max_threads() > 1)
     {
       parallelQuickSort(this->buffer.begin(), this->buffer.end(), joinRecordLess);
       if(this->statistics != nullptr) { this->statistics->join_parallel_sorts++; }
@@ -1902,7 +1907,7 @@ private:
   logical_file_id_t logical_id;
   JoinKeyKind key_kind;
   size_type budget, fan_in, run_records;
-  bool verify_runs;
+  bool verify_runs, parallel_sorting;
   ExternalPathJoinStats* statistics;
   TempFileCodecParameters codec;
   std::vector<JoinRecord> buffer;
@@ -1912,11 +1917,14 @@ private:
 class PathShardReader
 {
 public:
-  PathShardReader(const PathGraph& graph, size_type file) :
+  // With shared_cache, the reader leaves the pages it has consumed in the page
+  // cache: the key-range scan runs several readers over the same shards at
+  // once, and the leader must not evict what the others are about to read.
+  PathShardReader(const PathGraph& graph, size_type file, bool shared_cache = false) :
     path_name(graph.path_names.at(file)), rank_name(graph.rank_names.at(file)),
     path_descriptor(-1), rank_descriptor(-1), path_count(graph.path_counts.at(file)),
     rank_count(graph.rank_counts.at(file)), path_offset(0), rank_offset(0),
-    path_cache_released(0), rank_cache_released(0),
+    path_cache_released(0), rank_cache_released(0), retain_cache(shared_cache),
     path_buffer(std::max(static_cast<size_type>(1), JOIN_IO_BUFFER_BYTES / sizeof(PathNode))),
     rank_buffer(std::max(static_cast<size_type>(1),
       JOIN_IO_BUFFER_BYTES / sizeof(PathNode::rank_type))),
@@ -1934,6 +1942,10 @@ public:
     {
       this->compressed_path.reset(new CompressedBlockReader(this->path_name));
       this->compressed_rank.reset(new CompressedBlockReader(this->rank_name));
+      if(this->retain_cache)
+      {
+        this->compressed_path->retainPageCache(); this->compressed_rank->retainPageCache();
+      }
       if(this->compressed_path->logicalSize() !=
            checkedJoinMultiply(this->path_count, sizeof(PathNode), "path shard logical bytes") ||
          this->compressed_rank->logicalSize() !=
@@ -1965,11 +1977,13 @@ public:
   {
     if(this->path_descriptor >= 0)
     {
-      discardCachedRange(this->path_descriptor, 0, 0); ::close(this->path_descriptor);
+      if(!this->retain_cache) { discardCachedRange(this->path_descriptor, 0, 0); }
+      ::close(this->path_descriptor);
     }
     if(this->rank_descriptor >= 0)
     {
-      discardCachedRange(this->rank_descriptor, 0, 0); ::close(this->rank_descriptor);
+      if(!this->retain_cache) { discardCachedRange(this->rank_descriptor, 0, 0); }
+      ::close(this->rank_descriptor);
     }
   }
 
@@ -2027,7 +2041,7 @@ private:
       preadAll(this->path_descriptor, this->path_buffer.data(), bytes,
         this->path_buffer_first * sizeof(PathNode), this->path_name);
     }
-    if(this->path_descriptor >= 0)
+    if(this->path_descriptor >= 0 && !this->retain_cache)
     {
       trimReadCache(this->path_descriptor,
         (this->path_buffer_first + this->path_buffer_records) * sizeof(PathNode),
@@ -2053,7 +2067,7 @@ private:
       preadAll(this->rank_descriptor, this->rank_buffer.data(), bytes,
         this->rank_buffer_first * sizeof(PathNode::rank_type), this->rank_name);
     }
-    if(this->rank_descriptor >= 0)
+    if(this->rank_descriptor >= 0 && !this->retain_cache)
     {
       trimReadCache(this->rank_descriptor,
         (this->rank_buffer_first + this->rank_buffer_records) * sizeof(PathNode::rank_type),
@@ -2085,6 +2099,7 @@ private:
   int path_descriptor, rank_descriptor;
   size_type path_count, rank_count, path_offset, rank_offset;
   off_t path_cache_released, rank_cache_released;
+  bool retain_cache;
   std::vector<PathNode> path_buffer;
   std::vector<PathNode::rank_type> rank_buffer;
   size_type path_buffer_first, path_buffer_records;
@@ -2163,6 +2178,185 @@ scanJoinSide(const PathGraph& graph, const std::vector<size_type>& shards,
       else if(!record.node.sorted())
       {
         record.key = record.node.to; sorter.add(record);
+        if(stats != nullptr) { stats->left_records++; }
+      }
+    }
+  }
+}
+
+/*
+  Key-range distribution.
+
+  One logical input's distribution is a sort of its records by join key on each
+  side. Splitting the key space into ranges splits that sort into independent
+  sorts that run at once: a range worker rescans the input's shards and keeps
+  the records whose key falls in its range, so its runs are exactly the slice
+  of the single serial run that lies between its boundaries, and the ranges
+  concatenated in key order are that run. Both sides key on node ids, so one
+  set of boundaries keeps every joinable pair in the same range. The boundaries
+  come from a systematic sample of the input and are committed to the
+  workspace: a resumed step reuses them whatever its thread count, so the
+  per-range runs, and the plan and partition task names derived from their
+  checksums, come out the same.
+*/
+constexpr size_type JOIN_RANGE_MIN_RECORDS = 64 * 1024;
+constexpr size_type JOIN_RANGE_SAMPLE_POSITIONS = 32;
+constexpr size_type JOIN_RANGE_SAMPLE_RECORDS = 2048;
+constexpr size_type JOIN_RANGE_PLAN_MAX_BYTES = MEGABYTE;
+constexpr std::uint64_t JOIN_RANGE_PLAN_MAGIC = 0x31504e5247534347ULL; // "GCSGRNP1"
+constexpr std::uint32_t JOIN_RANGE_PLAN_VERSION = 1;
+
+struct JoinRangePlan
+{
+  size_type records;                  // paths in the input, the plan's identity
+  std::vector<node_type> boundaries;  // increasing; range r is [boundaries[r-1], boundaries[r])
+
+  JoinRangePlan() : records(0), boundaries() { }
+  size_type ranges() const { return this->boundaries.size() + 1; }
+  node_type lower(size_type range) const
+  {
+    return (range == 0 ? node_type(0) : this->boundaries[range - 1]);
+  }
+};
+
+size_type
+countJoinRecords(const PathGraph& graph, const std::vector<size_type>& shards)
+{
+  size_type total = 0;
+  for(size_type shard : shards)
+  {
+    total = checkedJoinAdd(total, graph.path_counts[shard], "logical input path count");
+  }
+  return total;
+}
+
+// Reads JOIN_RANGE_SAMPLE_RECORDS consecutive paths at each of
+// JOIN_RANGE_SAMPLE_POSITIONS evenly spaced positions and collects their join
+// keys: every from node, and the to node of every unsorted path. Shards are
+// label-sorted, and paths adjacent in label order come from unrelated graph
+// positions, so a block of consecutive paths samples node ids about as well as
+// the same number of scattered paths, at one block decode per position.
+void
+sampleInputJoinKeys(const PathGraph& graph, const std::vector<size_type>& shards,
+  std::vector<node_type>& keys)
+{
+  const size_type total = countJoinRecords(graph, shards);
+  if(total == 0) { return; }
+  const size_type positions = std::min(JOIN_RANGE_SAMPLE_POSITIONS, total);
+  const size_type quotient = total / positions, remainder = total % positions;
+  size_type position = 0, cumulative = 0;
+  std::vector<PathNode> nodes;
+  for(size_type shard : shards)
+  {
+    const size_type count = graph.path_counts[shard];
+    const std::string& name = graph.path_names[shard];
+    std::unique_ptr<CompressedBlockReader> compressed;
+    int descriptor = -1;
+    try
+    {
+      while(position < positions)
+      {
+        const size_type start = position * quotient + (position * remainder) / positions;
+        if(start >= cumulative + count) { break; }
+        const size_type offset = start - cumulative;
+        const size_type records = std::min(JOIN_RANGE_SAMPLE_RECORDS, count - offset);
+        const size_type bytes = records * sizeof(PathNode);
+        nodes.resize(records);
+        if(!compressed && descriptor < 0)
+        {
+          if(CompressedBlockReader::isFramed(name))
+          {
+            compressed.reset(new CompressedBlockReader(name));
+          }
+          else
+          {
+            descriptor = ::open(name.c_str(), O_RDONLY);
+            if(descriptor < 0) { throw joinError("cannot open path shard", name); }
+          }
+        }
+        if(compressed)
+        {
+          if(compressed->readAt(offset * sizeof(PathNode), nodes.data(), bytes) != bytes)
+          {
+            throw joinError("short compressed path shard", name);
+          }
+        }
+        else { preadAll(descriptor, nodes.data(), bytes, offset * sizeof(PathNode), name); }
+        for(const PathNode& node : nodes)
+        {
+          keys.push_back(node.from);
+          if(!node.sorted()) { keys.push_back(node.to); }
+        }
+        position++;
+      }
+    }
+    catch(...)
+    {
+      if(descriptor >= 0) { ::close(descriptor); }
+      throw;
+    }
+    if(descriptor >= 0) { ::close(descriptor); }
+    cumulative += count;
+  }
+}
+
+JoinRangePlan
+planJoinRanges(const PathGraph& graph, const std::vector<size_type>& shards,
+  size_type requested_ranges)
+{
+  JoinRangePlan plan;
+  plan.records = countJoinRecords(graph, shards);
+  const size_type ranges = std::min(requested_ranges,
+    plan.records / JOIN_RANGE_MIN_RECORDS);
+  if(ranges < 2) { return plan; }
+  std::vector<node_type> keys;
+  sampleInputJoinKeys(graph, shards, keys);
+  if(keys.size() < ranges) { return plan; }
+  std::sort(keys.begin(), keys.end());
+  for(size_type range = 1; range < ranges; range++)
+  {
+    // Quantiles of the sample, so every range holds about the same number of
+    // join records. A repeated quantile or a zero key just yields fewer ranges.
+    const node_type boundary = keys[(keys.size() / ranges) * range +
+      ((keys.size() % ranges) * range) / ranges];
+    if(boundary == 0) { continue; }
+    if(plan.boundaries.empty() || boundary > plan.boundaries.back())
+    {
+      plan.boundaries.push_back(boundary);
+    }
+  }
+  return plan;
+}
+
+// One range worker's scan: every shard of the input, keeping the records whose
+// join key lies in the range. Ordinals count every record of the input as the
+// serial scan does, so the kept records carry the same ordinals.
+void
+scanJoinRange(const PathGraph& graph, const std::vector<size_type>& shards,
+  logical_file_id_t logical, const JoinRangePlan& plan, size_type range,
+  ExternalJoinSorter& right_sorter, ExternalJoinSorter& left_sorter,
+  ExternalPathJoinStats* stats)
+{
+  const node_type lower = plan.lower(range);
+  const bool last = (range + 1 == plan.ranges());
+  const node_type upper = (last ? node_type(0) : plan.boundaries[range]);
+  std::uint64_t ordinal = 0;
+  for(size_type shard : shards)
+  {
+    PathShardReader reader(graph, shard, true);
+    JoinRecord record;
+    while(reader.read(record))
+    {
+      record.logical = logical; record.ordinal = ordinal++;
+      const node_type from = record.node.from, to = record.node.to;
+      if(from >= lower && (last || from < upper))
+      {
+        record.key = from; right_sorter.add(record);
+        if(stats != nullptr) { stats->right_records++; }
+      }
+      if(!record.node.sorted() && to >= lower && (last || to < upper))
+      {
+        record.key = to; left_sorter.add(record);
         if(stats != nullptr) { stats->left_records++; }
       }
     }
@@ -2775,6 +2969,101 @@ readPlanValue(const std::vector<std::uint8_t>& source, size_type& offset)
   }
   const std::uint8_t* input = source.data() + offset;
   Value result = decodeLittle<Value>(input); offset += sizeof(Value);
+  return result;
+}
+
+std::string
+joinRangePlanTaskName(const std::string& generation, logical_file_id_t logical)
+{
+  return generation + "-range-plan-l" + std::to_string(logical.value) + "-v1";
+}
+
+ArtifactIdentity
+joinRangePlanArtifact(const std::string& task)
+{
+  return ArtifactIdentity(task, "range-plan", "key-ranges", "join-range-plan-v1");
+}
+
+std::vector<std::uint8_t>
+encodeJoinRangePlan(const JoinRangePlan& plan, logical_file_id_t logical)
+{
+  std::vector<std::uint8_t> result;
+  appendPlanValue<std::uint64_t>(result, JOIN_RANGE_PLAN_MAGIC);
+  appendPlanValue<std::uint32_t>(result, JOIN_RANGE_PLAN_VERSION);
+  appendPlanValue<std::uint32_t>(result, logical.value);
+  appendPlanValue<std::uint64_t>(result, plan.records);
+  appendPlanValue<std::uint64_t>(result, plan.boundaries.size());
+  for(node_type boundary : plan.boundaries) { appendPlanValue<node_type>(result, boundary); }
+  return result;
+}
+
+JoinRangePlan
+decodeJoinRangePlan(const std::vector<std::uint8_t>& payload,
+  logical_file_id_t logical, size_type records)
+{
+  size_type offset = 0;
+  if(readPlanValue<std::uint64_t>(payload, offset) != JOIN_RANGE_PLAN_MAGIC ||
+     readPlanValue<std::uint32_t>(payload, offset) != JOIN_RANGE_PLAN_VERSION ||
+     readPlanValue<std::uint32_t>(payload, offset) != logical.value ||
+     readPlanValue<std::uint64_t>(payload, offset) != records)
+  {
+    throw joinError("key-range plan does not match its join input");
+  }
+  JoinRangePlan result;
+  result.records = records;
+  const size_type boundaries = readPlanValue<std::uint64_t>(payload, offset);
+  if(boundaries > (payload.size() - offset) / sizeof(node_type) ||
+     offset + boundaries * sizeof(node_type) != payload.size())
+  {
+    throw joinError("invalid key-range plan boundary count");
+  }
+  result.boundaries.reserve(boundaries);
+  for(size_type i = 0; i < boundaries; i++)
+  {
+    const node_type boundary = readPlanValue<node_type>(payload, offset);
+    if(boundary == 0 || (!result.boundaries.empty() && boundary <= result.boundaries.back()))
+    {
+      throw joinError("key-range plan boundaries are not increasing");
+    }
+    result.boundaries.push_back(boundary);
+  }
+  return result;
+}
+
+JoinRangePlan
+loadOrCreateJoinRangePlan(const PathGraph& graph, const std::vector<size_type>& shards,
+  logical_file_id_t logical, size_type requested_ranges, BuildWorkspace* workspace,
+  const std::string& checkpoint_task, ExternalPathJoinStats* stats)
+{
+  JoinRangePlan result;
+  std::string task;
+  bool restored = false;
+  if(workspace != nullptr && !checkpoint_task.empty())
+  {
+    task = joinRangePlanTaskName(checkpoint_task, logical);
+    if(workspace->task_completed(task, "range-plan"))
+    {
+      result = decodeJoinRangePlan(workspace->read_artifact_payload(
+        joinRangePlanArtifact(task), logical, physical_shard_id_t(0),
+        JOIN_RANGE_PLAN_MAX_BYTES), logical, countJoinRecords(graph, shards));
+      restored = true;
+    }
+  }
+  if(!restored)
+  {
+    result = planJoinRanges(graph, shards, requested_ranges);
+    if(workspace != nullptr && !task.empty())
+    {
+      std::vector<std::uint8_t> payload = encodeJoinRangePlan(result, logical);
+      BuildWorkspace::ArtifactWriter writer = workspace->open_artifact(
+        joinRangePlanArtifact(task), logical, physical_shard_id_t(0), "key", "all");
+      writer.write(payload.data(), payload.size());
+      std::vector<BuildWorkspace::ArtifactRef> artifacts;
+      artifacts.push_back(writer.finish(result.boundaries.size()));
+      workspace->commit_task(task, "range-plan", artifacts);
+    }
+  }
+  if(stats != nullptr && restored) { stats->restored_range_plans++; }
   return result;
 }
 
@@ -4689,9 +4978,17 @@ removeWorkerTemporaries(const std::string& directory, pid_t pid)
   ::closedir(handle);
 }
 
+// The sorted runs of one key range of a logical input, and the partitions the
+// planner cut them into. The serial distribution is the single range.
+struct RangeJoin
+{
+  JoinRun left, right;
+  std::vector<JoinPartition> partitions;
+};
+
 void
-runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
-  logical_file_id_t logical, const std::vector<JoinPartition>& partitions,
+runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
+  logical_file_id_t logical,
   size_type size_limit, const ConstructionParameters& parameters,
   size_type label_fan_in, PathGraph& next, size_type& next_physical,
   size_type& committed_bytes, ExternalPathJoinStats* stats,
@@ -4701,10 +4998,18 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
   {
     throw joinError("process workers require a worker executable");
   }
-  size_type requested = std::min(parameters.getProcessWorkers(), partitions.size());
+  size_type total_partitions = 0, pair_reader_bytes = 0;
+  for(const RangeJoin& job : jobs)
+  {
+    total_partitions = checkedJoinAdd(total_partitions, job.partitions.size(),
+      "join partitions of all key ranges");
+    pair_reader_bytes = std::max(pair_reader_bytes,
+      joinRunReaderPairMemory(job.left, job.right));
+  }
+  if(total_partitions == 0) { return; }
+  size_type requested = std::min(parameters.getProcessWorkers(), total_partitions);
   size_type minimum_join = checkedJoinAdd(joinRawMinimumBudget(),
-    joinRunReaderPairMemory(left, right),
-    "minimum compressed worker join scan");
+    pair_reader_bytes, "minimum compressed worker join scan");
   size_type minimum_worker = checkedJoinAdd(externalPathGraphSortMinimumBudget(),
     minimum_join, "minimum worker reservation");
   // Leave room for the coordinator, allocator metadata, dynamic-library state,
@@ -4735,7 +5040,7 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
   size_type planned_bytes = 0;
   size_type largest_peak = 0, largest_paths = 0, largest_ranks = 0;
   size_type planned_paths = 0, planned_ranks = 0;
-  for(const JoinPartition& partition : partitions)
+  for(const RangeJoin& job : jobs) for(const JoinPartition& partition : job.partitions)
   {
     const size_type peak_bytes = externalPathGraphShardPeakBytes(
       partition.expected_paths, partition.expected_ranks,
@@ -4768,7 +5073,7 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
   if(Verbosity::level >= Verbosity::EXTENDED)
   {
     std::cerr << "externalPathGraphExtend(): partition plan: "
-              << partitions.size() << " partitions, " << planned_paths
+              << total_partitions << " partitions, " << planned_paths
               << " paths and " << planned_ranks << " ranks, planning "
               << formatBytes(planned_bytes)
               << " against a remaining disk limit of " << formatBytes(size_limit)
@@ -4777,8 +5082,7 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
     std::cerr << "externalPathGraphExtend(): largest partition plans "
               << formatBytes(largest_peak) << " for " << largest_paths
               << " paths and " << largest_ranks << " ranks; mean "
-              << formatBytes(planned_bytes /
-                   std::max(static_cast<size_type>(1), partitions.size()))
+              << formatBytes(planned_bytes / total_partitions)
               << " per partition" << std::endl;
   }
   if(planned_bytes > size_limit || committed_bytes > size_limit - planned_bytes)
@@ -4787,10 +5091,9 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
     // raise --gcsa-disk-limit, and by how much, or whether the plan itself is
     // pathological -- the difference between a one-flag fix and a bug.
     throw joinError("configured disk limit exceeded by deterministic partition plan"
-      ": " + std::to_string(partitions.size()) + " partitions plan " +
+      ": " + std::to_string(total_partitions) + " partitions plan " +
       formatBytes(planned_bytes) + " (largest " + formatBytes(largest_peak) +
-      ", mean " + formatBytes(planned_bytes /
-        std::max(static_cast<size_type>(1), partitions.size())) + "), " +
+      ", mean " + formatBytes(planned_bytes / total_partitions) + "), " +
       formatBytes(committed_bytes) + " already committed, against a remaining "
       "limit of " + formatBytes(size_limit));
   }
@@ -4801,7 +5104,7 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
   // Step 4 of a chromosome-scale build spends hours here. Partitions are the
   // natural progress unit: each is a committed, resumable unit of work, so the
   // count is meaningful across a resume as well as within one run.
-  ProgressReporter partition_progress("join partitions", partitions.size(),
+  ProgressReporter partition_progress("join partitions", total_partitions,
     "partitions");
   auto collect_one = [&]()
   {
@@ -4899,8 +5202,10 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
 
   try
   {
-    for(const JoinPartition& partition : partitions)
+    for(const RangeJoin& job : jobs) for(const JoinPartition& partition : job.partitions)
     {
+      const JoinRun& left = job.left;
+      const JoinRun& right = job.right;
       const size_type peak_output_bytes = externalPathGraphShardPeakBytes(
         partition.expected_paths, partition.expected_ranks,
         sort_budget, worker_codec);
@@ -5012,7 +5317,7 @@ runJoinWorkerPartitions(const JoinRun& left, const JoinRun& right,
   }
   if(stats != nullptr)
   {
-    stats->join_partitions += partitions.size();
+    stats->join_partitions += total_partitions;
     stats->max_bytes_resident = std::max(stats->max_bytes_resident,
       static_cast<size_type>(memory.stats().maximum));
   }
@@ -5132,10 +5437,131 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
 
   PathGraph next(0, 2 * graph.k(), graph.step() + 1);
   size_type next_physical = 0, committed_bytes = 0;
+
+  // Key-range distribution runs several range workers at once, each holding a
+  // shard reader pair and two sorters that share the distribution lifetime's
+  // memory. Descriptors bound the workers as well: during a merge one sorter
+  // has fan_in run readers, its run writer and two sidecar writers open, and
+  // the shard reader two more. The largest count that admits a merge fan-in of
+  // at least four wins, so a range's runs merge in one pass.
+  const size_type thread_limit = static_cast<size_type>(std::max(1, omp_get_max_threads()));
+  const size_type descriptor_budget = parameters.getMaxOpenFiles() - 2;
+  const size_type total_distribution = checkedJoinAdd(maximum_distribution_sort,
+    source_codec_bytes, "distribution lifetime bytes");
+  TempFileCodecParameters requested_range_codec = parameters.getTempFileCodecParameters();
+  requested_range_codec.workers = 1;
+  auto admit_range_workers = [&](size_type ranges, size_type& fan_in,
+    size_type& sorter_budget, TempFileCodecParameters& codec) -> size_type
+  {
+    for(size_type active = std::min(ranges, thread_limit); active >= 2; active--)
+    {
+      if(descriptor_budget / active < 4 + 5) { continue; }
+      const size_type per_worker = total_distribution / active;
+      if(per_worker <= source_codec_bytes) { continue; }
+      const size_type budget = (per_worker - source_codec_bytes) / 2;
+      TempFileCodecParameters candidate = boundedJoinRunCodec(requested_range_codec,
+        budget, (parameters.getProcessWorkers() > 1 ? memory_budget : 0));
+      if(budget < joinRunSortMinimumBudget(candidate)) { continue; }
+      fan_in = std::min(join_fan_in, descriptor_budget / active - 5);
+      sorter_budget = budget; codec = candidate;
+      return active;
+    }
+    return static_cast<size_type>(1);
+  };
+
   for(const auto& group : groups)
   {
     logical_file_id_t logical = group.first;
+    std::vector<RangeJoin> jobs;
 
+    const JoinRangePlan range_plan = loadOrCreateJoinRangePlan(graph, group.second,
+      logical, thread_limit, workspace, checkpoint_task, stats);
+    size_type range_fan_in = 0, range_sort_budget = 0;
+    TempFileCodecParameters range_codec = requested_range_codec;
+    const size_type active_ranges = (range_plan.ranges() > 1 ?
+      admit_range_workers(range_plan.ranges(), range_fan_in, range_sort_budget, range_codec) :
+      static_cast<size_type>(1));
+    if(stats != nullptr)
+    {
+      stats->distribution_ranges = std::max(stats->distribution_ranges,
+        (active_ranges > 1 ? range_plan.ranges() : static_cast<size_type>(1)));
+      stats->distribution_concurrency = std::max(stats->distribution_concurrency,
+        active_ranges);
+    }
+
+    if(active_ranges > 1)
+    {
+      const size_type ranges = range_plan.ranges();
+      std::vector<JoinRun> lefts(ranges), rights(ranges);
+      std::vector<char> finished(ranges, 0);
+      std::vector<ExternalPathJoinStats> range_stats(ranges);
+      std::vector<std::exception_ptr> errors(ranges);
+      std::atomic<size_type> next_range(0);
+      auto run = [&]()
+      {
+        for(size_type range = next_range++; range < ranges; range = next_range++)
+        {
+          try
+          {
+            ExternalPathJoinStats* out = (stats != nullptr ? &range_stats[range] : nullptr);
+            ExternalJoinSorter right_sorter(logical, RIGHT_BY_FROM, range_sort_budget,
+              range_fan_in, parameters.getVerifyWorkspace(), out, range_codec, false);
+            ExternalJoinSorter left_sorter(logical, LEFT_BY_TO, range_sort_budget,
+              range_fan_in, parameters.getVerifyWorkspace(), out, range_codec, false);
+            scanJoinRange(graph, group.second, logical, range_plan, range,
+              right_sorter, left_sorter, out);
+            rights[range] = right_sorter.finish();
+            lefts[range] = left_sorter.finish();
+            finished[range] = 1;
+          }
+          catch(...) { errors[range] = std::current_exception(); }
+        }
+      };
+      std::vector<std::thread> threads;
+      // A thread that cannot start leaves its ranges to the others: the shared
+      // queue, not the thread count, decides which ranges run.
+      try { for(size_type t = 1; t < active_ranges; t++) { threads.emplace_back(run); } }
+      catch(const std::system_error&) { }
+      run();
+      for(std::thread& thread : threads) { thread.join(); }
+      for(size_type range = 0; range < ranges; range++)
+      {
+        if(errors[range])
+        {
+          for(size_type other = 0; other < ranges; other++)
+          {
+            if(finished[other]) { removeJoinRun(lefts[other]); removeJoinRun(rights[other]); }
+          }
+          std::rethrow_exception(errors[range]);
+        }
+      }
+      if(stats != nullptr)
+      {
+        for(size_type range = 0; range < ranges; range++)
+        {
+          mergeJoinScanStats(*stats, range_stats[range]);
+        }
+        stats->max_bytes_resident = std::max(stats->max_bytes_resident,
+          checkedJoinMultiply(active_ranges,
+            checkedJoinAdd(2 * range_sort_budget, source_codec_bytes, "range worker bytes"),
+            "concurrent range worker bytes"));
+      }
+      for(size_type range = 0; range < ranges; range++)
+      {
+        // A range without right records has nothing to emit: generated paths
+        // need a right record, and so does a bypass.
+        if(rights[range].records == 0)
+        {
+          removeJoinRun(lefts[range]); removeJoinRun(rights[range]);
+          continue;
+        }
+        RangeJoin job;
+        job.left = lefts[range]; job.right = rights[range];
+        jobs.push_back(job);
+      }
+    }
+    else
+    {
     // Both sides at once when the budget admits two sorters; otherwise the
     // original sequence, because halving each side's run space to buy
     // concurrency would trade fewer, larger runs for more merge passes.
@@ -5204,18 +5630,46 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
         checkedJoinAdd(distribution_sort_budget, source_codec_bytes,
           "compressed distribution scan peak"));
     }
+    RangeJoin job;
+    job.left = left; job.right = right;
+    jobs.push_back(job);
+    }
 
     if(parameters.getProcessWorkers() > 1)
     {
-      std::vector<JoinPartition> partitions = planJoinPartitions(left, right,
-        logical, parameters.getCheckpointBytes(), memory_budget,
-        parameters.getVerifyWorkspace(), stats, workspace, checkpoint_task);
-      runJoinWorkerPartitions(left, right, logical, partitions, size_limit,
+      for(RangeJoin& job : jobs)
+      {
+        job.partitions = planJoinPartitions(job.left, job.right,
+          logical, parameters.getCheckpointBytes(), memory_budget,
+          parameters.getVerifyWorkspace(), stats, workspace, checkpoint_task);
+      }
+      // A range whose right records are all unsorted and unmatched plans one
+      // partition that emits nothing. The serial route still runs it, and
+      // writes an empty shard as it always has; a range route with other
+      // output drops such ranges instead of writing one empty shard each.
+      if(jobs.size() > 1)
+      {
+        std::vector<RangeJoin> productive;
+        for(RangeJoin& job : jobs)
+        {
+          bool emits = false;
+          for(const JoinPartition& partition : job.partitions)
+          {
+            if(partition.expected_paths > 0) { emits = true; break; }
+          }
+          if(emits) { productive.push_back(job); }
+          else { removeJoinRun(job.left); removeJoinRun(job.right); }
+        }
+        if(!productive.empty()) { jobs.swap(productive); }
+      }
+      runJoinWorkerPartitions(jobs, logical, size_limit,
         parameters, label_fan_in, next, next_physical, committed_bytes, stats,
         workspace, checkpoint_task);
     }
-    else
+    else for(const RangeJoin& job : jobs)
     {
+      const JoinRun& left = job.left;
+      const JoinRun& right = job.right;
       size_type output_file = appendOutputShard(next, logical,
         physical_shard_id_t(next_physical++));
       // Both join sorters have released their run-sized buffers. Reuse that
@@ -5260,7 +5714,7 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
         // sort and join budgets as independent maxima.
       }
     }
-    removeJoinRun(left); removeJoinRun(right);
+    for(RangeJoin& job : jobs) { removeJoinRun(job.left); removeJoinRun(job.right); }
   }
 
   MemoryBudget compaction_memory(memory_budget, memory_budget / 16);

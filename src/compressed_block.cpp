@@ -1266,7 +1266,7 @@ CompressedBlockReader::CompressedBlockReader(const std::string& filename,
   current_offset(0), index_offset(0), block_count(0), block_size(0),
   current_logical(0), logical_bytes(0), physical_bytes(0), record_count(0),
   whole_checksum(0), sequential_bytes(0), sequential_checksum(FNV_OFFSET),
-  sequential(true), cache_descriptor(-1), cache_released(0),
+  sequential(true), cache_descriptor(-1), cache_released(0), retain_cache(false),
   prefetch_pool(pool), prefetch_owner(0), extent_cached(false),
   cached_extent_block(0), cached_physical(0), cached_logical(0),
   cached_next_physical(0), cached_next_logical(0)
@@ -1563,7 +1563,7 @@ void
 CompressedBlockReader::releaseConsumedCache(std::uint64_t physical_offset)
 {
 #if defined(POSIX_FADV_DONTNEED)
-  if(this->cache_descriptor < 0 || !this->sequential) { return; }
+  if(this->cache_descriptor < 0 || !this->sequential || this->retain_cache) { return; }
   if(physical_offset < this->cache_released + BLOCK_CACHE_FLUSH_BYTES) { return; }
   std::uint64_t discard_end = physical_offset - BLOCK_CACHE_TAIL_BYTES;
   if(discard_end <= this->cache_released) { return; }

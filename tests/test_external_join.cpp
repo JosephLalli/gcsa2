@@ -820,6 +820,107 @@ int main(int argc, char** argv)
     }
   }
 
+  // Key-range distribution. A logical input of at least 2 x 65,536 paths is
+  // split into key ranges, one per thread, whose distributions run at once.
+  // Every route must produce the serial route's records; the ranged process
+  // worker route must also restore its range plan and every partition when
+  // the same step runs again on its workspace.
+  {
+    const size_type chain = 4 * 65536;
+    std::vector<TestRecord> chain_records;
+    chain_records.reserve(chain);
+    for(size_type i = 0; i < chain; i++)
+    {
+      // Path i runs from node i + 1 to node i + 2, so it extends path i + 1.
+      chain_records.push_back({ i + 1, i + 2, static_cast<byte_type>(1 << (i % 4)),
+        static_cast<PathNode::rank_type>(i), false });
+    }
+    const std::string chain_path = base + ".chain.path";
+    const std::string chain_rank = base + ".chain.rank";
+    writePathPair(chain_path, chain_rank, chain_records);
+    auto chain_graph = [&](PathGraph& graph)
+    {
+      graph.order = 1;
+      graph.logical_file_ids[0] = logical_file_id_t(3);
+      graph.physical_shard_ids[0] = physical_shard_id_t(30);
+    };
+    ConstructionParameters range_parameters;
+    range_parameters.setMemoryLimitBytes(64 * MEGABYTE);
+    range_parameters.setCheckpointBytes(512 * KILOBYTE);
+    range_parameters.setWorkDirectory(".");
+    range_parameters.setTempCompression("none");
+
+    PathGraph serial_chain(chain_path, chain_rank);
+    chain_graph(serial_chain);
+    ExternalPathJoinStats serial_chain_stats;
+    omp_set_num_threads(1);
+    externalPathGraphExtend(serial_chain, GIGABYTE, range_parameters, &serial_chain_stats);
+    require(serial_chain_stats.distribution_ranges == 1);
+    require(serial_chain_stats.distribution_concurrency == 1);
+    require(serial_chain_stats.generated_records == chain - 1);
+    require(serial_chain.size() == chain - 1);
+
+    // Direct joins, one output shard per range.
+    PathGraph direct_chain(chain_path, chain_rank);
+    chain_graph(direct_chain);
+    ExternalPathJoinStats direct_chain_stats;
+    omp_set_num_threads(4);
+    externalPathGraphExtend(direct_chain, GIGABYTE, range_parameters, &direct_chain_stats);
+    omp_set_num_threads(1);
+    require(direct_chain_stats.distribution_ranges == 4);
+    require(direct_chain_stats.distribution_concurrency == 4);
+    require(direct_chain_stats.left_records == serial_chain_stats.left_records);
+    require(direct_chain_stats.right_records == serial_chain_stats.right_records);
+    require(direct_chain_stats.max_bytes_resident <= range_parameters.getMemoryLimitBytes());
+    require(direct_chain.files() == 4);
+    requireSameGraph(serial_chain, direct_chain, "key-range distribution, direct joins");
+
+    // Process workers over every range's partitions, on a workspace.
+    char range_root[] = "/tmp/gcsa-range-plan-XXXXXX";
+    require(mkdtemp(range_root) != nullptr);
+    BuildWorkspace::Settings range_semantic;
+    range_semantic["fixture"] = "external-join-ranges";
+    BuildWorkspace range_workspace(range_root, range_semantic, BuildWorkspace::Settings(),
+      BuildWorkspace::NEW_WORKSPACE);
+    ConstructionParameters worker_range_parameters = range_parameters;
+    worker_range_parameters.setProcessWorkers(2);
+    worker_range_parameters.setWorkerExecutable(argv[0]);
+    PathGraph worker_chain(chain_path, chain_rank);
+    chain_graph(worker_chain);
+    ExternalPathJoinStats worker_chain_stats;
+    omp_set_num_threads(4);
+    externalPathGraphExtend(worker_chain, GIGABYTE, worker_range_parameters,
+      &worker_chain_stats, &range_workspace, "step-ranges");
+    omp_set_num_threads(1);
+    require(worker_chain_stats.distribution_ranges == 4);
+    require(worker_chain_stats.distribution_concurrency == 4);
+    require(worker_chain_stats.restored_range_plans == 0);
+    require(worker_chain_stats.join_partitions >= 4);
+    require(worker_chain_stats.worker_processes == worker_chain_stats.join_partitions);
+    requireSameGraph(serial_chain, worker_chain, "key-range distribution, process workers");
+
+    // The same step again: the committed range plan gives the same ranges
+    // whatever the thread count, so the runs, their checksums and every
+    // partition task name match, and nothing is joined again.
+    PathGraph resumed_chain(chain_path, chain_rank);
+    chain_graph(resumed_chain);
+    ExternalPathJoinStats resumed_chain_stats;
+    omp_set_num_threads(2);
+    externalPathGraphExtend(resumed_chain, GIGABYTE, worker_range_parameters,
+      &resumed_chain_stats, &range_workspace, "step-ranges");
+    omp_set_num_threads(1);
+    require(resumed_chain_stats.restored_range_plans == 1);
+    require(resumed_chain_stats.distribution_ranges == 4);
+    require(resumed_chain_stats.distribution_concurrency == 2);
+    require(resumed_chain_stats.restored_radix_plans > 0);
+    require(resumed_chain_stats.restored_partitions == worker_chain_stats.join_partitions);
+    require(resumed_chain_stats.worker_processes == 0);
+    requireByteIdenticalGraph(worker_chain, resumed_chain);
+
+    std::remove(chain_path.c_str()); std::remove(chain_rank.c_str());
+    std::filesystem::remove_all(range_root);
+  }
+
   std::remove(combined_path.c_str()); std::remove(combined_rank.c_str());
   std::remove(left_path.c_str()); std::remove(left_rank.c_str());
   std::remove(right_path.c_str()); std::remove(right_rank.c_str());

@@ -230,7 +230,9 @@ std::string formatBytes(size_type bytes);
   remaining temporary files are deleted when the program exits (normally or
   with std::exit()).
 
-  TempFile is not thread-safe!
+  getName(), remove(), forget() and setDirectory() hold one mutex, so threads
+  may name and remove temporaries concurrently. temp_dir may be read while no
+  thread is setting it.
 */
 
 namespace TempFile

@@ -76,6 +76,8 @@ retireBeforeFrontier(BuildWorkspace& workspace,
         successor_task, successor_phase);
       workspace.retire_obsolete_family(task + "-msd-plan-", "join-plan",
         successor_task, successor_phase);
+      workspace.retire_obsolete_family(task + "-range-plan-", "range-plan",
+        successor_task, successor_phase);
     }
   }
 }
@@ -1210,6 +1212,10 @@ reportJoinStats(const ExternalPathJoinStats& join_stats)
               << join_stats.label_parallel_sorts << " parallel label sorts, "
               << join_stats.compaction_batches << " compaction batches ("
               << join_stats.compaction_concurrency << " at once)" << std::endl;
+    std::cerr << "externalPathGraphExtend(): distribution in "
+              << join_stats.distribution_ranges << " key ranges ("
+              << join_stats.distribution_concurrency << " at once, "
+              << join_stats.restored_range_plans << " range plans restored)" << std::endl;
     std::cerr << "externalPathGraphExtend(): phase budgets: distribution "
               << formatBytes(join_stats.distribution_sort_budget)
               << "; concurrent label sort "
@@ -1607,6 +1613,8 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
         workspace->retire_obsolete_family(task + "-join-", "join-partition",
           task, "extend");
         workspace->retire_obsolete_family(task + "-msd-plan-", "join-plan",
+          task, "extend");
+        workspace->retire_obsolete_family(task + "-range-plan-", "range-plan",
           task, "extend");
       }
       frontier_task = task; frontier_phase = "extend";

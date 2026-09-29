@@ -169,6 +169,10 @@ struct ExternalPathJoinStats
   size_type max_records_resident, max_bytes_resident;
   // Post-join compaction: merged batches, and the most that ran at once.
   size_type compaction_batches, compaction_concurrency;
+  // Key-range distribution: the most ranges one logical input was split into,
+  // the most range workers that ran at once, and range plans restored from
+  // the workspace.
+  size_type distribution_ranges, distribution_concurrency, restored_range_plans;
 
   ExternalPathJoinStats() :
     left_records(0), right_records(0), sorted_bypass(0), generated_records(0),
@@ -188,7 +192,8 @@ struct ExternalPathJoinStats
     compressed_join_sidecars(0),
     distribution_sort_budget(0), label_sort_budget(0), join_block_budget(0),
     max_records_resident(0), max_bytes_resident(0),
-    compaction_batches(0), compaction_concurrency(0) { }
+    compaction_batches(0), compaction_concurrency(0),
+    distribution_ranges(0), distribution_concurrency(0), restored_range_plans(0) { }
 };
 
 // Prefix doubling with a bounded external sort-merge join. Input shards with
