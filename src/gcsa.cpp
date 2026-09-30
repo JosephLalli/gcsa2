@@ -8,6 +8,9 @@
 #include <gcsa/path_graph.h>
 #include <gcsa/workspace.h>
 
+#include <array>
+#include <atomic>
+#include <exception>
 #include <fstream>
 #include <filesystem>
 #include <fcntl.h>
@@ -496,7 +499,7 @@ struct MergedGraphReader
   ReadBuffer<PathNode::rank_type> labels;
   ReadBuffer<range_type>          from_nodes;
 
-  size_type path, rank, from;
+  size_type path, rank, from, path_count;
 
   const DeBruijnGraph*            mapper;
   const sdsl::int_vector<0>*      last_char;
@@ -507,14 +510,20 @@ struct MergedGraphReader
     bool release_cache = false);
   void init(const MergedGraph& graph, size_type comp,
     size_type buffer_bytes = ReadBuffer<PathNode>::DEFAULT_BUFFER_BYTES,
-    bool release_cache = false);
+    bool release_cache = false, bool read_from_nodes = true);
+  void initFromOnly(const MergedGraph& graph,
+    size_type buffer_bytes = ReadBuffer<PathNode>::DEFAULT_BUFFER_BYTES,
+    bool release_cache = false, size_type comp = MergedGraph::UNKNOWN);
   void close();
 
-  void seek();
+  void seek(bool seek_labels = true);
 
   inline void advance()
   {
-    if(this->path + 1 >= this->paths.size()) { return; }
+    if(this->path >= this->path_count || this->path + 1 >= this->path_count)
+    {
+      return;
+    }
     this->path++;
     this->seek();
   }
@@ -528,6 +537,50 @@ struct MergedGraphReader
 
   void fromNodes(std::vector<node_type>& results, const NodeMapping& mapping);
   void fromNodes(SpillableNodeSet& results, const NodeMapping& mapping);
+  void fromNodes(SpillableNodeSet& results, const NodeMapping& mapping,
+    node_type primary);
+};
+
+/*
+  Source-label reader for bounded predecessor batches. It deliberately omits
+  the from-node stream: the ordered reader below remains responsible for that
+  stream, so preparing a batch neither advances nor rereads global scan state.
+*/
+struct MergedGraphLabelReader
+{
+  ReadBuffer<PathNode> paths;
+  ReadBuffer<PathNode::rank_type> labels;
+  size_type path;
+
+  MergedGraphLabelReader() : paths(), labels(), path(0) { }
+
+  void init(const MergedGraph& graph, size_type buffer_bytes)
+  {
+    this->paths.open(graph.path_name, buffer_bytes, true);
+    this->labels.open(graph.rank_name, buffer_bytes, true);
+    this->path = 0;
+    if(this->paths.size() > 0)
+    {
+      this->paths.seek(0);
+      this->labels.seek(this->paths[0].pointer());
+    }
+  }
+
+  void advance()
+  {
+    if(this->path + 1 >= this->paths.size()) { return; }
+    this->path++;
+    this->paths.seek(this->path);
+    this->labels.seek(this->paths[this->path].pointer());
+  }
+
+  void close()
+  {
+    this->paths.close(); this->labels.close(); this->path = 0;
+  }
+
+  MergedGraphLabelReader(const MergedGraphLabelReader&) = delete;
+  MergedGraphLabelReader& operator=(const MergedGraphLabelReader&) = delete;
 };
 
 void
@@ -539,7 +592,7 @@ MergedGraphReader::init(const MergedGraph& graph,
   this->labels.open(graph.rank_name, buffer_bytes, release_cache);
   this->from_nodes.open(graph.from_name, buffer_bytes, release_cache);
 
-  this->path = this->rank = this->from = 0;
+  this->path = this->rank = this->from = 0; this->path_count = graph.size();
   this->seek();
 
   this->mapper = _mapper;
@@ -548,18 +601,33 @@ MergedGraphReader::init(const MergedGraph& graph,
 
 void
 MergedGraphReader::init(const MergedGraph& graph, size_type comp,
-  size_type buffer_bytes, bool release_cache)
+  size_type buffer_bytes, bool release_cache, bool read_from_nodes)
 {
   this->paths.open(graph.path_name, buffer_bytes, release_cache);
   this->labels.open(graph.rank_name, buffer_bytes, release_cache);
-  this->from_nodes.open(graph.from_name, buffer_bytes, release_cache);
+  if(read_from_nodes)
+  {
+    this->from_nodes.open(graph.from_name, buffer_bytes, release_cache);
+  }
 
-  this->path = graph.next[comp];
+  this->path = graph.next[comp]; this->path_count = graph.size();
   this->from = graph.next_from[comp];
   this->seek();
 
   this->mapper = nullptr;
   this->last_char = nullptr;
+}
+
+void
+MergedGraphReader::initFromOnly(const MergedGraph& graph,
+  size_type buffer_bytes, bool release_cache, size_type comp)
+{
+  this->from_nodes.open(graph.from_name, buffer_bytes, release_cache);
+  this->path = (comp == MergedGraph::UNKNOWN ? 0 : graph.next[comp]);
+  this->from = (comp == MergedGraph::UNKNOWN ? 0 : graph.next_from[comp]);
+  this->rank = 0; this->path_count = graph.size();
+  this->seek(false);
+  this->mapper = nullptr; this->last_char = nullptr;
 }
 
 void
@@ -569,15 +637,28 @@ MergedGraphReader::close()
   this->labels.close();
   this->from_nodes.close();
 
-  this->path = this->rank = this->from = 0;
+  this->path = this->rank = this->from = this->path_count = 0;
 }
 
 void
-MergedGraphReader::seek()
+MergedGraphReader::seek(bool seek_labels)
 {
-  this->paths.seek(this->path);
-  this->rank = this->paths[this->path].pointer();
-  this->labels.seek(this->rank);
+  // A sparse alphabet component may have no destination paths. Keep its
+  // reader at a valid end frontier; callers that never observe the component
+  // need no dummy path, while an inconsistent edge still fails the explicit
+  // destination bounds check in the external scan.
+  if(this->path >= this->path_count)
+  {
+    this->rank = this->labels.size();
+    this->from = this->from_nodes.size();
+    return;
+  }
+  if(this->paths.descriptor >= 0)
+  {
+    this->paths.seek(this->path);
+    this->rank = this->paths[this->path].pointer();
+    if(seek_labels) { this->labels.seek(this->rank); }
+  }
   while(this->from < this->from_nodes.size() && this->from_nodes[this->from].first < this->path)
   {
     this->from++;
@@ -585,35 +666,41 @@ MergedGraphReader::seek()
   this->from_nodes.seek(this->from);
 }
 
+template<class LabelReader>
 void
-MergedGraphReader::predecessor(comp_type comp, PathLabel& first, PathLabel& last)
+predecessorRange(const PathNode& curr, comp_type comp,
+  const DeBruijnGraph& mapper, const sdsl::int_vector<0>& last_char,
+  const LabelReader& label,
+  PathLabel& first, PathLabel& last)
 {
-  const PathNode& curr = this->paths[this->path];
-  size_type i = 0, j = curr.pointer();
+  size_type i = 0;
   first.first = true; last.first = false;
 
   // Handle the common prefix of the labels.
   while(i < curr.lcp())
   {
-    first.label[i] = last.label[i] = this->mapper->LF(this->labels[j], comp);
-    comp = (*(this->last_char))[labels[j]];
-    i++; j++;
+    PathNode::rank_type rank = label(i);
+    first.label[i] = last.label[i] = mapper.LF(rank, comp);
+    comp = last_char[rank];
+    i++;
   }
 
   // Handle the diverging suffixes of the labels.
   comp_type first_comp = comp, last_comp = comp;
   if(i < curr.order())
   {
-    first.label[i] = this->mapper->LF(this->labels[j], first_comp);
-    first_comp = (*(this->last_char))[this->labels[j]];
-    last.label[i] = this->mapper->LF(this->labels[j + 1], last_comp);
-    last_comp = (*(this->last_char))[this->labels[j + 1]];
+    PathNode::rank_type first_rank = label(i);
+    PathNode::rank_type last_rank = label(i + 1);
+    first.label[i] = mapper.LF(first_rank, first_comp);
+    first_comp = last_char[first_rank];
+    last.label[i] = mapper.LF(last_rank, last_comp);
+    last_comp = last_char[last_rank];
     i++;
   }
   if(i < PathLabel::LABEL_LENGTH)
   {
-    first.label[i] = this->mapper->node_rank(this->mapper->alpha.C[first_comp]);
-    last.label[i] = this->mapper->node_rank(this->mapper->alpha.C[last_comp + 1]) - 1;
+    first.label[i] = mapper.node_rank(mapper.alpha.C[first_comp]);
+    last.label[i] = mapper.node_rank(mapper.alpha.C[last_comp + 1]) - 1;
     i++;
   }
 
@@ -622,6 +709,15 @@ MergedGraphReader::predecessor(comp_type comp, PathLabel& first, PathLabel& last
   {
     first.label[i] = 0; last.label[i] = PathLabel::NO_RANK; i++;
   }
+}
+
+void
+MergedGraphReader::predecessor(comp_type comp, PathLabel& first, PathLabel& last)
+{
+  const PathNode& curr = this->paths[this->path];
+  predecessorRange(curr, comp, *(this->mapper), *(this->last_char),
+    [this, &curr](size_type i) { return this->labels[curr.pointer() + i]; },
+    first, last);
 }
 
 inline PathLabel
@@ -682,12 +778,19 @@ MergedGraphReader::fromNodes(std::vector<node_type>& results, const NodeMapping&
 void
 MergedGraphReader::fromNodes(SpillableNodeSet& results, const NodeMapping& mapping)
 {
+  this->fromNodes(results, mapping, this->paths[this->path].from);
+}
+
+void
+MergedGraphReader::fromNodes(SpillableNodeSet& results,
+  const NodeMapping& mapping, node_type primary)
+{
   results.clear();
   const auto mapped = [&mapping](node_type node) {
     return (mapping.empty() ? node :
       Node::encode(mapping(Node::id(node)), Node::offset(node), Node::rc(node)));
   };
-  results.push_back(mapped(this->paths[this->path].from));
+  results.push_back(mapped(primary));
 
   size_type old_pointer = this->from;
   while(this->from < this->from_nodes.size() && this->from_nodes[this->from].first == this->path)
@@ -707,11 +810,37 @@ struct ExternalFinalScanStats
 {
   DiskBackedArray64::Stats previous_occurrences, suffix_tree_stack;
   size_type from_node_spills, maximum_from_nodes;
+  size_type predecessor_workers, predecessor_batches;
+  size_type maximum_predecessor_batch, predecessor_buffer_bytes;
+  bool predecessor_parallel_fallback;
   bool restored;
 
   ExternalFinalScanStats() : previous_occurrences(), suffix_tree_stack(),
-    from_node_spills(0), maximum_from_nodes(0), restored(false) { }
+    from_node_spills(0), maximum_from_nodes(0), predecessor_workers(1),
+    predecessor_batches(0), maximum_predecessor_batch(0),
+    predecessor_buffer_bytes(0), predecessor_parallel_fallback(false),
+    restored(false) { }
 };
+
+/*
+  Immutable work for the unordered half of one final-scan batch.
+
+  Each component worker follows exactly the same monotone destination-reader
+  trajectory as the serial scan, but it owns a distinct reader and destination
+  slot. The globally ordered consumer later emits those destinations and alone
+  mutates prev_occ, the suffix-tree stack, and the event streams. Keeping one
+  fixed-width record per path makes the queue reservation exact and prevents a
+  path with a very large mapped start-node set from inflating this pipeline.
+*/
+struct FinalPredecessorWork
+{
+  PathNode path;
+  std::array<PathNode::rank_type, PathLabel::LABEL_LENGTH + 1> labels;
+  std::array<size_type, FinalEventMetadata::MAX_SIGMA> destinations;
+  std::array<node_type, FinalEventMetadata::MAX_SIGMA> destination_primary;
+};
+
+constexpr size_type MIN_FINAL_PREDECESSOR_BATCH = 64;
 
 size_type
 checkedProduct(size_type first, size_type second, const std::string& label)
@@ -789,6 +918,12 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
   const size_type safety_margin = memory_limit / 8;
   MemoryBudget memory(memory_limit, safety_margin);
 
+  const size_type requested_predecessor_workers = std::min(graph.alpha.sigma,
+    static_cast<size_type>(std::max(1, omp_get_max_threads())));
+  // Parallel batches move the ordered path/label streams to a source reader.
+  // Each destination keeps lookup path/label streams and a separate sampling
+  // from-node stream. All are monotone; the stream count matches the serial
+  // route and no buffer is rewound after preparing a batch.
   const size_type reader_streams = 3 * (graph.alpha.sigma + 1) + 1;
   const size_type minimum_reader = std::max(sizeof(PathNode),
     std::max(sizeof(PathNode::rank_type), sizeof(range_type)));
@@ -863,6 +998,46 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
       }
       FinalEventWriter output(files, graph.alpha.sigma, writer_buffer, memory,
         parameters.getTempFileCodecParameters());
+
+      // Predecessor ranges and intersections are independent by alphabet
+      // component. Admit one fixed-width batch before handing the remaining
+      // bytes to the mutable arrays. Lookup and sampling own separate monotone
+      // streams; the source-label reader replaces two streams omitted from the
+      // ordered reader, keeping reader_streams unchanged. A tight budget or a
+      // small configured I/O buffer keeps the original serial scan as an
+      // explicit fallback.
+      size_type predecessor_batch_capacity = 0;
+      MemoryBudget::Reservation predecessor_work_reservation;
+      std::vector<FinalPredecessorWork> predecessor_work;
+      if(requested_predecessor_workers > 1 && memory.available() > array_minimum)
+      {
+        size_type batch_ceiling = (memory.available() - array_minimum) / 2;
+        size_type batch_bytes = std::min(parameters.getIOBufferSize(), batch_ceiling);
+        predecessor_batch_capacity = batch_bytes / sizeof(FinalPredecessorWork);
+        if(predecessor_batch_capacity >= MIN_FINAL_PREDECESSOR_BATCH)
+        {
+          batch_bytes = checkedProduct(predecessor_batch_capacity,
+            sizeof(FinalPredecessorWork), "final predecessor batch");
+          predecessor_work_reservation = memory.reserve(batch_bytes,
+            "final-predecessor-batch");
+          predecessor_work.resize(predecessor_batch_capacity);
+          if(stats != nullptr)
+          {
+            stats->predecessor_workers = requested_predecessor_workers;
+            stats->predecessor_buffer_bytes = batch_bytes;
+          }
+        }
+        else
+        {
+          predecessor_batch_capacity = 0;
+        }
+      }
+      if(stats != nullptr && requested_predecessor_workers > 1 &&
+         predecessor_batch_capacity == 0)
+      {
+        stats->predecessor_parallel_fallback = true;
+      }
+
       size_type cache_bytes = memory.available();
       size_type previous_cache = cache_bytes / 2;
       size_type stack_cache = cache_bytes - previous_cache;
@@ -908,11 +1083,31 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
       DiskBackedArray64 stack(stack_name, stack_capacity,
         stack_cache, memory, true, 64 * KILOBYTE);
 
+      const size_type scan_read_start = DiskIO::read_volume;
       std::vector<MergedGraphReader> reader(graph.alpha.sigma + 1);
-      reader[0].init(merged_graph, &mapper, &last_char, reader_buffer, true);
+      std::vector<MergedGraphReader> sampling_reader(
+        predecessor_batch_capacity > 0 ? graph.alpha.sigma : 0);
+      if(predecessor_batch_capacity > 0)
+      {
+        reader[0].initFromOnly(merged_graph, reader_buffer, true);
+      }
+      else
+      {
+        reader[0].init(merged_graph, &mapper, &last_char, reader_buffer, true);
+      }
       for(size_type comp = 0; comp < graph.alpha.sigma; comp++)
       {
-        reader[comp + 1].init(merged_graph, comp, reader_buffer, true);
+        reader[comp + 1].init(merged_graph, comp, reader_buffer, true,
+          predecessor_batch_capacity == 0);
+        if(predecessor_batch_capacity > 0)
+        {
+          sampling_reader[comp].initFromOnly(merged_graph, reader_buffer, true, comp);
+        }
+      }
+      MergedGraphLabelReader predecessor_source;
+      if(predecessor_batch_capacity > 0)
+      {
+        predecessor_source.init(merged_graph, reader_buffer);
       }
       ReadBuffer<merged_lcp_type> lcp_array;
       lcp_array.open(merged_graph.lcp_name, reader_buffer, true);
@@ -921,176 +1116,301 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
       size_type stack_size = 0;
       ProgressReporter scan_progress("final event scan",
         merged_graph.size(), "paths");
-      for(size_type i = 0; i < merged_graph.size(); i++, reader[0].advance())
+      std::array<std::exception_ptr, FinalEventMetadata::MAX_SIGMA>
+        predecessor_errors;
+      for(size_type i = 0; i < merged_graph.size();)
       {
-        scan_progress.advance();
-        // Close any predecessor spill reader retained by the preceding path
-        // before current-set collection can invoke the external sorter.
-        pred_from.clear();
-        size_type indegree = 0, pred_comp = 0;
-        byte_type predecessor_mask = 0;
-        bool sample_this = false;
-        for(size_type comp = 0; comp < graph.alpha.sigma; comp++)
+        size_type batch_paths = 1;
+        if(predecessor_batch_capacity > 0)
         {
-          if(!(reader[0].paths[reader[0].path].hasPredecessor(comp))) { continue; }
-          reader[0].predecessor(comp, first, last);
-          if(!(reader[comp + 1].intersect(first, last, 0)))
+          batch_paths = std::min(predecessor_batch_capacity,
+            merged_graph.size() - i);
+          for(size_type offset = 0; offset < batch_paths; offset++)
           {
-            reader[comp + 1].advance();
-          }
-          if(reader[comp + 1].path >= merged_graph.size())
-          {
-            throw std::runtime_error("GCSA::GCSA(): final edge destination is outside the merged graph");
-          }
-          predecessor_mask |= static_cast<byte_type>(static_cast<size_type>(1) << comp);
-          output.edge(comp, reader[comp + 1].path);
-          indegree++; pred_comp = comp;
-        }
-        output.path(predecessor_mask);
-
-        reader[0].fromNodes(curr_from, graph.mapping);
-        if(curr_from.size() == 0)
-        {
-          throw std::runtime_error("GCSA::GCSA(): merged path has no start node");
-        }
-        if(stats != nullptr)
-        {
-          stats->from_node_spills += curr_from.spilled();
-          stats->maximum_from_nodes = std::max(stats->maximum_from_nodes,
-            curr_from.size());
-        }
-        output.occurrence(i, curr_from.size() - 1);
-
-        lcp_array.seek(i);
-        size_type curr_lcp = lcp_array[i] + (i > 0 ? 1 : 0);
-        while(stack_size > 0 && stack.get(3 * (stack_size - 1)) > curr_lcp)
-        {
-          stack_size--;
-        }
-        if(stack_size > 0 && stack.get(3 * (stack_size - 1)) == curr_lcp)
-        {
-          stack.set(3 * (stack_size - 1) + 2, i);
-        }
-        else
-        {
-          // The bounded capacity above assumes one frame per distinct LCP
-          // value. Fail loudly rather than write past the array if a future
-          // LCP representation ever breaks that assumption.
-          if(3 * stack_size + 2 >= stack_capacity)
-          {
-            throw std::runtime_error(
-              "GCSA::GCSA(): suffix-tree stack exceeded its bounded capacity");
-          }
-          stack.set(3 * stack_size, curr_lcp);
-          stack.set(3 * stack_size + 1, i);
-          stack.set(3 * stack_size + 2, i);
-          stack_size++;
-        }
-
-        node_type node;
-        curr_from.rewind();
-        while(curr_from.next(node))
-        {
-          // sd_vector::operator[] performs its own select_0 and backward scan,
-          // and rank_support_sd::rank performs another, so testing membership
-          // and then taking the rank costs two descents for one lookup.
-          // successor(i) yields both: its one_iterator dereferences to
-          // (rank, position). ValueIndex::find uses the same idiom.
-          if(node >= from_nodes.size())
-          {
-            throw std::runtime_error(
-              "GCSA::GCSA(): start node " + Node::decode(node) +
-              " (encoded " + std::to_string(node) +
-              ") is absent from the external start-node index of universe " +
-              std::to_string(from_nodes.size()));
-          }
-          auto occurrence = from_nodes.successor(node);
-          if(occurrence->second != node)
-          {
-            throw std::runtime_error(
-              "GCSA::GCSA(): start node " + Node::decode(node) +
-              " (encoded " + std::to_string(node) +
-              ") is absent from the external start-node index of universe " +
-              std::to_string(from_nodes.size()));
-          }
-          size_type rank = occurrence->first;
-          size_type prior = previous.get(rank);
-          if(prior > 0)
-          {
-            size_type low = 0, high = stack_size;
-            while(low < high)
+            FinalPredecessorWork& work = predecessor_work[offset];
+            work.path = predecessor_source.paths[predecessor_source.path];
+            if(work.path.ranks() > work.labels.size())
             {
-              size_type middle = low + (high - low) / 2;
-              if(stack.get(3 * middle + 2) < prior) { low = middle + 1; }
-              else { high = middle; }
+              throw std::runtime_error(
+                "GCSA::GCSA(): final predecessor label exceeds the fixed bound");
             }
-            if(low >= stack_size)
+            for(size_type rank = 0; rank < work.path.ranks(); rank++)
             {
-              throw std::runtime_error("GCSA::GCSA(): invalid previous-occurrence suffix-tree state");
+              work.labels[rank] =
+                predecessor_source.labels[work.path.pointer() + rank];
             }
-            size_type first_time = stack.get(3 * low + 1);
-            if(first_time == 0)
+            work.destinations.fill(MergedGraph::UNKNOWN);
+            work.destination_primary.fill(MergedGraph::UNKNOWN);
+            predecessor_source.advance();
+          }
+
+          predecessor_errors.fill(std::exception_ptr());
+          std::atomic<bool> predecessor_failed(false);
+#pragma omp parallel for schedule(static, 1) num_threads(requested_predecessor_workers)
+          for(std::int64_t component = 0;
+              component < static_cast<std::int64_t>(graph.alpha.sigma);
+              component++)
+          {
+            size_type comp = static_cast<size_type>(component);
+            try
             {
-              throw std::runtime_error("GCSA::GCSA(): redundancy position underflows");
+              MergedGraphReader& destination_reader = reader[comp + 1];
+              PathLabel worker_first, worker_last;
+              for(size_type offset = 0; offset < batch_paths; offset++)
+              {
+                if(predecessor_failed.load(std::memory_order_relaxed)) { break; }
+                FinalPredecessorWork& work = predecessor_work[offset];
+                if(!(work.path.hasPredecessor(comp))) { continue; }
+                predecessorRange(work.path, comp, mapper, last_char,
+                  [&work](size_type rank) { return work.labels[rank]; },
+                  worker_first, worker_last);
+                if(!(destination_reader.intersect(worker_first, worker_last, 0)))
+                {
+                  destination_reader.advance();
+                }
+                if(destination_reader.path >= merged_graph.size())
+                {
+                  throw std::runtime_error(
+                    "GCSA::GCSA(): final edge destination is outside the merged graph");
+                }
+                work.destinations[comp] = destination_reader.path;
+                work.destination_primary[comp] =
+                  destination_reader.paths[destination_reader.path].from;
+              }
             }
-            output.redundancy(first_time - 1);
+            catch(...)
+            {
+              predecessor_errors[comp] = std::current_exception();
+              predecessor_failed.store(true, std::memory_order_relaxed);
+            }
           }
-          previous.set(rank, i + 1);
-        }
-
-        if(indegree > 1) { sample_this = true; }
-        if(reader[0].paths[reader[0].path].hasPredecessor(Alphabet::SINK_COMP))
-        {
-          sample_this = true;
-        }
-        curr_from.rewind();
-        while(curr_from.next(node))
-        {
-          if(node % parameters.getSamplePeriod() == 0)
+          for(size_type comp = 0; comp < graph.alpha.sigma; comp++)
           {
-            sample_this = true; break;
+            if(predecessor_errors[comp])
+            {
+              std::rethrow_exception(predecessor_errors[comp]);
+            }
           }
-        }
-
-        if(!sample_this)
-        {
-          if(indegree == 0)
-          {
-            throw std::runtime_error("GCSA::GCSA(): unsampled path has no predecessor");
-          }
-          reader[pred_comp + 1].fromNodes(pred_from, graph.mapping);
           if(stats != nullptr)
           {
-            stats->from_node_spills += pred_from.spilled();
-            stats->maximum_from_nodes = std::max(stats->maximum_from_nodes,
-              pred_from.size());
+            stats->predecessor_batches++;
+            stats->maximum_predecessor_batch = std::max(
+              stats->maximum_predecessor_batch, batch_paths);
           }
-          if(pred_from.size() != curr_from.size()) { sample_this = true; }
+        }
+
+        for(size_type batch_offset = 0; batch_offset < batch_paths;
+            batch_offset++, i++, reader[0].advance())
+        {
+          scan_progress.advance();
+          // Close any predecessor spill reader retained by the preceding path
+          // before current-set collection can invoke the external sorter.
+          pred_from.clear();
+          size_type indegree = 0, pred_comp = 0;
+          byte_type predecessor_mask = 0;
+          bool sample_this = false;
+          const PathNode& source_path = (predecessor_batch_capacity > 0 ?
+            predecessor_work[batch_offset].path :
+            reader[0].paths[reader[0].path]);
+          for(size_type comp = 0; comp < graph.alpha.sigma; comp++)
+          {
+            if(!(source_path.hasPredecessor(comp))) { continue; }
+            size_type destination = MergedGraph::UNKNOWN;
+            if(predecessor_batch_capacity > 0)
+            {
+              destination = predecessor_work[batch_offset].destinations[comp];
+            }
+            else
+            {
+              reader[0].predecessor(comp, first, last);
+              if(!(reader[comp + 1].intersect(first, last, 0)))
+              {
+                reader[comp + 1].advance();
+              }
+              destination = reader[comp + 1].path;
+            }
+            if(destination >= merged_graph.size())
+            {
+              throw std::runtime_error("GCSA::GCSA(): final edge destination is outside the merged graph");
+            }
+            predecessor_mask |= static_cast<byte_type>(static_cast<size_type>(1) << comp);
+            output.edge(comp, destination);
+            indegree++; pred_comp = comp;
+          }
+          output.path(predecessor_mask);
+
+          if(predecessor_batch_capacity > 0)
+          {
+            reader[0].fromNodes(curr_from, graph.mapping, source_path.from);
+          }
           else
           {
-            node_type curr_node, pred_node;
-            curr_from.rewind(); pred_from.rewind();
-            while(curr_from.next(curr_node))
+            reader[0].fromNodes(curr_from, graph.mapping);
+          }
+          if(curr_from.size() == 0)
+          {
+            throw std::runtime_error("GCSA::GCSA(): merged path has no start node");
+          }
+          if(stats != nullptr)
+          {
+            stats->from_node_spills += curr_from.spilled();
+            stats->maximum_from_nodes = std::max(stats->maximum_from_nodes,
+              curr_from.size());
+          }
+          output.occurrence(i, curr_from.size() - 1);
+
+          lcp_array.seek(i);
+          size_type curr_lcp = lcp_array[i] + (i > 0 ? 1 : 0);
+          while(stack_size > 0 && stack.get(3 * (stack_size - 1)) > curr_lcp)
+          {
+            stack_size--;
+          }
+          if(stack_size > 0 && stack.get(3 * (stack_size - 1)) == curr_lcp)
+          {
+            stack.set(3 * (stack_size - 1) + 2, i);
+          }
+          else
+          {
+            // The bounded capacity above assumes one frame per distinct LCP
+            // value. Fail loudly rather than write past the array if a future
+            // LCP representation ever breaks that assumption.
+            if(3 * stack_size + 2 >= stack_capacity)
             {
-              if(!pred_from.next(pred_node) || curr_node != pred_node + 1)
+              throw std::runtime_error(
+                "GCSA::GCSA(): suffix-tree stack exceeded its bounded capacity");
+            }
+            stack.set(3 * stack_size, curr_lcp);
+            stack.set(3 * stack_size + 1, i);
+            stack.set(3 * stack_size + 2, i);
+            stack_size++;
+          }
+
+          node_type node;
+          curr_from.rewind();
+          while(curr_from.next(node))
+          {
+            // sd_vector::operator[] performs its own select_0 and backward scan,
+            // and rank_support_sd::rank performs another, so testing membership
+            // and then taking the rank costs two descents for one lookup.
+            // successor(i) yields both: its one_iterator dereferences to
+            // (rank, position). ValueIndex::find uses the same idiom.
+            if(node >= from_nodes.size())
+            {
+              throw std::runtime_error(
+                "GCSA::GCSA(): start node " + Node::decode(node) +
+                " (encoded " + std::to_string(node) +
+                ") is absent from the external start-node index of universe " +
+                std::to_string(from_nodes.size()));
+            }
+            auto occurrence = from_nodes.successor(node);
+            if(occurrence->second != node)
+            {
+              throw std::runtime_error(
+                "GCSA::GCSA(): start node " + Node::decode(node) +
+                " (encoded " + std::to_string(node) +
+                ") is absent from the external start-node index of universe " +
+                std::to_string(from_nodes.size()));
+            }
+            size_type rank = occurrence->first;
+            size_type prior = previous.get(rank);
+            if(prior > 0)
+            {
+              size_type low = 0, high = stack_size;
+              while(low < high)
               {
-                sample_this = true; break;
+                size_type middle = low + (high - low) / 2;
+                if(stack.get(3 * middle + 2) < prior) { low = middle + 1; }
+                else { high = middle; }
+              }
+              if(low >= stack_size)
+              {
+                throw std::runtime_error("GCSA::GCSA(): invalid previous-occurrence suffix-tree state");
+              }
+              size_type first_time = stack.get(3 * low + 1);
+              if(first_time == 0)
+              {
+                throw std::runtime_error("GCSA::GCSA(): redundancy position underflows");
+              }
+              output.redundancy(first_time - 1);
+            }
+            previous.set(rank, i + 1);
+          }
+
+          if(indegree > 1) { sample_this = true; }
+          if(source_path.hasPredecessor(Alphabet::SINK_COMP))
+          {
+            sample_this = true;
+          }
+          curr_from.rewind();
+          while(curr_from.next(node))
+          {
+            if(node % parameters.getSamplePeriod() == 0)
+            {
+              sample_this = true; break;
+            }
+          }
+
+          if(!sample_this)
+          {
+            if(indegree == 0)
+            {
+              throw std::runtime_error("GCSA::GCSA(): unsampled path has no predecessor");
+            }
+            if(predecessor_batch_capacity > 0)
+            {
+              MergedGraphReader& sample_reader = sampling_reader[pred_comp];
+              size_type destination =
+                predecessor_work[batch_offset].destinations[pred_comp];
+              if(destination < sample_reader.path)
+              {
+                throw std::runtime_error("GCSA::GCSA(): sampling destination moved backwards");
+              }
+              sample_reader.path = destination;
+              sample_reader.seek(false);
+              sample_reader.fromNodes(pred_from, graph.mapping,
+                predecessor_work[batch_offset].destination_primary[pred_comp]);
+            }
+            else { reader[pred_comp + 1].fromNodes(pred_from, graph.mapping); }
+            if(stats != nullptr)
+            {
+              stats->from_node_spills += pred_from.spilled();
+              stats->maximum_from_nodes = std::max(stats->maximum_from_nodes,
+                pred_from.size());
+            }
+            if(pred_from.size() != curr_from.size()) { sample_this = true; }
+            else
+            {
+              node_type curr_node, pred_node;
+              curr_from.rewind(); pred_from.rewind();
+              while(curr_from.next(curr_node))
+              {
+                if(!pred_from.next(pred_node) || curr_node != pred_node + 1)
+                {
+                  sample_this = true; break;
+                }
               }
             }
           }
-        }
 
-        if(sample_this)
-        {
-          output.sampledPath(i);
-          curr_from.rewind();
-          while(curr_from.next(node)) { output.sample(node); }
-          output.sampleEnd();
+          if(sample_this)
+          {
+            output.sampledPath(i);
+            curr_from.rewind();
+            while(curr_from.next(node)) { output.sample(node); }
+            output.sampleEnd();
+          }
         }
       }
+      predecessor_source.close();
       for(MergedGraphReader& current : reader) { current.close(); }
+      for(MergedGraphReader& current : sampling_reader) { current.close(); }
       lcp_array.close();
       scan_progress.finish();
+      if(Verbosity::level >= Verbosity::EXTENDED)
+      {
+        std::cerr << "GCSA::GCSA(): final scan read bytes: "
+                  << (DiskIO::read_volume - scan_read_start) << std::endl;
+      }
       previous.flush(false); stack.flush(false);
       if(stats != nullptr)
       {
@@ -1276,6 +1596,8 @@ reportFinalMergeStats(const PathGraphMergeStats& final_merge_stats)
               << LCP::range_minimum_span.load() << " total key positions"
               << std::endl;
     std::cerr << "MergedGraph: "
+              << final_merge_stats.merge_workers << " worker(s) over "
+              << final_merge_stats.merge_partitions << " root partition(s); "
               << final_merge_stats.priority_spills << " path-group spills, "
               << final_merge_stats.range_spills << " range spills, "
               << final_merge_stats.from_set_sorts << " external from-set sorts (peak "
@@ -1338,6 +1660,17 @@ reportFinalEventStats(const FinalEventMetadata& event_metadata,
       std::cerr << "GCSA::GCSA(): final start-node sets: "
                 << event_stats.from_node_spills << " spills, maximum "
                 << event_stats.maximum_from_nodes << " unique nodes" << std::endl;
+      std::cerr << "GCSA::GCSA(): final predecessor lookup: "
+                << event_stats.predecessor_workers << " worker(s), "
+                << event_stats.predecessor_batches << " bounded batch(es), maximum "
+                << event_stats.maximum_predecessor_batch << " paths / "
+                << formatBytes(event_stats.predecessor_buffer_bytes)
+                << " admitted";
+      if(event_stats.predecessor_parallel_fallback)
+      {
+        std::cerr << " (serial fallback: batch admission too small)";
+      }
+      std::cerr << std::endl;
     }
   }
 }
@@ -1656,7 +1989,9 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   SubPhaseProbe merge_probe("merge/merged-graph");
   MergedGraph merged_graph(path_graph, mapper, lcp,
     path_graph.remainingLimit(parameters.getLimitBytes()), merge_buffer,
-    &final_merge_stats, parameters.getMaxOpenFiles(), merge_cache);
+    &final_merge_stats, parameters.getMaxOpenFiles(), merge_cache,
+    (parameters.externalMemory() ?
+      static_cast<size_type>(std::max(1, omp_get_max_threads())) : 1));
   merge_probe.report();
   reportFinalMergeStats(final_merge_stats);
   this->header.path_nodes = merged_graph.size();

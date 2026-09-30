@@ -221,14 +221,21 @@ void serializeRedundantPointers(std::ostream& out,
 
 /*
   Serialize final components directly from immutable event streams. Members
-  are constructed and released in GCSA::load() order, so this avoids retaining
-  the completed index during final file publication. The result has the normal
-  public .gcsa format and is published with a synced atomic rename.
+  are encoded concurrently when the thread, memory, and descriptor budgets
+  permit. Bounded pipes preserve GCSA::load() order without retaining the
+  completed index or writing component temporary files. The result has the
+  normal public .gcsa format and is published with a synced atomic rename.
 */
+struct FinalComponentStats
+{
+  size_type tasks = 0, workers = 1, buffer_limit_bytes = 0;
+};
+
 void storeFinalComponents(const GCSAHeader& header,
   const Alphabet& source_alphabet, const FinalEventFiles& files,
   const FinalEventMetadata& metadata,
-  const ConstructionParameters& parameters, const std::string& filename);
+  const ConstructionParameters& parameters, const std::string& filename,
+  FinalComponentStats* stats = nullptr);
 
 } // namespace gcsa
 

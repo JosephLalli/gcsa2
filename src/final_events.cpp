@@ -11,6 +11,10 @@
 #include <gcsa/internal.h>
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <exception>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -19,9 +23,12 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <mutex>
+#include <omp.h>
 #include <queue>
 #include <stdexcept>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 
 namespace gcsa
@@ -332,10 +339,24 @@ public:
       {
         throw eventError("framed reader memory estimate overflows", path_);
       }
+      // An encoder owns this budget and all of its readers. No other worker
+      // can release an existing reader reservation while this constructor
+      // waits, so an infeasible simultaneous reader set must fail promptly.
+      if(codec_bytes + capacity > budget.available())
+      {
+        throw eventError("memory limit cannot hold simultaneous final-event readers", path_);
+      }
       reservation_ = budget.reserve(codec_bytes + capacity, task);
       framed_.reset(new CompressedBlockReader(path_));
     }
-    else { reservation_ = budget.reserve(capacity, task); }
+    else
+    {
+      if(capacity > budget.available())
+      {
+        throw eventError("memory limit cannot hold simultaneous final-event readers", path_);
+      }
+      reservation_ = budget.reserve(capacity, task);
+    }
     buffer_.resize(capacity);
     if(!framed_)
     {
@@ -2168,11 +2189,225 @@ restoreFinalEvents(const BuildWorkspace& workspace,
   validatePayloads(files, metadata); return true;
 }
 
+
+namespace
+{
+
+// Each encoder writes to a bounded pipe. The foreground drains pipes in the
+// public serialization order, so workers never seek/write the shared output.
+// No component-sized allocation or temporary component file is required.
+class FinalComponentPipe : public std::streambuf
+{
+public:
+  explicit FinalComponentPipe(size_type capacity) :
+    capacity_(capacity), buffered_(0), done_(false), error_(),
+    pending_(std::min<size_type>(MEGABYTE, capacity))
+  {
+    this->setp(pending_.data(), pending_.data() + pending_.size());
+  }
+
+  void finish()
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    done_ = true; ready_.notify_all();
+  }
+
+  void cancel(std::exception_ptr error)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if(!error_) { error_ = error; }
+    done_ = true; ready_.notify_all(); space_.notify_all();
+  }
+
+  void drain(std::ostream& out)
+  {
+    while(true)
+    {
+      std::vector<char> block;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ready_.wait(lock, [&]() { return error_ || done_ || !blocks_.empty(); });
+        if(error_) { std::rethrow_exception(error_); }
+        if(blocks_.empty()) { return; }
+        block = std::move(blocks_.front()); blocks_.pop_front();
+        buffered_ -= block.size(); space_.notify_one();
+      }
+      out.write(block.data(), block.size());
+      if(!out) { throw eventError("cannot write ordered final component"); }
+    }
+  }
+
+protected:
+  std::streamsize xsputn(const char* data, std::streamsize count) override
+  {
+    std::streamsize written = 0;
+    while(written < count)
+    {
+      if(this->pptr() == this->epptr()) { flushBlock(); }
+      auto amount = std::min<std::streamsize>(count - written,
+        this->epptr() - this->pptr());
+      std::memcpy(this->pptr(), data + written, amount);
+      this->pbump(static_cast<int>(amount)); written += amount;
+    }
+    return written;
+  }
+
+  int_type overflow(int_type value) override
+  {
+    flushBlock();
+    if(!traits_type::eq_int_type(value, traits_type::eof()))
+    {
+      *this->pptr() = traits_type::to_char_type(value); this->pbump(1);
+    }
+    return traits_type::not_eof(value);
+  }
+
+  int sync() override { flushBlock(); return 0; }
+
+private:
+  size_type capacity_, buffered_;
+  bool done_;
+  std::exception_ptr error_;
+  std::vector<char> pending_;
+  std::deque<std::vector<char>> blocks_;
+  std::mutex mutex_;
+  std::condition_variable ready_, space_;
+
+  void flushBlock()
+  {
+    const size_type bytes = this->pptr() - this->pbase();
+    if(bytes == 0) { return; }
+    std::unique_lock<std::mutex> lock(mutex_);
+    space_.wait(lock, [&]() { return error_ || bytes <= capacity_ - buffered_; });
+    if(error_) { std::rethrow_exception(error_); }
+    blocks_.emplace_back(this->pbase(), this->pptr());
+    buffered_ += bytes; this->pbump(-static_cast<int>(bytes));
+    ready_.notify_one();
+  }
+};
+
+template<class Encoder>
+void
+writeFinalComponents(std::ostream& out, const FinalEventFiles& files,
+  const FinalEventMetadata& metadata, const ConstructionParameters& parameters,
+  size_type tasks, const Encoder& encode, FinalComponentStats* stats)
+{
+  // A worker may open all sigma edge streams; a framed stream may transiently
+  // need a second descriptor. Leave four descriptors for the output/coordinator.
+  const size_type per_worker_fds = 2 * metadata.sigma + 4;
+  const size_type threads = std::max(1, omp_get_max_threads());
+  size_type workers = std::min(tasks, threads > 1 ? threads - 1 : 0);
+  workers = std::min(workers, parameters.getMaxOpenFiles() > 4 ?
+    (parameters.getMaxOpenFiles() - 4) / per_worker_fds : 0);
+
+  // Admission uses actual framed blocks, which may have been created before a
+  // resume with a different compression setting. Reader buffers also receive
+  // only the worker's share of the aggregate memory goal.
+  size_type codec_bytes = 0;
+  std::vector<std::string> inputs = files.edge_destinations;
+  inputs.insert(inputs.end(), { files.bwt_masks, files.sample_positions,
+    files.sample_ids, files.sample_ends, files.occurrences, files.redundant });
+  if(workers > 1)
+  {
+    for(const auto& path : inputs)
+    {
+      if(CompressedBlockReader::isFramed(path))
+      {
+        codec_bytes = std::max<size_type>(codec_bytes,
+          CompressedBlockReader::workingMemoryEstimate(
+            CompressedBlockReader::declaredBlockSize(path)));
+      }
+    }
+  }
+  const size_type goal = parameters.getMemoryLimitBytes();
+  const size_type pipe_bytes = std::min<size_type>(64 * MEGABYTE, goal / (16 * tasks));
+  const size_type pipe_reservation = 3 * pipe_bytes * tasks;
+  const size_type worker_budget = goal - pipe_reservation;
+  size_type minimum_worker = 64 * KILOBYTE;
+  if(codec_bytes > (std::numeric_limits<size_type>::max() / (4 * metadata.sigma)) - 16)
+  {
+    workers = 0;
+  }
+  else { minimum_worker = std::max(minimum_worker, 4 * metadata.sigma * (codec_bytes + 16)); }
+  workers = std::min(workers, worker_budget / minimum_worker);
+  if(pipe_bytes < 16 || workers < 2) { workers = 1; }
+  if(stats != nullptr)
+  {
+    stats->tasks = tasks; stats->workers = workers;
+    stats->buffer_limit_bytes = workers > 1 ? pipe_reservation : 0;
+  }
+  if(Verbosity::level >= Verbosity::EXTENDED)
+  {
+    std::cerr << "GCSA::storeFinalComponents(): " << tasks << " components, "
+              << workers << " encoder(s), ordered streaming output" << std::endl;
+  }
+  if(workers == 1)
+  {
+    for(size_type task = 0; task < tasks; task++) { encode(task, out, parameters); }
+    return;
+  }
+
+  ConstructionParameters local = parameters;
+  local.setMemoryLimitBytes(worker_budget / workers);
+  std::vector<std::unique_ptr<FinalComponentPipe>> pipes;
+  for(size_type task = 0; task < tasks; task++)
+  {
+    pipes.emplace_back(new FinalComponentPipe(pipe_bytes));
+  }
+  std::atomic<size_type> next(0);
+  std::atomic<bool> failed(false);
+  std::exception_ptr first_error;
+  std::mutex error_mutex;
+  std::vector<std::thread> pool;
+  const auto cancel = [&](std::exception_ptr error)
+  {
+    {
+      std::lock_guard<std::mutex> lock(error_mutex);
+      if(!first_error) { first_error = error; }
+    }
+    failed.store(true);
+    for(auto& pipe : pipes) { pipe->cancel(error); }
+  };
+  const auto join = [&]() { for(auto& thread : pool) { if(thread.joinable()) { thread.join(); } } };
+  try
+  {
+    for(size_type worker = 0; worker < workers; worker++)
+    {
+      pool.emplace_back([&]()
+      {
+        try
+        {
+          while(!failed.load())
+          {
+            size_type task = next.fetch_add(1);
+            if(task >= tasks) { break; }
+            std::ostream stream(pipes[task].get());
+            stream.exceptions(std::ios::badbit | std::ios::failbit);
+            encode(task, stream, local);
+            stream.flush(); pipes[task]->finish();
+          }
+        }
+        catch(...) { cancel(std::current_exception()); }
+      });
+    }
+    for(auto& pipe : pipes) { pipe->drain(out); }
+    join();
+    if(first_error) { std::rethrow_exception(first_error); }
+  }
+  catch(...)
+  {
+    cancel(std::current_exception()); join();
+    std::rethrow_exception(first_error);
+  }
+}
+
+} // namespace
 void
 storeFinalComponents(const GCSAHeader& header,
   const Alphabet& source_alphabet, const FinalEventFiles& files,
   const FinalEventMetadata& metadata,
-  const ConstructionParameters& parameters, const std::string& filename)
+  const ConstructionParameters& parameters, const std::string& filename,
+  FinalComponentStats* stats)
 {
   validateMetadata(metadata); validatePayloads(files, metadata);
   if(!header.check() || header.path_nodes != metadata.paths ||
@@ -2203,181 +2438,190 @@ storeFinalComponents(const GCSAHeader& header,
     write(header);
     write(alphabet);
 
-    // The on-disk order is all BWTs followed by all ranks. Reconstructing a
-    // component for its rank costs one bounded stream pass but avoids retaining
-    // all BWT members merely to reach that later section.
-    for(size_type comp = 0; comp < metadata.sigma; comp++)
+    const size_type component_tasks = 2 * metadata.sigma + 6;
+    const auto encode = [&](size_type task, std::ostream& out,
+      const ConstructionParameters& parameters)
     {
-      if(comp > 0 && comp <= metadata.fast_chars)
+      const auto write = [&](const auto& value)
       {
-        serializeFastBWTComponent(out, files.bwt_masks, metadata.paths,
-          metadata.bwt_counts[comp], static_cast<comp_type>(comp), parameters);
+        value.serialize(out);
+        if(!out) { throw eventError("cannot encode final component", partial); }
+      };
+      if(task < metadata.sigma)
+      {
+        const size_type comp = task;
+        if(comp > 0 && comp <= metadata.fast_chars)
+        {
+          serializeFastBWTComponent(out, files.bwt_masks, metadata.paths,
+            metadata.bwt_counts[comp], static_cast<comp_type>(comp), parameters);
+        }
+        else { GCSA::fast_vector empty; write(empty); }
+      }
+      else if(task == metadata.sigma)
+      {
+        for(size_type comp = 0; comp < metadata.sigma; comp++)
+        {
+          GCSA::fast_vector::rank_1_type empty; write(empty);
+        }
+      }
+      else if(task <= 2 * metadata.sigma)
+      {
+        const size_type comp = task - metadata.sigma - 1;
+        if(comp > 0 && comp <= metadata.fast_chars)
+        {
+          GCSA::sparse_vector empty; write(empty);
+        }
+        else
+        {
+          serializeSparseBWTComponent(out, files.bwt_masks, metadata.paths,
+            metadata.bwt_counts[comp], static_cast<comp_type>(comp), parameters);
+        }
+      }
+      else if(task == 2 * metadata.sigma + 1)
+      {
+        for(size_type comp = 0; comp < metadata.sigma; comp++)
+        {
+          GCSA::sparse_vector::rank_1_type empty; write(empty);
+        }
+      }
+      else if(task == 2 * metadata.sigma + 2)
+      {
+        MemoryBudget budget(parameters.getMemoryLimitBytes(),
+          parameters.getMemoryLimitBytes() / 8);
+        size_type buffer_bytes = componentBufferBytes(parameters, metadata.sigma);
+        std::vector<std::unique_ptr<BufferedEventReader>> readers;
+        std::vector<std::uint64_t> current(metadata.sigma);
+        std::vector<bool> available(metadata.sigma, false);
+        for(size_type comp = 0; comp < metadata.sigma; comp++)
+        {
+          readers.emplace_back(new BufferedEventReader(files.edge_destinations[comp],
+            8, metadata.bwt_counts[comp], buffer_bytes, budget, "final-edge-reader"));
+          available[comp] = readers.back()->nextInteger(current[comp]);
+        }
+        size_type path = 0, remaining_degree = 0, consumed_edges = 0;
+        size_type observed_paths = serializeFastVector(out, metadata.total_edges, [&]()
+        {
+          if(remaining_degree == 0)
+          {
+            if(path >= metadata.paths)
+            {
+              throw eventError("edge stream exceeds path universe");
+            }
+            size_type degree = 0;
+            for(size_type comp = 0; comp < metadata.sigma; comp++)
+            {
+              if(available[comp] && current[comp] < path)
+              {
+                throw eventError("edge stream is not nondecreasing");
+              }
+              while(available[comp] && current[comp] == path)
+              {
+                degree++;
+                available[comp] = readers[comp]->nextInteger(current[comp]);
+              }
+            }
+            if(degree == 0 || degree > metadata.total_edges ||
+               consumed_edges > metadata.total_edges - degree)
+            {
+              throw eventError("invalid edge stream");
+            }
+            consumed_edges += degree;
+            remaining_degree = degree;
+            path++;
+          }
+          remaining_degree--;
+          return (remaining_degree == 0);
+        });
+        for(size_type comp = 0; comp < metadata.sigma; comp++)
+        {
+          if(available[comp])
+          {
+            throw eventError("edge rank exceeds path universe");
+          }
+          readers[comp]->finish();
+        }
+        if(path != metadata.paths || remaining_degree != 0 ||
+           consumed_edges != metadata.total_edges || observed_paths != metadata.paths)
+        {
+          throw eventError("edge total mismatch");
+        }
+        GCSA::fast_vector::rank_1_type empty_rank;
+        write(empty_rank);
+      }
+
+      else if(task == 2 * metadata.sigma + 3)
+      {
+        MemoryBudget budget(parameters.getMemoryLimitBytes(),
+          parameters.getMemoryLimitBytes() / 8);
+        size_type buffer_bytes = componentBufferBytes(parameters, 1);
+        {
+          BufferedEventReader positions(files.sample_positions, 8,
+            metadata.sampled_paths, buffer_bytes, budget,
+            "final-sample-path-reader");
+          std::uint64_t next_sample = 0, previous = 0;
+          bool sample_available = positions.nextInteger(next_sample);
+          size_type path = 0;
+          size_type observed_samples = serializeFastVector(out, metadata.paths, [&]()
+          {
+            if(sample_available && next_sample < path)
+            {
+              throw eventError("sampled path stream is not strictly increasing");
+            }
+            bool result = (sample_available && next_sample == path);
+            if(result)
+            {
+              previous = next_sample;
+              sample_available = positions.nextInteger(next_sample);
+              if(sample_available && next_sample <= previous)
+              {
+                throw eventError("sampled path stream is not strictly increasing");
+              }
+            }
+            path++;
+            return result;
+          });
+          positions.finish();
+          if(sample_available || observed_samples != metadata.sampled_paths)
+          {
+            throw eventError("sampled path stream does not match metadata");
+          }
+        }
+        GCSA::fast_vector::rank_1_type empty_rank;
+        write(empty_rank);
+
+        serializeSampleIds(out, files.sample_ids, metadata.sample_ids,
+          metadata.sample_bits, parameters);
+        if(!out) { throw eventError("cannot write partial final index", partial); }
+        serializeSampleBoundaries(out, files.sample_ends, metadata.sample_ids,
+          metadata.sampled_paths, parameters);
+        if(!out) { throw eventError("cannot write partial final index", partial); }
+      }
+
+      else if(task == 2 * metadata.sigma + 4)
+      {
+        serializeOccurrencePointers(out, files.occurrences, metadata.paths,
+          metadata.occurrence_items, metadata.occurrence_extra, parameters);
         if(!out) { throw eventError("cannot write partial final index", partial); }
       }
       else
       {
-        GCSA::fast_vector empty;
-        write(empty);
-      }
-    }
-    // rank_support_il serializes no payload; load() simply binds it to the BWT
-    // already read above. Rebuilding each fast BWT solely to initialize an
-    // empty serialization performed a full mask scan and allocation for no
-    // output bytes.
-    for(size_type comp = 0; comp < metadata.sigma; comp++)
-    {
-      GCSA::fast_vector::rank_1_type empty;
-      write(empty);
-    }
-    for(size_type comp = 0; comp < metadata.sigma; comp++)
-    {
-      if(comp > 0 && comp <= metadata.fast_chars)
-      {
-        GCSA::sparse_vector empty;
-        write(empty);
-        continue;
-      }
-      serializeSparseBWTComponent(out, files.bwt_masks, metadata.paths,
-        metadata.bwt_counts[comp], static_cast<comp_type>(comp), parameters);
-      if(!out) { throw eventError("cannot write partial final index", partial); }
-    }
-    // rank_support_sd serializes no payload and load() binds it to the sparse
-    // BWT already read above. Rebuilding every sparse vector solely to
-    // initialize this empty object doubled both scan I/O and peak memory.
-    for(size_type comp = 0; comp < metadata.sigma; comp++)
-    {
-      GCSA::sparse_vector::rank_1_type rank;
-      write(rank);
-    }
-
-    {
-      MemoryBudget budget(parameters.getMemoryLimitBytes(),
-        parameters.getMemoryLimitBytes() / 8);
-      size_type buffer_bytes = componentBufferBytes(parameters, metadata.sigma);
-      std::vector<std::unique_ptr<BufferedEventReader>> readers;
-      std::vector<std::uint64_t> current(metadata.sigma);
-      std::vector<bool> available(metadata.sigma, false);
-      for(size_type comp = 0; comp < metadata.sigma; comp++)
-      {
-        readers.emplace_back(new BufferedEventReader(files.edge_destinations[comp],
-          8, metadata.bwt_counts[comp], buffer_bytes, budget, "final-edge-reader"));
-        available[comp] = readers.back()->nextInteger(current[comp]);
-      }
-      size_type path = 0, remaining_degree = 0, consumed_edges = 0;
-      size_type observed_paths = serializeFastVector(out, metadata.total_edges, [&]()
-      {
-        if(remaining_degree == 0)
+        if(metadata.paths == 0 && metadata.redundant != 0)
         {
-          if(path >= metadata.paths)
-          {
-            throw eventError("edge stream exceeds path universe");
-          }
-          size_type degree = 0;
-          for(size_type comp = 0; comp < metadata.sigma; comp++)
-          {
-            if(available[comp] && current[comp] < path)
-            {
-              throw eventError("edge stream is not nondecreasing");
-            }
-            while(available[comp] && current[comp] == path)
-            {
-              degree++;
-              available[comp] = readers[comp]->nextInteger(current[comp]);
-            }
-          }
-          if(degree == 0 || degree > metadata.total_edges ||
-             consumed_edges > metadata.total_edges - degree)
-          {
-            throw eventError("invalid edge stream");
-          }
-          consumed_edges += degree;
-          remaining_degree = degree;
-          path++;
+          throw eventError("redundancy events exist for an empty graph");
         }
-        remaining_degree--;
-        return (remaining_degree == 0);
-      });
-      for(size_type comp = 0; comp < metadata.sigma; comp++)
-      {
-        if(available[comp])
+        size_type slots = (metadata.paths > 0 ? metadata.paths - 1 : 0);
+        if(metadata.redundant > std::numeric_limits<size_type>::max() - slots)
         {
-          throw eventError("edge rank exceeds path universe");
+          throw eventError("redundancy bitvector length overflows");
         }
-        readers[comp]->finish();
+        serializeRedundantPointers(out, files.redundant, metadata.paths,
+          metadata.redundant, parameters);
+        if(!out) { throw eventError("cannot write partial final index", partial); }
       }
-      if(path != metadata.paths || remaining_degree != 0 ||
-         consumed_edges != metadata.total_edges || observed_paths != metadata.paths)
-      {
-        throw eventError("edge total mismatch");
-      }
-      GCSA::fast_vector::rank_1_type empty_rank;
-      write(empty_rank);
-    }
+      if(!out) { throw eventError("cannot encode final component", partial); }
+    };
+    writeFinalComponents(out, files, metadata, parameters, component_tasks, encode, stats);
 
-    {
-      MemoryBudget budget(parameters.getMemoryLimitBytes(),
-        parameters.getMemoryLimitBytes() / 8);
-      size_type buffer_bytes = componentBufferBytes(parameters, 1);
-      {
-        BufferedEventReader positions(files.sample_positions, 8,
-          metadata.sampled_paths, buffer_bytes, budget,
-          "final-sample-path-reader");
-        std::uint64_t next_sample = 0, previous = 0;
-        bool sample_available = positions.nextInteger(next_sample);
-        size_type path = 0;
-        size_type observed_samples = serializeFastVector(out, metadata.paths, [&]()
-        {
-          if(sample_available && next_sample < path)
-          {
-            throw eventError("sampled path stream is not strictly increasing");
-          }
-          bool result = (sample_available && next_sample == path);
-          if(result)
-          {
-            previous = next_sample;
-            sample_available = positions.nextInteger(next_sample);
-            if(sample_available && next_sample <= previous)
-            {
-              throw eventError("sampled path stream is not strictly increasing");
-            }
-          }
-          path++;
-          return result;
-        });
-        positions.finish();
-        if(sample_available || observed_samples != metadata.sampled_paths)
-        {
-          throw eventError("sampled path stream does not match metadata");
-        }
-      }
-      GCSA::fast_vector::rank_1_type empty_rank;
-      write(empty_rank);
-
-      serializeSampleIds(out, files.sample_ids, metadata.sample_ids,
-        metadata.sample_bits, parameters);
-      if(!out) { throw eventError("cannot write partial final index", partial); }
-      serializeSampleBoundaries(out, files.sample_ends, metadata.sample_ids,
-        metadata.sampled_paths, parameters);
-      if(!out) { throw eventError("cannot write partial final index", partial); }
-    }
-
-    serializeOccurrencePointers(out, files.occurrences, metadata.paths,
-      metadata.occurrence_items, metadata.occurrence_extra, parameters);
-    if(!out) { throw eventError("cannot write partial final index", partial); }
-    {
-      if(metadata.paths == 0 && metadata.redundant != 0)
-      {
-        throw eventError("redundancy events exist for an empty graph");
-      }
-      size_type slots = (metadata.paths > 0 ? metadata.paths - 1 : 0);
-      if(metadata.redundant > std::numeric_limits<size_type>::max() - slots)
-      {
-        throw eventError("redundancy bitvector length overflows");
-      }
-      serializeRedundantPointers(out, files.redundant, metadata.paths,
-        metadata.redundant, parameters);
-      if(!out) { throw eventError("cannot write partial final index", partial); }
-    }
     out.flush();
     out.close();
     if(!out) { throw eventError("cannot finish partial final index", partial); }

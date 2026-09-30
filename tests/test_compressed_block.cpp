@@ -6,12 +6,14 @@
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <limits.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 using namespace gcsa;
@@ -54,7 +56,11 @@ rejected(const std::string& filename)
 int
 main()
 {
-  char root[] = "/tmp/gcsa-compressed-block-XXXXXX";
+  const char* configured_tmp = std::getenv("TMPDIR");
+  std::string pattern = std::string(configured_tmp != nullptr ? configured_tmp : "/tmp") +
+    "/gcsa-compressed-block-XXXXXX";
+  std::vector<char> root_buffer(pattern.begin(), pattern.end());
+  root_buffer.push_back(0); char* root = root_buffer.data();
   require(mkdtemp(root) != nullptr);
   std::string first = std::string(root) + "/first";
   std::string second = std::string(root) + "/second";
@@ -95,6 +101,47 @@ main()
     input.seekBlock(2);
     require(input.read(&byte, 1) == 1 && byte == data[28]);
     require(input.readAt(4, &byte, 1) == 1 && byte == data[4]);
+  }
+  // Decoded blocks can outlive their backing descriptors. More resident
+  // readers than the process FD ceiling must still support random/sequential
+  // reads, and a cache hit must not reopen the file.
+  {
+    struct rlimit original;
+    require(getrlimit(RLIMIT_NOFILE, &original) == 0);
+    struct rlimit limited = original;
+    limited.rlim_cur = std::min<rlim_t>(original.rlim_cur, 64);
+    require(setrlimit(RLIMIT_NOFILE, &limited) == 0);
+    std::vector<std::unique_ptr<CompressedBlockReader>> readers;
+    for(std::size_t i = 0; i < 128; i++)
+    {
+      readers.emplace_back(new CompressedBlockReader(first,
+        CompressedBlockReader::FileAccess::TRANSIENT));
+      std::uint8_t byte;
+      require(readers.back()->readAt(2, &byte, 1) == 1 && byte == data[2]);
+    }
+    const std::string hidden = first + ".hidden";
+    require(std::rename(first.c_str(), hidden.c_str()) == 0);
+    for(auto& reader : readers)
+    {
+      std::uint8_t byte;
+      require(reader->readAt(3, &byte, 1) == 1 && byte == data[3]);
+      bool failed = false;
+      try { reader->readAt(60, &byte, 1); }
+      catch(const std::runtime_error&) { failed = true; }
+      require(failed);
+    }
+    require(std::rename(hidden.c_str(), first.c_str()) == 0);
+    for(auto& reader : readers)
+    {
+      std::uint8_t byte;
+      require(reader->readAt(60, &byte, 1) == 1 && byte == data[60]);
+      reader->seekBlock(0);
+      std::vector<std::uint8_t> observed(data.size());
+      require(reader->read(observed.data(), observed.size()) == observed.size());
+      require(observed == data);
+    }
+    readers.clear();
+    require(setrlimit(RLIMIT_NOFILE, &original) == 0);
   }
   // Multiple readers share fixed workers and a single byte bound. Block 0 is
   // queued by the pooled constructor, allowing a caller such as the path

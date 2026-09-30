@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <omp.h>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
@@ -220,7 +221,11 @@ buildViaStore(const Alphabet& alphabet, const FinalEventFiles& files,
 
 int main()
 {
-  char root[] = "/tmp/gcsa-final-events-XXXXXX";
+  const char* temp_directory = std::getenv("TMPDIR");
+  std::string root_storage = std::string(
+    temp_directory != nullptr && temp_directory[0] != '\0' ? temp_directory : "/tmp") +
+    "/gcsa-final-events-XXXXXX";
+  char* root = root_storage.data();
   require(::mkdtemp(root) != nullptr);
   TempFile::setDirectory(root);
 
@@ -596,6 +601,21 @@ int main()
   std::ostringstream compressed_bytes;
   compressed_observed.serialize(compressed_bytes);
   require(compressed_bytes.str() == expected_bytes.str());
+  // Each decoder fits alone, but the simultaneous edge readers do not. A
+  // smaller resume budget must reject the set instead of waiting on itself.
+  ConstructionParameters insufficient_decoder_memory = compressed_parameters;
+  insufficient_decoder_memory.setMemoryLimitBytes(512 * KILOBYTE);
+  const std::string rejected_packed_name = std::string(root) + "/framed-too-small.gcsa";
+  bool rejected_decoder_budget = false;
+  try
+  {
+    storeFinalComponents(compressed_observed.header, alphabet,
+      compressed_restored, compressed_restored_metadata,
+      insufficient_decoder_memory, rejected_packed_name);
+  }
+  catch(const std::runtime_error&) { rejected_decoder_budget = true; }
+  require(rejected_decoder_budget);
+  require(!std::filesystem::exists(rejected_packed_name));
   const std::string compressed_mask_artifact = compressed_workspace.artifact_path(
     ArtifactIdentity("final", "events", "bwt-masks", "bwt-mask-u8-v1"),
     logical_file_id_t(0), physical_shard_id_t(1));
@@ -827,6 +847,121 @@ int main()
   require(packed.extra_pointers.count(2, 2) == 20);
   require(packed.redundant_pointers.count(2, 2) == 2);
   require(packed.sampleCount() == 3 && packed.sample(2) == 100);
+
+  // Parallel encoders must preserve the native byte stream, including empty
+  // rank supports. Memory and descriptor allowances bound worker admission.
+  const int saved_threads = omp_get_max_threads();
+  omp_set_num_threads(4);
+  ConstructionParameters parallel_parameters = parameters;
+  parallel_parameters.setMemoryLimitBytes(4 * MEGABYTE);
+  parallel_parameters.setMaxOpenFiles(128);
+  const auto read_bytes = [](const std::string& filename)
+  {
+    std::ifstream input(filename, std::ios_base::binary);
+    require(static_cast<bool>(input));
+    std::ostringstream bytes; bytes << input.rdbuf(); return bytes.str();
+  };
+  FinalComponentStats component_stats;
+  storeFinalComponents(observed.header, alphabet, restored, restored_metadata,
+    parallel_parameters, packed_name, &component_stats);
+  require(component_stats.workers == 3 && component_stats.buffer_limit_bytes > 0);
+  require(read_bytes(packed_name) == expected_bytes.str());
+  storeFinalComponents(observed.header, alphabet, restored, restored_metadata,
+    parameters, packed_name, &component_stats);
+  require(component_stats.workers == 1);
+  ConstructionParameters descriptor_limited = parallel_parameters;
+  descriptor_limited.setMaxOpenFiles(64);
+  omp_set_num_threads(8);
+  storeFinalComponents(observed.header, alphabet, restored, restored_metadata,
+    descriptor_limited, packed_name, &component_stats);
+  require(component_stats.workers == 3);
+  omp_set_num_threads(4);
+  require(read_bytes(packed_name) == expected_bytes.str());
+
+  // A late encoder failure must wake blocked producers, join every worker,
+  // remove the partial file, and preserve an already published index.
+  writeInteger(restored.occurrences, 0, restored_metadata.paths);
+  bool parallel_failure_rejected = false;
+  try
+  {
+    storeFinalComponents(observed.header, alphabet, restored, restored_metadata,
+      parallel_parameters, packed_name, &component_stats);
+  }
+  catch(const std::runtime_error&) { parallel_failure_rejected = true; }
+  require(parallel_failure_rejected && component_stats.workers == 3);
+  require(read_bytes(packed_name) == expected_bytes.str());
+  require(!std::filesystem::exists(packed_name + "." +
+    std::to_string(static_cast<unsigned long long>(::getpid())) + ".partial"));
+  writeInteger(restored.occurrences, 0, 0);
+
+  // Force queue backpressure with components larger than each bounded pipe.
+  // Raw and framed inputs must produce the same serial and parallel bytes.
+  std::string previous_large_bytes;
+  for(bool framed : { false, true })
+  {
+    ConstructionParameters large_parameters = parallel_parameters;
+    if(framed) { large_parameters.setMemoryLimitBytes(16 * MEGABYTE); }
+    FinalEventFiles large_files(alphabet.sigma);
+    FinalEventMetadata large_metadata;
+    const size_type paths = 100000;
+    {
+      MemoryBudget memory(64 * MEGABYTE);
+      FinalEventWriter writer(large_files, alphabet.sigma, 256, memory,
+        framed ? TempFileCodecParameters(TempCompression::ZSTD, 1024, 1, 1) :
+          TempFileCodecParameters());
+      for(size_type path = 0; path < paths; path++)
+      {
+        const comp_type comp = path % alphabet.sigma;
+        writer.path(1U << comp); writer.edge(comp, path);
+        if(path % 11 == 0)
+        {
+          writer.sampledPath(path); writer.sample(path + 1); writer.sampleEnd();
+        }
+        if(path % 17 == 0) { writer.occurrence(path, 1); }
+        if(path % 19 == 0 && path + 1 < paths) { writer.redundancy(path); }
+      }
+      large_metadata = writer.finish();
+    }
+    large_metadata.fast_chars = alphabet.fast_chars;
+    writeFinalEventMetadata(large_files, large_metadata);
+    GCSAHeader large_header = observed.header;
+    large_header.path_nodes = paths; large_header.edges = paths;
+    const std::string large_name = std::string(root) + "/large-packed.gcsa";
+    // A small queue limit relative to output size exercises blocked encoders.
+    omp_set_num_threads(1);
+    storeFinalComponents(large_header, alphabet, large_files, large_metadata,
+      large_parameters, large_name, &component_stats);
+    require(component_stats.workers == 1);
+    const std::string serial_bytes = read_bytes(large_name);
+    omp_set_num_threads(4);
+    storeFinalComponents(large_header, alphabet, large_files, large_metadata,
+      large_parameters, large_name, &component_stats);
+    require(component_stats.workers >= 2);
+    require(read_bytes(large_name) == serial_bytes);
+    if(!framed)
+    {
+      // Component 1 fails after producing more bytes than its pipe holds;
+      // later component producers can be blocked when cancellation arrives.
+      writeByte(large_files.bwt_masks, 1, 0);
+      bool rejected_parallel_mask = false;
+      try
+      {
+        storeFinalComponents(large_header, alphabet, large_files, large_metadata,
+          large_parameters, large_name, &component_stats);
+      }
+      catch(const std::runtime_error&) { rejected_parallel_mask = true; }
+      require(rejected_parallel_mask && component_stats.workers >= 2);
+      require(read_bytes(large_name) == serial_bytes);
+      writeByte(large_files.bwt_masks, 1, 1U << 1);
+    }
+    if(framed) { require(serial_bytes == previous_large_bytes); }
+    previous_large_bytes = serial_bytes;
+    std::istringstream stream(serial_bytes);
+    GCSA loaded; loaded.load(stream);
+    require(loaded.header.path_nodes == paths && loaded.sample(0) == 1);
+    large_files.clear();
+  }
+  omp_set_num_threads(saved_threads);
 
   const auto rejects = [&](const FinalEventMetadata& candidate_metadata)
   {

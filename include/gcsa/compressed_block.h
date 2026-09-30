@@ -115,7 +115,11 @@ private:
 class CompressedBlockReader
 {
 public:
+  enum class FileAccess { PERSISTENT, TRANSIENT };
   explicit CompressedBlockReader(const std::string& filename);
+  // Transient readers retain decoded blocks but open their immutable backing
+  // file only for an actual block/index read. They do not use async prefetch.
+  CompressedBlockReader(const std::string& filename, FileAccess access);
   // This form validates the stream metadata but queues block 0 instead of
   // decoding it synchronously. Readers sharing `pool` are serviced by the
   // same fixed workers and byte bound.
@@ -152,7 +156,16 @@ public:
 private:
   CompressedBlockReader(const std::string& filename,
     const std::shared_ptr<CompressedBlockPrefetchPool>& pool,
-    bool defer_first_block);
+    bool defer_first_block, bool transient_descriptor = false);
+  struct DescriptorLease
+  {
+    explicit DescriptorLease(CompressedBlockReader& reader);
+    ~DescriptorLease();
+    DescriptorLease(const DescriptorLease&) = delete;
+    DescriptorLease& operator=(const DescriptorLease&) = delete;
+    CompressedBlockReader& reader;
+    bool acquired;
+  };
   void loadBlock(std::size_t block);
   void prefetchBlock(std::size_t block);
   void resetPrefetch();
@@ -164,6 +177,8 @@ private:
   void checkSequentialChecksum();
   void releaseConsumedCache(std::uint64_t physical_offset);
   std::ifstream input;
+  std::string source_name;
+  bool transient_descriptor;
   std::vector<std::uint8_t> current;
   std::size_t current_block, current_offset;
   std::uint64_t index_offset, block_count, block_size, current_logical;

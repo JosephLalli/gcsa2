@@ -312,6 +312,10 @@ struct PathGraphMergeStats
   // set came. Its capacity is a share of the merge budget rather than a bound,
   // so the peak is what says whether that share is defensible.
   size_type max_from_set_nodes;
+  // MergedGraph leaves these at zero on prune() and records the execution
+  // shape of the final merge. They make the serial reference and the bounded
+  // parallel route distinguishable in focused tests without affecting output.
+  size_type merge_workers, merge_partitions;
 
   PathGraphMergeStats() :
     priority_spills(0), range_spills(0), from_set_sorts(0),
@@ -325,7 +329,7 @@ struct PathGraphMergeStats
     prefetch_errors(0), prefetch_physical_bytes(0),
     prefetch_decoded_bytes(0), prefetch_wait_nanoseconds(0),
     max_prefetch_bytes(0), oversized_input_pair_bytes(0),
-    max_from_set_nodes(0) { }
+    max_from_set_nodes(0), merge_workers(0), merge_partitions(0) { }
 };
 
 //------------------------------------------------------------------------------
@@ -475,7 +479,8 @@ struct MergedGraph
     size_type group_buffer_bytes = MEGABYTE,
     PathGraphMergeStats* stats = nullptr,
     size_type max_open_files = 128,
-    size_type input_cache_bytes = 0);
+    size_type input_cache_bytes = 0,
+    size_type merge_workers = 1);
   ~MergedGraph();
 
   void clear();

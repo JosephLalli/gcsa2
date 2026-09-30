@@ -659,10 +659,207 @@ static void compare_merged_graph(const std::string& base)
   std::remove(input_name.c_str());
 }
 
+static void write_parallel_merged_fixture(const std::string& name)
+{
+  Alphabet alpha;
+  const std::vector<std::pair<std::string, size_type>> groups = {
+    { "AAA", 5000 }, { "AAC", 5000 },
+    { "CAA", 300 },  { "CAC", 300 },
+    { "GAA", 17 },   { "GAC", 17 },
+    { "TAA", 3 },    { "TAC", 3 }
+  };
+  std::vector<KMer> kmers;
+  for(const auto& group : groups)
+  {
+    comp_type comp = alpha.char2comp[group.first.front()];
+    byte_type edge = static_cast<byte_type>(1 << comp);
+    key_type key = Key::encode(alpha, group.first, edge, edge);
+    size_type component_base = static_cast<size_type>(comp) * 100000;
+    for(size_type i = 0; i < group.second; i++)
+    {
+      // The two labels in each root component have exactly the same start set.
+      // extendRange() must merge across that nonzero-LCP label boundary, while
+      // the zero-LCP A/C/G/T boundaries remain independent worker tasks.
+      kmers.push_back(KMer(key, Node::encode(component_base + i + 1, 0),
+        Node::encode(component_base + i + 50001, 0)));
+    }
+  }
+  std::ofstream output(name.c_str(), std::ios_base::binary);
+  writeBinary(output, kmers, 3); output.close(); require(static_cast<bool>(output));
+}
+
+static void require_same_merged_graph(const MergedGraph& expected,
+  const MergedGraph& actual)
+{
+  require(expected.size() == actual.size());
+  require(expected.ranks() == actual.ranks());
+  require(expected.extra() == actual.extra());
+  require(expected.next == actual.next);
+  require(expected.next_from == actual.next_from);
+  require(contents(expected.path_name) == contents(actual.path_name));
+  require(contents(expected.rank_name) == contents(actual.rank_name));
+  require(contents(expected.from_name) == contents(actual.from_name));
+  require(contents(expected.lcp_name) == contents(actual.lcp_name));
+}
+
+static void compare_parallel_merged_graph(const std::string& base)
+{
+  const std::string input_name = base + ".graph";
+  write_parallel_merged_fixture(input_name);
+  ConstructionParameters parameters;
+  Alphabet alpha;
+  int previous_threads = omp_get_max_threads();
+  int previous_dynamic = omp_get_dynamic();
+  omp_set_dynamic(0); omp_set_num_threads(8);
+  {
+    InputGraph input(std::vector<std::string>{ input_name }, true, parameters, alpha);
+    std::vector<key_type> keys; input.readKeys(keys);
+    require(keys.size() == 8);
+    DeBruijnGraph mapper(keys, input.k(), input.alpha);
+    LCP lcp(keys, input.k());
+    sdsl::int_vector<0> distinct(keys.size(), 0,
+      bit_length(Key::label(keys.back())));
+    for(size_type i = 0; i < keys.size(); i++) { distinct[i] = Key::label(keys[i]); }
+    PathGraph paths(input, distinct);
+
+    const size_type parallel_budget = 256 * KILOBYTE;
+    PathGraphMergeStats serial_stats, two_stats, four_stats, fd_stats,
+      scratch_limited_stats;
+    MergedGraph serial(paths, mapper, lcp, GIGABYTE, MEGABYTE,
+      &serial_stats, 128, 0, 1);
+    MergedGraph two(paths, mapper, lcp, GIGABYTE, parallel_budget,
+      &two_stats, 128, 0, 2);
+    MergedGraph four(paths, mapper, lcp, GIGABYTE, parallel_budget,
+      &four_stats, 128, 0, 4);
+    // The 32-descriptor ceiling admits only two complete worker footprints.
+    MergedGraph fd_limited(paths, mapper, lcp, GIGABYTE, parallel_budget,
+      &fd_stats, 32, 0, 8);
+    // Parallel copy would need two logical copies of the merged streams. The
+    // output itself fits this limit exactly, so the bounded implementation
+    // must discard its local partitions and complete through the serial route.
+    MergedGraph scratch_limited(paths, mapper, lcp, serial.bytes(),
+      parallel_budget, &scratch_limited_stats, 128, 0, 4);
+
+    require_same_merged_graph(serial, two);
+    require_same_merged_graph(serial, four);
+    require_same_merged_graph(serial, fd_limited);
+    require_same_merged_graph(serial, scratch_limited);
+    require(serial.size() == 4); // Each within-component adjacent pair merged.
+    require(serial_stats.merge_workers == 1);
+    require(two_stats.merge_workers == 2);
+    require(four_stats.merge_workers == 4);
+    require(fd_stats.merge_workers == 2);
+    require(scratch_limited_stats.merge_workers == 1);
+    // Seven alphabet components are scheduled, including the empty $, N, and
+    // # intervals; A is deliberately much larger than C/G/T.
+    require(four_stats.merge_partitions == mapper.alpha.sigma);
+    require(four_stats.merge_partitions > four.size());
+    require(four_stats.priority_spills > 0);
+    require(four_stats.from_set_sorts > 0);
+    require(four_stats.prefetch_workers == 0);
+    require(2 * four_stats.max_open_input_pairs +
+      14 * four_stats.merge_workers <= 128);
+    require(four_stats.max_input_buffer_bytes <= parallel_budget);
+
+    // Fifty-seven interleaved framed shards reproduce the chr21 compactor's
+    // shape. Dividing 128 FDs among four workers must not reduce the decoded
+    // cache to a few pairs and decompress one whole block for every record.
+    {
+      constexpr size_type shard_count = 57;
+      constexpr size_type block_bytes = 64 * KILOBYTE;
+      PathGraph wide(shard_count, paths.order, paths.doubling_steps);
+      std::vector<PathNode> nodes;
+      std::vector<PathNode::rank_type> labels;
+      paths.read(nodes, labels, 0);
+      size_type stored_bytes = 0;
+      for(size_type shard = 0; shard < shard_count; shard++)
+      {
+        CompressedBlockWriter path_output(wide.path_names[shard], block_bytes,
+          CompressedBlockWriter::ZSTD);
+        CompressedBlockWriter rank_output(wide.rank_names[shard], block_bytes,
+          CompressedBlockWriter::ZSTD);
+        wide.logical_file_ids[shard] = logical_file_id_t(0);
+        for(size_type i = shard; i < nodes.size(); i += shard_count)
+        {
+          PathNode node = nodes[i];
+          size_type pointer = node.pointer();
+          node.setPointer(wide.rank_counts[shard]);
+          path_output.writeRecord(&node, sizeof(node));
+          rank_output.writeRecord(labels.data() + pointer,
+            node.ranks() * sizeof(PathNode::rank_type));
+          wide.path_counts[shard]++;
+          wide.rank_counts[shard] += node.ranks();
+        }
+        path_output.finish(); rank_output.finish();
+        wide.path_count += wide.path_counts[shard];
+        wide.rank_count += wide.rank_counts[shard];
+        stored_bytes += CompressedBlockReader(wide.path_names[shard]).physicalSize();
+        stored_bytes += CompressedBlockReader(wide.rank_names[shard]).physicalSize();
+      }
+      PathGraphMergeStats wide_stats;
+      size_type before = DiskIO::read_volume;
+      ScopedFileLimit limit(128);
+      MergedGraph merged(wide, mapper, lcp, GIGABYTE, MEGABYTE,
+        &wide_stats, 128, 256 * MEGABYTE, 4);
+      size_type read_bytes = DiskIO::read_volume - before;
+      require_same_merged_graph(serial, merged);
+      require(wide_stats.merge_workers == 4);
+      require(wide_stats.max_open_input_pairs <= 4);
+      require(wide_stats.max_input_buffer_bytes <= 256 * MEGABYTE);
+      // Allow all workers' boundary probes plus ordered-output assembly. This
+      // bound is far below repeatedly decoding a shard per merged record.
+      require(read_bytes < 32 * stored_bytes + 8 * serial.bytes());
+      // A mixed old/new workspace cannot use the all-framed descriptor mode.
+      // Its 57 persistent pairs only fit one worker under the same FD cap.
+      {
+        std::ofstream path_output(wide.path_names[0], std::ios::binary);
+        std::ofstream rank_output(wide.rank_names[0], std::ios::binary);
+        size_type rank_offset = 0;
+        for(size_type i = 0; i < nodes.size(); i += shard_count)
+        {
+          PathNode node = nodes[i];
+          size_type pointer = node.pointer(); node.setPointer(rank_offset);
+          path_output.write(reinterpret_cast<const char*>(&node), sizeof(node));
+          rank_output.write(reinterpret_cast<const char*>(labels.data() + pointer),
+            node.ranks() * sizeof(PathNode::rank_type));
+          rank_offset += node.ranks();
+        }
+      }
+      PathGraphMergeStats mixed_stats;
+      MergedGraph mixed(wide, mapper, lcp, GIGABYTE, MEGABYTE,
+        &mixed_stats, 128, 256 * MEGABYTE, 4);
+      require_same_merged_graph(serial, mixed);
+      require(mixed_stats.merge_workers == 1);
+    }
+
+    // A completely empty frontier still takes the parallel assembly route,
+    // creates four valid empty streams, and preserves the serial next tables.
+    PathGraph empty_paths(2, input.k(), 0);
+    PathGraphMergeStats empty_serial_stats, empty_parallel_stats;
+    MergedGraph empty_serial(empty_paths, mapper, lcp, GIGABYTE,
+      parallel_budget, &empty_serial_stats, 128, 0, 1);
+    MergedGraph empty_parallel(empty_paths, mapper, lcp, GIGABYTE,
+      parallel_budget, &empty_parallel_stats, 128, 0, 4);
+    require_same_merged_graph(empty_serial, empty_parallel);
+    require(empty_parallel.size() == 0 && empty_parallel.ranks() == 0 &&
+      empty_parallel.extra() == 0);
+    require(empty_parallel_stats.merge_workers == 4);
+    require(empty_parallel_stats.merge_partitions == mapper.alpha.sigma);
+  }
+  omp_set_num_threads(previous_threads); omp_set_dynamic(previous_dynamic);
+  std::remove(input_name.c_str());
+}
+
 int main()
 {
-  char root[] = "/tmp/gcsa-prune-spill-XXXXXX";
-  require(mkdtemp(root) != nullptr); TempFile::setDirectory(root);
+  const char* configured_tmp = std::getenv("TMPDIR");
+  const std::string temp_root =
+    ((configured_tmp != nullptr && configured_tmp[0] != 0) ? configured_tmp : "/tmp");
+  const std::string root_template = temp_root + "/gcsa-prune-spill-XXXXXX";
+  std::vector<char> root_buffer(root_template.begin(), root_template.end());
+  root_buffer.push_back(0);
+  require(mkdtemp(root_buffer.data()) != nullptr);
+  const std::string root(root_buffer.data()); TempFile::setDirectory(root);
   std::vector<key_type> keys(16); for(size_type i = 0; i < keys.size(); i++) { keys[i] = i; }
   LCP lcp(keys, 1);
 
@@ -726,6 +923,10 @@ int main()
   // Use the real construction route so mapper ranks and LCP invariants are
   // validated rather than synthesized by the test.
   compare_merged_graph(std::string(root) + "/merged");
-  rmdir(root);
+  // Force the bounded parallel route at several worker counts. The fixture has
+  // empty and highly skewed root components, spills its dominant group, and
+  // contains adjacent distinct-label groups that must not be cut apart.
+  compare_parallel_merged_graph(std::string(root) + "/parallel-merged");
+  rmdir(root.c_str());
   return 0;
 }

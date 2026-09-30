@@ -1,13 +1,18 @@
 #include <gcsa/algorithms.h>
+#include <gcsa/compressed_block.h>
 #include <gcsa/path_graph_external.h>
 #include <gcsa/files.h>
 #include <gcsa/gcsa.h>
 #include <gcsa/lcp.h>
 #include <gcsa/path_graph.h>
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
+#include <map>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
@@ -29,6 +34,19 @@ requireAt(bool condition, size_type line)
 }
 
 #define require(condition) requireAt((condition), __LINE__)
+
+std::string
+makeTempRoot(const std::string& stem)
+{
+  const char* configured = std::getenv("TMPDIR");
+  std::filesystem::path parent =
+    (configured != nullptr && configured[0] != '\0' ? configured : "/tmp");
+  std::string pattern = (parent / (stem + "-XXXXXX")).string();
+  std::vector<char> mutable_pattern(pattern.begin(), pattern.end());
+  mutable_pattern.push_back('\0');
+  require(mkdtemp(mutable_pattern.data()) != nullptr);
+  return std::string(mutable_pattern.data());
+}
 
 std::vector<char>
 readFile(const std::string& filename)
@@ -77,6 +95,146 @@ hasWorkspaceArtifact(const std::string& workspace, const std::string& prefix)
   return false;
 }
 
+std::map<std::string, std::vector<char>>
+workspaceArtifacts(const std::string& workspace, const std::string& prefix)
+{
+  std::map<std::string, std::vector<char>> result;
+  for(const std::filesystem::directory_entry& entry :
+      std::filesystem::directory_iterator(workspace))
+  {
+    const std::string name = entry.path().filename().string();
+    if(entry.is_regular_file() && name.compare(0, prefix.size(), prefix) == 0 &&
+       entry.path().extension() == ".bin")
+    {
+      result[name] = readFile(entry.path().string());
+    }
+  }
+  return result;
+}
+
+std::vector<char>
+readLogicalFile(const std::string& filename)
+{
+  if(!CompressedBlockReader::isFramed(filename)) { return readFile(filename); }
+  CompressedBlockReader input(filename);
+  require(input.logicalSize() <= std::numeric_limits<size_type>::max());
+  std::vector<char> result(static_cast<size_type>(input.logicalSize()));
+  if(!result.empty())
+  {
+    require(input.read(result.data(), result.size()) == result.size());
+  }
+  char extra = 0;
+  require(input.read(&extra, 1) == 0);
+  return result;
+}
+
+std::map<std::string, std::vector<char>>
+workspaceLogicalArtifacts(const std::string& workspace,
+  const std::string& prefix)
+{
+  std::map<std::string, std::vector<char>> result;
+  for(const std::filesystem::directory_entry& entry :
+      std::filesystem::directory_iterator(workspace))
+  {
+    const std::string name = entry.path().filename().string();
+    if(entry.is_regular_file() && name.compare(0, prefix.size(), prefix) == 0 &&
+       entry.path().extension() == ".bin")
+    {
+      result[name] = readLogicalFile(entry.path().string());
+    }
+  }
+  return result;
+}
+
+void
+enableSmallFramedCodec(ConstructionParameters& parameters)
+{
+  parameters.setTempCompression("zstd");
+  parameters.setCompressionBlockSize(64 * KILOBYTE);
+  parameters.setCompressionWorkers(1);
+  // The raw minima used by externalParameters() do not include zstd's
+  // writer and reader workspaces.  These established framed-join caps admit
+  // the minimum supported codec block while remaining small enough to
+  // exercise external runs.
+  parameters.setJoinPartitionSize(4 * MEGABYTE);
+  parameters.setSortRunSize(2 * MEGABYTE);
+}
+
+void
+enableSmallFramedStreams(ConstructionParameters& parameters)
+{
+  parameters.setIOBufferSize(16 * KILOBYTE);
+  enableSmallFramedCodec(parameters);
+}
+
+void
+appendDeBruijn(size_type t, size_type period, size_type order,
+  size_type alphabet_size, std::vector<size_type>& state,
+  std::vector<size_type>& sequence)
+{
+  if(t > order)
+  {
+    if(order % period == 0)
+    {
+      for(size_type i = 1; i <= period; i++) { sequence.push_back(state[i]); }
+    }
+    return;
+  }
+  state[t] = state[t - period];
+  appendDeBruijn(t + 1, period, order, alphabet_size, state, sequence);
+  for(size_type value = state[t - period] + 1; value < alphabet_size; value++)
+  {
+    state[t] = value;
+    appendDeBruijn(t + 1, t, order, alphabet_size, state, sequence);
+  }
+}
+
+void
+writeSparseSkewCycle(const std::string& filename)
+{
+  constexpr size_type order = 6;
+  const std::string alphabet = "ACGT";
+  std::vector<size_type> state(alphabet.size() * order + 1, 0), sequence;
+  appendDeBruijn(1, 1, order, alphabet.size(), state, sequence);
+  require(sequence.size() == 4096);
+
+  std::ofstream output(filename.c_str());
+  require(static_cast<bool>(output));
+  for(size_type i = 0; i < sequence.size(); i++)
+  {
+    std::string label;
+    for(size_type j = 0; j < order; j++)
+    {
+      label.push_back(alphabet[sequence[(i + j) % sequence.size()]]);
+    }
+    char predecessor = alphabet[sequence[(i + sequence.size() - 1) % sequence.size()]];
+    char successor = alphabet[sequence[(i + order) % sequence.size()]];
+    size_type next = (i + 1) % sequence.size();
+    output << label << '\t' << (10 + i / 256) << ':' << (i % 256 + 1) << '\t'
+           << predecessor << '\t' << successor << '\t'
+           << (10 + next / 256) << ':' << (next % 256 + 1) << '\n';
+  }
+
+  // A separate N self-loop component carries enough distinct starts to exceed
+  // the minimum SpillableNodeSet collection capacity. Each duplicate has a
+  // real incoming and outgoing loop, keeping the input graph consistent while
+  // its one-character predecessor mask remains sparse. The 4096 DNA paths force
+  // many batches and mostly exercise the unsampled continuation comparison.
+  const std::string skew_label(order, 'N');
+  for(size_type id = 1; id <= 3; id++)
+  {
+    output << skew_label << '\t' << id << ":1\tN\tN\t"
+           << id << ":1\n";
+  }
+  for(size_type copy = 0; copy < 2048; copy++)
+  {
+    size_type id = 1000 + copy;
+    output << skew_label << '\t' << id << ":1\tN\tN\t"
+           << id << ":1\n";
+  }
+  output.close(); require(static_cast<bool>(output));
+}
+
 } // namespace
 
 int
@@ -85,15 +243,17 @@ main()
   omp_set_num_threads(1);
   Verbosity::set(Verbosity::SILENT);
 
-  char legacy_root[] = "/tmp/gcsa-resume-legacy-XXXXXX";
-  char workspace_root[] = "/tmp/gcsa-resume-work-XXXXXX";
-  char empty_root[] = "/tmp/gcsa-resume-empty-XXXXXX";
-  require(mkdtemp(legacy_root) != nullptr);
-  require(mkdtemp(workspace_root) != nullptr);
-  require(mkdtemp(empty_root) != nullptr);
-  const std::string input_name = "tests/cycle.gcsa2";
+  const std::string legacy_root = makeTempRoot("gcsa-resume-legacy");
+  const std::string workspace_root = makeTempRoot("gcsa-resume-work");
+  const std::string parallel_root = makeTempRoot("gcsa-resume-parallel");
+  const std::string fallback_root = makeTempRoot("gcsa-resume-fallback");
+  const std::string empty_root = makeTempRoot("gcsa-resume-empty");
+  const std::string input_name = legacy_root + "/sparse-skew.gcsa2";
+  writeSparseSkewCycle(input_name);
   const std::string legacy_prefix = std::string(legacy_root) + "/index";
   const std::string external_prefix = std::string(workspace_root) + "/index";
+  const std::string parallel_prefix = std::string(parallel_root) + "/index";
+  const std::string fallback_prefix = std::string(fallback_root) + "/index";
   const std::string staged_prefix = std::string(workspace_root) + "/staged";
   const std::string mapping_name = std::string(legacy_root) + "/mapping";
   // Exercise mapping-before-deduplication in the final start-node set: the
@@ -143,9 +303,11 @@ main()
 
   // Resume through the final ordered scan, but stop before component assembly.
   // This verifies that a completed event set is independently durable.
+  std::ostringstream serial_log;
   {
     ConstructionParameters parameters = externalParameters(workspace_root,
-      external_minimum + 128 * KILOBYTE);
+      external_minimum + 64 * MEGABYTE);
+    enableSmallFramedStreams(parameters);
     parameters.setResume();
     // Cleanup is operational and may be enabled only after an older frontier
     // already exists. Resumption must catch up without discarding this step's
@@ -153,6 +315,8 @@ main()
     parameters.setCleanObsolete();
     parameters.setStopAfter("final-events");
     bool stopped = false;
+    std::streambuf* old_stderr = std::cerr.rdbuf(serial_log.rdbuf());
+    Verbosity::set(Verbosity::EXTENDED);
     try
     {
       InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
@@ -162,17 +326,148 @@ main()
     {
       stopped = (event.completed_phase == "final-events");
     }
+    catch(...)
+    {
+      std::cerr.rdbuf(old_stderr); Verbosity::set(Verbosity::SILENT); throw;
+    }
+    std::cerr.rdbuf(old_stderr); Verbosity::set(Verbosity::SILENT);
     require(stopped);
     require(std::filesystem::exists(
       std::string(workspace_root) + "/final--events.complete"));
     require(!hasWorkspaceArtifact(workspace_root, "initial--paths--"));
   }
 
+  // Rebuild the same event frontier with component-wise predecessor workers.
+  // A 16 KiB event buffer forces framed event payloads, while 64 descriptors
+  // is the supported minimum and the small sort/join caps retain forced
+  // spilling.
+  // The final event artifacts themselves must be byte-identical before either
+  // workspace is allowed to assemble the public index.
+  omp_set_num_threads(4);
+  TempFile::setDirectory(parallel_root);
+  std::ostringstream parallel_log;
+  {
+    ConstructionParameters parameters = externalParameters(parallel_root,
+      external_minimum + 64 * MEGABYTE);
+    enableSmallFramedStreams(parameters);
+    InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
+    std::streambuf* old_stderr = std::cerr.rdbuf(parallel_log.rdbuf());
+    Verbosity::set(Verbosity::EXTENDED);
+    try
+    {
+      GCSA::buildAndStore(graph, parameters,
+        parallel_prefix + GCSA::EXTENSION);
+      LCPArray::buildAndStore(graph, parameters,
+        parallel_prefix + LCPArray::EXTENSION);
+    }
+    catch(...)
+    {
+      std::cerr.rdbuf(old_stderr); Verbosity::set(Verbosity::SILENT); throw;
+    }
+    std::cerr.rdbuf(old_stderr); Verbosity::set(Verbosity::SILENT);
+    require(std::filesystem::exists(
+      std::string(parallel_root) + "/final--events.complete"));
+    GCSA index;
+    LCPArray lcp;
+    require(sdsl::load_from_file(index,
+      parallel_prefix + GCSA::EXTENSION));
+    require(sdsl::load_from_file(lcp,
+      parallel_prefix + LCPArray::EXTENSION));
+    require(verifyIndex(index, &lcp, graph));
+  }
+  const std::string predecessor_prefix =
+    "final predecessor lookup: 4 worker(s), ";
+  size_type predecessor_line = parallel_log.str().find(predecessor_prefix);
+  require(predecessor_line != std::string::npos);
+  size_type predecessor_batches = std::stoull(parallel_log.str().substr(
+    predecessor_line + predecessor_prefix.size()));
+  require(predecessor_batches > 1);
+  const auto scanReadBytes = [](const std::string& log) -> size_type {
+    const std::string prefix = "final scan read bytes: ";
+    size_type at = log.find(prefix); require(at != std::string::npos);
+    return std::stoull(log.substr(at + prefix.size()));
+  };
+  const size_type serial_scan_reads = scanReadBytes(serial_log.str());
+  const size_type parallel_scan_reads = scanReadBytes(parallel_log.str());
+  std::cerr << "final scan regression fixture read bytes: serial "
+            << serial_scan_reads << ", parallel " << parallel_scan_reads << '\n';
+  // Allow initial prefetch alignment, but not one full-buffer reread per
+  // component and batch. Sampling and lookup must remain monotone streams.
+  require(parallel_scan_reads <= serial_scan_reads + 1024 * KILOBYTE);
+  const std::string spill_prefix = "final start-node sets: ";
+  size_type spill_line = parallel_log.str().find(spill_prefix);
+  require(spill_line != std::string::npos);
+  size_type spills = std::stoull(parallel_log.str().substr(
+    spill_line + spill_prefix.size()));
+  require(spills > 0);
+  std::map<std::string, std::vector<char>> serial_events =
+    workspaceArtifacts(workspace_root, "final--events--");
+  std::map<std::string, std::vector<char>> parallel_events =
+    workspaceArtifacts(parallel_root, "final--events--");
+  require(!serial_events.empty());
+  require(serial_events == parallel_events);
+
+  require(readFile(legacy_prefix + GCSA::EXTENSION) ==
+    readFile(parallel_prefix + GCSA::EXTENSION));
+  require(readFile(legacy_prefix + LCPArray::EXTENSION) ==
+    readFile(parallel_prefix + LCPArray::EXTENSION));
+
+  // Request workers under the supported descriptor floor, but keep the 1 KiB
+  // I/O buffer below the minimum useful batch. The final scan must retain the
+  // serial reader layout and produce the same framed event bytes and indexes.
+  TempFile::setDirectory(fallback_root);
+  std::ostringstream fallback_log;
+  {
+    ConstructionParameters parameters = externalParameters(fallback_root,
+      external_minimum + 64 * MEGABYTE);
+    enableSmallFramedCodec(parameters);
+    InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
+    std::streambuf* old_stderr = std::cerr.rdbuf(fallback_log.rdbuf());
+    Verbosity::set(Verbosity::EXTENDED);
+    try
+    {
+      GCSA::buildAndStore(graph, parameters,
+        fallback_prefix + GCSA::EXTENSION);
+      LCPArray::buildAndStore(graph, parameters,
+        fallback_prefix + LCPArray::EXTENSION);
+    }
+    catch(...)
+    {
+      std::cerr.rdbuf(old_stderr); Verbosity::set(Verbosity::SILENT); throw;
+    }
+    std::cerr.rdbuf(old_stderr); Verbosity::set(Verbosity::SILENT);
+    GCSA index;
+    LCPArray lcp;
+    require(sdsl::load_from_file(index,
+      fallback_prefix + GCSA::EXTENSION));
+    require(sdsl::load_from_file(lcp,
+      fallback_prefix + LCPArray::EXTENSION));
+    require(verifyIndex(index, &lcp, graph));
+  }
+  require(fallback_log.str().find(
+    "final predecessor lookup: 1 worker(s), 0 bounded batch(es)") !=
+    std::string::npos);
+  require(fallback_log.str().find(
+    "serial fallback: batch admission too small") != std::string::npos);
+  // The final-event writer bounds its frame size by the I/O buffer, so this
+  // deliberate 1 KiB fallback uses different physical frame boundaries than
+  // the 16 KiB serial run. Compare decoded streams here; the matched-buffer
+  // serial/parallel comparison above remains byte-for-byte.
+  require(workspaceLogicalArtifacts(fallback_root, "final--events--") ==
+    workspaceLogicalArtifacts(workspace_root, "final--events--"));
+  require(readFile(legacy_prefix + GCSA::EXTENSION) ==
+    readFile(fallback_prefix + GCSA::EXTENSION));
+  require(readFile(legacy_prefix + LCPArray::EXTENSION) ==
+    readFile(fallback_prefix + LCPArray::EXTENSION));
+
+  omp_set_num_threads(1);
+  TempFile::setDirectory(workspace_root);
+
   // A second resume changes the operational RAM ceiling again, restores the
   // immutable events, and assembles byte-identical final components.
   {
     ConstructionParameters parameters = externalParameters(workspace_root,
-      external_minimum + 64 * KILOBYTE);
+      external_minimum + MEGABYTE);
     parameters.setResume();
     InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
     // Production builds both external products through buildAndStore, not
@@ -199,7 +494,7 @@ main()
   // remain compatible.
   {
     ConstructionParameters parameters = externalParameters(workspace_root,
-      external_minimum + 64 * KILOBYTE);
+      external_minimum + MEGABYTE);
     parameters.setResume();
     InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
     GCSA::buildAndStore(graph, parameters, staged_prefix + GCSA::EXTENSION);
@@ -267,6 +562,8 @@ main()
 
   std::filesystem::remove_all(legacy_root);
   std::filesystem::remove_all(workspace_root);
+  std::filesystem::remove_all(parallel_root);
+  std::filesystem::remove_all(fallback_root);
   std::filesystem::remove_all(empty_root);
   return 0;
 }

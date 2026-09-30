@@ -1254,6 +1254,13 @@ CompressedBlockReader::CompressedBlockReader(const std::string& filename) :
 }
 
 CompressedBlockReader::CompressedBlockReader(const std::string& filename,
+  FileAccess access) :
+  CompressedBlockReader(filename, std::shared_ptr<CompressedBlockPrefetchPool>(),
+    access == FileAccess::TRANSIENT, access == FileAccess::TRANSIENT)
+{
+}
+
+CompressedBlockReader::CompressedBlockReader(const std::string& filename,
   const std::shared_ptr<CompressedBlockPrefetchPool>& pool) :
   CompressedBlockReader(filename, pool, static_cast<bool>(pool))
 {
@@ -1261,8 +1268,9 @@ CompressedBlockReader::CompressedBlockReader(const std::string& filename,
 
 CompressedBlockReader::CompressedBlockReader(const std::string& filename,
   const std::shared_ptr<CompressedBlockPrefetchPool>& pool,
-  bool defer_first_block) :
-  input(filename, std::ios::binary), current(), current_block(0),
+  bool defer_first_block, bool transient) :
+  input(filename, std::ios::binary), source_name(filename),
+  transient_descriptor(transient), current(), current_block(0),
   current_offset(0), index_offset(0), block_count(0), block_size(0),
   current_logical(0), logical_bytes(0), physical_bytes(0), record_count(0),
   whole_checksum(0), sequential_bytes(0), sequential_checksum(FNV_OFFSET),
@@ -1358,15 +1366,18 @@ CompressedBlockReader::CompressedBlockReader(const std::string& filename,
   // cache advice. Close the metadata stream first, then use one raw descriptor
   // for every operation after construction.
   this->input.close();
-  this->cache_descriptor = ::open(filename.c_str(), O_RDONLY);
-  if(this->cache_descriptor < 0)
+  if(!this->transient_descriptor)
   {
-    throw std::runtime_error("compressed block: descriptor open failure");
-  }
+    this->cache_descriptor = ::open(filename.c_str(), O_RDONLY);
+    if(this->cache_descriptor < 0)
+    {
+      throw std::runtime_error("compressed block: descriptor open failure");
+    }
 #if defined(POSIX_FADV_SEQUENTIAL)
-  static_cast<void>(::posix_fadvise(this->cache_descriptor, 0, 0,
-    POSIX_FADV_SEQUENTIAL));
+    static_cast<void>(::posix_fadvise(this->cache_descriptor, 0, 0,
+      POSIX_FADV_SEQUENTIAL));
 #endif
+  }
 
   try
   {
@@ -1377,7 +1388,7 @@ CompressedBlockReader::CompressedBlockReader(const std::string& filename,
         this->prefetch_owner = this->prefetch_pool->registerReader();
         this->prefetchBlock(0);
       }
-      else
+      else if(!defer_first_block)
       {
         this->loadBlock(0);
       }
@@ -1392,6 +1403,32 @@ CompressedBlockReader::CompressedBlockReader(const std::string& filename,
     }
     ::close(this->cache_descriptor); this->cache_descriptor = -1;
     throw;
+  }
+}
+
+CompressedBlockReader::DescriptorLease::DescriptorLease(
+  CompressedBlockReader& owner) : reader(owner), acquired(false)
+{
+  // Metadata validation still uses the constructor's ifstream. Nested leases
+  // reuse the outer descriptor and never close it prematurely.
+  if(this->reader.cache_descriptor < 0 && !this->reader.input.is_open())
+  {
+    this->reader.cache_descriptor = ::open(this->reader.source_name.c_str(),
+      O_RDONLY);
+    if(this->reader.cache_descriptor < 0)
+    {
+      throw std::runtime_error("compressed block: descriptor reopen failure");
+    }
+    this->acquired = this->reader.transient_descriptor;
+  }
+}
+
+CompressedBlockReader::DescriptorLease::~DescriptorLease()
+{
+  if(this->acquired)
+  {
+    ::close(this->reader.cache_descriptor);
+    this->reader.cache_descriptor = -1;
   }
 }
 
@@ -1448,6 +1485,7 @@ CompressedBlockReader::blockExtent(std::size_t block,
     this->block_count - 1, block + 1);
   const std::size_t entries = static_cast<std::size_t>(last - first + 1);
   std::uint8_t encoded[3 * INDEX_ENTRY_SIZE];
+  DescriptorLease descriptor(*this);
   preadExactCounted(this->cache_descriptor, encoded,
     entries * INDEX_ENTRY_SIZE, this->index_offset + first * INDEX_ENTRY_SIZE,
     "offset index extent");
@@ -1496,6 +1534,7 @@ CompressedBlockReader::indexEntry(std::uint64_t block,
   }
   const std::uint64_t entry_offset =
     this->index_offset + block * INDEX_ENTRY_SIZE;
+  DescriptorLease descriptor(*this);
   if(this->cache_descriptor >= 0)
   {
     std::uint8_t entry[INDEX_ENTRY_SIZE];
@@ -1588,6 +1627,7 @@ CompressedBlockReader::loadBlock(std::size_t block)
     return;
   }
 
+  DescriptorLease descriptor(*this);
   std::uint64_t physical, logical;
   std::uint64_t next_physical, next_logical;
   this->blockExtent(block, physical, logical, next_physical, next_logical);
@@ -1793,6 +1833,7 @@ CompressedBlockReader::seekUncompressedByte(std::uint64_t offset)
     return;
   }
 
+  DescriptorLease descriptor(*this);
   std::uint64_t low = 0, high = this->block_count;
   while(low + 1 < high)
   {
