@@ -312,9 +312,11 @@ struct PathGraphMergeStats
   // set came. Its capacity is a share of the merge budget rather than a bound,
   // so the peak is what says whether that share is defensible.
   size_type max_from_set_nodes;
-  // MergedGraph leaves these at zero on prune() and records the execution
-  // shape of the final merge. They make the serial reference and the bounded
-  // parallel route distinguishable in focused tests without affecting output.
+  // Execution shape for the repeated prune and final-merge passes. Requested
+  // workers is retained even on a safe serial fallback, so a benchmark can
+  // distinguish an unused request from an actual parallel execution.
+  size_type prune_requested_workers, prune_workers, prune_partitions;
+  size_type prune_parallel_fallbacks;
   size_type merge_workers, merge_partitions;
 
   PathGraphMergeStats() :
@@ -329,7 +331,9 @@ struct PathGraphMergeStats
     prefetch_errors(0), prefetch_physical_bytes(0),
     prefetch_decoded_bytes(0), prefetch_wait_nanoseconds(0),
     max_prefetch_bytes(0), oversized_input_pair_bytes(0),
-    max_from_set_nodes(0), merge_workers(0), merge_partitions(0) { }
+    max_from_set_nodes(0),
+    prune_requested_workers(0), prune_workers(0), prune_partitions(0),
+    prune_parallel_fallbacks(0), merge_workers(0), merge_partitions(0) { }
 };
 
 //------------------------------------------------------------------------------
@@ -346,6 +350,8 @@ struct PathGraph
 {
   std::vector<std::string> path_names, rank_names;
   std::vector<size_type>   path_counts, rank_counts;
+  // Optional closed-writer provenance; absent/stale entries use checksum scans.
+  std::vector<ClosedPayloadChecksum> path_checksums, rank_checksums;
 
   // `file` in the legacy code is a physical stream index. It must never be
   // used as source-graph identity: one logical graph may have many spill
@@ -438,7 +444,8 @@ struct PathGraph
     size_type group_buffer_bytes = MEGABYTE,
     PathGraphMergeStats* stats = nullptr,
     size_type max_open_files = 128,
-    size_type input_cache_bytes = 0);
+    size_type input_cache_bytes = 0,
+    size_type prune_workers = 1);
   void extend(size_type size_limit, size_type memory_limit);
 
   void debugExtend();

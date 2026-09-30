@@ -12,6 +12,37 @@
 #include <sys/stat.h>
 #include <unistd.h>
 namespace gcsa {
+std::atomic<uint64_t> BuildWorkspace::adoption_checksum_scan_bytes(0);
+std::atomic<uint64_t> BuildWorkspace::adoption_checksum_reused_bytes(0);
+void
+ClosedPayloadChecksum::record(const std::string& path, uint64_t digest)
+{
+  this->valid = false;
+  if(::stat(path.c_str(), &this->identity) != 0 ||
+     !S_ISREG(this->identity.st_mode) || this->identity.st_size < 0)
+  {
+    throw std::runtime_error("cannot seal closed payload checksum: " + path);
+  }
+  this->value = digest;
+  this->valid = true;
+}
+
+bool
+ClosedPayloadChecksum::matches(const std::string& path, uint64_t bytes) const
+{
+  struct stat current;
+  if(!this->valid || ::stat(path.c_str(), &current) != 0 ||
+     !S_ISREG(current.st_mode) || current.st_size < 0 ||
+     static_cast<uint64_t>(current.st_size) != bytes) { return false; }
+  return current.st_dev == this->identity.st_dev &&
+    current.st_ino == this->identity.st_ino &&
+    current.st_size == this->identity.st_size &&
+    current.st_mtim.tv_sec == this->identity.st_mtim.tv_sec &&
+    current.st_mtim.tv_nsec == this->identity.st_mtim.tv_nsec &&
+    current.st_ctim.tv_sec == this->identity.st_ctim.tv_sec &&
+    current.st_ctim.tv_nsec == this->identity.st_ctim.tv_nsec;
+}
+
 namespace {
 const uint32_t HEAD=0x47534148U, FOOT=0x47534146U; const size_t BUFFER=1024*1024;
 const off_t CACHE_TAIL_BYTES=64*1024*1024, CACHE_FLUSH_BYTES=512*1024*1024;
@@ -574,8 +605,13 @@ BuildWorkspace::adopt_raw_payload(const ArtifactIdentity& identity,
       {
         allocate_buffer();
         sum = checksum_raw_file(input, expected_bytes, buffer, partial);
+        adoption_checksum_scan_bytes += expected_bytes;
       }
-      else { sum = *known_checksum; }
+      else
+      {
+        sum = *known_checksum;
+        adoption_checksum_reused_bytes += expected_bytes;
+      }
       if(close(input) != 0) { throw err("close failed", partial); }
       input = -1;
     }
@@ -604,6 +640,7 @@ BuildWorkspace::adopt_raw_payload(const ArtifactIdentity& identity,
           offset += got;
         }
         sum = checksum(buffer.data(), want, sum);
+        adoption_checksum_scan_bytes += want;
         write_all(output, buffer.data(), want, partial); left -= want;
         off_t consumed = lseek(input, 0, SEEK_CUR);
         if(consumed < 0) { throw err("cannot determine raw payload input position", source); }

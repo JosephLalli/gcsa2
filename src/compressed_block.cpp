@@ -77,7 +77,7 @@ checksum(const std::uint8_t* data, std::size_t bytes,
 
 template<class Value>
 void
-writeLittle(std::ostream& output, Value value)
+writeLittle(std::ostream& output, Value value, std::uint64_t* stored_digest = nullptr)
 {
   std::uint8_t bytes[sizeof(Value)];
   for(std::size_t i = 0; i < sizeof(Value); ++i)
@@ -86,6 +86,7 @@ writeLittle(std::ostream& output, Value value)
   }
   output.write(reinterpret_cast<const char*>(bytes), sizeof(bytes));
   DiskIO::write_volume += sizeof(bytes);
+  if(stored_digest != nullptr) { *stored_digest = checksum(bytes, sizeof(bytes), *stored_digest); }
   if(!output) { throw std::runtime_error("compressed block: write failure"); }
 }
 
@@ -361,7 +362,8 @@ CompressedBlockWriter::CompressedBlockWriter(const std::string& filename,
   buffer(), block_size(block_bytes), requested_mode(mode),
   compression_level(zstd_level), compression_workers(workers),
   compression_context(nullptr), record_count(0), buffer_records(0),
-  byte_count(0), whole_checksum(FNV_OFFSET), completed(false)
+  byte_count(0), whole_checksum(FNV_OFFSET), stored_checksum(FNV_OFFSET),
+  track_stored_checksum(false), completed(false)
 {
   if(block_bytes == 0 || workers == 0 || (mode != RAW && mode != ZSTD) ||
      zstd_level < ZSTD_minCLevel() || zstd_level > ZSTD_maxCLevel())
@@ -417,13 +419,13 @@ CompressedBlockWriter::CompressedBlockWriter(const std::string& filename,
     }
 
     this->buffer.reserve(block_bytes);
-    writeLittle(this->output, FILE_MAGIC);
-    writeLittle(this->output, FORMAT_VERSION);
-    writeLittle(this->output, HEADER_SIZE);
-    writeLittle(this->output, static_cast<std::uint64_t>(block_bytes));
-    writeLittle(this->output, static_cast<std::uint32_t>(mode));
+    writeLittle(this->output, FILE_MAGIC, &this->stored_checksum);
+    writeLittle(this->output, FORMAT_VERSION, &this->stored_checksum);
+    writeLittle(this->output, HEADER_SIZE, &this->stored_checksum);
+    writeLittle(this->output, static_cast<std::uint64_t>(block_bytes), &this->stored_checksum);
+    writeLittle(this->output, static_cast<std::uint32_t>(mode), &this->stored_checksum);
     writeLittle(this->output,
-      static_cast<std::uint32_t>(this->compression_workers));
+      static_cast<std::uint32_t>(this->compression_workers), &this->stored_checksum);
   }
   catch(...)
   {
@@ -451,6 +453,22 @@ CompressedBlockWriter::~CompressedBlockWriter()
     ::unlink(this->temporary_name.c_str());
   }
   if(!this->index_name.empty()) { ::unlink(this->index_name.c_str()); }
+}
+
+void
+CompressedBlockWriter::trackStoredChecksum()
+{
+  if(this->completed || this->record_count != 0)
+  { throw std::logic_error("stored checksum must be requested before writing records"); }
+  this->track_stored_checksum = true;
+}
+
+std::uint64_t
+CompressedBlockWriter::storedChecksum() const
+{
+  if(!this->completed || !this->track_stored_checksum)
+  { throw std::logic_error("stored checksum requires a completed tracked writer"); }
+  return this->stored_checksum;
 }
 
 void
@@ -507,17 +525,25 @@ CompressedBlockWriter::flushBlock()
   const std::vector<std::uint8_t>& payload =
     (codec == ZSTD_BLOCK ? compressed : this->buffer);
 
-  writeLittle(this->output, BLOCK_MAGIC);
-  writeLittle(this->output, codec);
-  writeLittle(this->output, this->buffer_records);
+  writeLittle(this->output, BLOCK_MAGIC,
+    this->track_stored_checksum ? &this->stored_checksum : nullptr);
+  writeLittle(this->output, codec,
+    this->track_stored_checksum ? &this->stored_checksum : nullptr);
+  writeLittle(this->output, this->buffer_records,
+    this->track_stored_checksum ? &this->stored_checksum : nullptr);
   writeLittle(this->output,
-    static_cast<std::uint64_t>(this->buffer.size()));
+    static_cast<std::uint64_t>(this->buffer.size()),
+    this->track_stored_checksum ? &this->stored_checksum : nullptr);
   writeLittle(this->output,
-    static_cast<std::uint64_t>(payload.size()));
+    static_cast<std::uint64_t>(payload.size()),
+    this->track_stored_checksum ? &this->stored_checksum : nullptr);
   writeLittle(this->output,
-    checksum(this->buffer.data(), this->buffer.size()));
+    checksum(this->buffer.data(), this->buffer.size()),
+    this->track_stored_checksum ? &this->stored_checksum : nullptr);
   this->output.write(reinterpret_cast<const char*>(payload.data()),
     payload.size());
+  if(this->track_stored_checksum)
+  { this->stored_checksum = checksum(payload.data(), payload.size(), this->stored_checksum); }
   DiskIO::write_volume += payload.size();
   if(!this->output)
   {
@@ -561,6 +587,8 @@ CompressedBlockWriter::finish()
       throw std::runtime_error("compressed block: truncated temporary index");
     }
     this->output.write(reinterpret_cast<const char*>(entry), sizeof(entry));
+    if(this->track_stored_checksum)
+    { this->stored_checksum = checksum(entry, sizeof(entry), this->stored_checksum); }
     DiskIO::read_volume += static_cast<std::size_t>(bytes);
     DiskIO::write_volume += sizeof(entry);
     if(!this->output)
@@ -572,14 +600,22 @@ CompressedBlockWriter::finish()
   index_input.close();
   this->index_output.close();
 
-  writeLittle(this->output, FOOTER_MAGIC);
-  writeLittle(this->output, FORMAT_VERSION);
-  writeLittle(this->output, FOOTER_SIZE);
-  writeLittle(this->output, blocks);
-  writeLittle(this->output, this->record_count);
-  writeLittle(this->output, this->byte_count);
-  writeLittle(this->output, this->whole_checksum);
-  writeLittle(this->output, index_offset);
+  writeLittle(this->output, FOOTER_MAGIC,
+    this->track_stored_checksum ? &this->stored_checksum : nullptr);
+  writeLittle(this->output, FORMAT_VERSION,
+    this->track_stored_checksum ? &this->stored_checksum : nullptr);
+  writeLittle(this->output, FOOTER_SIZE,
+    this->track_stored_checksum ? &this->stored_checksum : nullptr);
+  writeLittle(this->output, blocks,
+    this->track_stored_checksum ? &this->stored_checksum : nullptr);
+  writeLittle(this->output, this->record_count,
+    this->track_stored_checksum ? &this->stored_checksum : nullptr);
+  writeLittle(this->output, this->byte_count,
+    this->track_stored_checksum ? &this->stored_checksum : nullptr);
+  writeLittle(this->output, this->whole_checksum,
+    this->track_stored_checksum ? &this->stored_checksum : nullptr);
+  writeLittle(this->output, index_offset,
+    this->track_stored_checksum ? &this->stored_checksum : nullptr);
   this->output.flush();
   this->output.close();
   if(this->output.fail())

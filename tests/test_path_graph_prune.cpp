@@ -5,8 +5,10 @@
 
 #include <cstdlib>
 #include <cstdio>
+#include <dirent.h>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -89,6 +91,198 @@ static std::vector<char> contents(const std::string& name)
 {
   std::ifstream input(name.c_str(), std::ios_base::binary);
   return std::vector<char>((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+}
+
+enum PruneFixtureStorage { FIXTURE_RAW, FIXTURE_FRAMED, FIXTURE_MIXED };
+
+struct PruneFixtureRecord
+{
+  PathNode::rank_type rank;
+  node_type from;
+  bool sorted;
+};
+
+static std::vector<key_type> parallel_prune_keys(Alphabet& alpha)
+{
+  const std::vector<std::string> labels = {
+    "AAA", "AAC", "CAA", "CAC", "GAA", "GAC", "TAA", "TAC"
+  };
+  std::vector<key_type> result;
+  for(const std::string& label : labels)
+  {
+    comp_type comp = alpha.char2comp[label.front()];
+    byte_type edge = static_cast<byte_type>(1 << comp);
+    result.push_back(Key::encode(alpha, label, edge, edge));
+  }
+  std::sort(result.begin(), result.end());
+  return result;
+}
+
+static std::vector<std::vector<PruneFixtureRecord>> parallel_prune_records()
+{
+  std::vector<std::vector<PruneFixtureRecord>> result(3);
+  auto add = [&](size_type file, PathNode::rank_type rank, size_type count,
+    node_type from, bool sorted = false)
+  {
+    for(size_type i = 0; i < count; i++)
+    {
+      result[file].push_back({ rank, from, sorted && i == 0 });
+    }
+  };
+
+  // Ranks 0/1 share a nonzero-LCP root component, one semantic input, and a
+  // start node, so extendRange() must join their groups across two physical
+  // shards. Rank 2 is duplicated across logical inputs. Rank 3 mixes sorted
+  // and unsorted paths. Ranks 4/5 extend, while rank 6 has the same start and
+  // logical identity but sits beyond an exact zero-LCP boundary and must not.
+  add(0, 0, 32, Node::encode(100, 0));
+  add(1, 0, 24, Node::encode(100, 0));
+  add(0, 1, 6, Node::encode(100, 0));
+  add(1, 1, 4, Node::encode(100, 0));
+  add(0, 2, 3, Node::encode(200, 0));
+  add(2, 2, 3, Node::encode(200, 0));
+  add(0, 3, 2, Node::encode(301, 0), true);
+  add(1, 3, 2, Node::encode(302, 0));
+  add(1, 4, 8, Node::encode(500, 0));
+  add(1, 5, 5, Node::encode(500, 0));
+  add(1, 6, 5, Node::encode(500, 0));
+  add(2, 6, 2, Node::encode(600, 0));
+  add(1, 7, 3, Node::encode(500, 0));
+  add(2, 7, 2, Node::encode(601, 0));
+  for(auto& records : result)
+  {
+    std::stable_sort(records.begin(), records.end(),
+      [](const PruneFixtureRecord& left, const PruneFixtureRecord& right)
+      {
+        return left.rank < right.rank;
+      });
+  }
+  return result;
+}
+
+static void write_parallel_prune_pair(const std::string& path_name,
+  const std::string& rank_name, const std::vector<PruneFixtureRecord>& records,
+  bool framed, bool corrupt = false, bool invalid_tail_rank = false)
+{
+  std::ofstream raw_paths, raw_ranks;
+  std::unique_ptr<CompressedBlockWriter> framed_paths, framed_ranks;
+  if(framed)
+  {
+    framed_paths.reset(new CompressedBlockWriter(path_name, 4 * KILOBYTE,
+      CompressedBlockWriter::ZSTD));
+    framed_ranks.reset(new CompressedBlockWriter(rank_name, 4 * KILOBYTE,
+      CompressedBlockWriter::ZSTD));
+  }
+  else
+  {
+    raw_paths.open(path_name.c_str(), std::ios_base::binary);
+    raw_ranks.open(rank_name.c_str(), std::ios_base::binary);
+  }
+
+  for(size_type i = 0; i < records.size(); i++)
+  {
+    PathNode node;
+    node.from = records[i].from;
+    node.to = Node::encode(10000 + i, 0);
+    node.fields = 0; node.setPredecessors(1);
+    node.setOrder(1); node.setLCP(1); node.setPointer(2 * i);
+    if(records[i].sorted) { node.makeSorted(); }
+    if(corrupt && i == 0) { node.setPointer(2 * records.size() + 17); }
+    PathNode::rank_type label[2] = {
+      (invalid_tail_rank && i + 1 == records.size() ?
+        static_cast<PathNode::rank_type>(12345) : records[i].rank), 0 };
+    if(framed)
+    {
+      framed_paths->writeRecord(&node, sizeof(node));
+      framed_ranks->writeRecord(label, sizeof(label));
+    }
+    else
+    {
+      raw_paths.write(reinterpret_cast<const char*>(&node), sizeof(node));
+      raw_ranks.write(reinterpret_cast<const char*>(label), sizeof(label));
+    }
+  }
+  if(framed) { framed_paths->finish(); framed_ranks->finish(); }
+}
+
+static void initialize_parallel_prune_graph(PathGraph& graph,
+  const std::string& base, PruneFixtureStorage storage, bool corrupt = false,
+  bool invalid_tail_rank = false)
+{
+  const std::vector<std::vector<PruneFixtureRecord>> records =
+    parallel_prune_records();
+  const logical_file_id_t logical[3] = {
+    logical_file_id_t(7), logical_file_id_t(7), logical_file_id_t(8)
+  };
+  for(size_type file = 0; file < records.size(); file++)
+  {
+    const bool framed = (storage == FIXTURE_FRAMED ||
+      (storage == FIXTURE_MIXED && file == 1));
+    std::string path_name = base + "." + std::to_string(file) + ".path";
+    std::string rank_name = base + "." + std::to_string(file) + ".rank";
+    write_parallel_prune_pair(path_name, rank_name, records[file], framed,
+      corrupt && file == 0, invalid_tail_rank && file == 0);
+    graph.path_names.push_back(path_name); graph.rank_names.push_back(rank_name);
+    graph.path_counts.push_back(records[file].size());
+    graph.rank_counts.push_back(2 * records[file].size());
+    graph.path_checksums.push_back(ClosedPayloadChecksum());
+    graph.rank_checksums.push_back(ClosedPayloadChecksum());
+    graph.logical_file_ids.push_back(logical[file]);
+    graph.physical_shard_ids.push_back(physical_shard_id_t(100 + file));
+    graph.path_count += records[file].size();
+    graph.rank_count += 2 * records[file].size();
+  }
+}
+
+struct LogicalPruneRecord
+{
+  node_type from, to;
+  size_type fields;
+  std::vector<PathNode::rank_type> label;
+
+  bool operator==(const LogicalPruneRecord& another) const
+  {
+    return (this->from == another.from && this->to == another.to &&
+      this->fields == another.fields && this->label == another.label);
+  }
+};
+
+static std::map<logical_file_id_t, std::vector<LogicalPruneRecord>>
+logical_prune_records(const PathGraph& graph)
+{
+  std::map<logical_file_id_t, std::vector<LogicalPruneRecord>> result;
+  for(size_type file = 0; file < graph.files(); file++)
+  {
+    std::vector<PathNode> paths;
+    std::vector<PathNode::rank_type> labels;
+    graph.read(paths, labels, file);
+    for(PathNode node : paths)
+    {
+      size_type pointer = node.pointer();
+      require(pointer <= labels.size());
+      require(node.ranks() <= labels.size() - pointer);
+      LogicalPruneRecord record;
+      record.from = node.from; record.to = node.to;
+      record.label.assign(labels.begin() + pointer,
+        labels.begin() + pointer + node.ranks());
+      node.setPointer(0); record.fields = node.fields;
+      result[graph.logicalFile(file)].push_back(record);
+    }
+  }
+  return result;
+}
+
+static size_type directory_entries(const std::string& directory)
+{
+  DIR* stream = ::opendir(directory.c_str()); require(stream != nullptr);
+  size_type result = 0;
+  while(struct dirent* entry = ::readdir(stream))
+  {
+    std::string name(entry->d_name);
+    if(name != "." && name != "..") { result++; }
+  }
+  require(::closedir(stream) == 0);
+  return result;
 }
 
 static void initialize_graph(PathGraph& result, const std::string& base,
@@ -850,6 +1044,147 @@ static void compare_parallel_merged_graph(const std::string& base)
   std::remove(input_name.c_str());
 }
 
+static const char* prune_storage_name(PruneFixtureStorage storage)
+{
+  if(storage == FIXTURE_RAW) { return "raw"; }
+  if(storage == FIXTURE_FRAMED) { return "framed"; }
+  return "mixed";
+}
+
+static void compare_parallel_prune(const std::string& root,
+  PruneFixtureStorage storage)
+{
+  Alphabet alpha;
+  std::vector<key_type> keys = parallel_prune_keys(alpha);
+  LCP lcp(keys, 3);
+  DeBruijnGraph mapper(keys, 3, alpha);
+  const std::string tag = prune_storage_name(storage);
+  const size_type group_budget = 4 * KILOBYTE;
+  const size_type cache_budget = 64 * MEGABYTE;
+
+  int previous_threads = omp_get_max_threads();
+  int previous_dynamic = omp_get_dynamic();
+  omp_set_dynamic(0); omp_set_num_threads(std::max(4, previous_threads));
+  {
+    PathGraph serial(0, 3, 0), parallel(0, 3, 0);
+    initialize_parallel_prune_graph(serial,
+      root + "/parallel-prune-" + tag + "-serial", storage);
+    initialize_parallel_prune_graph(parallel,
+      root + "/parallel-prune-" + tag + "-parallel", storage);
+
+    PathGraphMergeStats serial_stats, parallel_stats;
+    serial.prune(lcp, GIGABYTE, group_budget, &serial_stats, 128,
+      cache_budget, 1);
+    parallel.prune(lcp, GIGABYTE, group_budget, &parallel_stats, 128,
+      cache_budget, 4);
+
+    require(logical_prune_records(serial) == logical_prune_records(parallel));
+    require(serial.size() == parallel.size());
+    require(serial.ranks() == parallel.ranks());
+    require(serial.ranges() == parallel.ranges());
+    require(serial.unique == parallel.unique);
+    require(serial.redundant == parallel.redundant);
+    require(serial.unsorted == parallel.unsorted);
+    require(serial.nondeterministic == parallel.nondeterministic);
+    require(parallel.files() > serial.files());
+    require(parallel_stats.prune_requested_workers == 4);
+    require(parallel_stats.prune_workers == 4);
+    require(parallel_stats.prune_partitions == 4);
+    require(parallel_stats.prune_parallel_fallbacks == 0);
+    require(parallel_stats.priority_spills > 0);
+    require(parallel_stats.prefetch_workers == 0);
+    require(parallel_stats.max_input_buffer_bytes <= cache_budget);
+    require(2 * parallel_stats.max_open_input_pairs +
+      2 * parallel_stats.max_open_output_pairs +
+      2 * parallel_stats.prune_workers <= 128);
+    for(size_type file = 0; file < serial.files(); file++)
+    {
+      require(serial.path_checksums[file].matches(serial.path_names[file],
+        serial.path_counts[file] * sizeof(PathNode)));
+      require(serial.rank_checksums[file].matches(serial.rank_names[file],
+        serial.rank_counts[file] * sizeof(PathNode::rank_type)));
+    }
+    for(size_type file = 0; file < parallel.files(); file++)
+    {
+      require(parallel.physicalShard(file) == physical_shard_id_t(file));
+      require(parallel.path_checksums[file].matches(parallel.path_names[file],
+        parallel.path_counts[file] * sizeof(PathNode)));
+      require(parallel.rank_checksums[file].matches(parallel.rank_names[file],
+        parallel.rank_counts[file] * sizeof(PathNode::rank_type)));
+    }
+
+    // Retaining root-partition shards must be transparent to the final merge,
+    // including its pointer and LCP streams, not merely to another prune.
+    PathGraphMergeStats final_serial_stats, final_parallel_stats;
+    MergedGraph serial_final(serial, mapper, lcp, GIGABYTE, MEGABYTE,
+      &final_serial_stats, 128, cache_budget, 1);
+    MergedGraph parallel_final(parallel, mapper, lcp, GIGABYTE, MEGABYTE,
+      &final_parallel_stats, 128, cache_budget, 1);
+    require_same_merged_graph(serial_final, parallel_final);
+
+    if(storage == FIXTURE_RAW)
+    {
+      // Six descriptors can make serial progress but cannot retain one full
+      // raw three-shard input set in two workers. The request must fall back
+      // before opening worker outputs and retain the exact serial result.
+      PathGraph limited(0, 3, 0);
+      initialize_parallel_prune_graph(limited,
+        root + "/parallel-prune-low-fd", storage);
+      PathGraphMergeStats limited_stats;
+      limited.prune(lcp, GIGABYTE, group_budget, &limited_stats, 6,
+        cache_budget, 4);
+      require(logical_prune_records(serial) == logical_prune_records(limited));
+      require(limited_stats.prune_requested_workers == 4);
+      require(limited_stats.prune_workers == 1);
+      require(limited_stats.prune_partitions == 1);
+      require(limited_stats.prune_parallel_fallbacks == 1);
+    }
+  }
+  omp_set_num_threads(previous_threads); omp_set_dynamic(previous_dynamic);
+}
+
+static void compare_parallel_prune_failure_cleanup(const std::string& root)
+{
+  Alphabet alpha;
+  std::vector<key_type> keys = parallel_prune_keys(alpha);
+  LCP lcp(keys, 3);
+  int previous_threads = omp_get_max_threads();
+  int previous_dynamic = omp_get_dynamic();
+  omp_set_dynamic(0); omp_set_num_threads(std::max(4, previous_threads));
+  {
+    auto require_clean_failure = [&](const std::string& name,
+      bool corrupt_pointer, bool invalid_tail_rank)
+    {
+      PathGraph broken(0, 3, 0);
+      initialize_parallel_prune_graph(broken,
+        root + "/parallel-prune-" + name, FIXTURE_RAW,
+        corrupt_pointer, invalid_tail_rank);
+      const size_type original_size = broken.size();
+      const std::vector<std::string> original_paths = broken.path_names;
+      const size_type before = directory_entries(root);
+      bool failed = false;
+      try
+      {
+        PathGraphMergeStats stats;
+        broken.prune(lcp, GIGABYTE, 4 * KILOBYTE, &stats, 128,
+          64 * MEGABYTE, 4);
+      }
+      catch(const std::runtime_error&) { failed = true; }
+      require(failed);
+      require(broken.size() == original_size);
+      require(broken.path_names == original_paths);
+      for(const std::string& path : original_paths)
+      {
+        require(::access(path.c_str(), F_OK) == 0);
+      }
+      require(directory_entries(root) == before);
+    };
+    require_clean_failure("broken-pointer", true, false);
+    require_clean_failure("invalid-tail-rank", false, true);
+  }
+  omp_set_num_threads(previous_threads); omp_set_dynamic(previous_dynamic);
+}
+
 int main()
 {
   const char* configured_tmp = std::getenv("TMPDIR");
@@ -927,6 +1262,14 @@ int main()
   // empty and highly skewed root components, spills its dominant group, and
   // contains adjacent distinct-label groups that must not be cut apart.
   compare_parallel_merged_graph(std::string(root) + "/parallel-merged");
+  // Repeated-round pruning uses exact zero-LCP root partitions. Exercise raw,
+  // framed, and mixed input generations, retained physical output shards,
+  // logical-file semantics, forced spills, bounded-resource fallback, final
+  // merge equality, checksum provenance, and exception cleanup.
+  compare_parallel_prune(root, FIXTURE_RAW);
+  compare_parallel_prune(root, FIXTURE_FRAMED);
+  compare_parallel_prune(root, FIXTURE_MIXED);
+  compare_parallel_prune_failure_cleanup(root);
   rmdir(root.c_str());
   return 0;
 }

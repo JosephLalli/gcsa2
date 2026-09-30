@@ -8,6 +8,7 @@
 #include <gcsa/path_graph.h>
 #include <gcsa/workspace.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <exception>
@@ -812,13 +813,17 @@ struct ExternalFinalScanStats
   size_type from_node_spills, maximum_from_nodes;
   size_type predecessor_workers, predecessor_batches;
   size_type maximum_predecessor_batch, predecessor_buffer_bytes;
+  size_type prepared_from_paths, prepared_from_ranks;
+  size_type prepared_from_spill_fallbacks, from_preparation_buffer_bytes;
   bool predecessor_parallel_fallback;
   bool restored;
 
   ExternalFinalScanStats() : previous_occurrences(), suffix_tree_stack(),
     from_node_spills(0), maximum_from_nodes(0), predecessor_workers(1),
     predecessor_batches(0), maximum_predecessor_batch(0),
-    predecessor_buffer_bytes(0), predecessor_parallel_fallback(false),
+    predecessor_buffer_bytes(0), prepared_from_paths(0),
+    prepared_from_ranks(0), prepared_from_spill_fallbacks(0),
+    from_preparation_buffer_bytes(0), predecessor_parallel_fallback(false),
     restored(false) { }
 };
 
@@ -827,10 +832,14 @@ struct ExternalFinalScanStats
 
   Each component worker follows exactly the same monotone destination-reader
   trajectory as the serial scan, but it owns a distinct reader and destination
-  slot. The globally ordered consumer later emits those destinations and alone
-  mutates prev_occ, the suffix-tree stack, and the event streams. Keeping one
-  fixed-width record per path makes the queue reservation exact and prevents a
-  path with a very large mapped start-node set from inflating this pipeline.
+  slot. Path workers independently sort/deduplicate the mapped current-node
+  slice and resolve each node's immutable from-rank. The globally ordered
+  consumer later emits those destinations and alone mutates prev_occ, the
+  suffix-tree stack, and the event streams.
+
+  Current-node payload is held in separately admitted arenas. A path that does
+  not fit is the last path in its batch and uses the existing spillable set, so
+  no variable-size allocation can inflate this fixed record.
 */
 struct FinalPredecessorWork
 {
@@ -838,6 +847,8 @@ struct FinalPredecessorWork
   std::array<PathNode::rank_type, PathLabel::LABEL_LENGTH + 1> labels;
   std::array<size_type, FinalEventMetadata::MAX_SIGMA> destinations;
   std::array<node_type, FinalEventMetadata::MAX_SIGMA> destination_primary;
+  size_type from_offset, from_count;
+  bool from_spilled, sample_by_period;
 };
 
 constexpr size_type MIN_FINAL_PREDECESSOR_BATCH = 64;
@@ -850,6 +861,58 @@ checkedProduct(size_type first, size_type second, const std::string& label)
     throw std::runtime_error("GCSA::GCSA(): " + label + " size overflows");
   }
   return first * second;
+}
+
+node_type
+mappedFinalNode(node_type node, const NodeMapping& mapping)
+{
+  return (mapping.empty() ? node :
+    Node::encode(mapping(Node::id(node)), Node::offset(node), Node::rc(node)));
+}
+
+size_type
+finalFromRank(node_type node, const sdsl::sd_vector<>& from_nodes)
+{
+  // successor() performs the membership test and rank lookup in one succinct
+  // descent. This helper is pure over the immutable sd_vector and is therefore
+  // safe to run in the unordered half of a batch.
+  if(node >= from_nodes.size())
+  {
+    throw std::runtime_error(
+      "GCSA::GCSA(): start node " + Node::decode(node) +
+      " (encoded " + std::to_string(node) +
+      ") is absent from the external start-node index of universe " +
+      std::to_string(from_nodes.size()));
+  }
+  auto occurrence = from_nodes.successor(node);
+  if(occurrence->second != node)
+  {
+    throw std::runtime_error(
+      "GCSA::GCSA(): start node " + Node::decode(node) +
+      " (encoded " + std::to_string(node) +
+      ") is absent from the external start-node index of universe " +
+      std::to_string(from_nodes.size()));
+  }
+  return occurrence->first;
+}
+
+template<class Callback>
+void
+forEachFinalFromNode(const FinalPredecessorWork& work,
+  const std::vector<node_type>& prepared_nodes, SpillableNodeSet& spilled_nodes,
+  Callback callback)
+{
+  if(work.from_spilled)
+  {
+    spilled_nodes.rewind();
+    node_type node;
+    while(spilled_nodes.next(node)) { callback(node); }
+    return;
+  }
+  for(size_type j = 0; j < work.from_count; j++)
+  {
+    callback(prepared_nodes[work.from_offset + j]);
+  }
 }
 
 /*
@@ -999,37 +1062,76 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
       FinalEventWriter output(files, graph.alpha.sigma, writer_buffer, memory,
         parameters.getTempFileCodecParameters());
 
-      // Predecessor ranges and intersections are independent by alphabet
-      // component. Admit one fixed-width batch before handing the remaining
-      // bytes to the mutable arrays. Lookup and sampling own separate monotone
-      // streams; the source-label reader replaces two streams omitted from the
-      // ordered reader, keeping reader_streams unchanged. A tight budget or a
-      // small configured I/O buffer keeps the original serial scan as an
-      // explicit fallback.
+      // Predecessor ranges are independent by alphabet component, while mapped
+      // current-node sets and their immutable from-ranks are independent by
+      // path. Admit both fixed records and node/rank arenas before handing the
+      // remaining bytes to the mutable arrays. Lookup and sampling own separate
+      // monotone streams; the source-label reader replaces two streams omitted
+      // from the ordered reader, keeping reader_streams unchanged. A tight
+      // budget or small configured I/O buffer keeps the original serial scan as
+      // an explicit fallback.
       size_type predecessor_batch_capacity = 0;
+      size_type prepared_from_capacity = 0;
       MemoryBudget::Reservation predecessor_work_reservation;
       std::vector<FinalPredecessorWork> predecessor_work;
+      std::vector<node_type> prepared_from_nodes;
+      std::vector<size_type> prepared_from_ranks;
       if(requested_predecessor_workers > 1 && memory.available() > array_minimum)
       {
-        size_type batch_ceiling = (memory.available() - array_minimum) / 2;
-        size_type batch_bytes = std::min(parameters.getIOBufferSize(), batch_ceiling);
-        predecessor_batch_capacity = batch_bytes / sizeof(FinalPredecessorWork);
+        const size_type staging_ceiling =
+          (memory.available() - array_minimum) / 2;
+        const size_type desired_batch_capacity =
+          parameters.getIOBufferSize() / sizeof(FinalPredecessorWork);
+        const size_type desired_work_bytes = checkedProduct(
+          desired_batch_capacity, sizeof(FinalPredecessorWork),
+          "final predecessor work");
+        const size_type desired_node_bytes = checkedProduct(
+          parameters.getIOBufferSize(), 2, "final from-node arenas");
+        if(desired_work_bytes >
+           std::numeric_limits<size_type>::max() - desired_node_bytes)
+        {
+          throw std::runtime_error(
+            "GCSA::GCSA(): final preparation staging size overflows");
+        }
+        const size_type staging_bytes = std::min(staging_ceiling,
+          desired_work_bytes + desired_node_bytes);
+        const size_type bytes_per_minimum_path = sizeof(FinalPredecessorWork) +
+          sizeof(node_type) + sizeof(size_type);
+        predecessor_batch_capacity = std::min(desired_batch_capacity,
+          staging_bytes / bytes_per_minimum_path);
         if(predecessor_batch_capacity >= MIN_FINAL_PREDECESSOR_BATCH)
         {
-          batch_bytes = checkedProduct(predecessor_batch_capacity,
+          const size_type work_bytes = checkedProduct(predecessor_batch_capacity,
             sizeof(FinalPredecessorWork), "final predecessor batch");
-          predecessor_work_reservation = memory.reserve(batch_bytes,
-            "final-predecessor-batch");
+          prepared_from_capacity = (staging_bytes - work_bytes) /
+            (sizeof(node_type) + sizeof(size_type));
+          if(prepared_from_capacity < predecessor_batch_capacity)
+          {
+            throw std::runtime_error(
+              "GCSA::GCSA(): final preparation arena cannot hold one node per path");
+          }
+          const size_type from_node_bytes = checkedProduct(prepared_from_capacity,
+            sizeof(node_type), "final prepared from nodes");
+          const size_type from_rank_bytes = checkedProduct(prepared_from_capacity,
+            sizeof(size_type), "final prepared from ranks");
+          const size_type admitted_bytes = work_bytes + from_node_bytes +
+            from_rank_bytes;
+          predecessor_work_reservation = memory.reserve(admitted_bytes,
+            "final-unordered-preparation");
           predecessor_work.resize(predecessor_batch_capacity);
+          prepared_from_nodes.resize(prepared_from_capacity);
+          prepared_from_ranks.resize(prepared_from_capacity);
           if(stats != nullptr)
           {
             stats->predecessor_workers = requested_predecessor_workers;
-            stats->predecessor_buffer_bytes = batch_bytes;
+            stats->predecessor_buffer_bytes = work_bytes;
+            stats->from_preparation_buffer_bytes =
+              from_node_bytes + from_rank_bytes;
           }
         }
         else
         {
-          predecessor_batch_capacity = 0;
+          predecessor_batch_capacity = prepared_from_capacity = 0;
         }
       }
       if(stats != nullptr && requested_predecessor_workers > 1 &&
@@ -1123,9 +1225,12 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
         size_type batch_paths = 1;
         if(predecessor_batch_capacity > 0)
         {
-          batch_paths = std::min(predecessor_batch_capacity,
+          const size_type batch_limit = std::min(predecessor_batch_capacity,
             merged_graph.size() - i);
-          for(size_type offset = 0; offset < batch_paths; offset++)
+          size_type prepared_from_used = 0;
+          batch_paths = 0;
+          curr_from.clear();
+          for(size_type offset = 0; offset < batch_limit; offset++)
           {
             FinalPredecessorWork& work = predecessor_work[offset];
             work.path = predecessor_source.paths[predecessor_source.path];
@@ -1141,48 +1246,156 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
             }
             work.destinations.fill(MergedGraph::UNKNOWN);
             work.destination_primary.fill(MergedGraph::UNKNOWN);
+            work.from_offset = prepared_from_used;
+            work.from_count = 0;
+            work.from_spilled = false;
+            work.sample_by_period = false;
+
+            if(reader[0].path != i + offset)
+            {
+              throw std::runtime_error(
+                "GCSA::GCSA(): current from-node reader lost batch alignment");
+            }
+            const auto append_from = [&](node_type unmapped) {
+              node_type node = mappedFinalNode(unmapped, graph.mapping);
+              if(!(work.from_spilled) &&
+                 prepared_from_used < prepared_from_capacity)
+              {
+                prepared_from_nodes[prepared_from_used++] = node;
+                work.from_count++;
+                return;
+              }
+              if(!(work.from_spilled))
+              {
+                work.from_spilled = true;
+                curr_from.clear();
+                for(size_type j = 0; j < work.from_count; j++)
+                {
+                  node_type buffered =
+                    prepared_from_nodes[work.from_offset + j];
+                  curr_from.push_back(buffered);
+                  if(buffered % parameters.getSamplePeriod() == 0)
+                  {
+                    work.sample_by_period = true;
+                  }
+                }
+              }
+              curr_from.push_back(node);
+              if(node % parameters.getSamplePeriod() == 0)
+              {
+                work.sample_by_period = true;
+              }
+            };
+
+            append_from(work.path.from);
+            while(reader[0].from < reader[0].from_nodes.size() &&
+                  reader[0].from_nodes[reader[0].from].first == reader[0].path)
+            {
+              append_from(reader[0].from_nodes[reader[0].from].second);
+              reader[0].from++;
+            }
+            reader[0].from_nodes.seek(reader[0].from);
+            if(work.from_spilled)
+            {
+              curr_from.finish();
+              work.from_count = curr_from.size();
+              if(stats != nullptr) { stats->prepared_from_spill_fallbacks++; }
+            }
+
             predecessor_source.advance();
+            reader[0].advance();
+            batch_paths++;
+            // curr_from is the one persistent overflow slot. Ending the batch
+            // here lets the ordered consumer reach this path before the slot is
+            // reused, without rereading any prefix of the from-node stream.
+            if(work.from_spilled) { break; }
           }
 
           predecessor_errors.fill(std::exception_ptr());
-          std::atomic<bool> predecessor_failed(false);
-#pragma omp parallel for schedule(static, 1) num_threads(requested_predecessor_workers)
-          for(std::int64_t component = 0;
-              component < static_cast<std::int64_t>(graph.alpha.sigma);
-              component++)
+          std::exception_ptr from_preparation_error;
+          std::atomic<bool> batch_failed(false);
+#pragma omp parallel num_threads(requested_predecessor_workers)
           {
-            size_type comp = static_cast<size_type>(component);
-            try
+#pragma omp for schedule(dynamic, 64) nowait
+            for(std::int64_t item = 0;
+                item < static_cast<std::int64_t>(batch_paths); item++)
             {
-              MergedGraphReader& destination_reader = reader[comp + 1];
-              PathLabel worker_first, worker_last;
-              for(size_type offset = 0; offset < batch_paths; offset++)
+              size_type offset = static_cast<size_type>(item);
+              FinalPredecessorWork& work = predecessor_work[offset];
+              if(work.from_spilled) { continue; }
+              try
               {
-                if(predecessor_failed.load(std::memory_order_relaxed)) { break; }
-                FinalPredecessorWork& work = predecessor_work[offset];
-                if(!(work.path.hasPredecessor(comp))) { continue; }
-                predecessorRange(work.path, comp, mapper, last_char,
-                  [&work](size_type rank) { return work.labels[rank]; },
-                  worker_first, worker_last);
-                if(!(destination_reader.intersect(worker_first, worker_last, 0)))
+                auto begin = prepared_from_nodes.begin() + work.from_offset;
+                auto end = begin + work.from_count;
+                std::sort(begin, end);
+                end = std::unique(begin, end);
+                work.from_count = static_cast<size_type>(end - begin);
+                for(size_type j = 0; j < work.from_count; j++)
                 {
-                  destination_reader.advance();
+                  node_type node = prepared_from_nodes[work.from_offset + j];
+                  prepared_from_ranks[work.from_offset + j] =
+                    finalFromRank(node, from_nodes);
+                  if(node % parameters.getSamplePeriod() == 0)
+                  {
+                    work.sample_by_period = true;
+                  }
                 }
-                if(destination_reader.path >= merged_graph.size())
+              }
+              catch(...)
+              {
+#pragma omp critical(gcsa_final_from_preparation_error)
                 {
-                  throw std::runtime_error(
-                    "GCSA::GCSA(): final edge destination is outside the merged graph");
+                  if(!(from_preparation_error))
+                  {
+                    from_preparation_error = std::current_exception();
+                  }
                 }
-                work.destinations[comp] = destination_reader.path;
-                work.destination_primary[comp] =
-                  destination_reader.paths[destination_reader.path].from;
+                batch_failed.store(true, std::memory_order_relaxed);
               }
             }
-            catch(...)
+
+#pragma omp for schedule(static, 1) nowait
+            for(std::int64_t component = 0;
+                component < static_cast<std::int64_t>(graph.alpha.sigma);
+                component++)
             {
-              predecessor_errors[comp] = std::current_exception();
-              predecessor_failed.store(true, std::memory_order_relaxed);
+              size_type comp = static_cast<size_type>(component);
+              try
+              {
+                MergedGraphReader& destination_reader = reader[comp + 1];
+                PathLabel worker_first, worker_last;
+                for(size_type offset = 0; offset < batch_paths; offset++)
+                {
+                  if(batch_failed.load(std::memory_order_relaxed)) { break; }
+                  FinalPredecessorWork& work = predecessor_work[offset];
+                  if(!(work.path.hasPredecessor(comp))) { continue; }
+                  predecessorRange(work.path, comp, mapper, last_char,
+                    [&work](size_type rank) { return work.labels[rank]; },
+                    worker_first, worker_last);
+                  if(!(destination_reader.intersect(worker_first, worker_last, 0)))
+                  {
+                    destination_reader.advance();
+                  }
+                  if(destination_reader.path >= merged_graph.size())
+                  {
+                    throw std::runtime_error(
+                      "GCSA::GCSA(): final edge destination is outside the merged graph");
+                  }
+                  work.destinations[comp] = destination_reader.path;
+                  work.destination_primary[comp] =
+                    destination_reader.paths[destination_reader.path].from;
+                }
+              }
+              catch(...)
+              {
+                predecessor_errors[comp] = std::current_exception();
+                batch_failed.store(true, std::memory_order_relaxed);
+              }
             }
+          }
+          if(from_preparation_error)
+          {
+            std::rethrow_exception(from_preparation_error);
           }
           for(size_type comp = 0; comp < graph.alpha.sigma; comp++)
           {
@@ -1200,7 +1413,7 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
         }
 
         for(size_type batch_offset = 0; batch_offset < batch_paths;
-            batch_offset++, i++, reader[0].advance())
+            batch_offset++, i++)
         {
           scan_progress.advance();
           // Close any predecessor spill reader retained by the preceding path
@@ -1239,25 +1452,35 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
           }
           output.path(predecessor_mask);
 
-          if(predecessor_batch_capacity > 0)
+          size_type curr_from_size = 0;
+          if(predecessor_batch_capacity == 0)
           {
-            reader[0].fromNodes(curr_from, graph.mapping, source_path.from);
+            reader[0].fromNodes(curr_from, graph.mapping);
+            curr_from_size = curr_from.size();
           }
           else
           {
-            reader[0].fromNodes(curr_from, graph.mapping);
+            curr_from_size = predecessor_work[batch_offset].from_count;
           }
-          if(curr_from.size() == 0)
+          if(curr_from_size == 0)
           {
             throw std::runtime_error("GCSA::GCSA(): merged path has no start node");
           }
           if(stats != nullptr)
           {
-            stats->from_node_spills += curr_from.spilled();
+            bool current_spilled = (predecessor_batch_capacity == 0 ?
+              curr_from.spilled() :
+              predecessor_work[batch_offset].from_spilled);
+            stats->from_node_spills += current_spilled;
             stats->maximum_from_nodes = std::max(stats->maximum_from_nodes,
-              curr_from.size());
+              curr_from_size);
+            if(predecessor_batch_capacity > 0 && !current_spilled)
+            {
+              stats->prepared_from_paths++;
+              stats->prepared_from_ranks += curr_from_size;
+            }
           }
-          output.occurrence(i, curr_from.size() - 1);
+          output.occurrence(i, curr_from_size - 1);
 
           lcp_array.seek(i);
           size_type curr_lcp = lcp_array[i] + (i > 0 ? 1 : 0);
@@ -1285,33 +1508,11 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
             stack_size++;
           }
 
-          node_type node;
-          curr_from.rewind();
-          while(curr_from.next(node))
-          {
-            // sd_vector::operator[] performs its own select_0 and backward scan,
-            // and rank_support_sd::rank performs another, so testing membership
-            // and then taking the rank costs two descents for one lookup.
-            // successor(i) yields both: its one_iterator dereferences to
-            // (rank, position). ValueIndex::find uses the same idiom.
-            if(node >= from_nodes.size())
-            {
-              throw std::runtime_error(
-                "GCSA::GCSA(): start node " + Node::decode(node) +
-                " (encoded " + std::to_string(node) +
-                ") is absent from the external start-node index of universe " +
-                std::to_string(from_nodes.size()));
-            }
-            auto occurrence = from_nodes.successor(node);
-            if(occurrence->second != node)
-            {
-              throw std::runtime_error(
-                "GCSA::GCSA(): start node " + Node::decode(node) +
-                " (encoded " + std::to_string(node) +
-                ") is absent from the external start-node index of universe " +
-                std::to_string(from_nodes.size()));
-            }
-            size_type rank = occurrence->first;
+          // Rank resolution is immutable and was prepared in parallel for
+          // bounded in-memory slices. The spill/serial route resolves it here.
+          // Only this callback touches previous occurrence state or emits a
+          // redundancy event, so path order remains the exact serial order.
+          const auto update_occurrence = [&](size_type rank) {
             size_type prior = previous.get(rank);
             if(prior > 0)
             {
@@ -1334,6 +1535,26 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
               output.redundancy(first_time - 1);
             }
             previous.set(rank, i + 1);
+          };
+
+          node_type node;
+          if(predecessor_batch_capacity > 0 &&
+             !(predecessor_work[batch_offset].from_spilled))
+          {
+            const FinalPredecessorWork& work =
+              predecessor_work[batch_offset];
+            for(size_type j = 0; j < work.from_count; j++)
+            {
+              update_occurrence(prepared_from_ranks[work.from_offset + j]);
+            }
+          }
+          else
+          {
+            curr_from.rewind();
+            while(curr_from.next(node))
+            {
+              update_occurrence(finalFromRank(node, from_nodes));
+            }
           }
 
           if(indegree > 1) { sample_this = true; }
@@ -1341,12 +1562,20 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
           {
             sample_this = true;
           }
-          curr_from.rewind();
-          while(curr_from.next(node))
+          if(predecessor_batch_capacity > 0)
           {
-            if(node % parameters.getSamplePeriod() == 0)
+            sample_this = sample_this ||
+              predecessor_work[batch_offset].sample_by_period;
+          }
+          else
+          {
+            curr_from.rewind();
+            while(curr_from.next(node))
             {
-              sample_this = true; break;
+              if(node % parameters.getSamplePeriod() == 0)
+              {
+                sample_this = true; break;
+              }
             }
           }
 
@@ -1377,16 +1606,36 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
               stats->maximum_from_nodes = std::max(stats->maximum_from_nodes,
                 pred_from.size());
             }
-            if(pred_from.size() != curr_from.size()) { sample_this = true; }
+            if(pred_from.size() != curr_from_size) { sample_this = true; }
             else
             {
-              node_type curr_node, pred_node;
-              curr_from.rewind(); pred_from.rewind();
-              while(curr_from.next(curr_node))
+              pred_from.rewind();
+              if(predecessor_batch_capacity > 0)
               {
-                if(!pred_from.next(pred_node) || curr_node != pred_node + 1)
+                const FinalPredecessorWork& work =
+                  predecessor_work[batch_offset];
+                bool continuation = true;
+                forEachFinalFromNode(work, prepared_from_nodes, curr_from,
+                  [&pred_from, &continuation](node_type curr_node) {
+                    node_type pred_node;
+                    if(continuation &&
+                       (!pred_from.next(pred_node) || curr_node != pred_node + 1))
+                    {
+                      continuation = false;
+                    }
+                  });
+                if(!continuation) { sample_this = true; }
+              }
+              else
+              {
+                node_type curr_node, pred_node;
+                curr_from.rewind();
+                while(curr_from.next(curr_node))
                 {
-                  sample_this = true; break;
+                  if(!pred_from.next(pred_node) || curr_node != pred_node + 1)
+                  {
+                    sample_this = true; break;
+                  }
                 }
               }
             }
@@ -1395,10 +1644,20 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
           if(sample_this)
           {
             output.sampledPath(i);
-            curr_from.rewind();
-            while(curr_from.next(node)) { output.sample(node); }
+            if(predecessor_batch_capacity > 0)
+            {
+              forEachFinalFromNode(predecessor_work[batch_offset],
+                prepared_from_nodes, curr_from,
+                [&output](node_type sample) { output.sample(sample); });
+            }
+            else
+            {
+              curr_from.rewind();
+              while(curr_from.next(node)) { output.sample(node); }
+            }
             output.sampleEnd();
           }
+          if(predecessor_batch_capacity == 0) { reader[0].advance(); }
         }
       }
       predecessor_source.close();
@@ -1472,6 +1731,10 @@ reportPruneMergeStats(const PathGraphMergeStats& merge_stats)
   if(Verbosity::level >= Verbosity::EXTENDED)
   {
     std::cerr << "PathGraph::prune(): "
+              << merge_stats.prune_workers << " of "
+              << merge_stats.prune_requested_workers << " requested worker(s) over "
+              << merge_stats.prune_partitions << " root partition(s), "
+              << merge_stats.prune_parallel_fallbacks << " serial fallback(s); "
               << merge_stats.priority_spills << " path-group spills, "
               << merge_stats.range_spills << " range spills, "
               << merge_stats.max_open_input_pairs << " input pairs and "
@@ -1671,6 +1934,14 @@ reportFinalEventStats(const FinalEventMetadata& event_metadata,
         std::cerr << " (serial fallback: batch admission too small)";
       }
       std::cerr << std::endl;
+      std::cerr << "GCSA::GCSA(): final ordered-state preparation: "
+                << event_stats.predecessor_workers << " worker(s), "
+                << event_stats.prepared_from_paths << " paths / "
+                << event_stats.prepared_from_ranks << " from-ranks prepared, "
+                << event_stats.prepared_from_spill_fallbacks
+                << " spill fallback(s), "
+                << formatBytes(event_stats.from_preparation_buffer_bytes)
+                << " admitted" << std::endl;
     }
   }
 }
@@ -1783,6 +2054,34 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   // Create or restore the initial PathGraph. Resumption still rebuilds the
   // compact key/LCP support above, but never repeats a committed doubling phase.
   PathGraph path_graph(0, graph.k(), 0);
+  const auto checkpoint_path_graph = [&](const std::string& task,
+      const std::string& phase) {
+    const std::uint64_t scan_before =
+      BuildWorkspace::adoption_checksum_scan_bytes.load(
+        std::memory_order_relaxed);
+    const std::uint64_t reused_before =
+      BuildWorkspace::adoption_checksum_reused_bytes.load(
+        std::memory_order_relaxed);
+    const double checkpoint_start = readTimer();
+    checkpointPathGraph(*workspace, path_graph, task, phase,
+      checkpoint_buffer);
+    const double checkpoint_stop = readTimer();
+    const std::uint64_t scan_after =
+      BuildWorkspace::adoption_checksum_scan_bytes.load(
+        std::memory_order_relaxed);
+    const std::uint64_t reused_after =
+      BuildWorkspace::adoption_checksum_reused_bytes.load(
+        std::memory_order_relaxed);
+    if(Verbosity::level >= Verbosity::BASIC)
+    {
+      std::cerr << "GCSA::GCSA(): Checkpoint " << task << "/" << phase
+                << ": " << (checkpoint_stop - checkpoint_start)
+                << " seconds, adoption checksum scanned "
+                << formatBytes(scan_after - scan_before) << ", reused "
+                << formatBytes(reused_after - reused_before)
+                << " of writer provenance" << std::endl;
+    }
+  };
   size_type first_step = 1;
   bool restored_prune = false, restored_graph = false;
   // Tracks the durable checkpoint backing the current in-memory frontier.
@@ -1855,7 +2154,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     path_graph.swap(initial_graph);
     if(workspace)
     {
-      checkpointPathGraph(*workspace, path_graph, "initial", "paths", checkpoint_buffer);
+      checkpoint_path_graph("initial", "paths");
       frontier_task = "initial"; frontier_phase = "paths";
       stopAfterCommittedPhase(parameters, "initial");
     }
@@ -1887,14 +2186,36 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
       size_type prune_buffer = pathMergeInputBudget(parameters, path_graph);
       PathGraphMergeStats merge_stats;
       const size_type merge_inputs = path_graph.files();
+      // Parallel prune may retain several physical shards for one logical
+      // input. The external extender joins across those shards by logical id;
+      // legacy PathGraph::extend() still joins only within each physical file.
+      // Keep that historical route serial until it has the same shard-aware
+      // contract, regardless of the caller's OpenMP thread count.
+      const size_type prune_workers = (parameters.externalMemory() ?
+        static_cast<size_type>(std::max(1, omp_get_max_threads())) : 1);
+      const double prune_start = readTimer();
       path_graph.prune(lcp, path_graph.remainingLimit(parameters.getLimitBytes()),
         prune_buffer, &merge_stats, parameters.getMaxOpenFiles(),
-        pathMergeInputCacheBudget(parameters, path_graph));
+        pathMergeInputCacheBudget(parameters, path_graph),
+        prune_workers);
+      const double prune_stop = readTimer();
+      if(Verbosity::level >= Verbosity::BASIC)
+      {
+        std::cerr << "GCSA::GCSA(): Prune " << task << ": "
+                  << (prune_stop - prune_start) << " seconds; "
+                  << merge_stats.prune_workers << " of "
+                  << merge_stats.prune_requested_workers
+                  << " requested worker(s), "
+                  << merge_stats.prune_partitions << " partition(s), "
+                  << merge_stats.prune_parallel_fallbacks
+                  << " serial fallback(s)" << std::endl;
+      }
       // The merger visits its shards in round-robin label order, so a cache one
       // entry short of the shard count misses on every record rather than on a
       // fraction of them. That cliff is worth a word at the default verbosity:
       // it is invisible in the output and the remedy is one flag.
-      if(merge_stats.max_open_input_pairs < merge_inputs &&
+      if(merge_stats.prune_workers == 1 &&
+         merge_stats.max_open_input_pairs < merge_inputs &&
          Verbosity::level >= Verbosity::BASIC)
       {
         std::cerr << "PathGraph::prune(): warning: only "
@@ -1907,7 +2228,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
       reportPruneMergeStats(merge_stats);
       if(workspace)
       {
-        checkpointPathGraph(*workspace, path_graph, task, "prune", checkpoint_buffer);
+        checkpoint_path_graph(task, "prune");
         if(parameters.getCleanObsolete() && !frontier_task.empty())
         {
           workspace->retire_obsolete(frontier_task, frontier_phase, task, "prune");
@@ -1932,7 +2253,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     }
     if(workspace)
     {
-      checkpointPathGraph(*workspace, path_graph, task, "extend", checkpoint_buffer);
+      checkpoint_path_graph(task, "extend");
       if(parameters.getCleanObsolete() && !frontier_task.empty())
       {
         workspace->retire_obsolete(frontier_task, frontier_phase, task, "extend");

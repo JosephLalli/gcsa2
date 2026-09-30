@@ -2,12 +2,28 @@
 #define GCSA_WORKSPACE_H
 
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <string>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <vector>
 namespace gcsa {
+// In-process provenance from an immutable, successfully closed writer. This is
+// not persisted in workspace manifests: reopening an old workspace uses its
+// recorded checksums and normal restore validation, not a remembered pathname.
+// A live child writer can transmit it in its ephemeral worker-result record.
+struct ClosedPayloadChecksum
+{
+  uint64_t value = 0;
+  bool valid = false;
+  struct stat identity = {};
+
+  void record(const std::string& path, uint64_t digest);
+  bool matches(const std::string& path, uint64_t bytes) const;
+};
+
 struct logical_file_id_t
 {
   explicit logical_file_id_t(uint32_t x = 0) : value(x) { }
@@ -30,6 +46,9 @@ struct ArtifactHeader { static const uint32_t VERSION=2; std::string kind,sort_o
 struct ArtifactFooter { static const uint32_t VERSION=2; std::string kind,sort_order,key_range; logical_file_id_t logical; physical_shard_id_t shard; uint64_t records,bytes,checksum; };
 class BuildWorkspace {
 public:
+  // Adoption diagnostics only; no effect on persisted metadata or semantics.
+  static std::atomic<uint64_t> adoption_checksum_scan_bytes;
+  static std::atomic<uint64_t> adoption_checksum_reused_bytes;
   typedef std::map<std::string,std::string> Settings;
   enum OpenMode { RESUME, NEW_WORKSPACE };
   struct ArtifactRef

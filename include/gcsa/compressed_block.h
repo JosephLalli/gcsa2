@@ -95,6 +95,10 @@ public:
   // Zero-byte records are rejected: every record belongs to one stored block.
   void writeRecord(const void* data, std::size_t bytes);
   void finish();
+  // Opt-in before the first record, for payloads that will be checkpointed.
+  // The stored-byte digest includes framing, compressed bytes, index and footer.
+  void trackStoredChecksum();
+  std::uint64_t storedChecksum() const;
   std::uint64_t records() const { return record_count; }
   std::uint64_t bytes() const { return byte_count; }
 
@@ -109,6 +113,8 @@ private:
   std::size_t compression_workers;
   void* compression_context;
   std::uint64_t record_count, buffer_records, byte_count, whole_checksum;
+  std::uint64_t stored_checksum;
+  bool track_stored_checksum;
   bool completed;
 };
 

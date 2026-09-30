@@ -59,8 +59,9 @@ recordCount(const std::string& name, size_type record_bytes)
 class RawWriter
 {
 public:
-  RawWriter(const std::string& name, size_type buffer_bytes) :
-    name_(name), output_(), buffer_(std::max(static_cast<size_type>(1), buffer_bytes)), used_(0)
+  RawWriter(const std::string& name, size_type buffer_bytes, bool track_digest = false) :
+    name_(name), output_(), buffer_(std::max(static_cast<size_type>(1), buffer_bytes)), used_(0),
+    track_digest_(track_digest), digest_(1469598103934665603ULL)
   {
     output_.rdbuf()->pubsetbuf(nullptr, 0);
     output_.open(name.c_str(), std::ios_base::binary | std::ios_base::trunc);
@@ -79,6 +80,7 @@ public:
       this->flush();
       output_.write(reinterpret_cast<const char*>(record), bytes);
       if(!output_) { throw std::runtime_error("external preprocessing: cannot write " + name_); }
+      if(track_digest_) { digest_ = BuildWorkspace::checksum(record, bytes, digest_); }
       DiskIO::write_volume += bytes;
       return;
     }
@@ -97,6 +99,7 @@ public:
     if(used_ == 0) { return; }
     output_.write(reinterpret_cast<const char*>(buffer_.data()), used_);
     if(!output_) { throw std::runtime_error("external preprocessing: cannot write " + name_); }
+    if(track_digest_) { digest_ = BuildWorkspace::checksum(buffer_.data(), used_, digest_); }
     DiskIO::write_volume += used_;
     used_ = 0;
   }
@@ -108,11 +111,20 @@ public:
     if(!output_) { throw std::runtime_error("external preprocessing: cannot close " + name_); }
   }
 
+  std::uint64_t storedChecksum() const
+  {
+    if(output_.is_open() || !track_digest_)
+    { throw std::logic_error("raw checksum requires a closed tracked writer"); }
+    return digest_;
+  }
+
 private:
   std::string name_;
   std::ofstream output_;
   std::vector<std::uint8_t> buffer_;
   size_type used_;
+  bool track_digest_;
+  std::uint64_t digest_;
 };
 
 class RawReader
@@ -553,19 +565,24 @@ ExternalInputPreprocessor::buildInitialPathGraph(PathGraph& result)
       {
         path_name = TempFile::getName(PathGraph::PREFIX);
         rank_name = TempFile::getName(PathGraph::PREFIX);
-        paths.reset(new RawWriter(path_name, io_bytes));
-        ranks.reset(new RawWriter(rank_name, io_bytes));
+        paths.reset(new RawWriter(path_name, io_bytes, true));
+        ranks.reset(new RawWriter(rank_name, io_bytes, true));
         path_count = rank_count = 0;
       };
       const auto close_shard = [&]()
       {
         if(!paths) { return; }
-        paths->close(); ranks->close(); paths.reset(); ranks.reset();
+        paths->close(); ranks->close();
+        const std::uint64_t path_digest = paths->storedChecksum(), rank_digest = ranks->storedChecksum();
+        paths.reset(); ranks.reset();
         if(path_count == 0)
         {
           TempFile::remove(path_name); TempFile::remove(rank_name); return;
         }
         initial.path_names.push_back(path_name); initial.rank_names.push_back(rank_name);
+        initial.path_checksums.emplace_back(); initial.rank_checksums.emplace_back();
+        initial.path_checksums.back().record(path_name, path_digest);
+        initial.rank_checksums.back().record(rank_name, rank_digest);
         initial.path_counts.push_back(path_count); initial.rank_counts.push_back(rank_count);
         initial.logical_file_ids.push_back(logical_file_id_t(static_cast<std::uint32_t>(file)));
         initial.physical_shard_ids.push_back(physicalId(logical_file_id_t(static_cast<std::uint32_t>(file)), local_shard));

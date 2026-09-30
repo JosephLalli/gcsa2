@@ -102,11 +102,13 @@ BuildWorkspace::ArtifactRef
 checkpointPayload(BuildWorkspace& workspace, const ArtifactIdentity& identity,
   logical_file_id_t logical, physical_shard_id_t shard, const std::string& source,
   size_type records, size_type expected_bytes, size_type buffer_bytes,
-  const std::string& sort_order)
+  const std::string& sort_order, const ClosedPayloadChecksum* provenance)
 {
   static_cast<void>(sort_order);
+  const uint64_t* known = (provenance != nullptr &&
+    provenance->matches(source, expected_bytes) ? &provenance->value : nullptr);
   return workspace.adopt_raw_payload(identity, logical, shard, source,
-    records, expected_bytes, buffer_bytes);
+    records, expected_bytes, buffer_bytes, known);
 }
 
 } // namespace
@@ -164,11 +166,13 @@ checkpointPathGraph(BuildWorkspace& workspace, const PathGraph& graph,
     artifacts.push_back(checkpointPayload(workspace, pathIdentity(task, phase, file),
       graph.logicalFile(file), graph.physicalShard(file), graph.path_names[file],
       graph.path_counts[file], storedBytes(graph.path_names[file]),
-      buffer_bytes, "label"));
+      buffer_bytes, "label", (file < graph.path_checksums.size() ?
+        &graph.path_checksums[file] : nullptr)));
     artifacts.push_back(checkpointPayload(workspace, rankIdentity(task, phase, file),
       graph.logicalFile(file), graph.physicalShard(file), graph.rank_names[file],
       graph.rank_counts[file], storedBytes(graph.rank_names[file]),
-      buffer_bytes, "path-order"));
+      buffer_bytes, "path-order", (file < graph.rank_checksums.size() ?
+        &graph.rank_checksums[file] : nullptr)));
   }
   workspace.commit_task(task, phase, artifacts);
 }

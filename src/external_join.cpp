@@ -3687,7 +3687,7 @@ planJoinPartitions(const JoinRun& left_run, const JoinRun& right_run,
 
 constexpr std::uint64_t WORKER_TASK_MAGIC = 0x314b535441534347ULL;   // "GCSATSK1"
 constexpr std::uint64_t WORKER_RESULT_MAGIC = 0x3153455241534347ULL; // "GCSARES1"
-constexpr std::uint32_t WORKER_FORMAT_VERSION = 5;
+constexpr std::uint32_t WORKER_FORMAT_VERSION = 6;
 constexpr size_type WORKER_CONTROL_LIMIT = MEGABYTE;
 
 struct ExternalJoinWorkerTask
@@ -3703,6 +3703,7 @@ struct ExternalJoinWorkerTask
 
 struct ExternalJoinWorkerResult
 {
+  ClosedPayloadChecksum path_checksum, rank_checksum;
   size_type paths, ranks, bytes, stored_bytes;
   size_type generated, bypassed, label_runs, label_merge_passes, label_parallel_sorts;
   size_type grouped_records, group_headers, context_bytes_saved;
@@ -3895,6 +3896,36 @@ decodeWorkerTask(const std::vector<std::uint8_t>& data)
   return task;
 }
 
+void
+appendWorkerChecksum(std::vector<std::uint8_t>& data, const ClosedPayloadChecksum& digest)
+{
+  if(!digest.valid) { throw joinError("worker omitted closed-writer checksum"); }
+  appendWorkerValue<std::uint64_t>(data, digest.value);
+  appendWorkerValue<std::uint64_t>(data, digest.identity.st_dev);
+  appendWorkerValue<std::uint64_t>(data, digest.identity.st_ino);
+  appendWorkerValue<std::uint64_t>(data, digest.identity.st_size);
+  appendWorkerValue<std::uint64_t>(data, digest.identity.st_mtim.tv_sec);
+  appendWorkerValue<std::uint64_t>(data, digest.identity.st_mtim.tv_nsec);
+  appendWorkerValue<std::uint64_t>(data, digest.identity.st_ctim.tv_sec);
+  appendWorkerValue<std::uint64_t>(data, digest.identity.st_ctim.tv_nsec);
+}
+
+ClosedPayloadChecksum
+readWorkerChecksum(const std::vector<std::uint8_t>& data, size_type& offset)
+{
+  ClosedPayloadChecksum digest;
+  digest.value = readWorkerValue<std::uint64_t>(data, offset);
+  digest.identity.st_dev = readWorkerValue<std::uint64_t>(data, offset);
+  digest.identity.st_ino = readWorkerValue<std::uint64_t>(data, offset);
+  digest.identity.st_size = readWorkerValue<std::uint64_t>(data, offset);
+  digest.identity.st_mtim.tv_sec = readWorkerValue<std::uint64_t>(data, offset);
+  digest.identity.st_mtim.tv_nsec = readWorkerValue<std::uint64_t>(data, offset);
+  digest.identity.st_ctim.tv_sec = readWorkerValue<std::uint64_t>(data, offset);
+  digest.identity.st_ctim.tv_nsec = readWorkerValue<std::uint64_t>(data, offset);
+  digest.valid = true;
+  return digest;
+}
+
 std::vector<std::uint8_t>
 encodeWorkerResult(const ExternalJoinWorkerResult& result)
 {
@@ -3918,6 +3949,8 @@ encodeWorkerResult(const ExternalJoinWorkerResult& result)
   appendWorkerValue<std::uint64_t>(data, result.blocks);
   appendWorkerValue<std::uint64_t>(data, result.bytes_read);
   appendWorkerValue<std::uint64_t>(data, result.bytes_written);
+  appendWorkerChecksum(data, result.path_checksum);
+  appendWorkerChecksum(data, result.rank_checksum);
   return data;
 }
 
@@ -3948,6 +3981,8 @@ decodeWorkerResult(const std::vector<std::uint8_t>& data)
   result.blocks = readWorkerValue<std::uint64_t>(data, offset);
   result.bytes_read = readWorkerValue<std::uint64_t>(data, offset);
   result.bytes_written = readWorkerValue<std::uint64_t>(data, offset);
+  result.path_checksum = readWorkerChecksum(data, offset);
+  result.rank_checksum = readWorkerChecksum(data, offset);
   if(offset != data.size()) { throw joinError("worker result has trailing data"); }
   return result;
 }
@@ -4011,6 +4046,8 @@ externalPathJoinWorker(const std::string& task_file)
     ExternalJoinWorkerResult result;
     result.paths = output.path_counts[0]; result.ranks = output.rank_counts[0];
     result.bytes = sink.bytes(); result.stored_bytes = sink.storedBytes();
+    result.path_checksum = output.path_checksums.at(0);
+    result.rank_checksum = output.rank_checksums.at(0);
     result.generated = join_stats.generated_records;
     result.bypassed = join_stats.sorted_bypass; result.label_runs = sort_stats.runs;
     result.label_merge_passes = sort_stats.merge_passes;
@@ -4048,6 +4085,7 @@ appendOutputShard(PathGraph& graph, logical_file_id_t logical,
   graph.path_names.push_back(TempFile::getName(PathGraph::PREFIX));
   graph.rank_names.push_back(TempFile::getName(PathGraph::PREFIX));
   graph.path_counts.push_back(0); graph.rank_counts.push_back(0);
+  graph.path_checksums.emplace_back(); graph.rank_checksums.emplace_back();
   graph.logical_file_ids.push_back(logical);
   graph.physical_shard_ids.push_back(physical);
   return file;
@@ -4319,6 +4357,7 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
     std::unique_ptr<CompressedBlockWriter> compressed_path, compressed_rank;
     std::string partial_path, partial_rank;
     size_type file = 0, written_paths = 0, written_ranks = 0;
+    std::uint64_t path_digest = 0, rank_digest = 0;
     size_type emitted_paths = 0, emitted_ranks = 0;
     off_t path_released = 0, rank_released = 0;
     std::vector<std::uint8_t> path_buffer, rank_buffer;
@@ -4327,6 +4366,8 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
       if(compressed_path)
       {
         compressed_path->finish(); compressed_rank->finish();
+        path_digest = compressed_path->storedChecksum();
+        rank_digest = compressed_rank->storedChecksum();
         compressed_path.reset(); compressed_rank.reset();
       }
       if(path_fd >= 0) { trimWrittenCache(path_fd, path_released, true, partial_path); }
@@ -4347,6 +4388,8 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
         throw joinError("cannot install logical merge output");
       }
       output.path_counts[file] = written_paths; output.rank_counts[file] = written_ranks;
+      output.path_checksums.at(file).record(output.path_names[file], path_digest);
+      output.rank_checksums.at(file).record(output.rank_names[file], rank_digest);
       result.paths += written_paths; result.ranks += written_ranks;
       const size_type output_bytes = checkedJoinAdd(stored_path_bytes,
         stored_rank_bytes, "stored logical-merge output bytes");
@@ -4356,6 +4399,7 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
     auto open_output = [&]()
     {
       file = next_output();
+      path_digest = rank_digest = 1469598103934665603ULL;
       partial_path = output.path_names[file] + ".partial";
       partial_rank = output.rank_names[file] + ".partial";
       std::remove(partial_path.c_str()); std::remove(partial_rank.c_str());
@@ -4367,6 +4411,7 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
         compressed_rank.reset(new CompressedBlockWriter(partial_rank,
           codec.block_size, CompressedBlockWriter::ZSTD,
           codec.level, codec.workers));
+        compressed_path->trackStoredChecksum(); compressed_rank->trackStoredChecksum();
         written_paths = 0; written_ranks = 0;
         return;
       }
@@ -4385,7 +4430,13 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
     auto flush = [&](std::vector<std::uint8_t>& buffer, int descriptor, off_t& released,
       const std::string& name)
     {
-      if(!buffer.empty()) { writeAll(descriptor, buffer.data(), buffer.size(), name); buffer.clear(); }
+      if(!buffer.empty())
+      {
+        writeAll(descriptor, buffer.data(), buffer.size(), name);
+        std::uint64_t& digest = (descriptor == path_fd ? path_digest : rank_digest);
+        digest = BuildWorkspace::checksum(buffer.data(), buffer.size(), digest);
+        buffer.clear();
+      }
       trimWrittenCache(descriptor, released, false, name);
     };
     try
@@ -4526,6 +4577,8 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
     {
       size_type file = shards.front();
       compacted.path_names.push_back(source.path_names[file]); compacted.rank_names.push_back(source.rank_names[file]);
+      compacted.path_checksums.push_back(file < source.path_checksums.size() ? source.path_checksums[file] : ClosedPayloadChecksum());
+      compacted.rank_checksums.push_back(file < source.rank_checksums.size() ? source.rank_checksums[file] : ClosedPayloadChecksum());
       compacted.path_counts.push_back(source.path_counts[file]); compacted.rank_counts.push_back(source.rank_counts[file]);
       compacted.logical_file_ids.push_back(logical); compacted.physical_shard_ids.push_back(physical_shard_id_t(next_physical++));
       compacted.path_count += source.path_counts[file]; compacted.rank_count += source.rank_counts[file];
@@ -4541,6 +4594,8 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
     for(size_type source_file : shards)
     {
       current.path_names.push_back(source.path_names[source_file]); current.rank_names.push_back(source.rank_names[source_file]);
+      current.path_checksums.push_back(source_file < source.path_checksums.size() ? source.path_checksums[source_file] : ClosedPayloadChecksum());
+      current.rank_checksums.push_back(source_file < source.rank_checksums.size() ? source.rank_checksums[source_file] : ClosedPayloadChecksum());
       current.path_counts.push_back(source.path_counts[source_file]); current.rank_counts.push_back(source.rank_counts[source_file]);
       current.logical_file_ids.push_back(logical); current.physical_shard_ids.push_back(source.physical_shard_ids[source_file]);
       current.path_count += source.path_counts[source_file]; current.rank_count += source.rank_counts[source_file];
@@ -4563,6 +4618,8 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
       auto pass_through = [&](size_type file)
       {
         pass.path_names.push_back(current.path_names[file]); pass.rank_names.push_back(current.rank_names[file]);
+        pass.path_checksums.push_back(file < current.path_checksums.size() ? current.path_checksums[file] : ClosedPayloadChecksum());
+        pass.rank_checksums.push_back(file < current.rank_checksums.size() ? current.rank_checksums[file] : ClosedPayloadChecksum());
         pass.path_counts.push_back(current.path_counts[file]); pass.rank_counts.push_back(current.rank_counts[file]);
         pass.logical_file_ids.push_back(logical); pass.physical_shard_ids.push_back(current.physical_shard_ids[file]);
         pass.path_count += current.path_counts[file]; pass.rank_count += current.rank_counts[file];
@@ -4664,6 +4721,8 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
     for(size_type file = 0; file < current.files(); file++)
     {
       compacted.path_names.push_back(current.path_names[file]); compacted.rank_names.push_back(current.rank_names[file]);
+      compacted.path_checksums.push_back(file < current.path_checksums.size() ? current.path_checksums[file] : ClosedPayloadChecksum());
+      compacted.rank_checksums.push_back(file < current.rank_checksums.size() ? current.rank_checksums[file] : ClosedPayloadChecksum());
       compacted.path_counts.push_back(current.path_counts[file]); compacted.rank_counts.push_back(current.rank_counts[file]);
       compacted.logical_file_ids.push_back(logical); compacted.physical_shard_ids.push_back(current.physical_shard_ids[file]);
       compacted.path_count += current.path_counts[file]; compacted.rank_count += current.rank_counts[file];
@@ -4743,14 +4802,17 @@ BuildWorkspace::ArtifactRef
 checkpointJoinPartitionArtifact(BuildWorkspace& workspace,
   const ArtifactIdentity& identity, logical_file_id_t logical,
   const std::string& source, size_type records, size_type expected_bytes,
-  size_type buffer_bytes, const std::string& sort_order)
+  size_type buffer_bytes, const std::string& sort_order,
+  const ClosedPayloadChecksum* provenance)
 {
   static_cast<void>(sort_order);
+  const uint64_t* known = (provenance != nullptr && provenance->matches(source, expected_bytes)
+    ? &provenance->value : nullptr);
   // Worker outputs are immutable once their result marker is read. Adopt the
   // raw payload so a colocated workspace keeps the same inode; the workspace
   // primitive retains its bounded-copy fallback for other filesystems.
   return workspace.adopt_raw_payload(identity, logical, physical_shard_id_t(0),
-    source, records, expected_bytes, buffer_bytes);
+    source, records, expected_bytes, buffer_bytes, known);
 }
 
 size_type
@@ -4770,17 +4832,18 @@ void
 checkpointJoinPartition(BuildWorkspace& workspace, const std::string& task,
   logical_file_id_t logical, const JoinPartition& partition,
   const std::string& path_name, const std::string& rank_name,
-  size_type buffer_bytes)
+  size_type buffer_bytes, const ClosedPayloadChecksum* path_checksum,
+  const ClosedPayloadChecksum* rank_checksum)
 {
   std::vector<BuildWorkspace::ArtifactRef> artifacts;
   artifacts.push_back(checkpointJoinPartitionArtifact(workspace,
     joinPartitionArtifact(task, "paths", "path-nodes-v1"), logical,
     path_name, partition.expected_paths,
-    storedJoinBytes(path_name), buffer_bytes, "label"));
+    storedJoinBytes(path_name), buffer_bytes, "label", path_checksum));
   artifacts.push_back(checkpointJoinPartitionArtifact(workspace,
     joinPartitionArtifact(task, "ranks", "path-ranks-v1"), logical,
     rank_name, partition.expected_ranks,
-    storedJoinBytes(rank_name), buffer_bytes, "path-order"));
+    storedJoinBytes(rank_name), buffer_bytes, "path-order", rank_checksum));
   workspace.commit_task(task, "join-partition", artifacts);
 }
 
@@ -5162,12 +5225,21 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
       throw joinError("worker stored output exceeds the peak admitted for the"
         " configured temporary-compression settings", result_file);
     }
+    if(!result.path_checksum.matches(next.path_names[worker.shard],
+         storedJoinBytes(next.path_names[worker.shard])) ||
+       !result.rank_checksum.matches(next.rank_names[worker.shard],
+         storedJoinBytes(next.rank_names[worker.shard])))
+    { throw joinError("worker payload changed after writer close", result_file); }
     if(workspace != nullptr && !worker.checkpoint_name.empty())
     {
       checkpointJoinPartition(*workspace, worker.checkpoint_name, logical,
         worker.partition, next.path_names[worker.shard],
-        next.rank_names[worker.shard], checkpoint_buffer);
+        next.rank_names[worker.shard], checkpoint_buffer,
+        &result.path_checksum, &result.rank_checksum);
     }
+    // Our checkpoint hardlinks change ctime without changing the payload.
+    next.path_checksums.at(worker.shard).record(next.path_names[worker.shard], result.path_checksum.value);
+    next.rank_checksums.at(worker.shard).record(next.rank_names[worker.shard], result.rank_checksum.value);
     next.path_counts[worker.shard] = result.paths;
     next.rank_counts[worker.shard] = result.ranks;
     next.path_count += result.paths; next.rank_count += result.ranks;

@@ -200,6 +200,12 @@ writeSparseSkewCycle(const std::string& filename)
 
   std::ofstream output(filename.c_str());
   require(static_cast<bool>(output));
+  // Reuse 257 graph positions around the 4096-label cycle. The same from node
+  // therefore recurs in many nonadjacent final paths and across every bounded
+  // preparation batch, while the de Bruijn order supplies changing LCP-stack
+  // boundaries. This makes byte equality exercise ordered prev-occurrence and
+  // suffix-stack state rather than merely disjoint per-path sets.
+  constexpr size_type graph_positions = 257;
   for(size_type i = 0; i < sequence.size(); i++)
   {
     std::string label;
@@ -209,8 +215,10 @@ writeSparseSkewCycle(const std::string& filename)
     }
     char predecessor = alphabet[sequence[(i + sequence.size() - 1) % sequence.size()]];
     char successor = alphabet[sequence[(i + order) % sequence.size()]];
-    size_type next = (i + 1) % sequence.size();
-    output << label << '\t' << (10 + i / 256) << ':' << (i % 256 + 1) << '\t'
+    size_type current_node = i % graph_positions;
+    size_type next = ((i + 1) % sequence.size()) % graph_positions;
+    output << label << '\t' << (10 + current_node / 256) << ':'
+           << (current_node % 256 + 1) << '\t'
            << predecessor << '\t' << successor << '\t'
            << (10 + next / 256) << ':' << (next % 256 + 1) << '\n';
   }
@@ -244,6 +252,8 @@ main()
   Verbosity::set(Verbosity::SILENT);
 
   const std::string legacy_root = makeTempRoot("gcsa-resume-legacy");
+  const std::string legacy_parallel_root =
+    makeTempRoot("gcsa-resume-legacy-parallel");
   const std::string workspace_root = makeTempRoot("gcsa-resume-work");
   const std::string parallel_root = makeTempRoot("gcsa-resume-parallel");
   const std::string fallback_root = makeTempRoot("gcsa-resume-fallback");
@@ -251,6 +261,8 @@ main()
   const std::string input_name = legacy_root + "/sparse-skew.gcsa2";
   writeSparseSkewCycle(input_name);
   const std::string legacy_prefix = std::string(legacy_root) + "/index";
+  const std::string legacy_parallel_prefix =
+    std::string(legacy_parallel_root) + "/index";
   const std::string external_prefix = std::string(workspace_root) + "/index";
   const std::string parallel_prefix = std::string(parallel_root) + "/index";
   const std::string fallback_prefix = std::string(fallback_root) + "/index";
@@ -279,6 +291,28 @@ main()
     require(verifyIndex(index, &lcp, graph));
     store(index, lcp, legacy_prefix);
   }
+
+  // The fixture has thousands of distinct labels joined across two doubling
+  // rounds. A caller may still configure OpenMP threads for the legacy route,
+  // but its extender requires one physical shard per logical input. Verify the
+  // constructor keeps prune serial and preserves the public oracle bytes.
+  omp_set_num_threads(4);
+  TempFile::setDirectory(legacy_parallel_root);
+  {
+    ConstructionParameters parameters;
+    parameters.setSteps(2);
+    parameters.setMemoryLimitBytes(MEGABYTE);
+    InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
+    GCSA index(graph, parameters);
+    LCPArray lcp(graph, parameters);
+    require(verifyIndex(index, &lcp, graph));
+    store(index, lcp, legacy_parallel_prefix);
+  }
+  require(readFile(legacy_prefix + GCSA::EXTENSION) ==
+    readFile(legacy_parallel_prefix + GCSA::EXTENSION));
+  require(readFile(legacy_prefix + LCPArray::EXTENSION) ==
+    readFile(legacy_parallel_prefix + LCPArray::EXTENSION));
+  omp_set_num_threads(1);
 
   // Stop after a durable, fine-grained prefix-doubling checkpoint.
   TempFile::setDirectory(workspace_root);
@@ -382,6 +416,15 @@ main()
   size_type predecessor_batches = std::stoull(parallel_log.str().substr(
     predecessor_line + predecessor_prefix.size()));
   require(predecessor_batches > 1);
+  const std::string preparation_prefix =
+    "final ordered-state preparation: 4 worker(s), ";
+  size_type preparation_line = parallel_log.str().find(preparation_prefix);
+  require(preparation_line != std::string::npos);
+  size_type prepared_paths = std::stoull(parallel_log.str().substr(
+    preparation_line + preparation_prefix.size()));
+  require(prepared_paths >= 4096);
+  require(parallel_log.str().find("1 spill fallback(s)", preparation_line) !=
+    std::string::npos);
   const auto scanReadBytes = [](const std::string& log) -> size_type {
     const std::string prefix = "final scan read bytes: ";
     size_type at = log.find(prefix); require(at != std::string::npos);
@@ -449,6 +492,9 @@ main()
     std::string::npos);
   require(fallback_log.str().find(
     "serial fallback: batch admission too small") != std::string::npos);
+  require(fallback_log.str().find(
+    "final ordered-state preparation: 1 worker(s), 0 paths / 0 from-ranks prepared") !=
+    std::string::npos);
   // The final-event writer bounds its frame size by the I/O buffer, so this
   // deliberate 1 KiB fallback uses different physical frame boundaries than
   // the 16 KiB serial run. Compare decoded streams here; the matched-buffer
@@ -561,6 +607,7 @@ main()
   }
 
   std::filesystem::remove_all(legacy_root);
+  std::filesystem::remove_all(legacy_parallel_root);
   std::filesystem::remove_all(workspace_root);
   std::filesystem::remove_all(parallel_root);
   std::filesystem::remove_all(fallback_root);
