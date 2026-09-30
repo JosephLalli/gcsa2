@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <filesystem>
 #include <limits>
 #include <stdexcept>
@@ -71,6 +72,16 @@ requireAt(bool condition, const char* expression, int line)
 // Keep assertions useful under the production -O3 test build, where adjacent
 // abort sites can otherwise collapse onto one misleading source line.
 #define require(value) requireAt((value), #value, __LINE__)
+
+void
+requireRecordedChecksum(const ClosedPayloadChecksum& provenance, const std::string& path)
+{
+  std::ifstream input(path.c_str(), std::ios::binary);
+  require(bool(input));
+  std::vector<char> payload((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+  require(provenance.matches(path, payload.size()));
+  require(provenance.value == BuildWorkspace::checksum(payload.data(), payload.size()));
+}
 
 void
 writePathPair(const std::string& path_name, const std::string& rank_name,
@@ -334,6 +345,13 @@ int main(int argc, char** argv)
   PathGraph legacy(combined_path, combined_rank);
   legacy.order = 1;
   legacy.extend(GIGABYTE, 64 * MEGABYTE);
+  // extend() sorts each file after writing it; the recorded checksum must
+  // describe the sorted bytes, not the unsorted ones written first.
+  for(size_type file = 0; file < legacy.files(); file++)
+  {
+    requireRecordedChecksum(legacy.path_checksums[file], legacy.path_names[file]);
+    requireRecordedChecksum(legacy.rank_checksums[file], legacy.rank_names[file]);
+  }
 
   PathGraph external(left_path, left_rank);
   external.order = 1;

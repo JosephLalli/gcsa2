@@ -388,6 +388,9 @@ struct PathGraphOutputCache
   PathGraph& graph;
   std::vector<Entry> entries;
   std::vector<std::uint64_t> path_digests, rank_digests;
+  // Files rewritten by a sort after they were written; the sort records their
+  // checksums, and the digests accumulated here describe the unsorted bytes.
+  std::vector<bool> rewritten;
   bool closed;
   size_type clock, max_pairs, pair_buffer_bytes;
   PathGraphMergeStats* stats;
@@ -398,7 +401,8 @@ struct PathGraphOutputCache
     size_type requested_pairs, PathGraphMergeStats* merge_stats) :
     graph(target), entries(),
     path_digests(target.files(), 1469598103934665603ULL),
-    rank_digests(target.files(), 1469598103934665603ULL), closed(false), clock(0),
+    rank_digests(target.files(), 1469598103934665603ULL),
+    rewritten(target.files(), false), closed(false), clock(0),
     max_pairs(std::max(static_cast<size_type>(1), std::min(requested_pairs,
       total_buffer_bytes / minimumPairBytes()))),
     // Cap the per-pair staging buffer. With output_pairs == 1 -- prune's normal
@@ -470,6 +474,8 @@ struct PathGraphOutputCache
     }
   }
 
+  void markRewritten(size_type file) { this->rewritten.at(file) = true; }
+
   void close()
   {
     if(this->closed) { return; }
@@ -484,6 +490,7 @@ struct PathGraphOutputCache
     if(first_error != nullptr) { std::rethrow_exception(first_error); }
     for(size_type file = 0; file < this->graph.files(); file++)
     {
+      if(this->rewritten[file]) { continue; }
       this->graph.path_checksums.at(file).record(this->graph.path_names[file],
         this->path_digests[file]);
       this->graph.rank_checksums.at(file).record(this->graph.rank_names[file],
@@ -793,6 +800,7 @@ PathGraphBuilder::sort(size_type file, size_type byte_budget, size_type fan_in)
 {
   this->output_files.closeFile(file);
   externalPathGraphSort(this->graph, file, byte_budget, fan_in);
+  this->output_files.markRewritten(file);
 
   if(Verbosity::level >= Verbosity::FULL)
   {
@@ -3752,18 +3760,27 @@ buildPrunePartition(PrunePartition& result, const PathGraph& source,
   result.graph->swap(builder.graph);
 }
 
+// Declines a requested parallel prune or merge. The serial route that follows
+// resets the stats, so the reason travels back to the caller to record.
+bool
+declineParallel(const char** reason_out, const char* reason)
+{
+  if(reason_out != nullptr) { *reason_out = reason; }
+  return false;
+}
+
 bool
 buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   size_type size_limit, size_type group_buffer_bytes,
   PathGraphMergeStats* stats, size_type max_open_files,
   size_type input_cache_bytes, size_type requested_workers,
-  const PruneOutputLayout& layout)
+  const PruneOutputLayout& layout, const char** fallback_reason)
 {
   std::vector<std::pair<PathNode::rank_type, PathNode::rank_type>> ranges;
-  if(requested_workers < 2 || source.size() == 0 || layout.logical.empty() ||
-     !pruneRootPartitions(lcp, ranges))
+  if(requested_workers < 2 || source.size() == 0 || layout.logical.empty()) { return false; }
+  if(!pruneRootPartitions(lcp, ranges))
   {
-    return false;
+    return declineParallel(fallback_reason, "no zero-LCP root partitions");
   }
 
   const size_type minimum_group = std::max(
@@ -3800,7 +3817,7 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   if(source.files() > 0 &&
      resident_pair > std::numeric_limits<size_type>::max() / source.files())
   {
-    return false;
+    return declineParallel(fallback_reason, "input window size overflows");
   }
   const size_type resident_per_worker = resident_pair * source.files();
   const size_type cache_budget = (input_cache_bytes == 0 ?
@@ -3813,12 +3830,15 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   {
     if(source.files() > (std::numeric_limits<size_type>::max() - 4) / 2)
     {
-      return false;
+      return declineParallel(fallback_reason, "too many input shards for the open-file limit");
     }
     workers = std::min(workers,
       max_open_files / (2 + 2 * source.files() + 2));
   }
-  if(workers < 2) { return false; }
+  if(workers < 2)
+  {
+    return declineParallel(fallback_reason, "memory, cache or open-file limits admit fewer than two workers");
+  }
 
   // The exact output-pair allocation depends on the per-worker FD share. If a
   // rounded share cannot retain the full raw/mixed input set, reduce
@@ -3835,12 +3855,18 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
     if(required_fds <= worker_open_files) { break; }
     workers--;
   }
-  if(workers < 2) { return false; }
+  if(workers < 2)
+  {
+    return declineParallel(fallback_reason, "open-file share cannot hold each worker's shards");
+  }
 
   const size_type worker_group = group_buffer_bytes / workers;
   const size_type worker_cache = (input_cache_bytes == 0 ? worker_group :
     input_cache_bytes / workers);
-  if(resident_per_worker > worker_cache) { return false; }
+  if(resident_per_worker > worker_cache)
+  {
+    return declineParallel(fallback_reason, "input cache cannot hold each worker's windows");
+  }
 
   validatePruneShardTails(source, lcp,
     (pair_bytes > 0 ? pair_bytes : raw_pair_budget));
@@ -3926,7 +3952,9 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
        lcp.max_lcp(previous->node, part.first_output.node,
          previous->label, part.first_output.label) != range_type(0, 0))
     {
-      return false;
+      std::cerr << "PathGraph::prune(): warning: root partitions share a nonzero LCP; "
+                << "pruning this step serially" << std::endl;
+      return declineParallel(fallback_reason, "root partitions share a nonzero LCP");
     }
     previous = &(part.last_output);
   }
@@ -4049,8 +4077,10 @@ PathGraph::prune(const LCP& lcp, size_type size_limit,
   const size_type requested_workers = std::max(static_cast<size_type>(1),
     prune_workers);
   PruneOutputLayout layout = pruneOutputLayout(*this);
+  const char* fallback_reason = nullptr;
   if(buildPrunedGraphParallel(*this, lcp, size_limit, group_buffer_bytes,
-       stats, max_open_files, input_cache_bytes, requested_workers, layout))
+       stats, max_open_files, input_cache_bytes, requested_workers, layout,
+       &fallback_reason))
   {
     if(Verbosity::level >= Verbosity::EXTENDED)
     {
@@ -4096,6 +4126,7 @@ PathGraph::prune(const LCP& lcp, size_type size_limit,
     stats->prune_workers = 1;
     stats->prune_partitions = (this->size() == 0 ? 0 : 1);
     stats->prune_parallel_fallbacks = (requested_workers > 1 ? 1 : 0);
+    stats->prune_fallback_reason = fallback_reason;
   }
   this->clear(); this->swap(builder.graph);
 
@@ -5218,13 +5249,13 @@ buildMergedGraphParallel(MergedGraph& result, const PathGraph& source,
   const DeBruijnGraph& mapper, const LCP& kmer_lcp, size_type size_limit,
   size_type group_buffer_bytes, PathGraphMergeStats* stats,
   size_type max_open_files, size_type input_cache_bytes,
-  size_type requested_workers)
+  size_type requested_workers, const char** fallback_reason)
 {
   std::vector<std::pair<PathNode::rank_type, PathNode::rank_type>> ranges;
-  if(requested_workers < 2 ||
-     !mergedGraphRootPartitions(mapper, kmer_lcp, ranges))
+  if(requested_workers < 2) { return false; }
+  if(!mergedGraphRootPartitions(mapper, kmer_lcp, ranges))
   {
-    return false;
+    return declineParallel(fallback_reason, "no zero-LCP root partitions");
   }
 
   constexpr size_type fixed_descriptors = 14;
@@ -5251,13 +5282,16 @@ buildMergedGraphParallel(MergedGraph& result, const PathGraph& source,
     if(source.files() >
        (std::numeric_limits<size_type>::max() - fixed_descriptors) / 2)
     {
-      return false;
+      return declineParallel(fallback_reason, "too many input shards for the open-file limit");
     }
     workers = std::min(workers,
       max_open_files / (fixed_descriptors + 2 * source.files()));
   }
   const size_type minimum_group = ExternalFixedRecordSorter::minimumBudget(sizeof(node_type));
-  if(group_buffer_bytes < minimum_group) { return false; }
+  if(group_buffer_bytes < minimum_group)
+  {
+    return declineParallel(fallback_reason, "group buffer below the sorter minimum");
+  }
   workers = std::min(workers, group_buffer_bytes / minimum_group);
   size_type pair_bytes = pathGraphFramedPairBytes(source);
   size_type cache_budget = (input_cache_bytes == 0 ? group_buffer_bytes : input_cache_bytes);
@@ -5266,13 +5300,19 @@ buildMergedGraphParallel(MergedGraph& result, const PathGraph& source,
     size_type shards = std::max(static_cast<size_type>(1), source.files());
     if(pair_bytes > std::numeric_limits<size_type>::max() / shards)
     {
-      return false;
+      return declineParallel(fallback_reason, "input cache size overflows");
     }
     size_type resident_bytes = pair_bytes * shards;
-    if(cache_budget < resident_bytes) { return false; }
+    if(cache_budget < resident_bytes)
+    {
+      return declineParallel(fallback_reason, "input cache cannot hold every shard's window");
+    }
     workers = std::min(workers, cache_budget / resident_bytes);
   }
-  if(workers < 2) { return false; }
+  if(workers < 2)
+  {
+    return declineParallel(fallback_reason, "memory, cache or open-file limits admit fewer than two workers");
+  }
 
   size_type worker_group = std::max(static_cast<size_type>(1), group_buffer_bytes / workers);
   size_type worker_cache = (input_cache_bytes == 0 ? 0 :
@@ -5337,7 +5377,9 @@ buildMergedGraphParallel(MergedGraph& result, const PathGraph& source,
          previous->label, part.first_output.label) != range_type(0, 0))
     {
       for(MergedGraphPartition& cleanup : partitions) { cleanup.clear(); }
-      return false;
+      std::cerr << "MergedGraph: warning: root partitions share a nonzero LCP; "
+                << "merging serially" << std::endl;
+      return declineParallel(fallback_reason, "root partitions share a nonzero LCP");
     }
     previous = &(part.last_output);
   }
@@ -5377,7 +5419,7 @@ buildMergedGraphParallel(MergedGraph& result, const PathGraph& source,
   {
     for(MergedGraphPartition& cleanup : partitions) { cleanup.clear(); }
     result.path_count = 0; result.rank_count = 0; result.from_count = 0;
-    return false;
+    return declineParallel(fallback_reason, "disk limit cannot hold two copies of the merged graph");
   }
 
   bool has_output = false;
@@ -5534,14 +5576,16 @@ MergedGraph::MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper,
   }
   static_cast<void>(fixed_descriptors);
   initializeMergedGraphNext(*this, mapper);
+  const char* fallback_reason = nullptr;
   if(!buildMergedGraphParallel(*this, source, mapper, kmer_lcp, size_limit,
       group_buffer_bytes, stats, max_open_files, input_cache_bytes,
-      merge_workers))
+      merge_workers, &fallback_reason))
   {
     this->path_count = 0; this->rank_count = 0; this->from_count = 0;
     initializeMergedGraphNext(*this, mapper);
     buildMergedGraphSerial(*this, source, mapper, kmer_lcp, size_limit,
       group_buffer_bytes, stats, max_open_files, input_cache_bytes);
+    if(stats != nullptr) { stats->merge_fallback_reason = fallback_reason; }
   }
 
   if(Verbosity::level >= Verbosity::EXTENDED)

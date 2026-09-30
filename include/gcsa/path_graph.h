@@ -318,6 +318,10 @@ struct PathGraphMergeStats
   size_type prune_requested_workers, prune_workers, prune_partitions;
   size_type prune_parallel_fallbacks;
   size_type merge_workers, merge_partitions;
+  // Why a requested parallel prune or merge ran serially (a string literal),
+  // or null when it ran in parallel or was not requested.
+  const char* prune_fallback_reason = nullptr;
+  const char* merge_fallback_reason = nullptr;
 
   PathGraphMergeStats() :
     priority_spills(0), range_spills(0), from_set_sorts(0),

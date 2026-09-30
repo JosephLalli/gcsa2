@@ -1716,6 +1716,13 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
 
 //------------------------------------------------------------------------------
 
+// " (reason)" for a declined parallel prune or merge, or nothing.
+std::string
+fallbackReason(const char* reason)
+{
+  return (reason == nullptr ? std::string() : std::string(" (") + reason + ")");
+}
+
 /*
   FORK: reporting for the external route.
 
@@ -1735,7 +1742,8 @@ reportPruneMergeStats(const PathGraphMergeStats& merge_stats)
               << merge_stats.prune_workers << " of "
               << merge_stats.prune_requested_workers << " requested worker(s) over "
               << merge_stats.prune_partitions << " root partition(s), "
-              << merge_stats.prune_parallel_fallbacks << " serial fallback(s); "
+              << merge_stats.prune_parallel_fallbacks << " serial fallback(s)"
+              << fallbackReason(merge_stats.prune_fallback_reason) << "; "
               << merge_stats.priority_spills << " path-group spills, "
               << merge_stats.range_spills << " range spills, "
               << merge_stats.max_open_input_pairs << " input pairs and "
@@ -1860,7 +1868,8 @@ reportFinalMergeStats(const PathGraphMergeStats& final_merge_stats)
               << LCP::range_minimum_span.load() << " total key positions"
               << std::endl;
     std::cerr << "MergedGraph: "
-              << final_merge_stats.merge_workers << " worker(s) over "
+              << final_merge_stats.merge_workers << " worker(s)"
+              << fallbackReason(final_merge_stats.merge_fallback_reason) << " over "
               << final_merge_stats.merge_partitions << " root partition(s); "
               << final_merge_stats.priority_spills << " path-group spills, "
               << final_merge_stats.range_spills << " range spills, "
@@ -2209,7 +2218,8 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
                   << " requested worker(s), "
                   << merge_stats.prune_partitions << " partition(s), "
                   << merge_stats.prune_parallel_fallbacks
-                  << " serial fallback(s)" << std::endl;
+                  << " serial fallback(s)"
+                  << fallbackReason(merge_stats.prune_fallback_reason) << std::endl;
       }
       // The merger visits its shards in round-robin label order, so a cache one
       // entry short of the shard count misses on every record rather than on a

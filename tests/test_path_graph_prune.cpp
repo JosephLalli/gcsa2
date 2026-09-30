@@ -944,6 +944,11 @@ static void compare_parallel_merged_graph(const std::string& base)
     require(four_stats.merge_workers == 4);
     require(fd_stats.merge_workers == 2);
     require(scratch_limited_stats.merge_workers == 1);
+    // One requested worker is not a fallback; a disk-limited request is, and
+    // the stats name why.
+    require(serial_stats.merge_fallback_reason == nullptr);
+    require(scratch_limited_stats.merge_fallback_reason != nullptr &&
+      std::string(scratch_limited_stats.merge_fallback_reason).find("disk") != std::string::npos);
     // Seven alphabet components are scheduled, including the empty $, N, and
     // # intervals; A is deliberately much larger than C/G/T.
     require(four_stats.merge_partitions == mapper.alpha.sigma);
@@ -1024,6 +1029,7 @@ static void compare_parallel_merged_graph(const std::string& base)
         &mixed_stats, 128, 256 * MEGABYTE, 4);
       require_same_merged_graph(serial, mixed);
       require(mixed_stats.merge_workers == 1);
+      require(mixed_stats.merge_fallback_reason != nullptr);
     }
 
     // A completely empty frontier still takes the parallel assembly route,
