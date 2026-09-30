@@ -1069,6 +1069,13 @@ Implemented as the bounded group-aware parallel final-path merge described in
 the implementation checkpoint above. The prefetch observation remains relevant:
 the change targets serial emission rather than adding readers.
 
+GCSA construction runs this merge serially unless
+`GCSA_EXPERIMENTAL_PARALLEL_MERGE=1` is set. Copying every partition into place
+doubles the merge's scratch writes, and on chr21 the parallel merge took 0:07:04
+against 0:07:48 serial while two runs of the same parallel code differed by
+0:00:42. `MergedGraph` still takes an explicit worker count, and its tests
+exercise both routes.
+
 ## Build, test, and usage
 
 From the containing `vg` checkout, use its local toolchain wrapper. The GCSA2

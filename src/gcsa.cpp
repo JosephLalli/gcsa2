@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <filesystem>
@@ -2306,13 +2307,20 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
               << " MB, framed input cache " << inMegabytes(merge_cache)
               << " MB over " << path_graph.files() << " shard(s)" << std::endl;
   }
+  // The partitioned merge copies every partition into place, doubling the
+  // merge's scratch writes, and its chr21 gain did not clear run-to-run
+  // spread; it runs only when requested.
+  const char* parallel_merge = std::getenv("GCSA_EXPERIMENTAL_PARALLEL_MERGE");
+  size_type merge_workers = 1;
+  if(parameters.externalMemory() && parallel_merge != nullptr && std::string(parallel_merge) == "1")
+  {
+    merge_workers = static_cast<size_type>(std::max(1, omp_get_max_threads()));
+  }
   PathGraphMergeStats final_merge_stats;
   SubPhaseProbe merge_probe("merge/merged-graph");
   MergedGraph merged_graph(path_graph, mapper, lcp,
     path_graph.remainingLimit(parameters.getLimitBytes()), merge_buffer,
-    &final_merge_stats, parameters.getMaxOpenFiles(), merge_cache,
-    (parameters.externalMemory() ?
-      static_cast<size_type>(std::max(1, omp_get_max_threads())) : 1));
+    &final_merge_stats, parameters.getMaxOpenFiles(), merge_cache, merge_workers);
   merge_probe.report();
   reportFinalMergeStats(final_merge_stats);
   this->header.path_nodes = merged_graph.size();
