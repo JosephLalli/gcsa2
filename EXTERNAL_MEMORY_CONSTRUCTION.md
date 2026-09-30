@@ -147,6 +147,27 @@ reported 497.497 GB read and 417.810 GB written. A separate 23 GiB internal /
 terminated before its incomplete join phase committed. Resumption retained its
 predecessor and ignored the incomplete successor exactly as designed.
 
+**Do not read the peak run-directory figures above as a workspace-to-input
+multiplier.** They are the right numbers for what they measure — the high-water
+mark a given run needed on disk — but three things make the ratio
+`peak / pruned-input-bytes` non-transferable, and a downstream consumer has
+already been misled by it. First, both peaks were reached by resumed,
+deliberately forced-spill runs that carry a predecessor's committed frontier
+alongside the successor's live state; the completed retained workspaces are
+much smaller (about 262 GiB against the 402.85 GiB peak, and about 177 GiB
+against 314.60 GiB). Second, spill volume is driven by the configured memory
+budget, so the tighter the budget the larger the workspace: the 23 GiB run
+peaked higher in absolute terms than the 96 GiB one despite a smaller input.
+Third, the ratio is not even monotone in input size. Dividing peak by input
+gives 767x for the chr20 fixture (337,799,719,952 / 440,223,843) and 1,756x for
+chr21 (432,556,537,957 / 246,263,907), while a 96 GiB-budget build recording no
+resume or forced spill, over a 4,231,235,421-byte pruned corpus, measured
+60,717,348,762 bytes —
+**14.35x** — settling to 4.66x after cleanup (`hprc_v2_vg_rna`,
+`notes/chr21_or_vs_exact_dedup_downstream.md`, 2026-09-14). Size a disk budget from
+a measurement at the intended budget, input shape and resume posture, not by
+scaling any figure on this page.
+
 The chromosome completion binary predates the later parallel run-sort,
 direct-join, external-preprocessing, final-event, streaming-LCP, and dirty-cache
 changes described below. Those changes pass unit and small integration tests,
@@ -487,10 +508,12 @@ quarantined; immutable inputs and committed predecessors remain. Task records
 are replayed in dependency order. Headers, lengths, footers, and task metadata
 are always checked. Join-run payload checksums are selected by
 `--verify-workspace`; normal construction trusts the checksum computed while a
-newly synced run was written and avoids immediately rereading it. Phase
-path/rank checkpoints adopt an immutable fixed-record payload: they hard-link
-the raw or framed file into the workspace when source and workspace share a
-filesystem and otherwise perform one bounded copy. Version-3 checkpoint
+newly synced run was written and avoids immediately rereading it. A newly
+closed phase path/rank writer passes its durable physical checksum to checkpoint
+adoption with the immutable fixed-record payload. Adoption therefore hard-links
+the raw or framed file without a checksum reread when source and workspace share
+a filesystem, and otherwise validates while performing one bounded copy.
+Version-3 checkpoint
 metadata records both logical record bytes and physical stored bytes and still
 restores version-2 raw checkpoints. Normal same-filesystem restore validates
 task identity, record count, and byte length and then hard-links the committed
@@ -711,10 +734,125 @@ throughput improvements rather than verification-correctness requirements.
 The ledger is intentionally conservative: a feature moves to **complete** only
 when its production call path and forced-spill/recovery tests pass.
 
+### Historical parallel-finalization checkpoint (2026-09-29)
+
+At this checkpoint, items 1, 2, and 4 were
+implemented and validated on chr21. The final candidate completed in **38:06
+versus 41:07** (7.34% shorter), with byte-identical GCSA/LCP outputs. Final merge
+was 424.4 versus 468.4 s; final events 578.1 versus 666.3 s; component encoding
+71.7 versus 155.9 s. Average cores increased 3.14 to 3.76; time below two cores
+fell 74.7% to 59.7%; peak sampled RSS remained about 14.6 GiB. Candidate total
+cgroup peak was 27.498 GiB, with no memory-limit/OOM events. This is a single
+shared-host fixture comparison, not a whole-genome performance prediction.
+
+All 15 GCSA2 targets, all 35 vg integration checks, and the expanded 4,097-pattern
+exact-output/resume fixture pass. Regression tests cover descriptor-limited
+cache thrashing and backward buffer refills discovered in two stopped attempts.
+The sealed candidate is `vg-gcsa-final-streams-20260929`, SHA256
+`3a8fffc210c9c0c541efa73d6b9b294ba622167e4808ad05550323bef155e91c`, based on
+vg `fd2ac2ba4` / GCSA2 `88d0621` plus the retained source patch. Ordinary `bin/vg`
+is unchanged. Source edits are uncommitted. At that checkpoint, the next
+recommended gate was a GCSA2-only comparison on retained chr2+chr18 inputs;
+it was not launched.
+
+Detailed implementation, receipts, CPU plot, resource tradeoffs, and preserved
+attempt history: [final parallel result](/mnt/ssd/lalli/hprc_v2_vg_rna/gcsa2_distribution_concurrency_20260928/final_parallel/README.md).
+
+### Completed serial-pass chr21 gate (2026-09-30)
+
+Fresh `run_1` exited 0 and reproduced final-parallel `run_4`'s public MD5s,
+`297f5fe840f7ec48337c97eacdc00c0f` (GCSA) and
+`6fc46b008b54f34cc30dcbb812807a9a` (LCP). All 16 GCSA2 suite targets and all
+35 vg integration checks pass, including the regression that keeps parallel
+prune off the legacy construction route. The sealed candidate is
+`bin/vg-gcsa-serial-passes-v2-20260930`, SHA256
+`0d5016aacc95a48705b798b25c3144f3caffa481d0387212562ad5d4210b6a92`.
+
+The three bounded changes exercised their intended paths. Four pruning rounds
+used seven workers and seven root partitions each, with no parallel fallback;
+their reported wall times totaled 157.2 s. Parallel prune is restricted to the
+external-memory route because its extend implementation preserves logical input
+identity across physical shards; the legacy extend implementation joins only
+within each physical file and therefore retains serial prune. All nine main
+initial/prune/extend path/rank checkpoints performed zero adoption checksum
+rescan and reused about 31.7 GiB of checksum provenance from their closed
+writers.
+
+Final preparation processed 399,778,113 paths and 631,824,030 ranks with seven
+workers and no spill fallback. Admission reserved 128 MiB for the bounded
+node/rank arenas plus 64 MiB for predecessor batches, 192 MiB combined. Workers
+prepare independent node/rank inputs; the previous-occurrence state, suffix-tree
+stack, and event serialization remain ordered. The complete final scan therefore
+retains serial state transitions.
+
+The candidate took 2,363.3 s (39:23), versus 2,285.5 s (38:06) for `run_4`, a
+3.4% wall-time increase. Candidate versus reference phase times were
+preprocessing 369.731 versus 151.342 s, doubling 953.1 versus 1,021.3 s, merge
+409.1 versus 424.4 s, events 500.3 versus 578.1 s, and components 76.5 versus
+71.7 s. Average cores were 3.77 versus 3.76; time below two cores was 47.5%
+versus 59.7%; sampled maximum RSS was 14.46 versus 14.57 GiB; and cgroup peak
+was 28.125 versus 27.498 GiB, with no memory-limit or OOM event.
+
+The main-thread sampled CPU profile supports the targeted checksum improvement:
+the raw checkpoint checksum function fell from 97.4 to 10.6 sampled CPU seconds,
+while `ExternalInputPreprocessor::buildLCP` was 76.6 to 74.8 s and `prepare`
+73.6 to 71.8 s. These values are inclusive CPU samples rather than wall times;
+overlapping values must not be subtracted, and they do not establish the cause
+of the preprocessing wall increase. This single shared-host A/B establishes
+exactness and the targeted mechanism behavior. Total wall time did not improve.
+
+The isolated triplet-state prototypes are now implemented. All 16 retained
+synthetic end-to-end runs have byte-identical public outputs; triplet pruning
+used 24 workers across 65 certified partitions. Two large-fixture repetitions
+observed 6.09 versus 10.27 s mean pruning time for triplet-only versus default
+(40.66% lower), not an established whole-build or chr21 speedup. Parallel final
+state is exact, but its 24-worker execution replayed 98.13M LCP updates and has
+no established speed benefit. The production GCSA2 implementation and ordinary
+`bin/vg` are unchanged, with no promotion or chr21/chr2+chr18/whole-genome
+launch. All 16 GCSA2 suite targets and final medium default/combined query
+smokes passed. The earlier tie-order assertion and interrupted suite are
+retained diagnostic history: a test-only repair canonicalizes full records
+within identical-label groups and compares downstream streams; no core algorithm
+change was required. The recommended real-chr21 triplet-only measurement remains
+unstarted; the state-chunk result below is completed historical evidence. The evidence navigator is
+`/mnt/ssd/lalli/hprc_v2_vg_rna/gcsa2_distribution_concurrency_20260928/triplet_state_20260930/README.md`.
+
+The state-chunk trial is complete:
+`/mnt/ssd/lalli/hprc_v2_vg_rna/gcsa2_distribution_concurrency_20260928/state_chunks_20260930/README.md`.
+It replaces repeated per-worker LCP replay with contiguous path chunks, using
+ordered-pass canonical stack seeds (at most 257 frames), rank-owned
+previous-occurrence updates, chunk-local queries, and coordinator emission. The
+sealed binary SHA256 is
+`21b90225129697d8785dbbe78f2e8c8454f541912d7fd266faa4c254375aa2a4`.
+All 16 GCSA2 targets and focused 1/2/24-worker, tie, spill, mapping-dedup,
+state-arena/predecessor-fallback, and resume checks passed. All 11 builds exited
+0 and byte-matched the archived public pair; five medium builds independently
+query-verified. On large input, worker replay fell 98,131,296 to 4,194,305
+(95.7258%) for 4,194,305 planned paths in 249 batches. Fresh old/new/new/old
+24-worker events averaged 8.75 s in both arms; build means were 86.1497 versus
+90.08535 s, so no wall-speed gain is established. New-24 chunk queries averaged
+0.0201025 s, but serial emission averaged 3.0748785 s. This is a work-efficiency
+success, not a performance promotion. **Completed emission profiling** used
+sealed instrumentation binary SHA256
+`032045ae8efc7592e0e15b63c82123a18b32add572001eb52c64a82fb081caa4`;
+all 10 runs passed, five medium runs query-verified, seven runs profiled, and
+the full 16-target suite passed. On the two 24-worker runs, emission was
+3.735008921/2.910755412 s and `writeAll()` was 3.697841370/2.873472212 s
+(about 98.88% on average); CPU outside full-buffer flush was only
+0.037077590/0.037206828 s. Close `fdatasync()` was 0.001495699/0.002553545 s,
+with no periodic sync. This bounds the dominant scope to full-buffer writes,
+but does not establish a kernel writeback or filesystem-contention cause and
+does not establish speedup. Aggregate telemetry makes native CPU sampling
+unnecessary. The next recommendation is a bounded write-stall/overlap
+investigation, not yet implemented or authorized. Production implementation and
+ordinary `vg` remain unchanged; no relink, promotion, chromosome, or
+whole-genome launch is authorized. Evidence is at
+`/mnt/ssd/lalli/hprc_v2_vg_rna/gcsa2_distribution_concurrency_20260928/emission_profile_20260930/README.md`.
+
 | Slice | State |
 | --- | --- |
 | Shared byte-token `MemoryBudget` and statvfs-aware `DiskBudget` | memory primitives, major external-phase byte caps, and framed encoder/decoder/zstd-worker reservations implemented; pruning/merged-graph buffers are byte-bounded but not globally admitted; final-scan readers retire cgroup-charged cache without extra descriptors; mapping/input/library allocations remain outside the shared budget; disk guard uses conservative framed peaks and exact installed sizes for generated path/join volume but not every final/LCP/checkpoint writer |
-| Versioned workspace artifacts, atomic publication, manifest compatibility, recovery tests | phase and join-range checkpoints plus abrupt-exit commit-boundary tests implemented; raw/framed mixed restore and journaled idempotent predecessor/family retirement implemented; transient distribution-run task records pending |
+| Versioned workspace artifacts, atomic publication, manifest compatibility, recovery tests | phase and join-range checkpoints plus abrupt-exit commit-boundary tests implemented; newly closed path/rank writers provide durable physical checksum provenance so normal same-filesystem adoption does not reread their payloads; the chr21 gate reused about 31.7 GiB across nine main checkpoints with zero adoption rescan; raw/framed mixed restore and journaled idempotent predecessor/family retirement implemented; transient distribution-run task records pending |
 | Human-readable operational construction parameters | core budget/run, temporary-compression, process-worker, and safe-cleanup controls implemented and parser-tested; checkpoint cadence remains standalone-only |
 | Framed temporary-file compression | versioned independently checksummed zstd/raw blocks, disk-spooled footer index, logical random access, raw fallback, mixed raw/framed join reading, exact primary/sidecar size telemetry, shared-budget admission, and multithreaded zstd contexts implemented for path/rank, fixed-record join-run plus group/detail sidecars, and final-event streams; a block is now admitted against its consumer's decode budget as well as its producer's, and the multi-worker estimate charges the job pool zstd actually allocates while clamping workers a block cannot feed; redundancy, preprocessing, and LCP level files remain raw |
 | Bounded external path-label runs and leveled multi-pass merge | versioned grouped/prefix-compressed runs, shared-left-context references, parallel in-place run sorting, rolling cache windows, one-run bypass, direct leveled merge of already-sorted worker shards, and forced multi-pass spilling implemented and tested |
@@ -723,12 +861,12 @@ when its production call path and forced-spill/recovery tests pass.
 | Direct join-to-label pipeline | implemented and forced-spill tested; the unsorted generated path/rank pair is no longer materialized |
 | Process worker scheduler and partition resume | implemented with fork-free spawn, global byte admission, immutable-payload semantic range checkpoints, same-filesystem zero-copy restore, and one-/multi-partition tests; a restored partition is admitted on the workspace's own record and charged its exact stored size instead of a peak re-derived from the resuming run's codec, and a killed sibling's pid-named label-sort runs are swept, including those of the worker whose failure ends the run |
 | External keys/start nodes/initial paths | implemented with bounded fixed-record runs, global duplicate reduction, streaming support construction, durable key/start checkpoints, and physical initial shards preserving logical IDs; only key LCP support remains resident during doubling, while mapper, last-character, and start-node supports are delayed to merge/final scan |
-| Spillable pruning groups | implemented and forced-spill tested for equal-label priority groups, extended ranges, external same-from sets, and bounded input/output descriptor caches; framed input pairs are bounded at write time so every shard a merge opens stays resident and each block is decoded once, and a pair committed above the current merge budget is admitted with its overshoot reported rather than refused, because a committed block cannot be renegotiated; the descriptor allowance is divided by what each cache can occupy rather than evenly, since pruning emits one output per logical input while only the input side scales with shard count, and the post-join compactor retains against that same bound (both label merges visit their shards in round-robin label order, where a cache one entry short of the shard count misses on every record rather than on a fraction of them) |
-| Final event/component passes | implemented with one-task immutable-payload event checkpoint, same-filesystem zero-copy restore, spillable mapped start-node sets, disk-backed `prev_occ` and suffix-tree stack, external redundancy sort, streaming fast/sparse BWT, packed-sample-ID, sample-boundary, SadaSparse, and SadaCount serialization, and direct component-at-a-time packing in standalone/vg/autoindex; mid-scan assignment logs pending |
+| Spillable pruning groups | implemented and forced-spill tested for equal-label priority groups, extended ranges, external same-from sets, and bounded input/output descriptor caches; the external route can partition zero-LCP roots across admitted workers and reconcile the exact logical output in root order, with resource/safe-boundary fallback to serial; legacy construction remains serial because its extend path is not physical-shard aware; framed input pairs are bounded at write time so every shard a merge opens stays resident and each block is decoded once, and a pair committed above the current merge budget is admitted with its overshoot reported rather than refused, because a committed block cannot be renegotiated; the descriptor allowance is divided by what each cache can occupy rather than evenly, since pruning emits one output per logical input while only the input side scales with shard count, and the post-join compactor retains against that same bound (both label merges visit their shards in round-robin label order, where a cache one entry short of the shard count misses on every record rather than on a fraction of them) |
+| Final event/component passes | implemented with one-task immutable-payload event checkpoint, same-filesystem zero-copy restore, spillable mapped start-node sets, disk-backed `prev_occ` and suffix-tree stack, external redundancy sort, streaming fast/sparse BWT, packed-sample-ID, sample-boundary, SadaSparse, and SadaCount serialization, direct component-at-a-time packing, bounded concurrent component queues, and predecessor batches preserving ordered state without rereading the source; bounded workers prepare independent node/rank inputs while `prev_occ`, the suffix stack, and serialization remain ordered; all 16 GCSA2 suite targets and all 35 vg integration checks pass, including legacy/parallel 4097-pattern resume, sparse/skewed and batch-boundary fixtures, spill/fallback coverage, and decoded-record equality for the changed-I/O-buffer fallback |
 | Streaming LCP levels and direct packing | implemented and resume-tested with one raw level resident at a time, bounded direct final serialization, atomic publication, and byte-identical legacy output including padding edge cases |
 | External verification | implemented and forced-spill tested with bounded input blocks, external expected/actual occurrence sorts, callback-based locate, and sequential set comparison; resumable runs and parallel label ranges pending |
 | Standalone and `vg index` / `vg autoindex` CLI integration | implemented for memory/disk, process workers, temporary compression, and safe cleanup; forced-spill/resume and raw-versus-framed equivalence integration tested |
-| Chromosome-scale benchmark | preexisting chr20 k32-pruned fixture completed and verified at 32.36 GiB RSS under a 128 GiB cgroup with byte-identical legacy outputs; preexisting chr21 k32-pruned fixture completed and verified at 21.34 GiB process RSS under a hard 25 GiB cgroup, including a successful step-4 resume |
+| Chromosome-scale benchmark | preexisting chr20 k32-pruned fixture completed and verified at 32.36 GiB RSS under a 128 GiB cgroup with byte-identical legacy outputs; preexisting chr21 k32-pruned fixture completed and verified at 21.34 GiB process RSS under a hard 25 GiB cgroup, including a successful step-4 resume; the 2026-09-30 chr21 serial-pass gate reproduced the accepted public MD5s but took 2,363.3 versus 2,285.5 s, so it is correctness and targeted-mechanism evidence rather than a whole-run speedup |
 
 Current limitations are intentionally explicit. The external route is selected
 only when `ConstructionParameters::work_directory` is nonempty. The production
@@ -763,8 +901,12 @@ receive a clear refusal.
 Label-sort runs group shared left contexts and prefix-compress labels, but a
 deeper reference representation spanning the pre-sort join stream remains an
 optional compaction rather than a feasibility dependency.
-Final component construction is serial and the ordered event scan resumes only
-at its task boundary. Process workers accelerate independent join ranges, and
+Final component construction, final-path merging, final-event preparation, and
+external-route pruning now have bounded parallel paths; the completed full-suite
+and exact chr21 gate is recorded above. Ordered previous-occurrence and suffix
+state remain serial, and legacy construction retains serial pruning because its
+extend path cannot join across physical shards. Process workers accelerate
+independent join ranges, and
 post-join compaction runs the batches of a pass on up to `-t` threads when each
 batch fits one output pair and the disk and memory budgets admit them together.
 On the chr21 k32 fixture (2026-09-28, 200 GiB goal, `-t 24`) that took step-4
@@ -815,6 +957,14 @@ value deliberately produces more spill runs and I/O while preserving logical
 file identity and final-index semantics. Disk limit and free-space safety—not
 the RAM goal—decide whether a valid but very large generation may continue.
 
+Following the completed emission profile and any explicitly authorized real-chr21
+triplet-only measurement, a bounded matched diagnosis of the 369.731 versus
+151.342 s preprocessing result comes before a chr2+chr18 gate. It must reuse
+one identical retained k-mer stream across both binaries to remove
+generated-order variability. The current shared-host comparison does not
+establish the slowdown's cause, and the targeted sampled-CPU reductions cannot
+be used to account for wall time.
+
 Before a whole-pangenome claim, the remaining work is ordered by the project's
 feasibility, RSS, then speed policy:
 
@@ -849,9 +999,10 @@ feasibility, RSS, then speed policy:
    label ranges run in parallel under combined memory and I/O admission.
 7. Extend framing only where measurement justifies it: LCP levels and
    preprocessing ranks are promising, while already grouped/prefix-compressed
-   label runs may not repay another codec layer. Export the framed writer's
-   physical checksum to checkpoint adoption and fuse compatible occurrence
-   component passes to remove rereads.
+   label runs may not repay another codec layer. Path/rank checkpoint adoption
+   already consumes its writer's durable checksum; exporting the final-event
+   framed writer's physical checksum and fusing compatible occurrence component
+   passes remain possible ways to remove other rereads.
 8. Add a resource-aware read/compute/write pipeline. Join partitions already
    run as independent `posix_spawn` workers and each stream can use bounded zstd
    threads; final component encoders and verifier label ranges are the next
@@ -903,7 +1054,7 @@ This is the same shape the join already uses -- `sampleJoinKeys`
 and the same shape `PhaseUnfolder` uses on the `vg` side, where workers mint
 duplicate ids locally and a serial pass in component order re-bases them.
 
-Two costs are not yet accounted and must be before this is attempted. Each
+Before implementation, two costs required explicit accounting. Each
 partition needs its own `PathGraphMerger`, whose `ranges` deque and `buffer`
 group are both sized from `group_buffer_bytes`; P mergers therefore multiply the
 merge reservation or divide it and spill more, and the phase allocator has no
@@ -914,10 +1065,9 @@ digests `297f5fe840f7ec48337c97eacdc00c0f` and
 the `.lcp` must match, since a wrong re-base can leave a self-consistent index
 whose pointers are uniformly shifted.
 
-Not implemented. Recorded here because the measurement that motivates it -- the
-prefetch hit rate that rules out I/O -- is only available while a run is in
-flight, and because the enabling primitive is easy to miss: reads are already
-ordinal-addressed, so no new seek layer is required.
+Implemented as the bounded group-aware parallel final-path merge described in
+the implementation checkpoint above. The prefetch observation remains relevant:
+the change targets serial emission rather than adding readers.
 
 ## Build, test, and usage
 
