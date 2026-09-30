@@ -3,6 +3,7 @@
 #include <gcsa/internal.h>
 
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -235,6 +236,59 @@ int main()
   parameters.setSortRunSize(64 * KILOBYTE);
   parameters.setIOBufferSize(128);
   parameters.setMergeFanIn(2);
+
+  // The optional profile observes only raw redundancy flushes. It must not
+  // alter the stream bytes or metadata, and a 24-byte buffer forces three
+  // full writes followed by one close-tail write for ten uint64 values.
+  FinalEventFiles profile_off_files(1), profile_on_files(1);
+  FinalEventMetadata profile_off_metadata, profile_on_metadata;
+  RedundancyEmissionProfile redundancy_profile;
+  {
+    MemoryBudget budget(1024);
+    FinalEventWriter writer(profile_off_files, 1, 24, budget);
+    for(size_type value = 0; value < 10; value++) { writer.redundancy(value * 7); }
+    profile_off_metadata = writer.finish();
+  }
+  {
+    MemoryBudget budget(1024);
+    FinalEventWriter writer(profile_on_files, 1, 24, budget,
+      TempFileCodecParameters(), &redundancy_profile);
+    for(size_type value = 0; value < 10; value++) { writer.redundancy(value * 7); }
+    profile_on_metadata = writer.finish();
+  }
+  const auto read_raw_bytes = [](const std::string& filename)
+  {
+    std::ifstream input(filename, std::ios_base::binary);
+    require(static_cast<bool>(input));
+    std::ostringstream bytes; bytes << input.rdbuf(); return bytes.str();
+  };
+  require(read_raw_bytes(profile_off_files.redundant) ==
+    read_raw_bytes(profile_on_files.redundant));
+  require(profile_off_metadata.redundant == profile_on_metadata.redundant);
+  require(profile_off_metadata.paths == profile_on_metadata.paths);
+  require(redundancy_profile.full_buffer_flushes == 3);
+  require(redundancy_profile.full_buffer_write_bytes == 72);
+  require(redundancy_profile.close_tail_flushes == 1);
+  require(redundancy_profile.close_tail_write_bytes == 8);
+  require(redundancy_profile.periodic_syncs == 0);
+  require(redundancy_profile.close_syncs == 1 && redundancy_profile.closes == 1);
+  for(double value : { redundancy_profile.full_buffer_write_wall_seconds,
+      redundancy_profile.full_buffer_write_cpu_seconds,
+      redundancy_profile.full_buffer_flush_wall_seconds,
+      redundancy_profile.full_buffer_flush_cpu_seconds,
+      redundancy_profile.close_tail_write_wall_seconds,
+      redundancy_profile.close_tail_write_cpu_seconds,
+      redundancy_profile.close_tail_flush_wall_seconds,
+      redundancy_profile.close_tail_flush_cpu_seconds,
+      redundancy_profile.periodic_sync_wall_seconds,
+      redundancy_profile.periodic_sync_cpu_seconds,
+      redundancy_profile.close_sync_wall_seconds,
+      redundancy_profile.close_sync_cpu_seconds,
+      redundancy_profile.close_wall_seconds,
+      redundancy_profile.close_cpu_seconds })
+  {
+    require(std::isfinite(value) && value >= 0.0);
+  }
 
   // Equal minima must retain the earliest first_time even when a worker starts
   // from a chunk seed. At path 5 the previous occurrence is path 4, while the

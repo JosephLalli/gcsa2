@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <ctime>
 #include <deque>
 #include <exception>
 #include <cerrno>
@@ -33,6 +34,32 @@
 
 namespace gcsa
 {
+
+RedundancyEmissionProfile::RedundancyEmissionProfile() :
+  full_buffer_flushes(0), full_buffer_write_bytes(0),
+  close_tail_flushes(0), close_tail_write_bytes(0),
+  periodic_syncs(0), close_syncs(0), closes(0),
+  full_buffer_write_wall_seconds(0.0), full_buffer_write_cpu_seconds(0.0),
+  full_buffer_flush_wall_seconds(0.0), full_buffer_flush_cpu_seconds(0.0),
+  close_tail_write_wall_seconds(0.0), close_tail_write_cpu_seconds(0.0),
+  close_tail_flush_wall_seconds(0.0), close_tail_flush_cpu_seconds(0.0),
+  periodic_sync_wall_seconds(0.0), periodic_sync_cpu_seconds(0.0),
+  close_sync_wall_seconds(0.0), close_sync_cpu_seconds(0.0),
+  close_wall_seconds(0.0), close_cpu_seconds(0.0)
+{
+}
+
+double
+readThreadCpuTimer()
+{
+  struct timespec value;
+  if(::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0)
+  {
+    throw std::runtime_error("final GCSA events: CLOCK_THREAD_CPUTIME_ID failed");
+  }
+  return static_cast<double>(value.tv_sec) +
+    static_cast<double>(value.tv_nsec) / 1000000000.0;
+}
 
 void
 advanceFinalStateStack(std::vector<FinalStateStackFrame>& stack,
@@ -304,10 +331,11 @@ class BufferedEventWriter
 public:
   BufferedEventWriter(const std::string& path, size_type buffer_bytes,
     MemoryBudget& budget, const std::string& task,
-    const TempFileCodecParameters& codec) :
+    const TempFileCodecParameters& codec,
+    RedundancyEmissionProfile* profile = nullptr) :
     path_(path), descriptor_(-1), buffer_(), used_(0), written_(0),
     checksum_(1469598103934665603ULL), cache_released_(0), closed_(false),
-    reservation_(), framed_()
+    reservation_(), framed_(), profile_(profile)
   {
     if(codec.enabled())
     {
@@ -361,10 +389,20 @@ public:
       framed_->finish(); framed_.reset(); closed_ = true;
       reservation_ = MemoryBudget::Reservation(); return;
     }
-    flush();
+    const double close_wall_start = (profile_ == nullptr ? 0.0 : readTimer());
+    const double close_cpu_start = (profile_ == nullptr ? 0.0 : readThreadCpuTimer());
+    flush(true);
+    const double sync_wall_start = (profile_ == nullptr ? 0.0 : readTimer());
+    const double sync_cpu_start = (profile_ == nullptr ? 0.0 : readThreadCpuTimer());
     if(::fdatasync(descriptor_) != 0)
     {
       throw eventError("fdatasync failed", path_);
+    }
+    if(profile_ != nullptr)
+    {
+      profile_->close_syncs++;
+      profile_->close_sync_wall_seconds += readTimer() - sync_wall_start;
+      profile_->close_sync_cpu_seconds += readThreadCpuTimer() - sync_cpu_start;
     }
     discardCache(descriptor_, 0, static_cast<off_t>(written_));
     if(::close(descriptor_) != 0)
@@ -374,6 +412,12 @@ public:
     descriptor_ = -1; closed_ = true;
     std::vector<std::uint8_t>().swap(buffer_);
     reservation_ = MemoryBudget::Reservation();
+    if(profile_ != nullptr)
+    {
+      profile_->closes++;
+      profile_->close_wall_seconds += readTimer() - close_wall_start;
+      profile_->close_cpu_seconds += readThreadCpuTimer() - close_cpu_start;
+    }
   }
 
 private:
@@ -386,6 +430,7 @@ private:
   bool closed_;
   MemoryBudget::Reservation reservation_;
   std::unique_ptr<CompressedBlockWriter> framed_;
+  RedundancyEmissionProfile* profile_;
 
   void append(const void* source, size_type bytes)
   {
@@ -403,25 +448,72 @@ private:
       std::memcpy(buffer_.data() + used_, data, count);
       checksum_ = BuildWorkspace::checksum(data, count, checksum_);
       used_ += count; data += count; bytes -= count;
-      if(used_ == buffer_.size()) { flush(); }
+      if(used_ == buffer_.size()) { flush(false); }
     }
   }
 
-  void flush()
+  void flush(bool close_tail)
   {
     if(used_ == 0) { return; }
+    const size_type bytes = used_;
+    const double flush_wall_start = (profile_ == nullptr ? 0.0 : readTimer());
+    const double flush_cpu_start = (profile_ == nullptr ? 0.0 : readThreadCpuTimer());
+    const double write_wall_start = (profile_ == nullptr ? 0.0 : readTimer());
+    const double write_cpu_start = (profile_ == nullptr ? 0.0 : readThreadCpuTimer());
     writeAll(descriptor_, buffer_.data(), used_, path_);
+    if(profile_ != nullptr)
+    {
+      const double write_wall = readTimer() - write_wall_start;
+      const double write_cpu = readThreadCpuTimer() - write_cpu_start;
+      if(close_tail)
+      {
+        profile_->close_tail_flushes++;
+        profile_->close_tail_write_bytes += bytes;
+        profile_->close_tail_write_wall_seconds += write_wall;
+        profile_->close_tail_write_cpu_seconds += write_cpu;
+      }
+      else
+      {
+        profile_->full_buffer_flushes++;
+        profile_->full_buffer_write_bytes += bytes;
+        profile_->full_buffer_write_wall_seconds += write_wall;
+        profile_->full_buffer_write_cpu_seconds += write_cpu;
+      }
+    }
     written_ += used_; used_ = 0;
     if(static_cast<off_t>(written_) - cache_released_ >= CACHE_FLUSH_BYTES)
     {
+      const double sync_wall_start = (profile_ == nullptr ? 0.0 : readTimer());
+      const double sync_cpu_start = (profile_ == nullptr ? 0.0 : readThreadCpuTimer());
       if(::fdatasync(descriptor_) != 0)
       {
         throw eventError("periodic fdatasync failed", path_);
+      }
+      if(profile_ != nullptr)
+      {
+        profile_->periodic_syncs++;
+        profile_->periodic_sync_wall_seconds += readTimer() - sync_wall_start;
+        profile_->periodic_sync_cpu_seconds += readThreadCpuTimer() - sync_cpu_start;
       }
       off_t discard_end = std::max(cache_released_,
         static_cast<off_t>(written_) - CACHE_TAIL_BYTES);
       discardCache(descriptor_, cache_released_, discard_end - cache_released_);
       cache_released_ = discard_end;
+    }
+    if(profile_ != nullptr)
+    {
+      const double flush_wall = readTimer() - flush_wall_start;
+      const double flush_cpu = readThreadCpuTimer() - flush_cpu_start;
+      if(close_tail)
+      {
+        profile_->close_tail_flush_wall_seconds += flush_wall;
+        profile_->close_tail_flush_cpu_seconds += flush_cpu;
+      }
+      else
+      {
+        profile_->full_buffer_flush_wall_seconds += flush_wall;
+        profile_->full_buffer_flush_cpu_seconds += flush_cpu;
+      }
     }
   }
 };
@@ -1912,7 +2004,8 @@ struct FinalEventWriter::Impl
 
   Impl(const FinalEventFiles& files, size_type alphabet_size,
     size_type buffer_bytes, MemoryBudget& budget,
-    const TempFileCodecParameters& requested_codec) :
+    const TempFileCodecParameters& requested_codec,
+    RedundancyEmissionProfile* redundancy_profile) :
     sigma(alphabet_size), masks(), edges(), sample_positions(), sample_ids(),
     sample_ends(), occurrences(), redundant(), metadata(), finished(false)
   {
@@ -1978,7 +2071,8 @@ struct FinalEventWriter::Impl
     // so the sorted output remains compatible with its fixed-record interface.
     const TempFileCodecParameters raw_codec;
     redundant.reset(new BufferedEventWriter(files.redundant,
-      buffer_bytes, budget, "final-event-redundancy", raw_codec));
+      buffer_bytes, budget, "final-event-redundancy", raw_codec,
+      redundancy_profile));
   }
 
   void closeAll()
@@ -1992,8 +2086,9 @@ struct FinalEventWriter::Impl
 
 FinalEventWriter::FinalEventWriter(const FinalEventFiles& files, size_type sigma,
   size_type buffer_bytes, MemoryBudget& budget,
-  const TempFileCodecParameters& codec) :
-  impl_(new Impl(files, sigma, buffer_bytes, budget, codec))
+  const TempFileCodecParameters& codec,
+  RedundancyEmissionProfile* redundancy_profile) :
+  impl_(new Impl(files, sigma, buffer_bytes, budget, codec, redundancy_profile))
 {
 }
 

@@ -823,6 +823,18 @@ struct ExternalFinalScanStats
   double state_lcp_read_seconds, state_seed_seconds;
   double state_dispatch_seconds, state_rank_seconds;
   double state_query_seconds, state_emit_seconds;
+  bool emission_profile_requested;
+  RedundancyEmissionProfile redundancy_profile;
+  size_type planned_emission_batches, planned_emission_redundancies;
+  size_type planned_full_buffer_flushes, planned_full_buffer_write_bytes;
+  size_type planned_periodic_syncs;
+  double planned_emission_wall_seconds, planned_emission_cpu_seconds;
+  double planned_full_buffer_write_wall_seconds;
+  double planned_full_buffer_write_cpu_seconds;
+  double planned_full_buffer_flush_wall_seconds;
+  double planned_full_buffer_flush_cpu_seconds;
+  double planned_periodic_sync_wall_seconds;
+  double planned_periodic_sync_cpu_seconds;
   bool predecessor_parallel_fallback;
   bool state_requested, state_fallback;
   std::string state_fallback_reason;
@@ -841,6 +853,17 @@ struct ExternalFinalScanStats
     state_lcp_read_seconds(0.0), state_seed_seconds(0.0),
     state_dispatch_seconds(0.0), state_rank_seconds(0.0),
     state_query_seconds(0.0), state_emit_seconds(0.0),
+    emission_profile_requested(false), redundancy_profile(),
+    planned_emission_batches(0), planned_emission_redundancies(0),
+    planned_full_buffer_flushes(0), planned_full_buffer_write_bytes(0),
+    planned_periodic_syncs(0),
+    planned_emission_wall_seconds(0.0), planned_emission_cpu_seconds(0.0),
+    planned_full_buffer_write_wall_seconds(0.0),
+    planned_full_buffer_write_cpu_seconds(0.0),
+    planned_full_buffer_flush_wall_seconds(0.0),
+    planned_full_buffer_flush_cpu_seconds(0.0),
+    planned_periodic_sync_wall_seconds(0.0),
+    planned_periodic_sync_cpu_seconds(0.0),
     predecessor_parallel_fallback(false), state_requested(false),
     state_fallback(false), state_fallback_reason(), restored(false) { }
 };
@@ -888,6 +911,13 @@ bool
 experimentalFinalStateRequested()
 {
   const char* value = std::getenv("GCSA_EXPERIMENTAL_FINAL_STATE");
+  return (value != nullptr && std::string(value) == "1");
+}
+
+bool
+experimentalEmissionProfileRequested()
+{
+  const char* value = std::getenv("GCSA_EXPERIMENTAL_EMISSION_PROFILE");
   return (value != nullptr && std::string(value) == "1");
 }
 
@@ -1070,6 +1100,8 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
   MemoryBudget memory(memory_limit, safety_margin);
 
   const bool state_requested = experimentalFinalStateRequested();
+  const bool emission_profile_requested = experimentalEmissionProfileRequested();
+  RedundancyEmissionProfile redundancy_profile;
   const size_type requested_state_workers = (state_requested ?
     experimentalFinalStateWorkers() : 1);
   size_type state_workers = (unique_from_nodes > 0 ?
@@ -1084,6 +1116,7 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
   if(stats != nullptr)
   {
     stats->state_requested = state_requested;
+    stats->emission_profile_requested = emission_profile_requested;
     stats->state_requested_workers = requested_state_workers;
     stats->state_workers = (state_enabled ? state_workers : 1);
   }
@@ -1200,7 +1233,8 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
         throw std::runtime_error("GCSA::GCSA(): memory limit cannot hold final event buffers");
       }
       FinalEventWriter output(files, graph.alpha.sigma, writer_buffer, memory,
-        parameters.getTempFileCodecParameters());
+        parameters.getTempFileCodecParameters(),
+        (emission_profile_requested ? &redundancy_profile : nullptr));
 
       typedef std::uint8_t merged_lcp_type;
       constexpr size_type distinct_lcp_values =
@@ -2246,6 +2280,9 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
           }
 
           stage_start = readTimer();
+          const double emission_cpu_start =
+            (emission_profile_requested ? readThreadCpuTimer() : 0.0);
+          const RedundancyEmissionProfile profile_before = redundancy_profile;
           size_type batch_redundancies = 0;
           for(size_type dense = 0; dense < state_record_count; dense++)
           {
@@ -2258,6 +2295,40 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
           if(stats != nullptr)
           {
             stats->state_emit_seconds += readTimer() - stage_start;
+            if(emission_profile_requested)
+            {
+              stats->planned_emission_batches++;
+              stats->planned_emission_redundancies += batch_redundancies;
+              stats->planned_emission_wall_seconds += readTimer() - stage_start;
+              stats->planned_emission_cpu_seconds +=
+                readThreadCpuTimer() - emission_cpu_start;
+              stats->planned_full_buffer_flushes +=
+                redundancy_profile.full_buffer_flushes -
+                profile_before.full_buffer_flushes;
+              stats->planned_full_buffer_write_bytes +=
+                redundancy_profile.full_buffer_write_bytes -
+                profile_before.full_buffer_write_bytes;
+              stats->planned_full_buffer_write_wall_seconds +=
+                redundancy_profile.full_buffer_write_wall_seconds -
+                profile_before.full_buffer_write_wall_seconds;
+              stats->planned_full_buffer_write_cpu_seconds +=
+                redundancy_profile.full_buffer_write_cpu_seconds -
+                profile_before.full_buffer_write_cpu_seconds;
+              stats->planned_full_buffer_flush_wall_seconds +=
+                redundancy_profile.full_buffer_flush_wall_seconds -
+                profile_before.full_buffer_flush_wall_seconds;
+              stats->planned_full_buffer_flush_cpu_seconds +=
+                redundancy_profile.full_buffer_flush_cpu_seconds -
+                profile_before.full_buffer_flush_cpu_seconds;
+              stats->planned_periodic_syncs += redundancy_profile.periodic_syncs -
+                profile_before.periodic_syncs;
+              stats->planned_periodic_sync_wall_seconds +=
+                redundancy_profile.periodic_sync_wall_seconds -
+                profile_before.periodic_sync_wall_seconds;
+              stats->planned_periodic_sync_cpu_seconds +=
+                redundancy_profile.periodic_sync_cpu_seconds -
+                profile_before.periodic_sync_cpu_seconds;
+            }
             stats->state_batches++;
             stats->state_chunks += state_chunk_count;
             stats->state_paths += state_planned_paths;
@@ -2301,6 +2372,10 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
       }
       metadata = output.finish();
       event_checksums = output.checksums();
+      if(stats != nullptr && emission_profile_requested)
+      {
+        stats->redundancy_profile = redundancy_profile;
+      }
     }
 
     TempFile::remove(previous_name); TempFile::remove(stack_name);
@@ -2605,6 +2680,77 @@ reportFinalEventStats(const FinalEventMetadata& event_metadata,
                   << event_stats.state_query_seconds
                   << " s, redundancy-emit " << event_stats.state_emit_seconds
                   << " s" << std::endl;
+        std::cerr.flags(old_flags); std::cerr.precision(old_precision);
+      }
+      if(event_stats.emission_profile_requested)
+      {
+        const RedundancyEmissionProfile& profile = event_stats.redundancy_profile;
+        const std::ios::fmtflags old_flags = std::cerr.flags();
+        const std::streamsize old_precision = std::cerr.precision();
+        std::cerr << std::fixed << std::setprecision(9)
+                  << "GCSA::GCSA(): experimental redundancy-profile: {"
+                  << "\"schema_version\":1,"
+                  << "\"planned_fields_scope\":\"state-planned-emission-only\","
+                  << "\"planned_emission_active\":"
+                  << (event_stats.planned_emission_batches > 0 ? "true" : "false")
+                  << ",\"planned_emission\":{"
+                  << "\"batches\":" << event_stats.planned_emission_batches
+                  << ",\"redundancy_records\":"
+                  << event_stats.planned_emission_redundancies
+                  << ",\"wall_seconds\":"
+                  << event_stats.planned_emission_wall_seconds
+                  << ",\"cpu_seconds\":"
+                  << event_stats.planned_emission_cpu_seconds
+                  << ",\"full_buffer_writes\":{"
+                  << "\"flushes\":" << event_stats.planned_full_buffer_flushes
+                  << ",\"bytes\":" << event_stats.planned_full_buffer_write_bytes
+                  << ",\"write_wall_seconds\":"
+                  << event_stats.planned_full_buffer_write_wall_seconds
+                  << ",\"write_cpu_seconds\":"
+                  << event_stats.planned_full_buffer_write_cpu_seconds
+                  << ",\"flush_wall_seconds\":"
+                  << event_stats.planned_full_buffer_flush_wall_seconds
+                  << ",\"flush_cpu_seconds\":"
+                  << event_stats.planned_full_buffer_flush_cpu_seconds
+                  << "},\"periodic_sync\":{\"count\":"
+                  << event_stats.planned_periodic_syncs
+                  << ",\"wall_seconds\":"
+                  << event_stats.planned_periodic_sync_wall_seconds
+                  << ",\"cpu_seconds\":"
+                  << event_stats.planned_periodic_sync_cpu_seconds
+                  << "}},\"writer\":{\"full_buffer\":{"
+                  << "\"flushes\":" << profile.full_buffer_flushes
+                  << ",\"bytes\":" << profile.full_buffer_write_bytes
+                  << ",\"write_wall_seconds\":"
+                  << profile.full_buffer_write_wall_seconds
+                  << ",\"write_cpu_seconds\":"
+                  << profile.full_buffer_write_cpu_seconds
+                  << ",\"flush_wall_seconds\":"
+                  << profile.full_buffer_flush_wall_seconds
+                  << ",\"flush_cpu_seconds\":"
+                  << profile.full_buffer_flush_cpu_seconds
+                  << "},\"close_tail\":{\"flushes\":"
+                  << profile.close_tail_flushes
+                  << ",\"bytes\":" << profile.close_tail_write_bytes
+                  << ",\"write_wall_seconds\":"
+                  << profile.close_tail_write_wall_seconds
+                  << ",\"write_cpu_seconds\":"
+                  << profile.close_tail_write_cpu_seconds
+                  << ",\"flush_wall_seconds\":"
+                  << profile.close_tail_flush_wall_seconds
+                  << ",\"flush_cpu_seconds\":"
+                  << profile.close_tail_flush_cpu_seconds
+                  << "},\"periodic_sync\":{\"count\":"
+                  << profile.periodic_syncs
+                  << ",\"wall_seconds\":" << profile.periodic_sync_wall_seconds
+                  << ",\"cpu_seconds\":" << profile.periodic_sync_cpu_seconds
+                  << "},\"close_sync\":{\"count\":" << profile.close_syncs
+                  << ",\"wall_seconds\":" << profile.close_sync_wall_seconds
+                  << ",\"cpu_seconds\":" << profile.close_sync_cpu_seconds
+                  << "},\"close\":{\"count\":" << profile.closes
+                  << ",\"wall_seconds\":" << profile.close_wall_seconds
+                  << ",\"cpu_seconds\":" << profile.close_cpu_seconds
+                  << "}}}" << std::endl;
         std::cerr.flags(old_flags); std::cerr.precision(old_precision);
       }
     }

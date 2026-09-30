@@ -147,6 +147,30 @@ struct FinalEventChecksums
 };
 
 /*
+  Optional diagnostic counters for the raw redundancy stream. These are not
+  serialized and are updated only when a caller supplies the stats pointer.
+  Flush timings include cache retirement; write timings cover writeAll() only.
+*/
+struct RedundancyEmissionProfile
+{
+  size_type full_buffer_flushes, full_buffer_write_bytes;
+  size_type close_tail_flushes, close_tail_write_bytes;
+  size_type periodic_syncs, close_syncs, closes;
+  double full_buffer_write_wall_seconds, full_buffer_write_cpu_seconds;
+  double full_buffer_flush_wall_seconds, full_buffer_flush_cpu_seconds;
+  double close_tail_write_wall_seconds, close_tail_write_cpu_seconds;
+  double close_tail_flush_wall_seconds, close_tail_flush_cpu_seconds;
+  double periodic_sync_wall_seconds, periodic_sync_cpu_seconds;
+  double close_sync_wall_seconds, close_sync_cpu_seconds;
+  double close_wall_seconds, close_cpu_seconds;
+
+  RedundancyEmissionProfile();
+};
+
+// CLOCK_THREAD_CPUTIME_ID seconds. Call only for optional diagnostics.
+double readThreadCpuTimer();
+
+/*
   A byte-budgeted writer set. buffer_bytes is the budget for each individual
   stream, and every buffer reserves from the shared MemoryBudget. The caller
   chooses buffer_bytes after accounting for the number of streams.
@@ -156,7 +180,8 @@ class FinalEventWriter
 public:
   FinalEventWriter(const FinalEventFiles& files, size_type sigma,
     size_type buffer_bytes, MemoryBudget& budget,
-    const TempFileCodecParameters& codec = TempFileCodecParameters());
+    const TempFileCodecParameters& codec = TempFileCodecParameters(),
+    RedundancyEmissionProfile* redundancy_profile = nullptr);
   ~FinalEventWriter();
 
   void path(byte_type predecessor_mask);
