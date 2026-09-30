@@ -4560,7 +4560,13 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
       checkedJoinMultiply(batch_width, reader_bytes, "concurrent logical merge reader bytes"),
       "concurrent logical merge batch bytes");
     const size_type by_memory = 1 + static_cast<size_type>(memory.available()) / per_batch_bytes;
-    return std::min(std::min(merges, thread_limit), by_memory);
+    // A running batch keeps two descriptors per input pair and up to four for
+    // its output pair (a compressed writer keeps an index stream beside each
+    // payload): the 2w + 4 the serial route fits one batch within. Batches
+    // running together share the ceiling instead of each claiming all of it.
+    const size_type by_descriptors = std::max(static_cast<size_type>(1),
+      parameters.getMaxOpenFiles() / (2 * batch_width + 4));
+    return std::min({ merges, thread_limit, by_memory, by_descriptors });
   };
   size_type merged_batches = 0, max_concurrency = 0;
   size_type peak_records = merge_fan_in, peak_bytes = merge_reservation;

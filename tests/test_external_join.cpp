@@ -14,6 +14,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
@@ -836,6 +837,66 @@ int main(int argc, char** argv)
         serial_paths.size() * sizeof(PathNode)) == 0);
       require(serial_ranks == concurrent_ranks);
     }
+  }
+
+  // Concurrent batches share the descriptor ceiling instead of each claiming
+  // all of it. A transient user service runs with a soft limit of 1,024
+  // descriptors, which unbounded 64-thread compaction of the joint chr2+chr18
+  // build exhausted; here the process limit sits exactly at the ceiling above
+  // the descriptors already open.
+  {
+    ConstructionParameters limited_parameters;
+    limited_parameters.setMemoryLimitBytes(2 * GIGABYTE);
+    limited_parameters.setTempCompression("zstd");
+    limited_parameters.setCompressionBlockSize(KILOBYTE);
+    limited_parameters.setMaxOpenFiles(ConstructionParameters::MIN_OPEN_FILES);
+    const size_type max_open = limited_parameters.getMaxOpenFiles();
+    const size_type logical_inputs = 2, records = 50;
+    const size_type target = pathMergeInputPairs(max_open, logical_inputs) / logical_inputs;
+    const size_type shards = 4 * target + 1, width = (shards + target - 1) / target;
+    PathGraph graph(0, 2, 1);
+    for(size_type logical = 0; logical < logical_inputs; logical++)
+    {
+      for(size_type shard = 0; shard < shards; shard++)
+      {
+        const std::string name = base + ".limited." + std::to_string(logical) + "." + std::to_string(shard);
+        std::vector<TestRecord> shard_records;
+        for(size_type i = 0; i < records; i++)
+        {
+          shard_records.push_back({ i + 1, i + 2, static_cast<byte_type>(1),
+            static_cast<PathNode::rank_type>((i * shards + shard) * logical_inputs + logical + 1), false });
+        }
+        writePathPair(name + ".path", name + ".rank", shard_records);
+        appendShard(graph, name + ".path", name + ".rank",
+          logical_file_id_t(logical), physical_shard_id_t(logical * shards + shard));
+      }
+    }
+    ExternalPathJoinStats stats;
+    size_type committed = 0;
+    MemoryBudget memory(limited_parameters.getMemoryLimitBytes(),
+      limited_parameters.getMemoryLimitBytes() / 16);
+    size_type open_now = 0; // Includes the listing's own descriptor, closed again below.
+    for(const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) { static_cast<void>(entry); open_now++; }
+    struct rlimit original, limited;
+    require(::getrlimit(RLIMIT_NOFILE, &original) == 0);
+    limited = original; limited.rlim_cur = open_now - 1 + max_open;
+    require(::setrlimit(RLIMIT_NOFILE, &limited) == 0);
+    omp_set_num_threads(8);
+    bool completed = true;
+    try
+    {
+      compactLogicalJoinShards(graph, GIGABYTE, limited_parameters,
+        std::min(limited_parameters.getMergeFanIn(), max_open - 1), memory, committed, &stats);
+    }
+    catch(const std::exception&) { completed = false; }
+    omp_set_num_threads(1);
+    require(::setrlimit(RLIMIT_NOFILE, &original) == 0);
+    require(completed);
+    require(stats.compaction_concurrency > 1);
+    require(stats.compaction_concurrency * (2 * width + 4) <= max_open);
+    require(graph.files() <= target * logical_inputs);
+    require(graph.path_count == logical_inputs * shards * records);
+    require(labelSorted(graph));
   }
 
   // Key-range distribution. A logical input of at least 2 x 65,536 paths is
