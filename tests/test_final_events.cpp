@@ -235,6 +235,33 @@ int main()
   parameters.setIOBufferSize(128);
   parameters.setMergeFanIn(2);
 
+  // Equal minima must retain the earliest first_time even when a worker starts
+  // from a chunk seed. At path 5 the previous occurrence is path 4, while the
+  // canonical redundancy slot is path 1, before that pair's interval. An
+  // ordinary RMQ argmin over only [4, 5] would therefore be wrong.
+  std::vector<FinalStateStackFrame> complete_stack;
+  const std::array<size_type, 6> state_depths = { 0, 4, 2, 2, 5, 2 };
+  for(size_type path = 0; path < 4; path++)
+  {
+    advanceFinalStateStack(complete_stack, path, state_depths[path]);
+  }
+  std::vector<FinalStateStackFrame> chunk_seed = complete_stack;
+  for(size_type path = 4; path < state_depths.size(); path++)
+  {
+    advanceFinalStateStack(complete_stack, path, state_depths[path]);
+  }
+  require(finalStateRedundancySlot(complete_stack, 5) == 1);
+  advanceFinalStateStack(chunk_seed, 4, state_depths[4]);
+  advanceFinalStateStack(chunk_seed, 5, state_depths[5]);
+  require(chunk_seed.size() == complete_stack.size());
+  for(size_type frame = 0; frame < chunk_seed.size(); frame++)
+  {
+    require(chunk_seed[frame].depth == complete_stack[frame].depth);
+    require(chunk_seed[frame].first_time == complete_stack[frame].first_time);
+    require(chunk_seed[frame].last_time == complete_stack[frame].last_time);
+  }
+  require(finalStateRedundancySlot(chunk_seed, 5) == 1);
+
   // Cross the bit_vector_il threshold where SDSL stores its auxiliary
   // breadth-first rank samples. Exact byte equality here covers both the
   // interleaved block layout and the bounded 1024-sample construction.

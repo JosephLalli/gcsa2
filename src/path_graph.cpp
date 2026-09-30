@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <fcntl.h>
@@ -2949,6 +2951,8 @@ struct PathGraphMerger
   std::vector<size_type>                        offsets, end_offsets;
   size_type                                     path_count;
   PriorityQueue<PriorityNode>                   inputs;
+  range_type                                    initial_left_lcp;
+  range_type                                    terminal_right_lcp;
 
   PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lcp,
     size_type group_buffer_bytes = MEGABYTE,
@@ -2957,7 +2961,9 @@ struct PathGraphMerger
     size_type input_cache_bytes = 0,
     PathNode::rank_type lower_rank = 0,
     PathNode::rank_type upper_rank = PathLabel::NO_RANK,
-    size_type max_prefetch_workers = PathGraphInputCache::MAX_PREFETCH_WORKERS);
+    size_type max_prefetch_workers = PathGraphInputCache::MAX_PREFETCH_WORKERS,
+    range_type _initial_left_lcp = range_type(0, 0),
+    range_type _terminal_right_lcp = range_type(0, 0));
   void close();
 
   inline size_type size() const { return this->path_count; }
@@ -3009,7 +3015,8 @@ PathGraphMerger::PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lc
   size_type group_buffer_bytes, PathGraphMergeStats* stats,
   size_type max_input_pairs, size_type input_cache_bytes,
   PathNode::rank_type lower_rank, PathNode::rank_type upper_rank,
-  size_type max_prefetch_workers) :
+  size_type max_prefetch_workers, range_type _initial_left_lcp,
+  range_type _terminal_right_lcp) :
   graph(path_graph), lcp(kmer_lcp),
   ranges(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->range_spills))),
   buffer(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->priority_spills))),
@@ -3017,7 +3024,8 @@ PathGraphMerger::PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lc
     (input_cache_bytes == 0 ? group_buffer_bytes : input_cache_bytes),
     max_prefetch_workers),
   offsets(path_graph.files()), end_offsets(path_graph.files()), path_count(0),
-  inputs(path_graph.files())
+  inputs(path_graph.files()), initial_left_lcp(_initial_left_lcp),
+  terminal_right_lcp(_terminal_right_lcp)
 {
   if(stats != nullptr)
   {
@@ -3081,7 +3089,8 @@ PathGraphMerger::first()
   this->ranges.clear();
   if(this->size() == 0) { return range_type(0, 0); }
 
-  this->ranges.pushBack(PathRange(0, this->rangeEnd(0), range_type(0, 0), *this));
+  this->ranges.pushBack(
+    PathRange(0, this->rangeEnd(0), this->initial_left_lcp, *this));
   return this->ranges.front().range();
 }
 
@@ -3215,6 +3224,7 @@ PathRange::PathRange(size_type start, size_type stop, range_type _left_lcp, Path
 {
   if(stop < merger.size()) { this->range_lcp = merger.range_lcp(start, stop); }
   if(stop + 1 < merger.size()) { this->right_lcp = merger.border_lcp(stop, stop + 1); }
+  else if(stop < merger.size()) { this->right_lcp = merger.terminal_right_lcp; }
 }
 
 //------------------------------------------------------------------------------
@@ -3494,6 +3504,48 @@ pruneOutputLayout(const PathGraph& source)
 struct PruneSizeLimit { };
 struct PruneCancelled { };
 
+struct PrunePartitionRange
+{
+  PathNode::rank_type lower_rank, upper_rank;
+  range_type left_lcp, right_lcp;
+
+  PrunePartitionRange(PathNode::rank_type lower = 0,
+    PathNode::rank_type upper = 0,
+    range_type left = range_type(0, 0),
+    range_type right = range_type(0, 0)) :
+    lower_rank(lower), upper_rank(upper), left_lcp(left), right_lcp(right) { }
+};
+
+struct PruneParallelAttempt
+{
+  bool prefix_mode;
+  size_type prefix_candidates, prefix_certified;
+  size_type prefix_rejected_spans, prefix_rejected_groups;
+  size_type planning_nanoseconds, reconciliation_nanoseconds;
+  size_type fallback_reason;
+  PathGraphMergeStats planning_stats;
+
+  PruneParallelAttempt() : prefix_mode(false), prefix_candidates(0),
+    prefix_certified(0), prefix_rejected_spans(0),
+    prefix_rejected_groups(0), planning_nanoseconds(0),
+    reconciliation_nanoseconds(0), fallback_reason(PRUNE_FALLBACK_NONE),
+    planning_stats() { }
+};
+
+bool
+experimentalTripletPrune()
+{
+  const char* value = std::getenv("GCSA_EXPERIMENTAL_TRIPLET_PRUNE");
+  return (value != nullptr && std::strcmp(value, "1") == 0);
+}
+
+size_type
+elapsedNanoseconds(const std::chrono::steady_clock::time_point& start)
+{
+  return static_cast<size_type>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now() - start).count());
+}
+
 bool
 reservePruneOutput(std::atomic<size_type>& used, size_type bytes,
   size_type limit)
@@ -3511,13 +3563,14 @@ reservePruneOutput(std::atomic<size_type>& used, size_type bytes,
 }
 
 /*
-  The only safe independent prune ranges are separated by a zero k-mer LCP.
-  Use wavelet-tree select rather than scanning all keys: this setup cost is
+  Ranges separated by a zero k-mer LCP are unconditionally independent and do
+  not need the stream certification used by the experimental prefix path. Use
+  wavelet-tree select rather than scanning all keys: this setup cost is
   proportional to the number of root components, not the graph or key count.
 */
 bool
 pruneRootPartitions(const LCP& lcp,
-  std::vector<std::pair<PathNode::rank_type, PathNode::rank_type>>& ranges)
+  std::vector<PrunePartitionRange>& ranges)
 {
   ranges.clear();
   if(lcp.total_keys < 2 || lcp.total_keys >= PathLabel::NO_RANK ||
@@ -3550,7 +3603,7 @@ pruneRootPartitions(const LCP& lcp,
     {
       ranges.clear(); return false;
     }
-    ranges.push_back(std::make_pair(
+    ranges.push_back(PrunePartitionRange(
       static_cast<PathNode::rank_type>(boundaries[i - 1]),
       static_cast<PathNode::rank_type>(boundaries[i])));
   }
@@ -3581,10 +3634,201 @@ validatePruneShardTails(const PathGraph& source, const LCP& lcp,
   input.close();
 }
 
+struct PrunePrefixCut
+{
+  PathNode::rank_type rank;
+  range_type border_lcp;
+  bool spanning, selected, rejected_group;
+
+  explicit PrunePrefixCut(PathNode::rank_type value = 0) : rank(value),
+    border_lcp(0, 0), spanning(false), selected(false),
+    rejected_group(false) { }
+};
+
+struct PruneBoundaryGroup
+{
+  bool valid, homogeneous;
+  PathNode::rank_type first_rank;
+  node_type from;
+  logical_file_id_t logical;
+  range_type left_lcp;
+
+  PruneBoundaryGroup() : valid(false), homogeneous(false), first_rank(0),
+    from(0), logical(0), left_lcp(0, 0) { }
+};
+
+/*
+  Nominate boundaries between distinct depth-3 k-mer prefixes, then certify
+  them against the actual merged PathNode stream. A certified boundary has no
+  interval spanning it and the equal-label ranges on its two sides cannot be
+  consumed by one SameFromLogicalFile extension. The true border LCP is saved
+  for both neighboring workers; replacing it with zero changes extendRange().
+
+  This is intentionally a bounded serial planning pass. It does not emit or
+  prune records, but its read and wall costs are part of the experimental
+  result rather than being hidden outside the timed operation.
+*/
+bool
+prunePrefixPartitions(const PathGraph& source, const LCP& lcp,
+  size_type group_buffer_bytes, size_type input_cache_bytes,
+  size_type input_pairs, std::vector<PrunePartitionRange>& ranges,
+  PruneParallelAttempt& attempt)
+{
+  ranges.clear(); attempt.prefix_mode = true;
+  const auto started = std::chrono::steady_clock::now();
+  if(lcp.total_keys < 2 || lcp.total_keys >= PathLabel::NO_RANK ||
+     lcp.kmer_lcp.size() != lcp.total_keys)
+  {
+    attempt.fallback_reason = PRUNE_FALLBACK_NO_PARTITIONS;
+    attempt.planning_nanoseconds = elapsedNanoseconds(started);
+    return false;
+  }
+
+  std::vector<size_type> boundaries;
+  for(LCP::rank_type prefix_lcp = 0; prefix_lcp < 3; prefix_lcp++)
+  {
+    size_type count = lcp.kmer_lcp.rank(lcp.total_keys, prefix_lcp);
+    for(size_type occurrence = 1; occurrence <= count; occurrence++)
+    {
+      size_type boundary = lcp.kmer_lcp.select(occurrence, prefix_lcp);
+      if(boundary > 0 && boundary < lcp.total_keys)
+      {
+        boundaries.push_back(boundary);
+      }
+    }
+  }
+  std::sort(boundaries.begin(), boundaries.end());
+  boundaries.erase(std::unique(boundaries.begin(), boundaries.end()),
+    boundaries.end());
+  attempt.prefix_candidates = boundaries.size();
+  if(boundaries.empty())
+  {
+    attempt.fallback_reason = PRUNE_FALLBACK_NO_PARTITIONS;
+    attempt.planning_nanoseconds = elapsedNanoseconds(started);
+    return false;
+  }
+
+  std::vector<PrunePrefixCut> cuts;
+  cuts.reserve(boundaries.size());
+  for(size_type boundary : boundaries)
+  {
+    cuts.push_back(PrunePrefixCut(
+      static_cast<PathNode::rank_type>(boundary)));
+  }
+
+  PathGraphMerger merger(source, lcp, group_buffer_bytes,
+    &(attempt.planning_stats), input_pairs, input_cache_bytes, 0,
+    PathLabel::NO_RANK, 0);
+  PruneBoundaryGroup previous;
+  for(range_type range = merger.first(); !(merger.atEnd(range));
+      range = merger.next())
+  {
+    SameFromLogicalFile same_from(merger, range);
+    PriorityNode first = merger.buffer.get(range.first);
+    PruneBoundaryGroup current;
+    current.valid = true;
+    current.homogeneous = (same_from.same_from && same_from.same_file);
+    current.first_rank = first.firstLabel(0);
+    current.from = same_from.from;
+    current.logical = same_from.logical_file;
+    current.left_lcp = merger.ranges.front().left_lcp;
+
+    // A PathNode whose first-label interval crosses a cut belongs to a parent
+    // prefix state. Assigning it to only one child would make the other worker
+    // start after information the serial merge still observes.
+    for(size_type i = range.first; i <= range.second; i++)
+    {
+      PriorityNode node = merger.buffer.get(i);
+      if(node.node.order() == 0)
+      {
+        for(PrunePrefixCut& cut : cuts) { cut.spanning = true; }
+        continue;
+      }
+      PathNode::rank_type first_rank = node.firstLabel(0);
+      PathNode::rank_type last_rank = node.node.lastLabel(0, node.label);
+      if(last_rank < first_rank || last_rank >= lcp.total_keys)
+      {
+        for(PrunePrefixCut& cut : cuts) { cut.spanning = true; }
+        continue;
+      }
+      auto cut = std::upper_bound(cuts.begin(), cuts.end(), first_rank,
+        [](PathNode::rank_type rank, const PrunePrefixCut& candidate)
+        {
+          return rank < candidate.rank;
+        });
+      while(cut != cuts.end() && cut->rank <= last_rank)
+      {
+        cut->spanning = true; ++cut;
+      }
+    }
+
+    if(previous.valid && previous.first_rank < current.first_rank)
+    {
+      auto first_cut = std::upper_bound(cuts.begin(), cuts.end(),
+        previous.first_rank,
+        [](PathNode::rank_type rank, const PrunePrefixCut& candidate)
+        {
+          return rank < candidate.rank;
+        });
+      auto last_cut = std::upper_bound(cuts.begin(), cuts.end(),
+        current.first_rank,
+        [](PathNode::rank_type rank, const PrunePrefixCut& candidate)
+        {
+          return rank < candidate.rank;
+        });
+      bool same_group = (previous.homogeneous && current.homogeneous &&
+        previous.from == current.from && previous.logical == current.logical &&
+        current.left_lcp != range_type(0, 0));
+      PrunePrefixCut* selected = nullptr;
+      for(auto cut = first_cut; cut != last_cut; ++cut)
+      {
+        if(same_group) { cut->rejected_group = true; }
+        else if(!cut->spanning && selected == nullptr) { selected = &(*cut); }
+      }
+      if(selected != nullptr)
+      {
+        selected->selected = true;
+        selected->border_lcp = current.left_lcp;
+      }
+    }
+    previous = current;
+  }
+  merger.close();
+
+  for(const PrunePrefixCut& cut : cuts)
+  {
+    if(cut.spanning) { attempt.prefix_rejected_spans++; }
+    else if(cut.rejected_group) { attempt.prefix_rejected_groups++; }
+    if(cut.selected) { attempt.prefix_certified++; }
+  }
+  if(attempt.prefix_certified == 0)
+  {
+    attempt.fallback_reason = PRUNE_FALLBACK_UNSAFE_PREFIX_BOUNDARIES;
+    attempt.planning_nanoseconds = elapsedNanoseconds(started);
+    return false;
+  }
+
+  PathNode::rank_type lower = 0;
+  range_type left_lcp(0, 0);
+  for(const PrunePrefixCut& cut : cuts)
+  {
+    if(!cut.selected) { continue; }
+    ranges.push_back(PrunePartitionRange(lower, cut.rank,
+      left_lcp, cut.border_lcp));
+    lower = cut.rank; left_lcp = cut.border_lcp;
+  }
+  ranges.push_back(PrunePartitionRange(lower,
+    static_cast<PathNode::rank_type>(lcp.total_keys), left_lcp,
+    range_type(0, 0)));
+  attempt.planning_nanoseconds = elapsedNanoseconds(started);
+  return (ranges.size() > 1);
+}
+
 template<bool report_progress>
 void
 prunePathRange(const PathGraph& source, const LCP& lcp,
   PathNode::rank_type lower_rank, PathNode::rank_type upper_rank,
+  range_type initial_left_lcp, range_type terminal_right_lcp,
   size_type group_buffer_bytes, size_type input_cache_bytes,
   size_type input_pairs, const PruneOutputLayout& layout,
   PathGraphBuilder& builder, PathGraphMergeStats* stats,
@@ -3596,7 +3840,8 @@ prunePathRange(const PathGraph& source, const LCP& lcp,
     input_cache_bytes, lower_rank, upper_rank,
     // Worker-level merge concurrency replaces the decoder pool. Keeping both
     // would oversubscribe CPUs and duplicate cache reservations.
-    (cancelled == nullptr ? PathGraphInputCache::MAX_PREFETCH_WORKERS : 0));
+    (cancelled == nullptr ? PathGraphInputCache::MAX_PREFETCH_WORKERS : 0),
+    initial_left_lcp, terminal_right_lcp);
 
   auto write_output = [&](PriorityNode node)
   {
@@ -3719,13 +3964,15 @@ pruneConcurrentPeak(const std::vector<PathGraphMergeStats>& parts,
 struct PrunePartition
 {
   PathNode::rank_type lower_rank, upper_rank;
+  range_type left_lcp, right_lcp;
   std::unique_ptr<PathGraph> graph;
   PathGraphMergeStats stats;
   PriorityNode first_output, last_output;
   bool has_output;
 
-  PrunePartition() : lower_rank(0), upper_rank(0), graph(), stats(),
-    first_output(), last_output(), has_output(false) { }
+  PrunePartition() : lower_rank(0), upper_rank(0), left_lcp(0, 0),
+    right_lcp(0, 0), graph(), stats(), first_output(), last_output(),
+    has_output(false) { }
 };
 
 void
@@ -3740,9 +3987,10 @@ buildPrunePartition(PrunePartition& result, const PathGraph& source,
   builder.graph.logical_file_ids = layout.logical;
   builder.graph.physical_shard_ids = layout.physical;
   prunePathRange<false>(source, lcp, result.lower_rank, result.upper_rank,
-    group_buffer_bytes, input_cache_bytes, input_pairs, layout, builder,
-    &(result.stats), &output_bytes, size_limit, &cancelled,
-    &(result.first_output), &(result.last_output), &(result.has_output), nullptr);
+    result.left_lcp, result.right_lcp, group_buffer_bytes, input_cache_bytes,
+    input_pairs, layout, builder, &(result.stats), &output_bytes, size_limit,
+    &cancelled, &(result.first_output), &(result.last_output),
+    &(result.has_output), nullptr);
   builder.close();
 
   // Retain only the lightweight graph metadata between tasks. In particular,
@@ -3757,24 +4005,13 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   size_type size_limit, size_type group_buffer_bytes,
   PathGraphMergeStats* stats, size_type max_open_files,
   size_type input_cache_bytes, size_type requested_workers,
-  const PruneOutputLayout& layout)
+  const PruneOutputLayout& layout, PruneParallelAttempt& attempt)
 {
-  std::vector<std::pair<PathNode::rank_type, PathNode::rank_type>> ranges;
-  if(requested_workers < 2 || source.size() == 0 || layout.logical.empty() ||
-     !pruneRootPartitions(lcp, ranges))
+  if(requested_workers < 2 || source.size() == 0 || layout.logical.empty())
   {
+    attempt.fallback_reason = PRUNE_FALLBACK_NO_PARTITIONS;
     return false;
   }
-
-  const size_type minimum_group = std::max(
-    2 * static_cast<size_type>(sizeof(PriorityNode)),
-    static_cast<size_type>(sizeof(PathNode)) +
-      (PathLabel::LABEL_LENGTH + 1) * sizeof(PathNode::rank_type));
-  size_type workers = std::min(requested_workers,
-    static_cast<size_type>(std::max(1, omp_get_max_threads())));
-  workers = std::min(workers, static_cast<size_type>(ranges.size()));
-  workers = std::min(workers, max_open_files / 6);
-  workers = std::min(workers, group_buffer_bytes / minimum_group);
 
   bool all_framed = (source.files() > 0);
   for(size_type file = 0; file < source.files(); file++)
@@ -3800,11 +4037,42 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   if(source.files() > 0 &&
      resident_pair > std::numeric_limits<size_type>::max() / source.files())
   {
+    attempt.fallback_reason = PRUNE_FALLBACK_RESOURCES;
     return false;
   }
   const size_type resident_per_worker = resident_pair * source.files();
   const size_type cache_budget = (input_cache_bytes == 0 ?
     group_buffer_bytes : input_cache_bytes);
+
+  std::vector<PrunePartitionRange> ranges;
+  const bool prefix_mode = experimentalTripletPrune();
+  if(prefix_mode)
+  {
+    validatePruneShardTails(source, lcp,
+      (pair_bytes > 0 ? pair_bytes : raw_pair_budget));
+    size_type planning_pairs = pathMergeInputPairs(max_open_files,
+      layout.logical.size());
+    if(!prunePrefixPartitions(source, lcp, group_buffer_bytes, cache_budget,
+      planning_pairs, ranges, attempt))
+    {
+      return false;
+    }
+  }
+  else if(!pruneRootPartitions(lcp, ranges))
+  {
+    attempt.fallback_reason = PRUNE_FALLBACK_NO_PARTITIONS;
+    return false;
+  }
+
+  const size_type minimum_group = std::max(
+    2 * static_cast<size_type>(sizeof(PriorityNode)),
+    static_cast<size_type>(sizeof(PathNode)) +
+      (PathLabel::LABEL_LENGTH + 1) * sizeof(PathNode::rank_type));
+  size_type workers = std::min(requested_workers,
+    static_cast<size_type>(std::max(1, omp_get_max_threads())));
+  workers = std::min(workers, static_cast<size_type>(ranges.size()));
+  workers = std::min(workers, max_open_files / 6);
+  workers = std::min(workers, group_buffer_bytes / minimum_group);
   if(resident_per_worker > 0)
   {
     workers = std::min(workers, cache_budget / resident_per_worker);
@@ -3813,12 +4081,16 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   {
     if(source.files() > (std::numeric_limits<size_type>::max() - 4) / 2)
     {
+      attempt.fallback_reason = PRUNE_FALLBACK_RESOURCES;
       return false;
     }
     workers = std::min(workers,
       max_open_files / (2 + 2 * source.files() + 2));
   }
-  if(workers < 2) { return false; }
+  if(workers < 2)
+  {
+    attempt.fallback_reason = PRUNE_FALLBACK_RESOURCES; return false;
+  }
 
   // The exact output-pair allocation depends on the per-worker FD share. If a
   // rounded share cannot retain the full raw/mixed input set, reduce
@@ -3835,21 +4107,31 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
     if(required_fds <= worker_open_files) { break; }
     workers--;
   }
-  if(workers < 2) { return false; }
+  if(workers < 2)
+  {
+    attempt.fallback_reason = PRUNE_FALLBACK_RESOURCES; return false;
+  }
 
   const size_type worker_group = group_buffer_bytes / workers;
   const size_type worker_cache = (input_cache_bytes == 0 ? worker_group :
     input_cache_bytes / workers);
-  if(resident_per_worker > worker_cache) { return false; }
-
-  validatePruneShardTails(source, lcp,
-    (pair_bytes > 0 ? pair_bytes : raw_pair_budget));
+  if(resident_per_worker > worker_cache)
+  {
+    attempt.fallback_reason = PRUNE_FALLBACK_RESOURCES; return false;
+  }
+  if(!prefix_mode)
+  {
+    validatePruneShardTails(source, lcp,
+      (pair_bytes > 0 ? pair_bytes : raw_pair_budget));
+  }
 
   std::vector<PrunePartition> partitions(ranges.size());
   for(size_type i = 0; i < ranges.size(); i++)
   {
-    partitions[i].lower_rank = ranges[i].first;
-    partitions[i].upper_rank = ranges[i].second;
+    partitions[i].lower_rank = ranges[i].lower_rank;
+    partitions[i].upper_rank = ranges[i].upper_rank;
+    partitions[i].left_lcp = ranges[i].left_lcp;
+    partitions[i].right_lcp = ranges[i].right_lcp;
   }
 
   std::atomic<size_type> output_bytes(0), next_partition(0);
@@ -3915,17 +4197,37 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
     std::exit(EXIT_SIZE_LIMIT_EXCEEDED);
   }
 
-  // Validate the actual emitted neighbors. A malformed or unusual label range
-  // that spans a planned root split cannot be published as independent shards;
-  // discard the attempt and let the exact serial route decide the groups.
+  const auto reconciliation_started = std::chrono::steady_clock::now();
+  // Validate the actual emitted neighbors before transferring any files. Root
+  // cuts retain the old zero-LCP proof. Certified prefix cuts may have a
+  // nonzero border, but their emitted label intervals must remain disjoint.
   const PriorityNode* previous = nullptr;
   for(const PrunePartition& part : partitions)
   {
     if(!part.has_output) { continue; }
-    if(previous != nullptr &&
-       lcp.max_lcp(previous->node, part.first_output.node,
-         previous->label, part.first_output.label) != range_type(0, 0))
+    bool invalid = false;
+    if(attempt.prefix_mode)
     {
+      invalid = (part.first_output.firstLabel(0) < part.lower_rank ||
+        part.last_output.firstLabel(0) >= part.upper_rank ||
+        part.last_output.node.lastLabel(0, part.last_output.label) >=
+          part.upper_rank);
+      if(previous != nullptr)
+      {
+        invalid = invalid || (previous->node.lastLabel(0, previous->label) >=
+          part.first_output.firstLabel(0));
+      }
+    }
+    else if(previous != nullptr)
+    {
+      invalid = (lcp.max_lcp(previous->node, part.first_output.node,
+        previous->label, part.first_output.label) != range_type(0, 0));
+    }
+    if(invalid)
+    {
+      attempt.fallback_reason = PRUNE_FALLBACK_RECONCILIATION;
+      attempt.reconciliation_nanoseconds =
+        elapsedNanoseconds(reconciliation_started);
       return false;
     }
     previous = &(part.last_output);
@@ -3987,6 +4289,7 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
     {
       addPruneStats(*stats, part.stats); part_stats.push_back(part.stats);
     }
+    addPruneStats(*stats, attempt.planning_stats);
     stats->max_open_input_pairs = pruneConcurrentPeak(part_stats, actual_workers,
       [](const PathGraphMergeStats& value) { return value.max_open_input_pairs; });
     stats->max_open_output_pairs = pruneConcurrentPeak(part_stats, actual_workers,
@@ -4001,9 +4304,30 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
       [](const PathGraphMergeStats& value) { return value.oversized_input_pair_bytes; });
     stats->max_from_set_nodes = pruneConcurrentPeak(part_stats, actual_workers,
       [](const PathGraphMergeStats& value) { return value.max_from_set_nodes; });
+    stats->max_open_input_pairs = std::max(stats->max_open_input_pairs,
+      attempt.planning_stats.max_open_input_pairs);
+    stats->max_open_output_pairs = std::max(stats->max_open_output_pairs,
+      attempt.planning_stats.max_open_output_pairs);
+    stats->max_input_buffer_bytes = std::max(stats->max_input_buffer_bytes,
+      attempt.planning_stats.max_input_buffer_bytes);
+    stats->prefetch_workers = std::max(stats->prefetch_workers,
+      attempt.planning_stats.prefetch_workers);
+    stats->max_prefetch_bytes = std::max(stats->max_prefetch_bytes,
+      attempt.planning_stats.max_prefetch_bytes);
+    stats->oversized_input_pair_bytes = std::max(
+      stats->oversized_input_pair_bytes,
+      attempt.planning_stats.oversized_input_pair_bytes);
+    stats->max_from_set_nodes = std::max(stats->max_from_set_nodes,
+      attempt.planning_stats.max_from_set_nodes);
     stats->prune_requested_workers = requested_workers;
     stats->prune_workers = actual_workers;
     stats->prune_partitions = partitions.size();
+    stats->prune_prefix_candidates = attempt.prefix_candidates;
+    stats->prune_prefix_certified = attempt.prefix_certified;
+    stats->prune_prefix_rejected_spans = attempt.prefix_rejected_spans;
+    stats->prune_prefix_rejected_groups = attempt.prefix_rejected_groups;
+    stats->prune_planning_nanoseconds = attempt.planning_nanoseconds;
+    stats->prune_fallback_reason = PRUNE_FALLBACK_NONE;
   }
 
   // Remove unretained empty pairs before transferring ownership. No payload is
@@ -4026,6 +4350,12 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
 
   combined.delete_files = true;
   source.clear(); source.swap(combined);
+  attempt.reconciliation_nanoseconds = elapsedNanoseconds(reconciliation_started);
+  if(stats != nullptr)
+  {
+    stats->prune_reconciliation_nanoseconds =
+      attempt.reconciliation_nanoseconds;
+  }
   return true;
 }
 
@@ -4049,8 +4379,10 @@ PathGraph::prune(const LCP& lcp, size_type size_limit,
   const size_type requested_workers = std::max(static_cast<size_type>(1),
     prune_workers);
   PruneOutputLayout layout = pruneOutputLayout(*this);
+  PruneParallelAttempt attempt;
   if(buildPrunedGraphParallel(*this, lcp, size_limit, group_buffer_bytes,
-       stats, max_open_files, input_cache_bytes, requested_workers, layout))
+       stats, max_open_files, input_cache_bytes, requested_workers, layout,
+       attempt))
   {
     if(Verbosity::level >= Verbosity::EXTENDED)
     {
@@ -4063,6 +4395,19 @@ PathGraph::prune(const LCP& lcp, size_type size_limit,
                 << this->nondeterministic << " nondeterministic paths" << std::endl;
       std::cerr << "PathGraph::prune(): " << inGigabytes(this->bytes()) << " GB in "
                 << this->files() << " file(s)" << std::endl;
+      if(stats != nullptr && stats->prune_prefix_candidates > 0)
+      {
+        std::cerr << "PathGraph::prune(): depth-3 prefix planning nominated "
+                  << stats->prune_prefix_candidates << " cut(s), certified "
+                  << stats->prune_prefix_certified << ", rejected "
+                  << stats->prune_prefix_rejected_spans << " spanning and "
+                  << stats->prune_prefix_rejected_groups << " cross-group cut(s); "
+                  << (stats->prune_planning_nanoseconds / 1000000000.0)
+                  << " s planning, "
+                  << (stats->prune_reconciliation_nanoseconds / 1000000000.0)
+                  << " s reconciliation, fallback reason "
+                  << stats->prune_fallback_reason << std::endl;
+      }
     }
     return;
   }
@@ -4086,16 +4431,41 @@ PathGraph::prune(const LCP& lcp, size_type size_limit,
   builder.graph.physical_shard_ids = layout.physical;
   ProgressReporter progress("PathGraph::prune()", this->size(), "paths");
   prunePathRange<true>(*this, lcp, 0, PathLabel::NO_RANK,
-    group_buffer_bytes, input_cache_bytes, input_pairs, layout, builder, stats,
-    nullptr, size_limit, nullptr, nullptr, nullptr, nullptr, &progress);
+    range_type(0, 0), range_type(0, 0), group_buffer_bytes,
+    input_cache_bytes, input_pairs, layout, builder, stats, nullptr,
+    size_limit, nullptr, nullptr, nullptr, nullptr, &progress);
   progress.finish();
   builder.close();
   if(stats != nullptr)
   {
+    addPruneStats(*stats, attempt.planning_stats);
+    stats->max_open_input_pairs = std::max(stats->max_open_input_pairs,
+      attempt.planning_stats.max_open_input_pairs);
+    stats->max_open_output_pairs = std::max(stats->max_open_output_pairs,
+      attempt.planning_stats.max_open_output_pairs);
+    stats->max_input_buffer_bytes = std::max(stats->max_input_buffer_bytes,
+      attempt.planning_stats.max_input_buffer_bytes);
+    stats->prefetch_workers = std::max(stats->prefetch_workers,
+      attempt.planning_stats.prefetch_workers);
+    stats->max_prefetch_bytes = std::max(stats->max_prefetch_bytes,
+      attempt.planning_stats.max_prefetch_bytes);
+    stats->oversized_input_pair_bytes = std::max(
+      stats->oversized_input_pair_bytes,
+      attempt.planning_stats.oversized_input_pair_bytes);
+    stats->max_from_set_nodes = std::max(stats->max_from_set_nodes,
+      attempt.planning_stats.max_from_set_nodes);
     stats->prune_requested_workers = requested_workers;
     stats->prune_workers = 1;
     stats->prune_partitions = (this->size() == 0 ? 0 : 1);
     stats->prune_parallel_fallbacks = (requested_workers > 1 ? 1 : 0);
+    stats->prune_prefix_candidates = attempt.prefix_candidates;
+    stats->prune_prefix_certified = attempt.prefix_certified;
+    stats->prune_prefix_rejected_spans = attempt.prefix_rejected_spans;
+    stats->prune_prefix_rejected_groups = attempt.prefix_rejected_groups;
+    stats->prune_planning_nanoseconds = attempt.planning_nanoseconds;
+    stats->prune_reconciliation_nanoseconds =
+      attempt.reconciliation_nanoseconds;
+    stats->prune_fallback_reason = attempt.fallback_reason;
   }
   this->clear(); this->swap(builder.graph);
 
@@ -4110,6 +4480,19 @@ PathGraph::prune(const LCP& lcp, size_type size_limit,
               << this->nondeterministic << " nondeterministic paths" << std::endl;
     std::cerr << "PathGraph::prune(): " << inGigabytes(this->bytes()) << " GB in "
               << this->files() << " file(s)" << std::endl;
+    if(stats != nullptr && stats->prune_prefix_candidates > 0)
+    {
+      std::cerr << "PathGraph::prune(): depth-3 prefix planning nominated "
+                << stats->prune_prefix_candidates << " cut(s), certified "
+                << stats->prune_prefix_certified << ", rejected "
+                << stats->prune_prefix_rejected_spans << " spanning and "
+                << stats->prune_prefix_rejected_groups << " cross-group cut(s); "
+                << (stats->prune_planning_nanoseconds / 1000000000.0)
+                << " s planning, "
+                << (stats->prune_reconciliation_nanoseconds / 1000000000.0)
+                << " s reconciliation, fallback reason "
+                << stats->prune_fallback_reason << std::endl;
+    }
   }
 }
 

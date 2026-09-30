@@ -34,6 +34,47 @@
 namespace gcsa
 {
 
+void
+advanceFinalStateStack(std::vector<FinalStateStackFrame>& stack,
+  size_type path, size_type depth)
+{
+  while(!(stack.empty()) && stack.back().depth > depth) { stack.pop_back(); }
+  if(!(stack.empty()) && stack.back().depth == depth)
+  {
+    stack.back().last_time = path;
+  }
+  else
+  {
+    stack.push_back({ depth, path, path });
+  }
+}
+
+size_type
+finalStateRedundancySlot(const std::vector<FinalStateStackFrame>& stack,
+  size_type previous_time)
+{
+  if(previous_time == 0)
+  {
+    throw std::invalid_argument(
+      "finalStateRedundancySlot(): previous time must be one-based");
+  }
+  auto frame = std::lower_bound(stack.begin(), stack.end(), previous_time,
+    [](const FinalStateStackFrame& candidate, size_type prior) {
+      return candidate.last_time < prior;
+    });
+  if(frame == stack.end())
+  {
+    throw std::runtime_error(
+      "finalStateRedundancySlot(): previous occurrence is outside the stack state");
+  }
+  if(frame->first_time == 0)
+  {
+    throw std::runtime_error(
+      "finalStateRedundancySlot(): redundancy position underflows");
+  }
+  return frame->first_time - 1;
+}
+
 namespace
 {
 

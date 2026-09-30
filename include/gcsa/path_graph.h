@@ -279,6 +279,21 @@ struct LCP
 //------------------------------------------------------------------------------
 
 /*
+  Why an attempted parallel prune used the exact serial route instead. The
+  value is diagnostic only; it does not affect construction semantics.
+*/
+enum PruneParallelFallbackReason
+{
+  PRUNE_FALLBACK_NONE = 0,
+  PRUNE_FALLBACK_NO_PARTITIONS = 1,
+  PRUNE_FALLBACK_RESOURCES = 2,
+  PRUNE_FALLBACK_UNSAFE_PREFIX_BOUNDARIES = 3,
+  PRUNE_FALLBACK_RECONCILIATION = 4
+};
+
+//------------------------------------------------------------------------------
+
+/*
   Diagnostics for the bounded merge used by prune() and MergedGraph. The
   counters are optional and do not affect construction semantics.
 */
@@ -317,6 +332,13 @@ struct PathGraphMergeStats
   // distinguish an unused request from an actual parallel execution.
   size_type prune_requested_workers, prune_workers, prune_partitions;
   size_type prune_parallel_fallbacks;
+  // The experimental depth-3 path first nominates prefix cuts and then
+  // certifies them against the actual PathNode stream. Planning and ordered
+  // reconciliation are included in prune wall time and reported separately.
+  size_type prune_prefix_candidates, prune_prefix_certified;
+  size_type prune_prefix_rejected_spans, prune_prefix_rejected_groups;
+  size_type prune_planning_nanoseconds, prune_reconciliation_nanoseconds;
+  size_type prune_fallback_reason;
   size_type merge_workers, merge_partitions;
 
   PathGraphMergeStats() :
@@ -333,7 +355,12 @@ struct PathGraphMergeStats
     max_prefetch_bytes(0), oversized_input_pair_bytes(0),
     max_from_set_nodes(0),
     prune_requested_workers(0), prune_workers(0), prune_partitions(0),
-    prune_parallel_fallbacks(0), merge_workers(0), merge_partitions(0) { }
+    prune_parallel_fallbacks(0),
+    prune_prefix_candidates(0), prune_prefix_certified(0),
+    prune_prefix_rejected_spans(0), prune_prefix_rejected_groups(0),
+    prune_planning_nanoseconds(0), prune_reconciliation_nanoseconds(0),
+    prune_fallback_reason(PRUNE_FALLBACK_NONE),
+    merge_workers(0), merge_partitions(0) { }
 };
 
 //------------------------------------------------------------------------------

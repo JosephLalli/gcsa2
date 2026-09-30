@@ -248,6 +248,8 @@ writeSparseSkewCycle(const std::string& filename)
 int
 main()
 {
+  unsetenv("GCSA_EXPERIMENTAL_FINAL_STATE");
+  unsetenv("GCSA_EXPERIMENTAL_STATE_WORKERS");
   omp_set_num_threads(1);
   Verbosity::set(Verbosity::SILENT);
 
@@ -256,6 +258,9 @@ main()
     makeTempRoot("gcsa-resume-legacy-parallel");
   const std::string workspace_root = makeTempRoot("gcsa-resume-work");
   const std::string parallel_root = makeTempRoot("gcsa-resume-parallel");
+  const std::string state_one_root = makeTempRoot("gcsa-resume-state-one");
+  const std::string state_parallel_root =
+    makeTempRoot("gcsa-resume-state-parallel");
   const std::string fallback_root = makeTempRoot("gcsa-resume-fallback");
   const std::string empty_root = makeTempRoot("gcsa-resume-empty");
   const std::string input_name = legacy_root + "/sparse-skew.gcsa2";
@@ -265,6 +270,9 @@ main()
     std::string(legacy_parallel_root) + "/index";
   const std::string external_prefix = std::string(workspace_root) + "/index";
   const std::string parallel_prefix = std::string(parallel_root) + "/index";
+  const std::string state_one_prefix = std::string(state_one_root) + "/index";
+  const std::string state_parallel_prefix =
+    std::string(state_parallel_root) + "/index";
   const std::string fallback_prefix = std::string(fallback_root) + "/index";
   const std::string staged_prefix = std::string(workspace_root) + "/staged";
   const std::string mapping_name = std::string(legacy_root) + "/mapping";
@@ -455,9 +463,80 @@ main()
   require(readFile(legacy_prefix + LCPArray::EXTENSION) ==
     readFile(parallel_prefix + LCPArray::EXTENSION));
 
+  // Exercise the opt-in final-state planner through the same bounded batches
+  // with one and four state workers. The 257 recurring ranks skip many batch
+  // boundaries, the mapping collapses duplicate nodes before rank dispatch,
+  // and the oversized N path forces the serial spill path to update the same
+  // owner shard. Sorted event checkpoints and both public products must remain
+  // byte-identical to the legacy and default external routes.
+  const auto runExperimentalState = [&](const std::string& root,
+    const std::string& prefix, const char* workers) -> std::string
+  {
+    require(setenv("GCSA_EXPERIMENTAL_FINAL_STATE", "1", 1) == 0);
+    require(setenv("GCSA_EXPERIMENTAL_STATE_WORKERS", workers, 1) == 0);
+    TempFile::setDirectory(root);
+    std::ostringstream log;
+    ConstructionParameters parameters = externalParameters(root,
+      external_minimum + 64 * MEGABYTE);
+    enableSmallFramedStreams(parameters);
+    InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
+    std::streambuf* old_stderr = std::cerr.rdbuf(log.rdbuf());
+    Verbosity::set(Verbosity::EXTENDED);
+    try
+    {
+      GCSA::buildAndStore(graph, parameters, prefix + GCSA::EXTENSION);
+      LCPArray::buildAndStore(graph, parameters, prefix + LCPArray::EXTENSION);
+    }
+    catch(...)
+    {
+      std::cerr.rdbuf(old_stderr); Verbosity::set(Verbosity::SILENT);
+      unsetenv("GCSA_EXPERIMENTAL_FINAL_STATE");
+      unsetenv("GCSA_EXPERIMENTAL_STATE_WORKERS");
+      throw;
+    }
+    std::cerr.rdbuf(old_stderr); Verbosity::set(Verbosity::SILENT);
+    unsetenv("GCSA_EXPERIMENTAL_FINAL_STATE");
+    unsetenv("GCSA_EXPERIMENTAL_STATE_WORKERS");
+    GCSA index;
+    LCPArray lcp;
+    require(sdsl::load_from_file(index, prefix + GCSA::EXTENSION));
+    require(sdsl::load_from_file(lcp, prefix + LCPArray::EXTENSION));
+    require(verifyIndex(index, &lcp, graph));
+    return log.str();
+  };
+
+  const std::string state_one_log = runExperimentalState(
+    state_one_root, state_one_prefix, "1");
+  const std::string state_parallel_log = runExperimentalState(
+    state_parallel_root, state_parallel_prefix, "4");
+  require(state_one_log.find(
+    "experimental final state: requested 1 worker(s), active 1 worker(s)") !=
+    std::string::npos);
+  require(state_parallel_log.find(
+    "experimental final state: requested 4 worker(s), active 4 worker(s)") !=
+    std::string::npos);
+  require(state_one_log.find("experimental final-state timings:") !=
+    std::string::npos);
+  require(state_parallel_log.find("experimental final-state LCP replay:") !=
+    std::string::npos);
+  require(workspaceArtifacts(state_one_root, "final--events--") ==
+    serial_events);
+  require(workspaceArtifacts(state_parallel_root, "final--events--") ==
+    serial_events);
+  require(readFile(state_one_prefix + GCSA::EXTENSION) ==
+    readFile(legacy_prefix + GCSA::EXTENSION));
+  require(readFile(state_parallel_prefix + GCSA::EXTENSION) ==
+    readFile(legacy_prefix + GCSA::EXTENSION));
+  require(readFile(state_one_prefix + LCPArray::EXTENSION) ==
+    readFile(legacy_prefix + LCPArray::EXTENSION));
+  require(readFile(state_parallel_prefix + LCPArray::EXTENSION) ==
+    readFile(legacy_prefix + LCPArray::EXTENSION));
+
   // Request workers under the supported descriptor floor, but keep the 1 KiB
   // I/O buffer below the minimum useful batch. The final scan must retain the
   // serial reader layout and produce the same framed event bytes and indexes.
+  require(setenv("GCSA_EXPERIMENTAL_FINAL_STATE", "1", 1) == 0);
+  require(setenv("GCSA_EXPERIMENTAL_STATE_WORKERS", "4", 1) == 0);
   TempFile::setDirectory(fallback_root);
   std::ostringstream fallback_log;
   {
@@ -487,6 +566,8 @@ main()
       fallback_prefix + LCPArray::EXTENSION));
     require(verifyIndex(index, &lcp, graph));
   }
+  unsetenv("GCSA_EXPERIMENTAL_FINAL_STATE");
+  unsetenv("GCSA_EXPERIMENTAL_STATE_WORKERS");
   require(fallback_log.str().find(
     "final predecessor lookup: 1 worker(s), 0 bounded batch(es)") !=
     std::string::npos);
@@ -495,6 +576,11 @@ main()
   require(fallback_log.str().find(
     "final ordered-state preparation: 1 worker(s), 0 paths / 0 from-ranks prepared") !=
     std::string::npos);
+  require(fallback_log.str().find(
+    "experimental final state: requested 4 worker(s), active 1 worker(s)") !=
+    std::string::npos);
+  require(fallback_log.str().find(
+    "serial fallback: predecessor batch admission") != std::string::npos);
   // The final-event writer bounds its frame size by the I/O buffer, so this
   // deliberate 1 KiB fallback uses different physical frame boundaries than
   // the 16 KiB serial run. Compare decoded streams here; the matched-buffer
@@ -610,6 +696,8 @@ main()
   std::filesystem::remove_all(legacy_parallel_root);
   std::filesystem::remove_all(workspace_root);
   std::filesystem::remove_all(parallel_root);
+  std::filesystem::remove_all(state_one_root);
+  std::filesystem::remove_all(state_parallel_root);
   std::filesystem::remove_all(fallback_root);
   std::filesystem::remove_all(empty_root);
   return 0;

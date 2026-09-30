@@ -102,6 +102,26 @@ struct FinalEventFiles
 };
 
 /*
+  One frame in the canonical suffix-tree traversal used for redundant-pointer
+  construction. Equal LCP minima coalesce by retaining the earliest
+  first_time while advancing last_time. This small helper is public only so the
+  experimental parallel final-state replay can be checked against adversarial
+  equal-minimum and chunk-boundary fixtures.
+*/
+struct FinalStateStackFrame
+{
+  size_type depth, first_time, last_time;
+};
+
+void advanceFinalStateStack(std::vector<FinalStateStackFrame>& stack,
+  size_type path, size_type depth);
+
+// previous_time is the legacy one-based previous occurrence. Returns the
+// exact zero-based redundancy slot selected by the serial construction.
+size_type finalStateRedundancySlot(
+  const std::vector<FinalStateStackFrame>& stack, size_type previous_time);
+
+/*
   Incremental checksums for streams written directly by FinalEventWriter.
   Redundancy is omitted because its order changes in the subsequent external
   sort, and metadata is small enough that avoiding its checksum scan is not

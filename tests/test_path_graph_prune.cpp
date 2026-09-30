@@ -20,6 +20,34 @@ using namespace gcsa;
 
 static void require(bool value) { if(!value) { std::abort(); } }
 
+class ScopedEnvironment
+{
+public:
+  ScopedEnvironment(const std::string& variable, const std::string& value) :
+    name(variable), previous(), had_previous(false)
+  {
+    const char* old_value = std::getenv(this->name.c_str());
+    if(old_value != nullptr)
+    {
+      this->previous = old_value; this->had_previous = true;
+    }
+    require(::setenv(this->name.c_str(), value.c_str(), 1) == 0);
+  }
+
+  ~ScopedEnvironment()
+  {
+    if(this->had_previous)
+    {
+      require(::setenv(this->name.c_str(), this->previous.c_str(), 1) == 0);
+    }
+    else { require(::unsetenv(this->name.c_str()) == 0); }
+  }
+
+private:
+  std::string name, previous;
+  bool had_previous;
+};
+
 // A framed reader must consume one descriptor, not an istream descriptor plus
 // a second pread/cache-advice descriptor. Lowering the process ceiling makes
 // that resource contract executable: the 40-pair fixture below fits with one
@@ -229,6 +257,167 @@ static void initialize_parallel_prune_graph(PathGraph& graph,
     graph.rank_checksums.push_back(ClosedPayloadChecksum());
     graph.logical_file_ids.push_back(logical[file]);
     graph.physical_shard_ids.push_back(physical_shard_id_t(100 + file));
+    graph.path_count += records[file].size();
+    graph.rank_count += 2 * records[file].size();
+  }
+}
+
+struct PrefixKeyFixture
+{
+  std::vector<key_type> keys;
+  std::vector<PathNode::rank_type> active_ranks;
+};
+
+static PrefixKeyFixture prefix_prune_keys(Alphabet& alpha)
+{
+  const std::string symbols = "$ACGTN#";
+  std::vector<std::pair<key_type, std::string>> encoded;
+  for(char first : symbols)
+  {
+    for(char second : symbols)
+    {
+      for(char third : symbols)
+      {
+        std::string label;
+        label.push_back(first); label.push_back(second); label.push_back(third);
+        comp_type comp = alpha.char2comp[static_cast<byte_type>(first)];
+        byte_type edge = static_cast<byte_type>(1 << comp);
+        encoded.push_back(std::make_pair(
+          Key::encode(alpha, label, edge, edge), label));
+      }
+    }
+  }
+  std::sort(encoded.begin(), encoded.end(),
+    [](const std::pair<key_type, std::string>& left,
+       const std::pair<key_type, std::string>& right)
+    {
+      return left.first < right.first;
+    });
+
+  PrefixKeyFixture result;
+  for(size_type rank = 0; rank < encoded.size(); rank++)
+  {
+    const std::string& label = encoded[rank].second;
+    result.keys.push_back(encoded[rank].first);
+    bool dna = true;
+    for(char value : label)
+    {
+      dna = dna && (value == 'A' || value == 'C' ||
+        value == 'G' || value == 'T');
+    }
+    if(dna || label == "$NN" || label == "NAA" || label == "#NN")
+    {
+      result.active_ranks.push_back(
+        static_cast<PathNode::rank_type>(rank));
+    }
+  }
+  return result;
+}
+
+struct PrefixFixtureRecord
+{
+  PathNode::rank_type first_rank, last_rank;
+  node_type from;
+};
+
+static void write_prefix_prune_pair(const std::string& path_name,
+  const std::string& rank_name,
+  const std::vector<PrefixFixtureRecord>& records, bool framed)
+{
+  std::ofstream raw_paths, raw_ranks;
+  std::unique_ptr<CompressedBlockWriter> framed_paths, framed_ranks;
+  if(framed)
+  {
+    framed_paths.reset(new CompressedBlockWriter(path_name, 4 * KILOBYTE,
+      CompressedBlockWriter::ZSTD));
+    framed_ranks.reset(new CompressedBlockWriter(rank_name, 4 * KILOBYTE,
+      CompressedBlockWriter::ZSTD));
+  }
+  else
+  {
+    raw_paths.open(path_name.c_str(), std::ios_base::binary);
+    raw_ranks.open(rank_name.c_str(), std::ios_base::binary);
+  }
+
+  for(size_type i = 0; i < records.size(); i++)
+  {
+    PathNode node;
+    node.from = records[i].from;
+    node.to = Node::encode(200000 + records[i].first_rank * 256 + i, 0);
+    node.fields = 0; node.setPredecessors(1);
+    node.setOrder(1);
+    node.setLCP(records[i].first_rank == records[i].last_rank ? 1 : 0);
+    node.setPointer(2 * i);
+    PathNode::rank_type label[2] = {
+      records[i].first_rank, records[i].last_rank
+    };
+    if(framed)
+    {
+      framed_paths->writeRecord(&node, sizeof(node));
+      framed_ranks->writeRecord(label, sizeof(label));
+    }
+    else
+    {
+      raw_paths.write(reinterpret_cast<const char*>(&node), sizeof(node));
+      raw_ranks.write(reinterpret_cast<const char*>(label), sizeof(label));
+    }
+  }
+  if(framed) { framed_paths->finish(); framed_ranks->finish(); }
+}
+
+static void initialize_prefix_prune_graph(PathGraph& graph,
+  const std::string& base, PruneFixtureStorage storage,
+  const std::vector<PathNode::rank_type>& active_ranks,
+  bool spanning_interval = false)
+{
+  std::vector<std::vector<PrefixFixtureRecord>> records(3);
+  for(size_type i = 0; i < active_ranks.size(); i++)
+  {
+    size_type file = i % records.size();
+    PathNode::rank_type last_rank = active_ranks[i];
+    if(spanning_interval && i == 0 && active_ranks.size() > 1)
+    {
+      require(active_ranks[0] + 1 < active_ranks[1]);
+      last_rank = active_ranks[0] + 1;
+    }
+    records[file].push_back({ active_ranks[i], last_rank,
+      Node::encode(1000 + i, 0) });
+  }
+  // Make one prefix heavily skewed without reducing the number of active
+  // tasks. All records in the group have one semantic start and logical file.
+  size_type skew = active_ranks.size() / 2;
+  size_type skew_file = skew % records.size();
+  for(size_type i = 0; i < 96; i++)
+  {
+    records[skew_file].push_back({ active_ranks[skew], active_ranks[skew],
+      Node::encode(5000, 0) });
+  }
+  for(auto& file_records : records)
+  {
+    std::stable_sort(file_records.begin(), file_records.end(),
+      [](const PrefixFixtureRecord& left, const PrefixFixtureRecord& right)
+      {
+        return left.first_rank < right.first_rank;
+      });
+  }
+
+  const logical_file_id_t logical[3] = {
+    logical_file_id_t(7), logical_file_id_t(7), logical_file_id_t(8)
+  };
+  for(size_type file = 0; file < records.size(); file++)
+  {
+    const bool framed = (storage == FIXTURE_FRAMED ||
+      (storage == FIXTURE_MIXED && file == 1));
+    std::string path_name = base + "." + std::to_string(file) + ".path";
+    std::string rank_name = base + "." + std::to_string(file) + ".rank";
+    write_prefix_prune_pair(path_name, rank_name, records[file], framed);
+    graph.path_names.push_back(path_name); graph.rank_names.push_back(rank_name);
+    graph.path_counts.push_back(records[file].size());
+    graph.rank_counts.push_back(2 * records[file].size());
+    graph.path_checksums.push_back(ClosedPayloadChecksum());
+    graph.rank_checksums.push_back(ClosedPayloadChecksum());
+    graph.logical_file_ids.push_back(logical[file]);
+    graph.physical_shard_ids.push_back(physical_shard_id_t(200 + file));
     graph.path_count += records[file].size();
     graph.rank_count += 2 * records[file].size();
   }
@@ -1051,6 +1240,223 @@ static const char* prune_storage_name(PruneFixtureStorage storage)
   return "mixed";
 }
 
+static void require_same_pruned_graph(const PathGraph& serial,
+  const PathGraph& parallel)
+{
+  require(logical_prune_records(serial) == logical_prune_records(parallel));
+  require(serial.size() == parallel.size());
+  require(serial.ranks() == parallel.ranks());
+  require(serial.ranges() == parallel.ranges());
+  require(serial.unique == parallel.unique);
+  require(serial.redundant == parallel.redundant);
+  require(serial.unsorted == parallel.unsorted);
+  require(serial.nondeterministic == parallel.nondeterministic);
+}
+
+static std::map<logical_file_id_t, std::vector<LogicalPruneRecord>>
+canonical_prefix_prune_records(const PathGraph& graph)
+{
+  auto result = logical_prune_records(graph);
+  auto record_less = [](const LogicalPruneRecord& left,
+    const LogicalPruneRecord& right)
+  {
+    if(left.from != right.from) { return left.from < right.from; }
+    if(left.to != right.to) { return left.to < right.to; }
+    if(left.fields != right.fields) { return left.fields < right.fields; }
+    return left.label < right.label;
+  };
+  for(auto& input : result)
+  {
+    size_type first = 0;
+    while(first < input.second.size())
+    {
+      size_type limit = first + 1;
+      while(limit < input.second.size() &&
+        input.second[limit].label == input.second[first].label)
+      {
+        limit++;
+      }
+      std::sort(input.second.begin() + first, input.second.begin() + limit,
+        record_less);
+      first = limit;
+    }
+  }
+  return result;
+}
+
+static void require_same_prefix_pruned_graph(const PathGraph& serial,
+  const PathGraph& parallel)
+{
+  // A fresh partition heap may permute PriorityNodes that have identical
+  // labels: PriorityNode ordering deliberately ignores source, from, and to.
+  // Preserve the serial label-group order while canonicalizing only those
+  // unspecified ties, then compare every complete logical record.
+  require(canonical_prefix_prune_records(serial) ==
+    canonical_prefix_prune_records(parallel));
+  require(serial.size() == parallel.size());
+  require(serial.ranks() == parallel.ranks());
+  require(serial.ranges() == parallel.ranges());
+  require(serial.unique == parallel.unique);
+  require(serial.redundant == parallel.redundant);
+  require(serial.unsorted == parallel.unsorted);
+  require(serial.nondeterministic == parallel.nondeterministic);
+}
+
+static void compare_experimental_prefix_prune(const std::string& root,
+  PruneFixtureStorage storage)
+{
+  Alphabet alpha;
+  PrefixKeyFixture fixture = prefix_prune_keys(alpha);
+  require(fixture.keys.size() == 343);
+  require(fixture.active_ranks.size() >= 67);
+  LCP lcp(fixture.keys, 3);
+  DeBruijnGraph mapper(fixture.keys, 3, alpha);
+  const std::string tag = prune_storage_name(storage);
+  const size_type group_budget = 64 * KILOBYTE;
+  const size_type cache_budget = 128 * MEGABYTE;
+
+  int previous_threads = omp_get_max_threads();
+  int previous_dynamic = omp_get_dynamic();
+  omp_set_dynamic(0); omp_set_num_threads(std::max(16, previous_threads));
+  {
+    ScopedEnvironment enabled("GCSA_EXPERIMENTAL_TRIPLET_PRUNE", "1");
+    PathGraph serial(0, 3, 0), parallel(0, 3, 0);
+    initialize_prefix_prune_graph(serial,
+      root + "/prefix-prune-" + tag + "-serial", storage,
+      fixture.active_ranks);
+    initialize_prefix_prune_graph(parallel,
+      root + "/prefix-prune-" + tag + "-parallel", storage,
+      fixture.active_ranks);
+
+    PathGraphMergeStats serial_stats, parallel_stats;
+    serial.prune(lcp, GIGABYTE, group_budget, &serial_stats, 256,
+      cache_budget, 1);
+    parallel.prune(lcp, GIGABYTE, group_budget, &parallel_stats, 256,
+      cache_budget, 16);
+
+    require_same_pruned_graph(serial, parallel);
+    require(parallel_stats.prune_requested_workers == 16);
+    require(parallel_stats.prune_workers >= 8);
+    require(parallel_stats.prune_partitions >= 64);
+    require(parallel_stats.prune_prefix_candidates == 342);
+    require(parallel_stats.prune_prefix_certified + 1 ==
+      parallel_stats.prune_partitions);
+    require(parallel_stats.prune_prefix_certified >= 63);
+    require(parallel_stats.prune_parallel_fallbacks == 0);
+    require(parallel_stats.prune_fallback_reason == PRUNE_FALLBACK_NONE);
+    require(parallel_stats.prune_planning_nanoseconds > 0);
+    require(parallel_stats.prune_reconciliation_nanoseconds > 0);
+    require(parallel.files() > serial.files());
+    for(size_type file = 0; file < parallel.files(); file++)
+    {
+      require(parallel.path_checksums[file].matches(parallel.path_names[file],
+        parallel.path_counts[file] * sizeof(PathNode)));
+      require(parallel.rank_checksums[file].matches(parallel.rank_names[file],
+        parallel.rank_counts[file] * sizeof(PathNode::rank_type)));
+    }
+
+    PathGraphMergeStats final_serial_stats, final_parallel_stats;
+    MergedGraph serial_final(serial, mapper, lcp, GIGABYTE, MEGABYTE,
+      &final_serial_stats, 256, cache_budget, 1);
+    MergedGraph parallel_final(parallel, mapper, lcp, GIGABYTE, MEGABYTE,
+      &final_parallel_stats, 256, cache_budget, 1);
+    require_same_merged_graph(serial_final, parallel_final);
+  }
+  omp_set_num_threads(previous_threads); omp_set_dynamic(previous_dynamic);
+}
+
+static void compare_experimental_prefix_boundaries(const std::string& root,
+  PruneFixtureStorage storage)
+{
+  Alphabet alpha;
+  std::vector<key_type> keys = parallel_prune_keys(alpha);
+  LCP lcp(keys, 3);
+  DeBruijnGraph mapper(keys, 3, alpha);
+  const std::string tag = prune_storage_name(storage);
+  int previous_threads = omp_get_max_threads();
+  int previous_dynamic = omp_get_dynamic();
+  omp_set_dynamic(0); omp_set_num_threads(std::max(4, previous_threads));
+  {
+    ScopedEnvironment enabled("GCSA_EXPERIMENTAL_TRIPLET_PRUNE", "1");
+    PathGraph serial(0, 3, 0), parallel(0, 3, 0);
+    initialize_parallel_prune_graph(serial,
+      root + "/prefix-boundary-" + tag + "-serial", storage);
+    initialize_parallel_prune_graph(parallel,
+      root + "/prefix-boundary-" + tag + "-parallel", storage);
+    PathGraphMergeStats serial_stats, parallel_stats;
+    serial.prune(lcp, GIGABYTE, 4 * KILOBYTE, &serial_stats, 128,
+      64 * MEGABYTE, 1);
+    parallel.prune(lcp, GIGABYTE, 4 * KILOBYTE, &parallel_stats, 128,
+      64 * MEGABYTE, 4);
+    require_same_prefix_pruned_graph(serial, parallel);
+    require(parallel_stats.prune_prefix_candidates > 0);
+    require(parallel_stats.prune_prefix_rejected_groups > 0);
+    require(parallel_stats.prune_prefix_certified > 0);
+    require(parallel_stats.prune_partitions ==
+      parallel_stats.prune_prefix_certified + 1);
+    require(parallel_stats.prune_parallel_fallbacks == 0);
+    require(parallel_stats.prune_fallback_reason == PRUNE_FALLBACK_NONE);
+
+    PathGraphMergeStats final_serial_stats, final_parallel_stats;
+    MergedGraph serial_final(serial, mapper, lcp, GIGABYTE, MEGABYTE,
+      &final_serial_stats, 128, 64 * MEGABYTE, 1);
+    MergedGraph parallel_final(parallel, mapper, lcp, GIGABYTE, MEGABYTE,
+      &final_parallel_stats, 128, 64 * MEGABYTE, 1);
+    require_same_merged_graph(serial_final, parallel_final);
+  }
+  omp_set_num_threads(previous_threads); omp_set_dynamic(previous_dynamic);
+}
+
+static void compare_experimental_spanning_and_fallback(const std::string& root)
+{
+  Alphabet alpha;
+  PrefixKeyFixture fixture = prefix_prune_keys(alpha);
+  LCP lcp(fixture.keys, 3);
+  int previous_threads = omp_get_max_threads();
+  int previous_dynamic = omp_get_dynamic();
+  omp_set_dynamic(0); omp_set_num_threads(std::max(16, previous_threads));
+  {
+    ScopedEnvironment enabled("GCSA_EXPERIMENTAL_TRIPLET_PRUNE", "1");
+    PathGraph serial(0, 3, 0), spanning(0, 3, 0);
+    initialize_prefix_prune_graph(serial, root + "/prefix-span-serial",
+      FIXTURE_RAW, fixture.active_ranks, true);
+    initialize_prefix_prune_graph(spanning, root + "/prefix-span-parallel",
+      FIXTURE_RAW, fixture.active_ranks, true);
+    PathGraphMergeStats serial_stats, spanning_stats;
+    serial.prune(lcp, GIGABYTE, 64 * KILOBYTE, &serial_stats, 256,
+      128 * MEGABYTE, 1);
+    spanning.prune(lcp, GIGABYTE, 64 * KILOBYTE, &spanning_stats, 256,
+      128 * MEGABYTE, 16);
+    require_same_pruned_graph(serial, spanning);
+    require(spanning_stats.prune_prefix_rejected_spans > 0);
+    require(spanning_stats.prune_partitions >= 64);
+    require(spanning_stats.prune_parallel_fallbacks == 0);
+
+    // Planning is still reported when the worker request cannot pass resource
+    // admission. The exact serial output remains the result of the operation.
+    PathGraph limited(0, 3, 0);
+    initialize_prefix_prune_graph(limited, root + "/prefix-low-fd",
+      FIXTURE_RAW, fixture.active_ranks);
+    PathGraphMergeStats limited_stats;
+    limited.prune(lcp, GIGABYTE, 64 * KILOBYTE, &limited_stats, 6,
+      128 * MEGABYTE, 16);
+    PathGraph reference(0, 3, 0);
+    initialize_prefix_prune_graph(reference, root + "/prefix-low-fd-reference",
+      FIXTURE_RAW, fixture.active_ranks);
+    reference.prune(lcp, GIGABYTE, 64 * KILOBYTE, nullptr, 6,
+      128 * MEGABYTE, 1);
+    require_same_pruned_graph(reference, limited);
+    require(limited_stats.prune_requested_workers == 16);
+    require(limited_stats.prune_workers == 1);
+    require(limited_stats.prune_partitions == 1);
+    require(limited_stats.prune_parallel_fallbacks == 1);
+    require(limited_stats.prune_prefix_candidates == 342);
+    require(limited_stats.prune_planning_nanoseconds > 0);
+    require(limited_stats.prune_fallback_reason == PRUNE_FALLBACK_RESOURCES);
+  }
+  omp_set_num_threads(previous_threads); omp_set_dynamic(previous_dynamic);
+}
+
 static void compare_parallel_prune(const std::string& root,
   PruneFixtureStorage storage)
 {
@@ -1270,6 +1676,20 @@ int main()
   compare_parallel_prune(root, FIXTURE_FRAMED);
   compare_parallel_prune(root, FIXTURE_MIXED);
   compare_parallel_prune_failure_cleanup(root);
+  // The experimental depth-3 route must create substantially more than the
+  // seven alphabet-root tasks while retaining full serial records and final
+  // merge streams. The 343-key fixture leaves most prefix buckets empty, keeps
+  // all 64 DNA triplets active, adds $, N, and # prefixes, and skews one group.
+  compare_experimental_prefix_prune(root, FIXTURE_RAW);
+  compare_experimental_prefix_prune(root, FIXTURE_FRAMED);
+  compare_experimental_prefix_prune(root, FIXTURE_MIXED);
+  // Adjacent same-from/logical groups cannot be split merely because their
+  // depth-3 prefixes differ. Spanning PathNodes must likewise lift the cut,
+  // and a tight descriptor ceiling must report an exact serial fallback.
+  compare_experimental_prefix_boundaries(root, FIXTURE_RAW);
+  compare_experimental_prefix_boundaries(root, FIXTURE_FRAMED);
+  compare_experimental_prefix_boundaries(root, FIXTURE_MIXED);
+  compare_experimental_spanning_and_fallback(root);
   rmdir(root.c_str());
   return 0;
 }
