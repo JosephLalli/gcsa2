@@ -454,6 +454,7 @@ InputGraph::scanKMerBlocks(size_type file, size_type byte_budget,
   };
 
   std::ifstream input; this->open(input, file);
+  ReadAhead read_ahead(this->filenames[file]);
   if(this->binary)
   {
     size_type section = 0;
@@ -476,7 +477,7 @@ InputGraph::scanKMerBlocks(size_type file, size_type byte_budget,
         // scanKMerBlocks replaced a readBinary path that used DiskIO::read, so
         // the external route's reported read total silently excluded the entire
         // k-mer input scan.
-        if(!DiskIO::read(input, block.data(), count))
+        if(!DiskIO::read(input, block.data(), count, true, &read_ahead))
         {
           std::cerr << "InputGraph::scanKMerBlocks(): Unexpected EOF" << std::endl;
           std::exit(EXIT_FAILURE);

@@ -1413,6 +1413,7 @@ CompressedBlockReader::CompressedBlockReader(const std::string& filename,
     static_cast<void>(::posix_fadvise(this->cache_descriptor, 0, 0,
       POSIX_FADV_SEQUENTIAL));
 #endif
+    this->read_ahead.reset(new ReadAhead(this->cache_descriptor));
   }
 
   try
@@ -1437,6 +1438,7 @@ CompressedBlockReader::CompressedBlockReader(const std::string& filename,
       this->prefetch_pool->cancel(this->prefetch_owner);
       this->prefetch_owner = 0;
     }
+    this->read_ahead.reset();
     ::close(this->cache_descriptor); this->cache_descriptor = -1;
     throw;
   }
@@ -1625,6 +1627,7 @@ CompressedBlockReader::~CompressedBlockReader()
     this->prefetch_pool->cancel(this->prefetch_owner);
     this->prefetch_owner = 0;
   }
+  this->read_ahead.reset();
   if(this->cache_descriptor >= 0) { ::close(this->cache_descriptor); }
 }
 
@@ -1667,6 +1670,7 @@ CompressedBlockReader::loadBlock(std::size_t block)
   std::uint64_t physical, logical;
   std::uint64_t next_physical, next_logical;
   this->blockExtent(block, physical, logical, next_physical, next_logical);
+  if(this->read_ahead) { this->read_ahead->advance(physical); }
 
   if(this->prefetch_pool && this->prefetch_owner != 0)
   {

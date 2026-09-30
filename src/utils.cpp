@@ -25,18 +25,27 @@
 
 #include <gcsa/utils.h>
 
+#include <atomic>
+#include <cerrno>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cctype>
 #include <cmath>
+#include <deque>
 #include <iomanip>
 #include <limits>
+#include <new>
 #include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
+#include <fcntl.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <gcsa/internal.h>
@@ -448,6 +457,512 @@ ProgressReporter::report(bool final_report)
     }
   }
   std::cerr << std::endl;
+}
+
+//------------------------------------------------------------------------------
+
+struct ReadAhead::Source
+{
+  int descriptor = -1;
+  bool owns = false;
+  std::uint64_t size = 0;
+  std::mutex mtx;
+  std::condition_variable idle;
+  std::size_t in_flight = 0;
+  bool cancelled = false;
+
+  ~Source() { if(this->owns && this->descriptor >= 0) { ::close(this->descriptor); } }
+};
+
+namespace
+{
+
+// A non-negative integer from the environment, with an optional binary K/M/G suffix.
+std::uint64_t
+environmentSize(const char* name, std::uint64_t fallback)
+{
+  const char* value = std::getenv(name);
+  if(value == nullptr || *value == '\0') { return fallback; }
+  char* end = nullptr;
+  errno = 0;
+  unsigned long long parsed = std::strtoull(value, &end, 10);
+  std::uint64_t scale = 1;
+  if(end != value && *end != '\0' && end[1] == '\0')
+  {
+    switch(std::toupper(static_cast<unsigned char>(*end)))
+    {
+      case 'K': scale = std::uint64_t(1) << 10; end++; break;
+      case 'M': scale = std::uint64_t(1) << 20; end++; break;
+      case 'G': scale = std::uint64_t(1) << 30; end++; break;
+    }
+  }
+  if(end == value || *end != '\0' || errno == ERANGE ||
+     parsed > std::numeric_limits<std::uint64_t>::max() / scale)
+  {
+    throw std::invalid_argument(std::string(name) + " must be a size such as 64M, not '" + value + "'");
+  }
+  return parsed * scale;
+}
+
+// Reads queued pieces into a scratch buffer, which leaves them in the page cache.
+class ReadAheadPool
+{
+public:
+  static ReadAheadPool& instance()
+  {
+    // Never destroyed: its detached threads wait on the queue for the life of the process.
+    static ReadAheadPool* pool = new ReadAheadPool();
+    return *pool;
+  }
+
+  void submit(const std::shared_ptr<ReadAhead::Source>& source, std::uint64_t from, std::uint64_t to)
+  {
+    {
+      std::lock_guard<std::mutex> lock(this->mtx);
+      for(std::uint64_t offset = from; offset < to; offset += ReadAhead::PIECE_BYTES)
+      {
+        this->pieces.emplace_back(source, offset);
+      }
+    }
+    this->ready.notify_all();
+  }
+
+private:
+  ReadAheadPool()
+  {
+    const std::uint64_t threads = environmentSize("GCSA_IO_READAHEAD_THREADS", 16);
+    if(threads == 0) { throw std::invalid_argument("GCSA_IO_READAHEAD_THREADS must be positive"); }
+    for(std::uint64_t i = 0; i < threads; i++) { std::thread(&ReadAheadPool::work, this).detach(); }
+  }
+
+  void work()
+  {
+    std::vector<char> scratch(ReadAhead::PIECE_BYTES);
+    while(true)
+    {
+      std::pair<std::shared_ptr<ReadAhead::Source>, std::uint64_t> piece;
+      {
+        std::unique_lock<std::mutex> lock(this->mtx);
+        this->ready.wait(lock, [this]() { return !this->pieces.empty(); });
+        piece = std::move(this->pieces.front());
+        this->pieces.pop_front();
+      }
+      ReadAhead::Source& source = *(piece.first);
+      {
+        std::lock_guard<std::mutex> lock(source.mtx);
+        if(source.cancelled) { continue; }
+        source.in_flight++;
+      }
+      // Advisory: after an error or a short read, the reader reads the range itself.
+      static_cast<void>(::pread(source.descriptor, scratch.data(), scratch.size(),
+        static_cast<off_t>(piece.second)));
+      {
+        std::lock_guard<std::mutex> lock(source.mtx);
+        source.in_flight--;
+      }
+      source.idle.notify_all();
+    }
+  }
+
+  std::mutex mtx;
+  std::condition_variable ready;
+  std::deque<std::pair<std::shared_ptr<ReadAhead::Source>, std::uint64_t>> pieces;
+};
+
+} // anonymous namespace
+
+std::uint64_t
+ReadAhead::windowBytes()
+{
+  static const std::uint64_t window = environmentSize("GCSA_IO_READAHEAD_BYTES", 0);
+  return window;
+}
+
+ReadAhead::ReadAhead(const std::string& filename) :
+  source(), requested(0)
+{
+  if(windowBytes() == 0) { return; }
+  // Advisory: if this descriptor cannot be opened the reader still reads the
+  // file itself, without read-ahead.
+  int descriptor = ::open(filename.c_str(), O_RDONLY | O_CLOEXEC);
+  if(descriptor < 0) { return; }
+  struct stat status;
+  if(::fstat(descriptor, &status) != 0 || status.st_size < 0) { ::close(descriptor); return; }
+  this->source = std::make_shared<Source>();
+  this->source->descriptor = descriptor;
+  this->source->owns = true;
+  this->source->size = static_cast<std::uint64_t>(status.st_size);
+}
+
+ReadAhead::ReadAhead(int descriptor) :
+  source(), requested(0)
+{
+  if(windowBytes() == 0 || descriptor < 0) { return; }
+  struct stat status;
+  if(::fstat(descriptor, &status) != 0 || status.st_size < 0) { return; }
+  this->source = std::make_shared<Source>();
+  this->source->descriptor = descriptor;
+  this->source->size = static_cast<std::uint64_t>(status.st_size);
+}
+
+ReadAhead::~ReadAhead()
+{
+  this->release();
+}
+
+ReadAhead::ReadAhead(ReadAhead&& another) noexcept :
+  source(std::move(another.source)), requested(another.requested)
+{
+}
+
+ReadAhead&
+ReadAhead::operator=(ReadAhead&& another) noexcept
+{
+  if(this != &another)
+  {
+    this->release();
+    this->source = std::move(another.source);
+    this->requested = another.requested;
+  }
+  return *this;
+}
+
+void
+ReadAhead::release()
+{
+  if(!(this->source)) { return; }
+  {
+    std::unique_lock<std::mutex> lock(this->source->mtx);
+    this->source->cancelled = true;
+    this->source->idle.wait(lock, [this]() { return this->source->in_flight == 0; });
+  }
+  this->source.reset();
+}
+
+void
+ReadAhead::advance(std::uint64_t offset)
+{
+  if(!(this->source)) { return; }
+  const std::uint64_t target = std::min(this->source->size, offset + windowBytes());
+  if(this->requested < offset) { this->requested = offset - offset % PIECE_BYTES; }
+  // Queue whole pieces, so a reader advancing a record at a time does not queue
+  // a job per call; the file's last piece may be partial.
+  if(target <= this->requested ||
+     (target - this->requested < PIECE_BYTES && target < this->source->size)) { return; }
+  ReadAheadPool::instance().submit(this->source, this->requested, target);
+  this->requested = target;
+}
+
+//------------------------------------------------------------------------------
+
+namespace
+{
+
+constexpr std::size_t DIRECT_ALIGNMENT = 4096;
+constexpr std::size_t DIRECT_BLOCK_BYTES = std::size_t(4) << 20;
+
+struct AlignedBlock
+{
+  char* data;
+
+  AlignedBlock() : data(nullptr)
+  {
+    void* memory = nullptr;
+    if(::posix_memalign(&memory, DIRECT_ALIGNMENT, DIRECT_BLOCK_BYTES) != 0) { throw std::bad_alloc(); }
+    this->data = static_cast<char*>(memory);
+  }
+  ~AlignedBlock() { std::free(this->data); }
+
+  AlignedBlock(const AlignedBlock&) = delete;
+  AlignedBlock& operator=(const AlignedBlock&) = delete;
+};
+
+// Writes all of `bytes` at `offset`; returns 0 or an errno value.
+int
+pwriteAll(int descriptor, const char* data, std::size_t bytes, std::uint64_t offset)
+{
+  std::size_t done = 0;
+  while(done < bytes)
+  {
+    ssize_t result = ::pwrite(descriptor, data + done, bytes - done,
+      static_cast<off_t>(offset + done));
+    if(result < 0 && errno == EINTR) { continue; }
+    if(result <= 0) { return (result < 0 ? errno : EIO); }
+    done += static_cast<std::size_t>(result);
+  }
+  return 0;
+}
+
+// What a direct stream shares with its blocks in flight.
+struct DirectWriteState
+{
+  int descriptor = -1;
+  std::mutex mtx;
+  std::condition_variable returned;
+  std::vector<std::unique_ptr<AlignedBlock>> free_blocks;
+  std::size_t in_flight = 0;
+  int error = 0;  // first failed write's errno
+};
+
+struct DirectWriteJob
+{
+  std::shared_ptr<DirectWriteState> state;
+  std::unique_ptr<AlignedBlock> block;
+  std::uint64_t offset;
+};
+
+class DirectWritePool
+{
+public:
+  static DirectWritePool& instance()
+  {
+    // Never destroyed: its detached threads wait on the queue for the life of the process.
+    static DirectWritePool* pool = new DirectWritePool();
+    return *pool;
+  }
+
+  void submit(DirectWriteJob job)
+  {
+    {
+      std::lock_guard<std::mutex> lock(this->mtx);
+      this->jobs.push_back(std::move(job));
+    }
+    this->ready.notify_one();
+  }
+
+private:
+  DirectWritePool()
+  {
+    const std::uint64_t threads = environmentSize("GCSA_IO_DIRECT_WRITE_THREADS", 16);
+    if(threads == 0) { throw std::invalid_argument("GCSA_IO_DIRECT_WRITE_THREADS must be positive"); }
+    for(std::uint64_t i = 0; i < threads; i++) { std::thread(&DirectWritePool::work, this).detach(); }
+  }
+
+  void work()
+  {
+    while(true)
+    {
+      DirectWriteJob job;
+      {
+        std::unique_lock<std::mutex> lock(this->mtx);
+        this->ready.wait(lock, [this]() { return !this->jobs.empty(); });
+        job = std::move(this->jobs.front());
+        this->jobs.pop_front();
+      }
+      int error = pwriteAll(job.state->descriptor, job.block->data, DIRECT_BLOCK_BYTES, job.offset);
+      {
+        std::lock_guard<std::mutex> lock(job.state->mtx);
+        if(error != 0 && job.state->error == 0) { job.state->error = error; }
+        job.state->free_blocks.push_back(std::move(job.block));
+        job.state->in_flight--;
+      }
+      job.state->returned.notify_all();
+    }
+  }
+
+  std::mutex mtx;
+  std::condition_variable ready;
+  std::deque<DirectWriteJob> jobs;
+};
+
+/*
+  Put area-free stream buffer: every write goes through xsputn(), which fills
+  the current aligned block and hands full blocks to the pool. The current block
+  always starts at an aligned file offset.
+*/
+class DirectOutputBuffer : public std::streambuf
+{
+public:
+  DirectOutputBuffer() : state(), current(), used(0), block_offset(0), open_(false) { }
+  ~DirectOutputBuffer() override { if(this->open_) { this->close(); } }
+
+  // Returns 0, or the errno of a failed open (EINVAL when O_DIRECT is unsupported).
+  int open(const std::string& filename)
+  {
+    int descriptor = ::open(filename.c_str(),
+      O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT | O_CLOEXEC, 0666);
+    if(descriptor < 0) { return errno; }
+    this->state = std::make_shared<DirectWriteState>();
+    this->state->descriptor = descriptor;
+    const std::uint64_t depth = std::max(std::uint64_t(2),
+      environmentSize("GCSA_IO_DIRECT_WRITE_DEPTH", 4));
+    for(std::uint64_t i = 1; i < depth; i++)
+    {
+      this->state->free_blocks.emplace_back(new AlignedBlock());
+    }
+    this->current.reset(new AlignedBlock());
+    this->used = 0; this->block_offset = 0; this->open_ = true;
+    return 0;
+  }
+
+  bool is_open() const { return this->open_; }
+
+  bool close()
+  {
+    if(!this->open_) { return false; }
+    bool ok = (this->sync() == 0);
+    ok = (::close(this->state->descriptor) == 0) && ok;
+    this->open_ = false;
+    return ok;
+  }
+
+protected:
+  std::streamsize xsputn(const char* data, std::streamsize count) override
+  {
+    // After a failed write the current block is gone; the stream reports the short write.
+    if(!this->open_ || !this->current || count < 0) { return 0; }
+    std::streamsize done = 0;
+    while(done < count)
+    {
+      const std::size_t take = std::min(DIRECT_BLOCK_BYTES - this->used,
+        static_cast<std::size_t>(count - done));
+      std::memcpy(this->current->data + this->used, data + done, take);
+      this->used += take; done += static_cast<std::streamsize>(take);
+      if(this->used == DIRECT_BLOCK_BYTES && !this->submitCurrent()) { return done; }
+    }
+    return done;
+  }
+
+  int_type overflow(int_type ch) override
+  {
+    if(traits_type::eq_int_type(ch, traits_type::eof())) { return traits_type::not_eof(ch); }
+    char c = traits_type::to_char_type(ch);
+    return (this->xsputn(&c, 1) == 1 ? ch : traits_type::eof());
+  }
+
+  // Writes every byte: waits for the blocks in flight, writes the current block
+  // padded to the alignment, and truncates the file to its logical size.
+  int sync() override
+  {
+    if(!this->open_) { return -1; }
+    std::unique_lock<std::mutex> lock(this->state->mtx);
+    this->state->returned.wait(lock, [this]() { return this->state->in_flight == 0; });
+    if(this->state->error != 0) { return -1; }
+    lock.unlock();
+    if(this->used > 0)
+    {
+      const std::size_t padded = (this->used + DIRECT_ALIGNMENT - 1) / DIRECT_ALIGNMENT * DIRECT_ALIGNMENT;
+      std::memset(this->current->data + this->used, 0, padded - this->used);
+      if(pwriteAll(this->state->descriptor, this->current->data, padded, this->block_offset) != 0) { return -1; }
+    }
+    if(::ftruncate(this->state->descriptor, static_cast<off_t>(this->block_offset + this->used)) != 0) { return -1; }
+    return 0;
+  }
+
+  pos_type seekoff(off_type offset, std::ios_base::seekdir direction, std::ios_base::openmode which) override
+  {
+    if(offset != 0 || direction != std::ios_base::cur || !(which & std::ios_base::out)) { return pos_type(off_type(-1)); }
+    return pos_type(static_cast<off_type>(this->block_offset + this->used));
+  }
+
+  pos_type seekpos(pos_type, std::ios_base::openmode) override { return pos_type(off_type(-1)); }
+
+private:
+  // Hands the full current block to the pool and takes a free one.
+  bool submitCurrent()
+  {
+    {
+      std::lock_guard<std::mutex> lock(this->state->mtx);
+      if(this->state->error != 0) { return false; }
+      this->state->in_flight++;
+    }
+    DirectWritePool::instance().submit({ this->state, std::move(this->current), this->block_offset });
+    this->block_offset += DIRECT_BLOCK_BYTES; this->used = 0;
+    std::unique_lock<std::mutex> lock(this->state->mtx);
+    this->state->returned.wait(lock, [this]()
+      { return !this->state->free_blocks.empty() || this->state->error != 0; });
+    if(this->state->error != 0) { return false; }
+    this->current = std::move(this->state->free_blocks.back());
+    this->state->free_blocks.pop_back();
+    return true;
+  }
+
+  std::shared_ptr<DirectWriteState> state;
+  std::unique_ptr<AlignedBlock> current;
+  std::size_t used;
+  std::uint64_t block_offset;
+  bool open_;
+};
+
+} // anonymous namespace
+
+bool
+OutputStream::directWrites()
+{
+  static const bool enabled = (environmentSize("GCSA_IO_DIRECT_WRITES", 0) != 0);
+  return enabled;
+}
+
+OutputStream::OutputStream() :
+  std::ostream(nullptr), buffer(), direct_io(false)
+{
+  this->setstate(std::ios_base::badbit);
+}
+
+OutputStream::OutputStream(const std::string& filename, std::ios_base::openmode mode) :
+  OutputStream()
+{
+  this->open(filename, mode);
+}
+
+OutputStream::~OutputStream()
+{
+  if(this->is_open()) { this->close(); }
+}
+
+void
+OutputStream::open(const std::string& filename, std::ios_base::openmode mode)
+{
+  if(this->is_open()) { this->setstate(std::ios_base::failbit); return; }
+  const bool truncating = !(mode & (std::ios_base::app | std::ios_base::in | std::ios_base::ate));
+  if(directWrites() && truncating)
+  {
+    std::unique_ptr<DirectOutputBuffer> direct(new DirectOutputBuffer());
+    int error = direct->open(filename);
+    if(error == 0)
+    {
+      this->buffer = std::move(direct); this->direct_io = true;
+      this->rdbuf(this->buffer.get());
+      return;
+    }
+    if(error != EINVAL) { this->setstate(std::ios_base::failbit); return; }
+    static std::once_flag warned;
+    std::call_once(warned, [&filename]()
+    {
+      std::cerr << "OutputStream: O_DIRECT is unsupported for " << filename
+                << "; writing through the page cache" << std::endl;
+    });
+  }
+  std::unique_ptr<std::filebuf> file(new std::filebuf());
+  if(this->file_buffer_size >= 0) { file->pubsetbuf(this->file_buffer, this->file_buffer_size); }
+  if(file->open(filename, mode | std::ios_base::out) == nullptr)
+  {
+    this->setstate(std::ios_base::failbit); return;
+  }
+  this->buffer = std::move(file); this->direct_io = false;
+  this->rdbuf(this->buffer.get());
+}
+
+bool
+OutputStream::is_open() const
+{
+  if(!(this->buffer)) { return false; }
+  return (this->direct_io ?
+    static_cast<const DirectOutputBuffer*>(this->buffer.get())->is_open() :
+    static_cast<const std::filebuf*>(this->buffer.get())->is_open());
+}
+
+void
+OutputStream::close()
+{
+  bool ok = false;
+  if(this->buffer)
+  {
+    ok = (this->direct_io ?
+      static_cast<DirectOutputBuffer*>(this->buffer.get())->close() :
+      static_cast<std::filebuf*>(this->buffer.get())->close() != nullptr);
+  }
+  if(!ok) { this->setstate(std::ios_base::failbit); }
 }
 
 //------------------------------------------------------------------------------

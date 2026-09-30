@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <string>
 #include <vector>
 
 #include <sdsl/bit_vector_il.hpp>
@@ -464,6 +466,106 @@ private:
   size_type total, processed, next_check;
   double start_time, last_report, interval;
   bool done;
+};
+
+//------------------------------------------------------------------------------
+
+/*
+  FORK: read-ahead for sequential readers.
+
+  On a shared device with high queue latency, a stream's throughput is bounded
+  by the bytes it has in flight: one 1 MiB request per 30 ms is about 33 MB/s.
+  A ReadAhead keeps a window ahead of its reader in the page cache by reading
+  it in PIECE_BYTES pieces on a shared pool of threads, so the stream has many
+  requests in flight while the reader's own reads hit the cache.
+
+  GCSA_IO_READAHEAD_BYTES sets the window (0 or unset disables read-ahead) and
+  GCSA_IO_READAHEAD_THREADS the pool size (default 16). A ReadAhead borrows its
+  reader's descriptor where the reader has one, so it adds nothing to the
+  --max-open-files budget; destroying it cancels queued pieces and waits for
+  those in flight, after which the owner may close the descriptor. A reader
+  without a descriptor gives a filename, and the ReadAhead opens its own.
+  Read-ahead is advisory: its reads only populate the page cache, and the
+  reader's own reads report any error.
+*/
+class ReadAhead
+{
+public:
+  explicit ReadAhead(const std::string& filename);
+  explicit ReadAhead(int descriptor);
+  ~ReadAhead();
+
+  // The reader's next read starts at byte `offset`.
+  void advance(std::uint64_t offset);
+
+  // Window size from GCSA_IO_READAHEAD_BYTES; 0 when read-ahead is disabled.
+  static std::uint64_t windowBytes();
+
+  constexpr static std::uint64_t PIECE_BYTES = std::uint64_t(1) << 20;
+
+  struct Source;
+
+  ReadAhead(const ReadAhead&) = delete;
+  ReadAhead& operator=(const ReadAhead&) = delete;
+  ReadAhead(ReadAhead&& another) noexcept;
+  ReadAhead& operator=(ReadAhead&& another) noexcept;
+
+private:
+  // Cancels queued pieces and waits for those in flight.
+  void release();
+
+  std::shared_ptr<Source> source;
+  std::uint64_t requested;
+};
+
+//------------------------------------------------------------------------------
+
+/*
+  FORK: sequential output that can bypass the page cache.
+
+  Buffered writes on a shared host are paced by the kernel's global dirty-page
+  limit, which other processes fill. With GCSA_IO_DIRECT_WRITES=1, an
+  OutputStream opened for truncating output ("w" semantics) writes with
+  O_DIRECT from aligned 4 MiB blocks, with up to GCSA_IO_DIRECT_WRITE_DEPTH
+  blocks per stream (default 4) in flight on a shared pool of
+  GCSA_IO_DIRECT_WRITE_THREADS threads (default 16), so its data never enters
+  the page cache. flush() writes everything: it pads the final partial block,
+  writes it, and truncates the file to its logical size; later writes rewrite
+  that block. A filesystem without O_DIRECT falls back to buffered output with
+  a warning. The blocks are outside GCSA2's memory budget.
+
+  Otherwise an OutputStream behaves like std::ofstream, which it replaces.
+*/
+class OutputStream : public std::ostream
+{
+public:
+  OutputStream();
+  explicit OutputStream(const std::string& filename,
+    std::ios_base::openmode mode = std::ios_base::out);
+  ~OutputStream() override;
+
+  void open(const std::string& filename,
+    std::ios_base::openmode mode = std::ios_base::out);
+  bool is_open() const;
+  void close();
+
+  // True when this stream writes with O_DIRECT.
+  bool direct() const { return this->direct_io; }
+
+  // What std::ofstream::rdbuf()->pubsetbuf() before open() did: applied to a
+  // buffered stream at open(); a direct stream stages through its own blocks.
+  void setFileBuffer(char* data, std::streamsize size) { this->file_buffer = data; this->file_buffer_size = size; }
+
+  static bool directWrites();
+
+  OutputStream(const OutputStream&) = delete;
+  OutputStream& operator=(const OutputStream&) = delete;
+
+private:
+  std::unique_ptr<std::streambuf> buffer;
+  bool direct_io;
+  char* file_buffer = nullptr;
+  std::streamsize file_buffer_size = -1;  // negative: the filebuf's default buffering
 };
 
 //------------------------------------------------------------------------------

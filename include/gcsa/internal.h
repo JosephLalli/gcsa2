@@ -36,12 +36,20 @@ struct DiskIO
   static std::atomic<size_type> read_volume, write_volume;
   constexpr static size_type block_size = MEGABYTE;
 
+  // With `read_ahead`, the stream's next slices are read ahead in parallel
+  // while this slice is read.
   template<class Element>
-  static bool read(std::istream& in, Element* data, size_type n = 1, bool update = true)
+  static bool read(std::istream& in, Element* data, size_type n = 1, bool update = true,
+    ReadAhead* read_ahead = nullptr)
   {
     for(size_type offset = 0; offset < n; offset += block_size)
     {
       size_type bytes = std::min(block_size, n - offset) * sizeof(Element);
+      if(read_ahead != nullptr)
+      {
+        std::streamoff position = in.tellg();
+        if(position >= 0) { read_ahead->advance(static_cast<std::uint64_t>(position)); }
+      }
       in.read(reinterpret_cast<char*>(data + offset), bytes);
       size_type read_bytes = in.gcount();
       if(update) { read_volume += read_bytes; }
@@ -333,6 +341,7 @@ struct ReadBuffer
   size_type               elements, file_offset;
   bool                    release_file_cache;
   size_type               cache_released;
+  std::unique_ptr<ReadAhead> read_ahead;  // guarded by mtx after open()
 
   // Reader thread.
   std::vector<Element>    read_buffer;
@@ -436,6 +445,7 @@ ReadBuffer<Element>::open(const std::string& filename, size_type buffer_bytes,
   this->minimum_elements = std::max((size_type)1, this->buffer_elements / 2);
   sdsl::util::clear(this->read_buffer);
   this->read_buffer.reserve(this->buffer_elements);
+  this->read_ahead.reset(new ReadAhead(this->descriptor));
 #if defined(POSIX_FADV_SEQUENTIAL)
   if(this->release_file_cache)
   {
@@ -458,6 +468,7 @@ ReadBuffer<Element>::close()
   this->empty.notify_one();
   this->mtx.unlock();
   if(this->reader_thread.joinable()) { this->reader_thread.join(); }
+  this->read_ahead.reset();
 
   this->releaseCache(this->elements, true);
   if(this->descriptor >= 0) { ::close(this->descriptor); }
@@ -507,6 +518,7 @@ ReadBuffer<Element>::fill()
   this->empty.wait(lock, [this]() { return read_buffer.empty(); } );
 
   this->read_buffer.resize(std::min(this->buffer_elements, this->size() - this->file_offset));
+  if(this->read_ahead) { this->read_ahead->advance(this->file_offset * sizeof(Element)); }
   this->readBlock(this->file_offset, this->read_buffer.data(),
     this->read_buffer.size());
   this->file_offset += this->read_buffer.size();
@@ -533,6 +545,7 @@ ReadBuffer<Element>::forceRead()
   if(this->read_buffer.empty())
   {
     this->read_buffer.resize(std::min(this->buffer_elements, this->size() - this->file_offset));
+    if(this->read_ahead) { this->read_ahead->advance(this->file_offset * sizeof(Element)); }
     this->readBlock(this->file_offset, this->read_buffer.data(),
       this->read_buffer.size());
     this->file_offset += this->read_buffer.size();

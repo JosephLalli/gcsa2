@@ -51,6 +51,44 @@ rejected(const std::string& filename)
   return false;
 }
 
+// OutputStream writes the same bytes as std::ofstream in whichever mode the
+// environment selects: around the direct writer's 4 KiB alignment and 4 MiB
+// block boundaries, through a flush in mid-stream, with tellp() positions.
+void
+outputStreamTest(const std::string& root)
+{
+  const std::size_t block = std::size_t(4) << 20;
+  const std::size_t sizes[] = { 0, 1, 4095, 4096, 4097, block - 1, block, block + 1, 10 * (std::size_t(1) << 20) + 123 };
+  std::vector<std::uint8_t> data(10 * (std::size_t(1) << 20) + 200);
+  for(std::size_t i = 0; i < data.size(); i++) { data[i] = static_cast<std::uint8_t>((i * 2654435761u) >> 13); }
+  const std::string name = root + "/output-stream";
+  for(std::size_t size : sizes)
+  {
+    for(bool flush_midway : { false, true })
+    {
+      const std::size_t half = size / 2;
+      {
+        OutputStream output(name, std::ios::binary | std::ios::trunc);
+        require(output.is_open() && output.good());
+        output.write(reinterpret_cast<const char*>(data.data()), half);
+        if(flush_midway)
+        {
+          output.flush();
+          require(output.good());
+          require(readAll(name) == std::vector<std::uint8_t>(data.begin(), data.begin() + half));
+        }
+        require(static_cast<std::size_t>(output.tellp()) == half);
+        output.write(reinterpret_cast<const char*>(data.data() + half), size - half);
+        require(static_cast<std::size_t>(output.tellp()) == size);
+        output.close();
+        require(!output.fail() && !output.is_open());
+      }
+      require(readAll(name) == std::vector<std::uint8_t>(data.begin(), data.begin() + size));
+    }
+  }
+  require(::unlink(name.c_str()) == 0);
+}
+
 } // namespace
 
 int
@@ -336,6 +374,8 @@ main()
     output.write(reinterpret_cast<const char*>(corrupt.data()), corrupt.size());
   }
   require(rejected(second));
+
+  outputStreamTest(root);
 
   require(::unlink(first.c_str()) == 0);
   require(::unlink(second.c_str()) == 0);

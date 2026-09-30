@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 
+#include <gcsa/utils.h>
+
 namespace gcsa
 {
 
@@ -105,7 +107,8 @@ public:
 private:
   void flushBlock();
   std::string final_name, temporary_name, index_name;
-  std::ofstream output, index_output;
+  OutputStream output;
+  std::ofstream index_output;
   std::vector<std::uint8_t> buffer;
   std::size_t block_size;
   Mode requested_mode;
@@ -204,6 +207,9 @@ private:
   std::size_t cached_extent_block;
   std::uint64_t cached_physical, cached_logical;
   std::uint64_t cached_next_physical, cached_next_logical;
+  // Only readers with a resident descriptor read ahead; transient readers exist
+  // to stay within the descriptor budget.
+  std::unique_ptr<ReadAhead> read_ahead;
 };
 
 } // namespace gcsa

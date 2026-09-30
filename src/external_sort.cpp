@@ -110,10 +110,13 @@ trimReadCache(int descriptor, off_t consumed, off_t& released,
 }
 
 void
-trimWrittenCache(std::ofstream& output, int descriptor, off_t written,
+trimWrittenCache(OutputStream& output, int descriptor, off_t written,
   off_t& released, bool complete, const std::string& name)
 {
   if(!complete && written - released < CACHE_FLUSH_BYTES) { return; }
+  // A direct stream leaves nothing in the page cache to release; only the
+  // final call's durability sync applies.
+  if(!complete && output.direct()) { return; }
   output.flush();
   if(!output || ::fdatasync(descriptor) != 0)
   {
@@ -164,8 +167,28 @@ fileRecords(const std::string& name, size_type record_bytes)
   return static_cast<size_type>(static_cast<std::uint64_t>(bytes) / record_bytes);
 }
 
+// Reads `bytes` starting at byte `offset` of `input` in slices, advancing
+// `read_ahead` before each, and returns the bytes read.
+size_type
+readSliced(std::ifstream& input, std::uint8_t* data, size_type bytes,
+  std::uint64_t offset, ReadAhead& read_ahead)
+{
+  constexpr size_type SLICE_BYTES = 16 * MEGABYTE;
+  size_type done = 0;
+  while(done < bytes)
+  {
+    read_ahead.advance(offset + done);
+    const size_type slice = std::min(SLICE_BYTES, bytes - done);
+    input.read(reinterpret_cast<char*>(data + done), slice);
+    const size_type got = static_cast<size_type>(input.gcount());
+    done += got;
+    if(got < slice) { break; }
+  }
+  return done;
+}
+
 void
-writeBytes(std::ofstream& output, const std::uint8_t* data, size_type bytes,
+writeBytes(std::ostream& output, const std::uint8_t* data, size_type bytes,
   const std::string& name)
 {
   if(bytes == 0) { return; }
@@ -177,8 +200,8 @@ writeBytes(std::ofstream& output, const std::uint8_t* data, size_type bytes,
 void
 writeEmpty(const std::string& name)
 {
-  std::ofstream output;
-  output.rdbuf()->pubsetbuf(nullptr, 0);
+  OutputStream output;
+  output.setFileBuffer(nullptr, 0);
   output.open(name.c_str(), std::ios_base::binary | std::ios_base::trunc);
   if(!output) { fail("cannot create " + name); }
 }
@@ -279,11 +302,12 @@ struct RunReader
   off_t total_bytes, bytes_read, cache_released;
   bool at_end;
   CacheDescriptor cache;
+  ReadAhead read_ahead;
 
   RunReader(const std::string& name, size_type width, size_type requested) :
     input(), buffer(), record_bytes(width), capacity(0), records(0), offset(0),
     total_bytes(0), bytes_read(0), cache_released(0), at_end(false),
-    cache(name, O_RDONLY)
+    cache(name, O_RDONLY), read_ahead(cache.value)
   {
     input.rdbuf()->pubsetbuf(nullptr, 0);
     input.open(name.c_str(), std::ios_base::binary);
@@ -300,6 +324,7 @@ struct RunReader
   {
     trimReadCache(this->cache.value, this->bytes_read, this->cache_released,
       this->bytes_read == this->total_bytes);
+    read_ahead.advance(static_cast<std::uint64_t>(this->bytes_read));
     input.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
     std::streamsize bytes = input.gcount();
     if(bytes < 0 || static_cast<size_type>(bytes) % record_bytes != 0)
@@ -331,7 +356,7 @@ struct RunReader
     records(another.records), offset(another.offset),
     total_bytes(another.total_bytes), bytes_read(another.bytes_read),
     cache_released(another.cache_released), at_end(another.at_end),
-    cache(std::move(another.cache))
+    cache(std::move(another.cache)), read_ahead(std::move(another.read_ahead))
   {
   }
 
@@ -405,8 +430,8 @@ std::string
 writeSortedRun(const std::uint8_t* records, size_type count,
   const SortPlan& plan, const std::string& name)
 {
-  std::ofstream output;
-  output.rdbuf()->pubsetbuf(nullptr, 0);
+  OutputStream output;
+  output.setFileBuffer(nullptr, 0);
   output.open(name.c_str(), std::ios_base::binary | std::ios_base::trunc);
   if(!output) { fail("cannot create run " + name); }
   CacheDescriptor cache(name, O_RDWR);
@@ -432,8 +457,8 @@ std::string
 writeSortedRun(const std::uint8_t* records, const std::vector<size_type>& order,
   size_type count, const SortPlan& plan, const std::string& name)
 {
-  std::ofstream output;
-  output.rdbuf()->pubsetbuf(nullptr, 0);
+  OutputStream output;
+  output.setFileBuffer(nullptr, 0);
   output.open(name.c_str(), std::ios_base::binary | std::ios_base::trunc);
   if(!output) { fail("cannot create run " + name); }
   CacheDescriptor cache(name, O_RDWR);
@@ -482,8 +507,8 @@ mergeRuns(const std::vector<std::string>& names, const SortPlan& plan,
     FIXED_BYTES + (buffered_records + plan.merge_records) * plan.record_bytes);
 
   std::string output_name = makeRunName();
-  std::ofstream output;
-  output.rdbuf()->pubsetbuf(nullptr, 0);
+  OutputStream output;
+  output.setFileBuffer(nullptr, 0);
   output.open(output_name.c_str(), std::ios_base::binary | std::ios_base::trunc);
   if(!output) { fail("cannot create merged run " + output_name); }
   CacheDescriptor output_cache(output_name, O_RDWR);
@@ -588,6 +613,7 @@ sortToRun(const std::string& input_name, const SortPlan& plan,
   input.open(input_name.c_str(), std::ios_base::binary);
   if(!input) { fail("cannot open " + input_name); }
   CacheDescriptor input_cache(input_name, O_RDONLY);
+  ReadAhead read_ahead(input_cache.value);
   off_t input_bytes = 0, input_cache_released = 0;
 
   std::vector<std::vector<std::string>> levels;
@@ -618,8 +644,8 @@ sortToRun(const std::string& input_name, const SortPlan& plan,
     // order. A caller that declared a total order has no equal-but-distinct
     // records, so the array preserves an order that cannot be observed.
     std::vector<size_type> order(plan.total_order ? 0 : buffer_records);
-    input.read(reinterpret_cast<char*>(records.data()), count * plan.record_bytes);
-    if(input.gcount() != static_cast<std::streamsize>(count * plan.record_bytes))
+    if(readSliced(input, records.data(), count * plan.record_bytes,
+         static_cast<std::uint64_t>(input_bytes), read_ahead) != count * plan.record_bytes)
     {
       fail("short read from " + input_name);
     }
@@ -686,8 +712,8 @@ consumeRun(const std::string& run, const SortPlan& plan,
   // budget-accounted output buffer so key/start deduplication does not turn
   // into one syscall per result while still avoiding a hidden stream buffer.
   std::vector<char> output_buffer(plan.merge_records * plan.record_bytes);
-  std::ofstream output;
-  output.rdbuf()->pubsetbuf(output_buffer.data(), output_buffer.size());
+  OutputStream output;
+  output.setFileBuffer(output_buffer.data(), output_buffer.size());
   output.open(output_name.c_str(), std::ios_base::binary | std::ios_base::trunc);
   if(!output) { fail("cannot create reduced output " + output_name); }
   CacheDescriptor output_cache(output_name, O_RDWR);

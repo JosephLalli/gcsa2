@@ -63,7 +63,7 @@ public:
     name_(name), output_(), buffer_(std::max(static_cast<size_type>(1), buffer_bytes)), used_(0),
     track_digest_(track_digest), digest_(1469598103934665603ULL)
   {
-    output_.rdbuf()->pubsetbuf(nullptr, 0);
+    output_.setFileBuffer(nullptr, 0);
     output_.open(name.c_str(), std::ios_base::binary | std::ios_base::trunc);
     if(!output_) { throw std::runtime_error("external preprocessing: cannot create " + name); }
   }
@@ -120,7 +120,7 @@ public:
 
 private:
   std::string name_;
-  std::ofstream output_;
+  OutputStream output_;
   std::vector<std::uint8_t> buffer_;
   size_type used_;
   bool track_digest_;
