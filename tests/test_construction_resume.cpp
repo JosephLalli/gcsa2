@@ -259,8 +259,11 @@ main()
   const std::string workspace_root = makeTempRoot("gcsa-resume-work");
   const std::string parallel_root = makeTempRoot("gcsa-resume-parallel");
   const std::string state_one_root = makeTempRoot("gcsa-resume-state-one");
+  const std::string state_two_root = makeTempRoot("gcsa-resume-state-two");
   const std::string state_parallel_root =
-    makeTempRoot("gcsa-resume-state-parallel");
+    makeTempRoot("gcsa-resume-state-24");
+  const std::string state_arena_fallback_root =
+    makeTempRoot("gcsa-resume-state-arena-fallback");
   const std::string fallback_root = makeTempRoot("gcsa-resume-fallback");
   const std::string empty_root = makeTempRoot("gcsa-resume-empty");
   const std::string input_name = legacy_root + "/sparse-skew.gcsa2";
@@ -271,8 +274,11 @@ main()
   const std::string external_prefix = std::string(workspace_root) + "/index";
   const std::string parallel_prefix = std::string(parallel_root) + "/index";
   const std::string state_one_prefix = std::string(state_one_root) + "/index";
+  const std::string state_two_prefix = std::string(state_two_root) + "/index";
   const std::string state_parallel_prefix =
     std::string(state_parallel_root) + "/index";
+  const std::string state_arena_fallback_prefix =
+    std::string(state_arena_fallback_root) + "/index";
   const std::string fallback_prefix = std::string(fallback_root) + "/index";
   const std::string staged_prefix = std::string(workspace_root) + "/staged";
   const std::string mapping_name = std::string(legacy_root) + "/mapping";
@@ -464,20 +470,25 @@ main()
     readFile(parallel_prefix + LCPArray::EXTENSION));
 
   // Exercise the opt-in final-state planner through the same bounded batches
-  // with one and four state workers. The 257 recurring ranks skip many batch
+  // with one, two, and 24 state workers. The 257 recurring ranks skip many batch
   // boundaries, the mapping collapses duplicate nodes before rank dispatch,
   // and the oversized N path forces the serial spill path to update the same
   // owner shard. Sorted event checkpoints and both public products must remain
   // byte-identical to the legacy and default external routes.
   const auto runExperimentalState = [&](const std::string& root,
-    const std::string& prefix, const char* workers) -> std::string
+    const std::string& prefix, size_type workers,
+    size_type max_open_files) -> std::string
   {
+    omp_set_num_threads(static_cast<int>(workers));
     require(setenv("GCSA_EXPERIMENTAL_FINAL_STATE", "1", 1) == 0);
-    require(setenv("GCSA_EXPERIMENTAL_STATE_WORKERS", workers, 1) == 0);
+    const std::string configured_workers = std::to_string(workers);
+    require(setenv("GCSA_EXPERIMENTAL_STATE_WORKERS",
+      configured_workers.c_str(), 1) == 0);
     TempFile::setDirectory(root);
     std::ostringstream log;
     ConstructionParameters parameters = externalParameters(root,
       external_minimum + 64 * MEGABYTE);
+    parameters.setMaxOpenFiles(max_open_files);
     enableSmallFramedStreams(parameters);
     InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
     std::streambuf* old_stderr = std::cerr.rdbuf(log.rdbuf());
@@ -506,30 +517,141 @@ main()
   };
 
   const std::string state_one_log = runExperimentalState(
-    state_one_root, state_one_prefix, "1");
+    state_one_root, state_one_prefix, 1, ConstructionParameters::MIN_OPEN_FILES);
+  const std::string state_two_log = runExperimentalState(
+    state_two_root, state_two_prefix, 2, ConstructionParameters::MIN_OPEN_FILES);
   const std::string state_parallel_log = runExperimentalState(
-    state_parallel_root, state_parallel_prefix, "4");
+    state_parallel_root, state_parallel_prefix, 24, 128);
   require(state_one_log.find(
     "experimental final state: requested 1 worker(s), active 1 worker(s)") !=
     std::string::npos);
+  require(state_two_log.find(
+    "experimental final state: requested 2 worker(s), active 2 worker(s)") !=
+    std::string::npos);
   require(state_parallel_log.find(
-    "experimental final state: requested 4 worker(s), active 4 worker(s)") !=
+    "experimental final state: requested 24 worker(s), active 24 worker(s)") !=
     std::string::npos);
   require(state_one_log.find("experimental final-state timings:") !=
     std::string::npos);
   require(state_parallel_log.find("experimental final-state LCP replay:") !=
     std::string::npos);
+  require(state_parallel_log.find("lcp-read ") != std::string::npos);
+  require(state_parallel_log.find("seed-snapshot ") != std::string::npos);
+  require(state_parallel_log.find("chunk-query ") != std::string::npos);
+  require(state_parallel_log.find("redundancy-emit ") != std::string::npos);
+  const auto requireBoundedStateReplay = [](const std::string& log) {
+    const std::string replay_prefix =
+      "experimental final-state LCP replay: ";
+    const std::string planned_marker = " worker-path updates for ";
+    size_type replay_line = log.find(replay_prefix);
+    require(replay_line != std::string::npos);
+    size_type replayed_paths = std::stoull(log.substr(
+      replay_line + replay_prefix.size()));
+    size_type planned = log.find(planned_marker, replay_line);
+    require(planned != std::string::npos);
+    size_type planned_paths = std::stoull(log.substr(
+      planned + planned_marker.size()));
+    require(replayed_paths <= planned_paths);
+    require(replayed_paths == planned_paths);
+    require(planned_paths >= 4096);
+  };
+  requireBoundedStateReplay(state_one_log);
+  requireBoundedStateReplay(state_two_log);
+  requireBoundedStateReplay(state_parallel_log);
   require(workspaceArtifacts(state_one_root, "final--events--") ==
+    serial_events);
+  require(workspaceArtifacts(state_two_root, "final--events--") ==
     serial_events);
   require(workspaceArtifacts(state_parallel_root, "final--events--") ==
     serial_events);
   require(readFile(state_one_prefix + GCSA::EXTENSION) ==
     readFile(legacy_prefix + GCSA::EXTENSION));
+  require(readFile(state_two_prefix + GCSA::EXTENSION) ==
+    readFile(legacy_prefix + GCSA::EXTENSION));
   require(readFile(state_parallel_prefix + GCSA::EXTENSION) ==
     readFile(legacy_prefix + GCSA::EXTENSION));
   require(readFile(state_one_prefix + LCPArray::EXTENSION) ==
     readFile(legacy_prefix + LCPArray::EXTENSION));
+  require(readFile(state_two_prefix + LCPArray::EXTENSION) ==
+    readFile(legacy_prefix + LCPArray::EXTENSION));
   require(readFile(state_parallel_prefix + LCPArray::EXTENSION) ==
+    readFile(legacy_prefix + LCPArray::EXTENSION));
+
+  // A resumed build reuses the new event frontier under a different worker
+  // request and still publishes the same public bytes.
+  const std::string state_resumed_prefix =
+    std::string(state_parallel_root) + "/resumed";
+  omp_set_num_threads(1);
+  require(setenv("GCSA_EXPERIMENTAL_FINAL_STATE", "1", 1) == 0);
+  require(setenv("GCSA_EXPERIMENTAL_STATE_WORKERS", "1", 1) == 0);
+  {
+    ConstructionParameters parameters = externalParameters(state_parallel_root,
+      external_minimum + MEGABYTE);
+    parameters.setMaxOpenFiles(128);
+    parameters.setResume();
+    InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
+    GCSA::buildAndStore(graph, parameters,
+      state_resumed_prefix + GCSA::EXTENSION);
+    LCPArray::buildAndStore(graph, parameters,
+      state_resumed_prefix + LCPArray::EXTENSION);
+  }
+  unsetenv("GCSA_EXPERIMENTAL_FINAL_STATE");
+  unsetenv("GCSA_EXPERIMENTAL_STATE_WORKERS");
+  require(readFile(state_resumed_prefix + GCSA::EXTENSION) ==
+    readFile(legacy_prefix + GCSA::EXTENSION));
+  require(readFile(state_resumed_prefix + LCPArray::EXTENSION) ==
+    readFile(legacy_prefix + LCPArray::EXTENSION));
+
+  // Admit bounded predecessor batches but leave too little memory for the
+  // additional dense result, seed, and replay arenas. The experiment alone
+  // must fall back; the serial state path remains viable and exact.
+  omp_set_num_threads(24);
+  require(setenv("GCSA_EXPERIMENTAL_FINAL_STATE", "1", 1) == 0);
+  require(setenv("GCSA_EXPERIMENTAL_STATE_WORKERS", "24", 1) == 0);
+  TempFile::setDirectory(state_arena_fallback_root);
+  std::ostringstream state_arena_fallback_log;
+  {
+    ConstructionParameters parameters = externalParameters(
+      state_arena_fallback_root, external_minimum + 256 * KILOBYTE);
+    parameters.setIOBufferSize(16 * KILOBYTE);
+    parameters.setMaxOpenFiles(128);
+    InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
+    std::streambuf* old_stderr =
+      std::cerr.rdbuf(state_arena_fallback_log.rdbuf());
+    Verbosity::set(Verbosity::EXTENDED);
+    try
+    {
+      GCSA::buildAndStore(graph, parameters,
+        state_arena_fallback_prefix + GCSA::EXTENSION);
+      LCPArray::buildAndStore(graph, parameters,
+        state_arena_fallback_prefix + LCPArray::EXTENSION);
+    }
+    catch(...)
+    {
+      std::cerr.rdbuf(old_stderr); Verbosity::set(Verbosity::SILENT); throw;
+    }
+    std::cerr.rdbuf(old_stderr); Verbosity::set(Verbosity::SILENT);
+  }
+  unsetenv("GCSA_EXPERIMENTAL_FINAL_STATE");
+  unsetenv("GCSA_EXPERIMENTAL_STATE_WORKERS");
+  const std::string arena_predecessor_prefix =
+    "final predecessor lookup: 7 worker(s), ";
+  size_type arena_predecessor_line =
+    state_arena_fallback_log.str().find(arena_predecessor_prefix);
+  require(arena_predecessor_line != std::string::npos);
+  require(std::stoull(state_arena_fallback_log.str().substr(
+    arena_predecessor_line + arena_predecessor_prefix.size())) > 0);
+  require(state_arena_fallback_log.str().find(
+    "experimental final state: requested 24 worker(s), active 1 worker(s)") !=
+    std::string::npos);
+  require(state_arena_fallback_log.str().find(
+    "serial fallback: state arena admission") != std::string::npos);
+  require(workspaceLogicalArtifacts(state_arena_fallback_root,
+    "final--events--") == workspaceLogicalArtifacts(workspace_root,
+      "final--events--"));
+  require(readFile(state_arena_fallback_prefix + GCSA::EXTENSION) ==
+    readFile(legacy_prefix + GCSA::EXTENSION));
+  require(readFile(state_arena_fallback_prefix + LCPArray::EXTENSION) ==
     readFile(legacy_prefix + LCPArray::EXTENSION));
 
   // Request workers under the supported descriptor floor, but keep the 1 KiB
@@ -537,6 +659,7 @@ main()
   // serial reader layout and produce the same framed event bytes and indexes.
   require(setenv("GCSA_EXPERIMENTAL_FINAL_STATE", "1", 1) == 0);
   require(setenv("GCSA_EXPERIMENTAL_STATE_WORKERS", "4", 1) == 0);
+  omp_set_num_threads(4);
   TempFile::setDirectory(fallback_root);
   std::ostringstream fallback_log;
   {
@@ -697,7 +820,9 @@ main()
   std::filesystem::remove_all(workspace_root);
   std::filesystem::remove_all(parallel_root);
   std::filesystem::remove_all(state_one_root);
+  std::filesystem::remove_all(state_two_root);
   std::filesystem::remove_all(state_parallel_root);
+  std::filesystem::remove_all(state_arena_fallback_root);
   std::filesystem::remove_all(fallback_root);
   std::filesystem::remove_all(empty_root);
   return 0;

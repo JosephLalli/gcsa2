@@ -9,6 +9,7 @@
 #include <limits>
 #include <omp.h>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -261,6 +262,56 @@ int main()
     require(chunk_seed[frame].last_time == complete_stack[frame].last_time);
   }
   require(finalStateRedundancySlot(chunk_seed, 5) == 1);
+
+  // Chunk planning uses dense path-order occurrence offsets, keeps every
+  // boundary on a path, and limits total replay to the planned path count.
+  // The second path is deliberately much heavier than its neighbors.
+  const std::array<size_type, 6> skew_offsets = { 0, 1, 11, 12, 13, 14 };
+  std::array<size_type, 25> chunk_starts = {};
+  size_type chunks = planFinalStateChunks(skew_offsets.data(), 5, 2,
+    chunk_starts.data());
+  require(chunks == 2);
+  require(chunk_starts[0] == 0);
+  require(chunk_starts[1] == 2);
+  require(chunk_starts[2] == 5);
+  size_type replayed_paths = 0;
+  for(size_type chunk = 0; chunk < chunks; chunk++)
+  {
+    require(chunk_starts[chunk] < chunk_starts[chunk + 1]);
+    replayed_paths += chunk_starts[chunk + 1] - chunk_starts[chunk];
+  }
+  require(replayed_paths == 5);
+
+  const std::array<size_type, 2> one_path_offsets = { 0, 17 };
+  chunks = planFinalStateChunks(one_path_offsets.data(), 1, 24,
+    chunk_starts.data());
+  require(chunks == 1 && chunk_starts[0] == 0 && chunk_starts[1] == 1);
+
+  std::array<size_type, 33> many_offsets = {};
+  for(size_type path = 0; path + 1 < many_offsets.size(); path++)
+  {
+    many_offsets[path + 1] = many_offsets[path] + (path % 7) + 1;
+  }
+  chunks = planFinalStateChunks(many_offsets.data(), 32, 24,
+    chunk_starts.data());
+  require(chunks == 24 && chunk_starts[0] == 0 && chunk_starts[chunks] == 32);
+  replayed_paths = 0;
+  for(size_type chunk = 0; chunk < chunks; chunk++)
+  {
+    require(chunk_starts[chunk] < chunk_starts[chunk + 1]);
+    replayed_paths += chunk_starts[chunk + 1] - chunk_starts[chunk];
+  }
+  require(replayed_paths == 32);
+
+  bool nonzero_origin_rejected = false;
+  const std::array<size_type, 2> nonzero_offsets = { 1, 2 };
+  try
+  {
+    planFinalStateChunks(nonzero_offsets.data(), 1, 1,
+      chunk_starts.data());
+  }
+  catch(const std::invalid_argument&) { nonzero_origin_rejected = true; }
+  require(nonzero_origin_rejected);
 
   // Cross the bit_vector_il threshold where SDSL stores its auxiliary
   // breadth-first rank samples. Exact byte equality here covers both the

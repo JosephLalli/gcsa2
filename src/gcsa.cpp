@@ -817,11 +817,12 @@ struct ExternalFinalScanStats
   size_type prepared_from_paths, prepared_from_ranks;
   size_type prepared_from_spill_fallbacks, from_preparation_buffer_bytes;
   size_type state_requested_workers, state_workers, state_batches;
-  size_type state_paths, state_ranks, state_redundancies;
+  size_type state_chunks, state_paths, state_ranks, state_redundancies;
   size_type state_batch_fallbacks, state_replayed_lcp_paths;
-  size_type state_buffer_bytes;
-  double state_seed_seconds, state_dispatch_seconds;
-  double state_rank_seconds, state_query_seconds;
+  size_type state_seed_frames, state_buffer_bytes;
+  double state_lcp_read_seconds, state_seed_seconds;
+  double state_dispatch_seconds, state_rank_seconds;
+  double state_query_seconds, state_emit_seconds;
   bool predecessor_parallel_fallback;
   bool state_requested, state_fallback;
   std::string state_fallback_reason;
@@ -833,11 +834,13 @@ struct ExternalFinalScanStats
     predecessor_buffer_bytes(0), prepared_from_paths(0),
     prepared_from_ranks(0), prepared_from_spill_fallbacks(0),
     from_preparation_buffer_bytes(0), state_requested_workers(1),
-    state_workers(1), state_batches(0), state_paths(0), state_ranks(0),
+    state_workers(1), state_batches(0), state_chunks(0), state_paths(0),
+    state_ranks(0),
     state_redundancies(0), state_batch_fallbacks(0),
-    state_replayed_lcp_paths(0), state_buffer_bytes(0),
-    state_seed_seconds(0.0), state_dispatch_seconds(0.0),
-    state_rank_seconds(0.0), state_query_seconds(0.0),
+    state_replayed_lcp_paths(0), state_seed_frames(0), state_buffer_bytes(0),
+    state_lcp_read_seconds(0.0), state_seed_seconds(0.0),
+    state_dispatch_seconds(0.0), state_rank_seconds(0.0),
+    state_query_seconds(0.0), state_emit_seconds(0.0),
     predecessor_parallel_fallback(false), state_requested(false),
     state_fallback(false), state_fallback_reason(), restored(false) { }
 };
@@ -872,10 +875,10 @@ struct FinalPredecessorWork
 
 struct FinalStateOccurrence
 {
+  // The source rank stays in prepared_from_ranks[prepared_slot]. Rank owners
+  // write the previous time into the path-ordered dense result arena.
+  size_type prepared_slot;
   size_type path_offset;
-  // The mapped from-rank is replaced first by its one-based previous time and
-  // then by either the exact redundancy slot or NO_FINAL_REDUNDANCY.
-  size_type value;
 };
 
 constexpr size_type NO_FINAL_REDUNDANCY =
@@ -1282,18 +1285,20 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
         stats->predecessor_parallel_fallback = true;
       }
 
-      // The opt-in state planner holds one fixed record per prepared from-rank,
-      // one LCP byte per path, and at most 257 stack frames per worker. It owns
-      // no occurrence-proportional file. If this bounded arena cannot coexist
-      // with the mutable arrays, retain the exact serial state route.
+      // The opt-in state planner holds one owner-dispatch record and one dense,
+      // path-ordered result per prepared from-rank, one LCP byte and occurrence
+      // prefix per path, and at most 257 seed / replay frames per worker. It
+      // owns no occurrence-proportional file. If this fully admitted arena
+      // cannot coexist with the mutable arrays, retain the exact serial route.
       size_type state_occurrence_capacity = 0;
       MemoryBudget::Reservation state_work_reservation;
       std::vector<FinalStateOccurrence> state_occurrences;
+      std::vector<size_type> state_values, state_path_offsets;
       std::vector<merged_lcp_type> state_lcp;
       std::vector<size_type> state_owner_counts, state_owner_starts,
-        state_owner_cursors;
+        state_owner_cursors, state_chunk_starts, state_chunk_seed_sizes;
+      std::vector<FinalStateStackFrame> state_chunk_seeds;
       std::vector<std::vector<FinalStateStackFrame>> state_worker_stacks;
-      std::vector<FinalStateStackFrame> state_seed;
       std::vector<std::exception_ptr> state_errors;
       if(state_enabled && predecessor_batch_capacity == 0)
       {
@@ -1305,63 +1310,79 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
       {
         const size_type lcp_bytes = checkedProduct(predecessor_batch_capacity,
           sizeof(merged_lcp_type), "experimental final-state LCP arena");
-        const size_type stack_items = checkedProduct(state_workers + 1,
-          distinct_lcp_values, "experimental final-state stack frames");
-        const size_type stack_bytes = checkedProduct(stack_items,
-          sizeof(FinalStateStackFrame), "experimental final-state stack arena");
-        const size_type owner_bytes = checkedProduct(state_workers,
-          3 * sizeof(size_type) + sizeof(std::vector<FinalStateStackFrame>) +
-          sizeof(std::exception_ptr), "experimental final-state worker metadata");
-        size_type fixed_state_bytes = lcp_bytes;
-        if(stack_bytes > std::numeric_limits<size_type>::max() - fixed_state_bytes ||
-           owner_bytes > std::numeric_limits<size_type>::max() -
-             fixed_state_bytes - stack_bytes)
+        const size_type occurrence_bytes = checkedProduct(prepared_from_capacity,
+          sizeof(FinalStateOccurrence),
+          "experimental final-state occurrence arena");
+        const size_type value_bytes = checkedProduct(prepared_from_capacity,
+          sizeof(size_type), "experimental final-state value arena");
+        const size_type path_offset_items = predecessor_batch_capacity + 1;
+        if(path_offset_items == 0)
         {
           throw std::runtime_error(
-            "GCSA::GCSA(): experimental final-state arena size overflows");
+            "GCSA::GCSA(): experimental final-state path offsets overflow");
         }
-        fixed_state_bytes += stack_bytes + owner_bytes;
+        const size_type path_offset_bytes = checkedProduct(path_offset_items,
+          sizeof(size_type), "experimental final-state path offsets");
+        const size_type seed_items = checkedProduct(state_workers,
+          distinct_lcp_values, "experimental final-state stack frames");
+        const size_type seed_bytes = checkedProduct(seed_items,
+          sizeof(FinalStateStackFrame), "experimental final-state stack arena");
+        const size_type owner_bytes = checkedProduct(state_workers,
+          6 * sizeof(size_type) + sizeof(std::vector<FinalStateStackFrame>) +
+          sizeof(std::exception_ptr),
+          "experimental final-state worker metadata");
+        size_type state_arena_bytes = 0;
+        const auto add_state_bytes = [&](size_type bytes) {
+          if(bytes > std::numeric_limits<size_type>::max() - state_arena_bytes)
+          {
+            throw std::runtime_error(
+              "GCSA::GCSA(): experimental final-state arena size overflows");
+          }
+          state_arena_bytes += bytes;
+        };
+        add_state_bytes(lcp_bytes);
+        add_state_bytes(occurrence_bytes);
+        add_state_bytes(value_bytes);
+        add_state_bytes(path_offset_bytes);
+        // Seeds and mutable replay stacks are distinct concurrently live
+        // arenas, each with one bounded stack per active worker.
+        add_state_bytes(seed_bytes);
+        add_state_bytes(seed_bytes);
+        add_state_bytes(owner_bytes);
         const size_type available_state_bytes =
           (memory.available() > array_minimum ?
             memory.available() - array_minimum : 0);
-        if(available_state_bytes > fixed_state_bytes)
-        {
-          state_occurrence_capacity = std::min(prepared_from_capacity,
-            (available_state_bytes - fixed_state_bytes) /
-              sizeof(FinalStateOccurrence));
-        }
-        if(state_occurrence_capacity < predecessor_batch_capacity)
+        if(available_state_bytes < state_arena_bytes)
         {
           state_enabled = false; state_workers = 1;
           array_minimum = serial_array_minimum;
-          state_occurrence_capacity = 0;
           state_fallback_reason = "state arena admission";
         }
         else
         {
-          const size_type occurrence_bytes = checkedProduct(
-            state_occurrence_capacity, sizeof(FinalStateOccurrence),
-            "experimental final-state occurrence arena");
-          state_work_reservation = memory.reserve(
-            fixed_state_bytes + occurrence_bytes,
+          state_occurrence_capacity = prepared_from_capacity;
+          state_work_reservation = memory.reserve(state_arena_bytes,
             "experimental-final-state");
           state_occurrences.resize(state_occurrence_capacity);
+          state_values.resize(state_occurrence_capacity);
+          state_path_offsets.resize(path_offset_items);
           state_lcp.resize(predecessor_batch_capacity);
           state_owner_counts.resize(state_workers);
           state_owner_starts.resize(state_workers);
           state_owner_cursors.resize(state_workers);
+          state_chunk_starts.resize(state_workers + 1);
+          state_chunk_seed_sizes.resize(state_workers);
+          state_chunk_seeds.resize(seed_items);
           state_worker_stacks.resize(state_workers);
           for(auto& worker_stack : state_worker_stacks)
           {
             worker_stack.reserve(distinct_lcp_values);
           }
-          state_seed.reserve(distinct_lcp_values);
           state_errors.resize(state_workers);
           if(stats != nullptr)
           {
             stats->state_workers = state_workers;
-            stats->state_buffer_bytes =
-              fixed_state_bytes + occurrence_bytes;
+            stats->state_buffer_bytes = state_arena_bytes;
           }
         }
       }
@@ -1491,6 +1512,7 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
         predecessor_errors;
       for(size_type i = 0; i < merged_graph.size();)
       {
+        const size_type batch_base = i;
         size_type batch_paths = 1;
         if(predecessor_batch_capacity > 0)
         {
@@ -1683,6 +1705,8 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
 
         bool state_batch_planned = false;
         size_type state_planned_paths = 0, state_record_count = 0;
+        size_type state_chunk_count = 0, state_next_seed = 0;
+        size_type state_batch_seed_frames = 0;
         if(state_enabled && predecessor_batch_capacity > 0)
         {
           state_planned_paths = batch_paths;
@@ -1694,36 +1718,40 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
           {
             state_planned_paths--;
           }
+          state_path_offsets[0] = 0;
           for(size_type offset = 0; offset < state_planned_paths; offset++)
           {
-            if(predecessor_work[offset].from_count >
-               state_occurrence_capacity - state_record_count)
+            const FinalPredecessorWork& work = predecessor_work[offset];
+            if(work.from_offset > prepared_from_capacity ||
+               work.from_count > prepared_from_capacity - work.from_offset)
+            {
+              throw std::runtime_error(
+                "GCSA::GCSA(): experimental final-state prepared slot is outside its arena");
+            }
+            if(work.from_count > state_occurrence_capacity - state_record_count)
             {
               state_record_count = state_occurrence_capacity + 1; break;
             }
-            state_record_count += predecessor_work[offset].from_count;
+            state_record_count += work.from_count;
+            state_path_offsets[offset + 1] = state_record_count;
           }
           if(state_planned_paths > 0 &&
              state_record_count <= state_occurrence_capacity)
           {
             double stage_start = readTimer();
-            state_seed.clear();
-            for(size_type frame = 0; frame < stack_size; frame++)
-            {
-              state_seed.push_back({ stack.get(3 * frame),
-                stack.get(3 * frame + 1), stack.get(3 * frame + 2) });
-            }
             for(size_type offset = 0; offset < batch_paths; offset++)
             {
-              lcp_array.seek(i + offset);
-              state_lcp[offset] = lcp_array[i + offset];
+              lcp_array.seek(batch_base + offset);
+              state_lcp[offset] = lcp_array[batch_base + offset];
             }
             if(stats != nullptr)
             {
-              stats->state_seed_seconds += readTimer() - stage_start;
+              stats->state_lcp_read_seconds += readTimer() - stage_start;
             }
 
             stage_start = readTimer();
+            state_chunk_count = planFinalStateChunks(state_path_offsets.data(),
+              state_planned_paths, state_workers, state_chunk_starts.data());
             std::fill(state_owner_counts.begin(), state_owner_counts.end(), 0);
             for(size_type offset = 0; offset < state_planned_paths; offset++)
             {
@@ -1754,14 +1782,14 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
               const FinalPredecessorWork& work = predecessor_work[offset];
               for(size_type j = 0; j < work.from_count; j++)
               {
-                const size_type rank =
-                  prepared_from_ranks[work.from_offset + j];
+                const size_type prepared_slot = work.from_offset + j;
+                const size_type rank = prepared_from_ranks[prepared_slot];
                 size_type owner = 0, local = 0;
                 finalStateRankLocation(rank, unique_from_nodes, state_workers,
                   owner, local);
                 static_cast<void>(local);
                 state_occurrences[state_owner_cursors[owner]++] =
-                  { offset, rank };
+                  { prepared_slot, offset };
               }
             }
             if(stats != nullptr)
@@ -1783,9 +1811,32 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
                 const size_type end = begin + state_owner_counts[worker];
                 for(size_type at = begin; at < end; at++)
                 {
-                  FinalStateOccurrence& occurrence = state_occurrences[at];
+                  const FinalStateOccurrence& occurrence = state_occurrences[at];
+                  if(occurrence.path_offset >= state_planned_paths)
+                  {
+                    throw std::runtime_error(
+                      "GCSA::GCSA(): experimental final-state path offset is outside its batch");
+                  }
+                  const FinalPredecessorWork& work =
+                    predecessor_work[occurrence.path_offset];
+                  if(occurrence.prepared_slot < work.from_offset ||
+                     occurrence.prepared_slot >= work.from_offset + work.from_count)
+                  {
+                    throw std::runtime_error(
+                      "GCSA::GCSA(): experimental final-state prepared slot lost path ownership");
+                  }
+                  const size_type dense_slot =
+                    state_path_offsets[occurrence.path_offset] +
+                    (occurrence.prepared_slot - work.from_offset);
+                  if(dense_slot >= state_record_count)
+                  {
+                    throw std::runtime_error(
+                      "GCSA::GCSA(): experimental final-state result slot is outside its arena");
+                  }
+                  const size_type rank =
+                    prepared_from_ranks[occurrence.prepared_slot];
                   size_type owner = 0, local = 0;
-                  finalStateRankLocation(occurrence.value, unique_from_nodes,
+                  finalStateRankLocation(rank, unique_from_nodes,
                     state_workers, owner, local);
                   if(owner != worker)
                   {
@@ -1794,8 +1845,8 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
                   }
                   size_type prior = state_previous[worker]->get(local);
                   state_previous[worker]->set(local,
-                    i + occurrence.path_offset + 1);
-                  occurrence.value = prior;
+                    batch_base + occurrence.path_offset + 1);
+                  state_values[dense_slot] = prior;
                 }
               }
               catch(...) { state_errors[worker] = std::current_exception(); }
@@ -1807,71 +1858,6 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
             if(stats != nullptr)
             {
               stats->state_rank_seconds += readTimer() - stage_start;
-            }
-
-            std::fill(state_errors.begin(), state_errors.end(),
-              std::exception_ptr());
-            stage_start = readTimer();
-#pragma omp parallel for num_threads(state_workers) schedule(static, 1)
-            for(std::int64_t item = 0;
-                item < static_cast<std::int64_t>(state_workers); item++)
-            {
-              const size_type worker = static_cast<size_type>(item);
-              try
-              {
-                std::vector<FinalStateStackFrame>& worker_stack =
-                  state_worker_stacks[worker];
-                worker_stack.assign(state_seed.begin(), state_seed.end());
-                size_type replayed = 0;
-                const size_type begin = state_owner_starts[worker];
-                const size_type end = begin + state_owner_counts[worker];
-                for(size_type at = begin; at < end; at++)
-                {
-                  FinalStateOccurrence& occurrence = state_occurrences[at];
-                  while(replayed <= occurrence.path_offset)
-                  {
-                    const size_type path = i + replayed;
-                    const size_type depth = state_lcp[replayed] +
-                      (path > 0 ? 1 : 0);
-                    advanceFinalStateStack(worker_stack, path, depth);
-                    replayed++;
-                  }
-                  occurrence.value = (occurrence.value == 0 ?
-                    NO_FINAL_REDUNDANCY :
-                    finalStateRedundancySlot(worker_stack, occurrence.value));
-                }
-                // Reuse the dispatch cursor after all records have been placed.
-                state_owner_cursors[worker] = replayed;
-              }
-              catch(...) { state_errors[worker] = std::current_exception(); }
-            }
-            for(const std::exception_ptr& error : state_errors)
-            {
-              if(error) { std::rethrow_exception(error); }
-            }
-            size_type batch_redundancies = 0, replayed_paths = 0;
-            for(size_type worker = 0; worker < state_workers; worker++)
-            {
-              replayed_paths += state_owner_cursors[worker];
-              const size_type begin = state_owner_starts[worker];
-              const size_type end = begin + state_owner_counts[worker];
-              for(size_type at = begin; at < end; at++)
-              {
-                if(state_occurrences[at].value != NO_FINAL_REDUNDANCY)
-                {
-                  output.redundancy(state_occurrences[at].value);
-                  batch_redundancies++;
-                }
-              }
-            }
-            if(stats != nullptr)
-            {
-              stats->state_query_seconds += readTimer() - stage_start;
-              stats->state_batches++;
-              stats->state_paths += state_planned_paths;
-              stats->state_ranks += state_record_count;
-              stats->state_redundancies += batch_redundancies;
-              stats->state_replayed_lcp_paths += replayed_paths;
             }
             state_batch_planned = true;
           }
@@ -1951,6 +1937,36 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
           }
           output.occurrence(i, curr_from_size - 1);
 
+          // Capture each chunk's canonical incoming stack in the ordered pass
+          // that already visits this path. The snapshot is taken before the
+          // chunk's first LCP update, so replay performs each planned path once.
+          if(state_batch_planned && state_next_seed < state_chunk_count &&
+             batch_offset == state_chunk_starts[state_next_seed])
+          {
+            const double seed_start = readTimer();
+            if(stack_size > distinct_lcp_values)
+            {
+              throw std::runtime_error(
+                "GCSA::GCSA(): experimental final-state seed exceeds its arena");
+            }
+            state_chunk_seed_sizes[state_next_seed] = stack_size;
+            const size_type seed_offset =
+              state_next_seed * distinct_lcp_values;
+            for(size_type frame = 0; frame < stack_size; frame++)
+            {
+              state_chunk_seeds[seed_offset + frame] = {
+                stack.get(3 * frame), stack.get(3 * frame + 1),
+                stack.get(3 * frame + 2)
+              };
+            }
+            state_batch_seed_frames += stack_size;
+            state_next_seed++;
+            if(stats != nullptr)
+            {
+              stats->state_seed_seconds += readTimer() - seed_start;
+            }
+          }
+
           size_type curr_lcp = 0;
           if(state_batch_planned)
           {
@@ -2026,8 +2042,9 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
             batch_offset < state_planned_paths;
           if(occurrence_planned)
           {
-            // Rank state and redundancy events were completed by the bounded
-            // planner. The ordered consumer still owns every other event.
+            // Rank state was completed before ordered consumption. The
+            // redundancy query follows the ordered pass using this chunk's
+            // exact incoming stack; every other event remains ordered here.
           }
           else if(predecessor_batch_capacity > 0 &&
                   !(predecessor_work[batch_offset].from_spilled))
@@ -2149,6 +2166,106 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
             output.sampleEnd();
           }
           if(predecessor_batch_capacity == 0) { reader[0].advance(); }
+        }
+
+        if(state_batch_planned)
+        {
+          if(state_next_seed != state_chunk_count)
+          {
+            throw std::runtime_error(
+              "GCSA::GCSA(): experimental final-state seed coverage mismatch");
+          }
+          std::fill(state_errors.begin(), state_errors.end(),
+            std::exception_ptr());
+          double stage_start = readTimer();
+#pragma omp parallel for num_threads(state_workers) schedule(static, 1)
+          for(std::int64_t item = 0;
+              item < static_cast<std::int64_t>(state_chunk_count); item++)
+          {
+            const size_type worker = static_cast<size_type>(item);
+            try
+            {
+              std::vector<FinalStateStackFrame>& worker_stack =
+                state_worker_stacks[worker];
+              const size_type seed_offset = worker * distinct_lcp_values;
+              const size_type seed_size = state_chunk_seed_sizes[worker];
+              worker_stack.assign(state_chunk_seeds.begin() + seed_offset,
+                state_chunk_seeds.begin() + seed_offset + seed_size);
+              const size_type begin = state_chunk_starts[worker];
+              const size_type end = state_chunk_starts[worker + 1];
+              size_type replayed = 0;
+              for(size_type offset = begin; offset < end; offset++)
+              {
+                const size_type path = batch_base + offset;
+                const size_type depth = state_lcp[offset] +
+                  (path > 0 ? 1 : 0);
+                advanceFinalStateStack(worker_stack, path, depth);
+                replayed++;
+                const size_type dense_begin = state_path_offsets[offset];
+                const size_type dense_end = state_path_offsets[offset + 1];
+                for(size_type dense = dense_begin; dense < dense_end; dense++)
+                {
+                  const size_type prior = state_values[dense];
+                  state_values[dense] = (prior == 0 ? NO_FINAL_REDUNDANCY :
+                    finalStateRedundancySlot(worker_stack, prior));
+                }
+              }
+              // Rank dispatch no longer needs its cursor after the barrier.
+              state_owner_cursors[worker] = replayed;
+            }
+            catch(...) { state_errors[worker] = std::current_exception(); }
+          }
+          for(const std::exception_ptr& error : state_errors)
+          {
+            if(error) { std::rethrow_exception(error); }
+          }
+          size_type replayed_paths = 0;
+          for(size_type worker = 0; worker < state_chunk_count; worker++)
+          {
+            if(state_owner_cursors[worker] >
+               std::numeric_limits<size_type>::max() - replayed_paths)
+            {
+              throw std::runtime_error(
+                "GCSA::GCSA(): experimental final-state replay count overflows");
+            }
+            replayed_paths += state_owner_cursors[worker];
+          }
+          if(replayed_paths > state_planned_paths)
+          {
+            throw std::runtime_error(
+              "GCSA::GCSA(): experimental final-state worker replay exceeds planned paths");
+          }
+          if(replayed_paths != state_planned_paths)
+          {
+            throw std::runtime_error(
+              "GCSA::GCSA(): experimental final-state worker replay coverage mismatch");
+          }
+          if(stats != nullptr)
+          {
+            stats->state_query_seconds += readTimer() - stage_start;
+          }
+
+          stage_start = readTimer();
+          size_type batch_redundancies = 0;
+          for(size_type dense = 0; dense < state_record_count; dense++)
+          {
+            if(state_values[dense] != NO_FINAL_REDUNDANCY)
+            {
+              output.redundancy(state_values[dense]);
+              batch_redundancies++;
+            }
+          }
+          if(stats != nullptr)
+          {
+            stats->state_emit_seconds += readTimer() - stage_start;
+            stats->state_batches++;
+            stats->state_chunks += state_chunk_count;
+            stats->state_paths += state_planned_paths;
+            stats->state_ranks += state_record_count;
+            stats->state_redundancies += batch_redundancies;
+            stats->state_replayed_lcp_paths += replayed_paths;
+            stats->state_seed_frames += state_batch_seed_frames;
+          }
         }
       }
       predecessor_source.close();
@@ -2471,16 +2588,23 @@ reportFinalEventStats(const FinalEventMetadata& event_metadata,
         std::cerr << std::endl;
         std::cerr << "GCSA::GCSA(): experimental final-state LCP replay: "
                   << event_stats.state_replayed_lcp_paths
-                  << " worker-path updates plus " << event_stats.state_paths
-                  << " ordered planned-path updates" << std::endl;
+                  << " worker-path updates for " << event_stats.state_paths
+                  << " planned paths plus " << event_stats.state_paths
+                  << " ordered path updates; "
+                  << event_stats.state_seed_frames << " seed frame(s) across "
+                  << event_stats.state_chunks << " chunk(s)" << std::endl;
         const std::ios::fmtflags old_flags = std::cerr.flags();
         const std::streamsize old_precision = std::cerr.precision();
         std::cerr << std::fixed << std::setprecision(6)
-                  << "GCSA::GCSA(): experimental final-state timings: seed+lcp "
-                  << event_stats.state_seed_seconds << " s, dispatch "
+                  << "GCSA::GCSA(): experimental final-state timings: lcp-read "
+                  << event_stats.state_lcp_read_seconds
+                  << " s, seed-snapshot " << event_stats.state_seed_seconds
+                  << " s, dispatch "
                   << event_stats.state_dispatch_seconds << " s, rank-state "
-                  << event_stats.state_rank_seconds << " s, stack-query+emit "
-                  << event_stats.state_query_seconds << " s" << std::endl;
+                  << event_stats.state_rank_seconds << " s, chunk-query "
+                  << event_stats.state_query_seconds
+                  << " s, redundancy-emit " << event_stats.state_emit_seconds
+                  << " s" << std::endl;
         std::cerr.flags(old_flags); std::cerr.precision(old_precision);
       }
     }

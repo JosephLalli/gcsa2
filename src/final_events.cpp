@@ -75,6 +75,74 @@ finalStateRedundancySlot(const std::vector<FinalStateStackFrame>& stack,
   return frame->first_time - 1;
 }
 
+size_type
+planFinalStateChunks(const size_type* occurrence_offsets,
+  size_type paths, size_type workers, size_type* starts)
+{
+  if(paths == 0)
+  {
+    if(starts != nullptr) { starts[0] = 0; }
+    return 0;
+  }
+  if(occurrence_offsets == nullptr || starts == nullptr || workers == 0)
+  {
+    throw std::invalid_argument(
+      "planFinalStateChunks(): invalid occurrence offsets or worker count");
+  }
+  if(occurrence_offsets[0] != 0)
+  {
+    throw std::invalid_argument(
+      "planFinalStateChunks(): occurrence offsets must start at zero");
+  }
+  for(size_type path = 0; path < paths; path++)
+  {
+    if(occurrence_offsets[path + 1] < occurrence_offsets[path])
+    {
+      throw std::invalid_argument(
+        "planFinalStateChunks(): occurrence offsets are not monotone");
+    }
+  }
+  if(occurrence_offsets[paths] >
+     std::numeric_limits<size_type>::max() - paths)
+  {
+    throw std::overflow_error(
+      "planFinalStateChunks(): path and occurrence work overflows");
+  }
+
+  const size_type chunks = std::min(paths, workers);
+  starts[0] = 0;
+  size_type begin = 0;
+  size_type remaining_weight = paths + occurrence_offsets[paths];
+  for(size_type chunk = 0; chunk + 1 < chunks; chunk++)
+  {
+    const size_type remaining_chunks = chunks - chunk;
+    const size_type target = remaining_weight / remaining_chunks +
+      (remaining_weight % remaining_chunks != 0 ? 1 : 0);
+    const size_type maximum_end = paths - (remaining_chunks - 1);
+    size_type end = begin, weight = 0;
+    do
+    {
+      const size_type occurrence_weight =
+        occurrence_offsets[end + 1] - occurrence_offsets[end];
+      if(occurrence_weight == std::numeric_limits<size_type>::max() ||
+         weight > std::numeric_limits<size_type>::max() -
+           (occurrence_weight + 1))
+      {
+        throw std::overflow_error(
+          "planFinalStateChunks(): chunk work overflows");
+      }
+      weight += occurrence_weight + 1;
+      end++;
+    }
+    while(end < maximum_end && weight < target);
+    starts[chunk + 1] = end;
+    remaining_weight -= weight;
+    begin = end;
+  }
+  starts[chunks] = paths;
+  return chunks;
+}
+
 namespace
 {
 

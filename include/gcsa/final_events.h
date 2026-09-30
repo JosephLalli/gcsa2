@@ -122,6 +122,15 @@ size_type finalStateRedundancySlot(
   const std::vector<FinalStateStackFrame>& stack, size_type previous_time);
 
 /*
+  Split a path-ordered occurrence prefix into at most workers contiguous
+  chunks. occurrence_offsets has paths + 1 monotone entries and gives the
+  dense occurrence range of each path. The returned chunk count is zero only
+  when paths is zero; starts[0..result] then delimit every path exactly once.
+*/
+size_type planFinalStateChunks(const size_type* occurrence_offsets,
+  size_type paths, size_type workers, size_type* starts);
+
+/*
   Incremental checksums for streams written directly by FinalEventWriter.
   Redundancy is omitted because its order changes in the subsequent external
   sort, and metadata is small enough that avoiding its checksum scan is not
