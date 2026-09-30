@@ -506,6 +506,24 @@ main()
   require(readFile(legacy_prefix + LCPArray::EXTENSION) ==
     readFile(fallback_prefix + LCPArray::EXTENSION));
 
+  // The original tiny budget, 64 KiB above the external minimum: with four
+  // threads every parallel stage is requested and must decline to its serial
+  // route, and the indexes must still match the legacy route byte for byte.
+  const std::string tiny_root = makeTempRoot("gcsa-resume-tiny");
+  const std::string tiny_prefix = tiny_root + "/index";
+  TempFile::setDirectory(tiny_root);
+  {
+    ConstructionParameters parameters = externalParameters(tiny_root,
+      external_minimum + 64 * KILOBYTE);
+    InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
+    GCSA::buildAndStore(graph, parameters, tiny_prefix + GCSA::EXTENSION);
+    LCPArray::buildAndStore(graph, parameters, tiny_prefix + LCPArray::EXTENSION);
+  }
+  require(readFile(legacy_prefix + GCSA::EXTENSION) ==
+    readFile(tiny_prefix + GCSA::EXTENSION));
+  require(readFile(legacy_prefix + LCPArray::EXTENSION) ==
+    readFile(tiny_prefix + LCPArray::EXTENSION));
+
   omp_set_num_threads(1);
   TempFile::setDirectory(workspace_root);
 
@@ -612,5 +630,6 @@ main()
   std::filesystem::remove_all(parallel_root);
   std::filesystem::remove_all(fallback_root);
   std::filesystem::remove_all(empty_root);
+  std::filesystem::remove_all(tiny_root);
   return 0;
 }
