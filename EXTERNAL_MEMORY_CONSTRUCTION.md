@@ -1126,7 +1126,37 @@ application reads against 185 GB from the device). On a 97 MB synthetic graph
 the median whole build fell from 0:01:45.0 to 0:00:57.7 with direct writes and
 identical output; read-ahead alone showed no consistent effect. No controlled
 chromosome-scale timing exists yet; a chr18 merge-write comparison is recorded
-under `chr18_iteration_20261001/` in the evidence root.
+under `chr18_iteration_20261001/` in the evidence root: on chr18 alone the merge took
+0:06:31.3 buffered (15 of 195 build-thread samples in the dirty-page throttle) against 0:05:35.7
+direct (none of 168), one run each, with byte-identical final-events checkpoints.
+
+### Prefix-depth prune partitions and stitching (2026-10-01, experimental)
+
+The parallel prune splits its input where the first key character changes, so it has at most
+seven partitions. `GCSA_EXPERIMENTAL_PRUNE_SPLIT_DEPTH=d` (`d958a7d`) splits wherever adjacent keys
+share fewer than `d` characters. Every comparison inside such a partition shares at least `d`
+characters, so a merged group can cross a split only through the partition's first range, and
+only if that range merged the whole partition. `d958a7d` fell back to the serial prune whenever
+that happened, and on chr18 at depths 3 and 4 it always did.
+
+That rule is necessary but not sufficient. `extendRange()` carries the range into the next
+partition only if (a) the LCP across the right split exceeds the LCP across the left split, which
+is the range's left LCP, and (b) every partition below that right LCP is also one merged range
+from the same start node and logical file; otherwise it stops at the first group that fails.
+`4bf5201` tests (a) and (b) exactly. On chr18 at depth 3, eight of 143 partitions were one merged
+range; seven failed (a) or (b), and one crossed: the end-marker root. All 26,623 keys beginning
+with `#` start at the graph's end node, so the serial merge collapses every subtree under `#`, and
+any deeper split inside `#` cuts a merged group.
+
+`0d6443e` replaces that fallback with stitching: the crossed span (the open partition through the
+last partition below the right LCP) is pruned again on one thread as one partition, and the check
+repeats until nothing crosses. On chr18 that span is the `#` root. A node whose label interval
+reaches past a split still sends the step to the serial prune; that trigger is possible from step
+2 on, when merged nodes carry label intervals, and is untested at depth greater than 1. Equal-label
+records from different shards may leave the parallel prune in a different order than the serial
+pass; the final index's insensitivity to that order is shown at depth 1 (byte-identical joint
+index) and is what the chr18 full-build comparison in `chr18_iteration_20261001/split_identity/`
+tests at depth 3.
 
 ## Build, test, and usage
 
