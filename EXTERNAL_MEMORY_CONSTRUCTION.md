@@ -1160,12 +1160,15 @@ index) and at depth 3: with `2144b0e`, which also stitches spans that a merged n
 crosses (the step 2 to 4 trigger), full chr18 builds at depth 1 and 3 are byte-identical (`.gcsa`
 MD5 `02b0b8c0b3f55ab875421a22abdb047d`) with no serial fallback at any step. The depth-3 build was
 slower, 0:54:09 against 0:43:26: its step 2 to 4 prunes took 332.8 to 469.3 s on 9 to 11 workers
-against 74.0 to 91.4 s on 7, with one output shard per partition (131) and framed-shard admission
-held to the 128-file ceiling. Depth 1 remains the default. In the unit fixture a stitched span's records match the serial
+against 74.0 to 91.4 s on 7. The extend after each prune re-partitions the data (the same join
+partition counts at both depths), so the cause is inside the prune; per-partition merger setup over
+every input shard, with framed-shard admission held to the 128-file ceiling, is the unmeasured
+candidate. Depth 1 remains the default. In the unit fixture a stitched span's records match the serial
 pass as a multiset per label but not in order: four unsorted records with one label from two start
 nodes leave in a different order, because a stitched span starts a fresh merge heap. The test
-compares per-label multisets for that reason; the chr18 full builds show that order does not reach
-the final index there.
+compares per-label multisets for that reason. Whether such reordering occurred in the chr18 builds
+was not checked, so their identical indexes do not by themselves establish that the index is
+insensitive to it.
 
 ## Build, test, and usage
 
