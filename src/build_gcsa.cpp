@@ -111,8 +111,9 @@ main(int argc, char** argv)
     std::cerr << "      --join-partition-size SIZE maximum join working set (default 25% of memory goal)" << std::endl;
     std::cerr << "      --merge-fan-in N           maximum merge inputs" << std::endl;
     std::cerr << "      --max-open-files N         construction descriptor ceiling" << std::endl;
-    std::cerr << "      --concurrent-open-files N  descriptors raw-shard prune workers may share" << std::endl;
-    std::cerr << "                                 (default: the process limit less the ceiling)" << std::endl;
+    std::cerr << "      --concurrent-open-files N  descriptors concurrent prune, compaction and planning" << std::endl;
+    std::cerr << "                                 workers may share (default: the process limit less" << std::endl;
+    std::cerr << "                                 the ceiling)" << std::endl;
     std::cerr << "      --process-workers N        parallel external join worker processes" << std::endl;
     std::cerr << "      --temp-compression MODE    auto, none, or zstd (default auto)" << std::endl;
     std::cerr << "      --compression-block-size S independent compressed block size (default 16M)" << std::endl;
@@ -312,7 +313,7 @@ main(int argc, char** argv)
       printHeader("Join worker processes", INDENT);
       std::cout << parameters.getProcessWorkers() << std::endl;
       printHeader("Open-file ceiling", INDENT);
-      std::cout << parameters.getMaxOpenFiles() << " (concurrent prune workers: "
+      std::cout << parameters.getMaxOpenFiles() << " (concurrent workers: "
                 << parameters.getConcurrentOpenFiles() << ")" << std::endl;
       printHeader("Temp compression", INDENT);
       std::cout << tempCompressionName(parameters.getTempCompression()) << std::endl;

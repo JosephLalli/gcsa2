@@ -146,10 +146,11 @@ struct ConstructionParameters
   bool joinPartitionSizeIsAutomatic() const { return this->join_partition_size == 0; }
   size_type getMergeFanIn() const { return this->merge_fan_in; }
   size_type getMaxOpenFiles() const { return this->max_open_files; }
-  // Descriptors that concurrent prune workers holding raw shards may share.
-  // The max-open-files ceiling still sizes every merge and every other stage;
-  // this budget only admits workers. Zero derives it from the process's soft
-  // open-file limit less that ceiling, and it never falls below the ceiling.
+  // Descriptors that concurrent workers holding their files open may share:
+  // prune workers over raw shards, compaction batches and join-range planners.
+  // The max-open-files ceiling still sizes every merge; this budget only
+  // admits workers. Zero derives it from the process's soft open-file limit
+  // less that ceiling, and it never falls below the ceiling.
   size_type getConcurrentOpenFiles() const;
   size_type getProcessWorkers() const { return this->process_workers; }
   const std::string& getWorkerExecutable() const { return this->worker_executable; }
