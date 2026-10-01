@@ -4563,9 +4563,10 @@ compactLogicalJoinShards(PathGraph& source, size_type size_limit,
     // A running batch keeps two descriptors per input pair and up to four for
     // its output pair (a compressed writer keeps an index stream beside each
     // payload): the 2w + 4 the serial route fits one batch within. Batches
-    // running together share the ceiling instead of each claiming all of it.
+    // running together share the concurrent budget, which is never below the
+    // ceiling; the ceiling alone still sets w.
     const size_type by_descriptors = std::max(static_cast<size_type>(1),
-      parameters.getMaxOpenFiles() / (2 * batch_width + 4));
+      parameters.getConcurrentOpenFiles() / (2 * batch_width + 4));
     return std::min({ merges, thread_limit, by_memory, by_descriptors });
   };
   size_type merged_batches = 0, max_concurrency = 0;
@@ -5740,8 +5741,11 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
       const size_type planner_bytes = std::max(static_cast<size_type>(1),
         saturatingPlanAdd(saturatingPlanAdd(JOIN_PLAN_RUNTIME_OVERHEAD, planner_codec_bytes),
           saturatingPlanMultiply(4, joinPlanSerializedLimit(memory_budget, planner_codec_bytes))));
+      // Its six readers and the descriptor that commits its plan come out of
+      // the concurrent budget, as compaction batches do.
       const size_type planners = std::max(static_cast<size_type>(1),
-        std::min(std::min(jobs.size(), thread_limit), memory_budget / planner_bytes));
+        std::min({ jobs.size(), thread_limit, memory_budget / planner_bytes,
+          parameters.getConcurrentOpenFiles() / 8 }));
       std::vector<ExternalPathJoinStats> plan_stats(jobs.size());
       std::vector<std::exception_ptr> plan_errors(jobs.size());
       std::atomic<size_type> next_job(0);

@@ -839,11 +839,11 @@ int main(int argc, char** argv)
     }
   }
 
-  // Concurrent batches share the descriptor ceiling instead of each claiming
+  // Concurrent batches share the descriptor budget instead of each claiming
   // all of it. A transient user service runs with a soft limit of 1,024
   // descriptors, which unbounded 64-thread compaction of the joint chr2+chr18
-  // build exhausted; here the process limit sits exactly at the ceiling above
-  // the descriptors already open.
+  // build exhausted; here the budget equals the ceiling, and the process limit
+  // sits exactly that far above the descriptors already open.
   {
     ConstructionParameters limited_parameters;
     limited_parameters.setMemoryLimitBytes(2 * GIGABYTE);
@@ -851,26 +851,31 @@ int main(int argc, char** argv)
     limited_parameters.setCompressionBlockSize(KILOBYTE);
     limited_parameters.setMaxOpenFiles(ConstructionParameters::MIN_OPEN_FILES);
     const size_type max_open = limited_parameters.getMaxOpenFiles();
+    limited_parameters.setConcurrentOpenFiles(max_open);
     const size_type logical_inputs = 2, records = 50;
     const size_type target = pathMergeInputPairs(max_open, logical_inputs) / logical_inputs;
     const size_type shards = 4 * target + 1, width = (shards + target - 1) / target;
-    PathGraph graph(0, 2, 1);
-    for(size_type logical = 0; logical < logical_inputs; logical++)
+    auto build_limited = [&](PathGraph& target_graph, const std::string& tag)
     {
-      for(size_type shard = 0; shard < shards; shard++)
+      for(size_type logical = 0; logical < logical_inputs; logical++)
       {
-        const std::string name = base + ".limited." + std::to_string(logical) + "." + std::to_string(shard);
-        std::vector<TestRecord> shard_records;
-        for(size_type i = 0; i < records; i++)
+        for(size_type shard = 0; shard < shards; shard++)
         {
-          shard_records.push_back({ i + 1, i + 2, static_cast<byte_type>(1),
-            static_cast<PathNode::rank_type>((i * shards + shard) * logical_inputs + logical + 1), false });
+          const std::string name = base + ".limited." + tag + "." + std::to_string(logical) + "." + std::to_string(shard);
+          std::vector<TestRecord> shard_records;
+          for(size_type i = 0; i < records; i++)
+          {
+            shard_records.push_back({ i + 1, i + 2, static_cast<byte_type>(1),
+              static_cast<PathNode::rank_type>((i * shards + shard) * logical_inputs + logical + 1), false });
+          }
+          writePathPair(name + ".path", name + ".rank", shard_records);
+          appendShard(target_graph, name + ".path", name + ".rank",
+            logical_file_id_t(logical), physical_shard_id_t(logical * shards + shard));
         }
-        writePathPair(name + ".path", name + ".rank", shard_records);
-        appendShard(graph, name + ".path", name + ".rank",
-          logical_file_id_t(logical), physical_shard_id_t(logical * shards + shard));
       }
-    }
+    };
+    PathGraph graph(0, 2, 1);
+    build_limited(graph, "ceiling");
     ExternalPathJoinStats stats;
     size_type committed = 0;
     MemoryBudget memory(limited_parameters.getMemoryLimitBytes(),
@@ -897,6 +902,30 @@ int main(int argc, char** argv)
     require(graph.files() <= target * logical_inputs);
     require(graph.path_count == logical_inputs * shards * records);
     require(labelSorted(graph));
+
+    // A larger concurrent budget runs more of the same batches at once and
+    // leaves their width, and so the published frontier, unchanged.
+    limited_parameters.setConcurrentOpenFiles(1024);
+    PathGraph budgeted(0, 2, 1);
+    build_limited(budgeted, "budgeted");
+    ExternalPathJoinStats budgeted_stats;
+    size_type budgeted_committed = 0;
+    MemoryBudget budgeted_memory(limited_parameters.getMemoryLimitBytes(),
+      limited_parameters.getMemoryLimitBytes() / 16);
+    omp_set_num_threads(8);
+    compactLogicalJoinShards(budgeted, GIGABYTE, limited_parameters,
+      std::min(limited_parameters.getMergeFanIn(), max_open - 1), budgeted_memory,
+      budgeted_committed, &budgeted_stats);
+    omp_set_num_threads(1);
+    require(budgeted_stats.compaction_batches == stats.compaction_batches);
+    require(budgeted_stats.compaction_concurrency > stats.compaction_concurrency);
+    require(budgeted.files() == graph.files());
+    require(budgeted.path_count == graph.path_count);
+    for(size_type file = 0; file < graph.files(); file++)
+    {
+      require(budgeted.path_counts[file] == graph.path_counts[file]);
+      require(budgeted.rank_counts[file] == graph.rank_counts[file]);
+    }
   }
 
   // Key-range distribution. A logical input of at least 2 x 65,536 paths is
