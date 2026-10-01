@@ -10,6 +10,7 @@
 #include <array>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <fcntl.h>
@@ -3525,7 +3526,8 @@ reservePruneOutput(std::atomic<size_type>& used, size_type bytes,
 */
 bool
 pruneRootPartitions(const LCP& lcp,
-  std::vector<std::pair<PathNode::rank_type, PathNode::rank_type>>& ranges)
+  std::vector<std::pair<PathNode::rank_type, PathNode::rank_type>>& ranges,
+  size_type depth)
 {
   ranges.clear();
   if(lcp.total_keys < 2 || lcp.total_keys >= PathLabel::NO_RANK ||
@@ -3534,19 +3536,20 @@ pruneRootPartitions(const LCP& lcp,
     return false;
   }
 
-  const LCP::rank_type zero = 0;
-  size_type zero_count = lcp.kmer_lcp.rank(lcp.total_keys, zero);
-  std::vector<size_type> boundaries;
-  boundaries.reserve(zero_count + 1); boundaries.push_back(0);
-  for(size_type occurrence = 1; occurrence <= zero_count; occurrence++)
+  // Split wherever adjacent keys share fewer than depth leading characters.
+  std::vector<size_type> boundaries; boundaries.push_back(0);
+  for(size_type value = 0; value < depth; value++)
   {
-    size_type boundary = lcp.kmer_lcp.select(occurrence, zero);
-    if(boundary > 0 && boundary < lcp.total_keys)
+    const LCP::rank_type shared = value;
+    size_type count = lcp.kmer_lcp.rank(lcp.total_keys, shared);
+    for(size_type occurrence = 1; occurrence <= count; occurrence++)
     {
-      boundaries.push_back(boundary);
+      size_type boundary = lcp.kmer_lcp.select(occurrence, shared);
+      if(boundary > 0 && boundary < lcp.total_keys) { boundaries.push_back(boundary); }
     }
   }
   boundaries.push_back(lcp.total_keys);
+  std::sort(boundaries.begin(), boundaries.end());
   boundaries.erase(std::unique(boundaries.begin(), boundaries.end()),
     boundaries.end());
   if(boundaries.size() < 3) { return false; }
@@ -3554,7 +3557,7 @@ pruneRootPartitions(const LCP& lcp,
   for(size_type i = 1; i < boundaries.size(); i++)
   {
     if(boundaries[i] <= boundaries[i - 1] ||
-       (i + 1 < boundaries.size() && lcp.kmer_lcp[boundaries[i]] != 0))
+       (i + 1 < boundaries.size() && lcp.kmer_lcp[boundaries[i]] >= depth))
     {
       ranges.clear(); return false;
     }
@@ -3563,6 +3566,18 @@ pruneRootPartitions(const LCP& lcp,
       static_cast<PathNode::rank_type>(boundaries[i])));
   }
   return (ranges.size() > 1);
+}
+
+// Experimental: split prune partitions where adjacent keys share fewer than
+// this many leading characters. 1, the default, splits only where the first
+// character changes, the zero-LCP boundaries no group can cross.
+size_type
+pruneSplitDepth()
+{
+  const char* value = std::getenv("GCSA_EXPERIMENTAL_PRUNE_SPLIT_DEPTH");
+  if(value == nullptr || *value == '\0') { return 1; }
+  const unsigned long long depth = std::strtoull(value, nullptr, 10);
+  return (depth == 0 ? 1 : static_cast<size_type>(std::min<unsigned long long>(depth, 16)));
 }
 
 void
@@ -3598,7 +3613,8 @@ prunePathRange(const PathGraph& source, const LCP& lcp,
   PathGraphBuilder& builder, PathGraphMergeStats* stats,
   std::atomic<size_type>* output_bytes, size_type size_limit,
   std::atomic<bool>* cancelled, PriorityNode* first_output,
-  PriorityNode* last_output, bool* has_output, ProgressReporter* progress)
+  PriorityNode* last_output, bool* has_output, ProgressReporter* progress,
+  bool* first_range_open = nullptr)
 {
   PathGraphMerger merger(source, lcp, group_buffer_bytes, stats, input_pairs,
     input_cache_bytes, lower_rank, upper_rank,
@@ -3646,6 +3662,13 @@ prunePathRange(const PathGraph& source, const LCP& lcp,
       if(same_from.same_file)
       {
         range = merger.extendRange(same_from);
+        // Only a first range that merged its whole partition could have
+        // continued into the next one; the caller decides whether it might.
+        if(first_range_open != nullptr && range.first == 0 &&
+           range.second + 1 == merger.size())
+        {
+          *first_range_open = true;
+        }
         merger.mergePathNodes();
         write_output(merger.buffer.get(range.second));
         builder.graph.unique++;
@@ -3730,10 +3753,10 @@ struct PrunePartition
   std::unique_ptr<PathGraph> graph;
   PathGraphMergeStats stats;
   PriorityNode first_output, last_output;
-  bool has_output;
+  bool has_output, first_range_open;
 
   PrunePartition() : lower_rank(0), upper_rank(0), graph(), stats(),
-    first_output(), last_output(), has_output(false) { }
+    first_output(), last_output(), has_output(false), first_range_open(false) { }
 };
 
 void
@@ -3750,7 +3773,8 @@ buildPrunePartition(PrunePartition& result, const PathGraph& source,
   prunePathRange<false>(source, lcp, result.lower_rank, result.upper_rank,
     group_buffer_bytes, input_cache_bytes, input_pairs, layout, builder,
     &(result.stats), &output_bytes, size_limit, &cancelled,
-    &(result.first_output), &(result.last_output), &(result.has_output), nullptr);
+    &(result.first_output), &(result.last_output), &(result.has_output), nullptr,
+    &(result.first_range_open));
   builder.close();
 
   // Retain only the lightweight graph metadata between tasks. In particular,
@@ -3779,7 +3803,8 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
 {
   std::vector<std::pair<PathNode::rank_type, PathNode::rank_type>> ranges;
   if(requested_workers < 2 || source.size() == 0 || layout.logical.empty()) { return false; }
-  if(!pruneRootPartitions(lcp, ranges))
+  const size_type split_depth = pruneSplitDepth();
+  if(!pruneRootPartitions(lcp, ranges, split_depth))
   {
     return declineParallel(fallback_reason, "no zero-LCP root partitions");
   }
@@ -3952,9 +3977,31 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   // that spans a planned root split cannot be published as independent shards;
   // discard the attempt and let the exact serial route decide the groups.
   const PriorityNode* previous = nullptr;
-  for(const PrunePartition& part : partitions)
+  for(size_type i = 0; i < partitions.size(); i++)
   {
+    const PrunePartition& part = partitions[i];
     if(!part.has_output) { continue; }
+    if(split_depth > 1)
+    {
+      // Neighbors across a deeper split share fewer than split_depth leading
+      // characters, while every comparison inside a partition shares at least
+      // that many. So a group crosses a split only if a node's label interval
+      // reaches past it, or if the partition's first range merged all of the
+      // partition and might continue into the next one.
+      if(part.last_output.node.lastLabel(0, part.last_output.label) >= part.upper_rank)
+      {
+        std::cerr << "PathGraph::prune(): warning: a label range reaches past a prefix split; "
+                  << "pruning this step serially" << std::endl;
+        return declineParallel(fallback_reason, "a label range reaches past a prefix split");
+      }
+      if(part.first_range_open && i + 1 < partitions.size())
+      {
+        std::cerr << "PathGraph::prune(): warning: a merged range may continue past a prefix split; "
+                  << "pruning this step serially" << std::endl;
+        return declineParallel(fallback_reason, "a merged range may continue past a prefix split");
+      }
+      continue;
+    }
     if(previous != nullptr &&
        lcp.max_lcp(previous->node, part.first_output.node,
          previous->label, part.first_output.label) != range_type(0, 0))

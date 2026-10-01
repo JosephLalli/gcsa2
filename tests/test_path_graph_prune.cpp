@@ -207,10 +207,11 @@ static void write_parallel_prune_pair(const std::string& path_name,
 
 static void initialize_parallel_prune_graph(PathGraph& graph,
   const std::string& base, PruneFixtureStorage storage, bool corrupt = false,
-  bool invalid_tail_rank = false)
+  bool invalid_tail_rank = false,
+  const std::vector<std::vector<PruneFixtureRecord>>* fixture = nullptr)
 {
   const std::vector<std::vector<PruneFixtureRecord>> records =
-    parallel_prune_records();
+    (fixture != nullptr ? *fixture : parallel_prune_records());
   const logical_file_id_t logical[3] = {
     logical_file_id_t(7), logical_file_id_t(7), logical_file_id_t(8)
   };
@@ -1050,6 +1051,20 @@ static void compare_parallel_merged_graph(const std::string& base)
   std::remove(input_name.c_str());
 }
 
+static std::vector<std::vector<PruneFixtureRecord>> distinct_start_prune_records()
+{
+  std::vector<std::vector<PruneFixtureRecord>> result(3);
+  for(PathNode::rank_type rank = 0; rank < 8; rank++)
+  {
+    for(size_type i = 0; i < 2; i++)
+    {
+      result[0].push_back({ rank, Node::encode(1000 + 2 * rank, 0), false });
+      result[1].push_back({ rank, Node::encode(1001 + 2 * rank, 0), false });
+    }
+  }
+  return result;
+}
+
 static const char* prune_storage_name(PruneFixtureStorage storage)
 {
   if(storage == FIXTURE_RAW) { return "raw"; }
@@ -1209,6 +1224,76 @@ static void compare_parallel_prune_failure_cleanup(const std::string& root)
   omp_set_num_threads(previous_threads); omp_set_dynamic(previous_dynamic);
 }
 
+// Splitting at three leading characters gives the fixture's eight keys a
+// partition each. Ranks 0/1 share a start node and merge across AAA|AAC, so the
+// parallel attempt must notice and fall back to the exact serial result; with
+// two start nodes per key nothing merges across keys, and eight partitions run
+// and publish the serial records.
+// Partitions start with a fresh merge heap, so records whose labels are equal
+// can leave in a different order than the serial pass emits them; compare those
+// as multisets.
+static std::map<logical_file_id_t, std::vector<LogicalPruneRecord>>
+label_ordered_records(const PathGraph& graph)
+{
+  std::map<logical_file_id_t, std::vector<LogicalPruneRecord>> result = logical_prune_records(graph);
+  for(auto& entry : result)
+  {
+    std::stable_sort(entry.second.begin(), entry.second.end(),
+      [](const LogicalPruneRecord& left, const LogicalPruneRecord& right)
+      {
+        if(left.label != right.label) { return left.label < right.label; }
+        if(left.from != right.from) { return left.from < right.from; }
+        if(left.to != right.to) { return left.to < right.to; }
+        return left.fields < right.fields;
+      });
+  }
+  return result;
+}
+
+static void compare_split_depth_prune(const std::string& root)
+{
+  Alphabet alpha;
+  std::vector<key_type> keys = parallel_prune_keys(alpha);
+  LCP lcp(keys, 3);
+  const size_type group_budget = 4 * KILOBYTE;
+  const size_type cache_budget = 64 * MEGABYTE;
+  int previous_threads = omp_get_max_threads();
+  int previous_dynamic = omp_get_dynamic();
+  omp_set_dynamic(0); omp_set_num_threads(std::max(4, previous_threads));
+  require(::setenv("GCSA_EXPERIMENTAL_PRUNE_SPLIT_DEPTH", "3", 1) == 0);
+  {
+    PathGraph serial(0, 3, 0), parallel(0, 3, 0);
+    initialize_parallel_prune_graph(serial, root + "/split-depth-merging-serial", FIXTURE_RAW);
+    initialize_parallel_prune_graph(parallel, root + "/split-depth-merging-parallel", FIXTURE_RAW);
+    PathGraphMergeStats serial_stats, parallel_stats;
+    serial.prune(lcp, GIGABYTE, group_budget, &serial_stats, 128, cache_budget, 1);
+    parallel.prune(lcp, GIGABYTE, group_budget, &parallel_stats, 128, cache_budget, 4);
+    require(logical_prune_records(serial) == logical_prune_records(parallel));
+    require(parallel.unique == serial.unique && parallel.unsorted == serial.unsorted);
+    require(parallel_stats.prune_parallel_fallbacks == 1);
+    require(parallel_stats.prune_fallback_reason != nullptr &&
+      std::string(parallel_stats.prune_fallback_reason).find("prefix split") != std::string::npos);
+  }
+  {
+    const std::vector<std::vector<PruneFixtureRecord>> records = distinct_start_prune_records();
+    PathGraph serial(0, 3, 0), parallel(0, 3, 0);
+    initialize_parallel_prune_graph(serial, root + "/split-depth-distinct-serial", FIXTURE_RAW,
+      false, false, &records);
+    initialize_parallel_prune_graph(parallel, root + "/split-depth-distinct-parallel", FIXTURE_RAW,
+      false, false, &records);
+    PathGraphMergeStats serial_stats, parallel_stats;
+    serial.prune(lcp, GIGABYTE, group_budget, &serial_stats, 128, cache_budget, 1);
+    parallel.prune(lcp, GIGABYTE, group_budget, &parallel_stats, 128, cache_budget, 4);
+    require(label_ordered_records(serial) == label_ordered_records(parallel));
+    require(parallel.unique == serial.unique && parallel.unsorted == serial.unsorted);
+    require(parallel_stats.prune_parallel_fallbacks == 0);
+    require(parallel_stats.prune_partitions == 8);
+    require(parallel_stats.prune_workers == 4);
+  }
+  require(::unsetenv("GCSA_EXPERIMENTAL_PRUNE_SPLIT_DEPTH") == 0);
+  omp_set_num_threads(previous_threads); omp_set_dynamic(previous_dynamic);
+}
+
 int main()
 {
   const char* configured_tmp = std::getenv("TMPDIR");
@@ -1293,6 +1378,7 @@ int main()
   compare_parallel_prune(root, FIXTURE_RAW);
   compare_parallel_prune(root, FIXTURE_FRAMED);
   compare_parallel_prune(root, FIXTURE_MIXED);
+  compare_split_depth_prune(root);
   compare_parallel_prune_failure_cleanup(root);
   rmdir(root.c_str());
   return 0;
