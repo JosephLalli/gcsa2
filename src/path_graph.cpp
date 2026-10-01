@@ -4003,22 +4003,40 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
     size_type stitches = 0, stitched_partitions = 0, logged = 0;
     while(true)
     {
+      // A node merged in an earlier step carries a label interval. If one
+      // reaches past its partition's split, its neighbors' LCPs depend on keys
+      // in later partitions: stitch through the partition holding its end.
+      size_type stitch_first = 0, stitch_last = 0;
+      bool found = false;
       std::vector<size_type> nonempty;
-      for(size_type i = 0; i < partitions.size(); i++)
+      for(size_type i = 0; !found && i < partitions.size(); i++)
       {
         const PrunePartition& part = partitions[i];
         if(!part.has_output) { continue; }
-        if(part.last_output.node.lastLabel(0, part.last_output.label) >= part.upper_rank)
+        const PathNode::rank_type last = part.last_output.node.lastLabel(0, part.last_output.label);
+        if(last >= part.upper_rank)
         {
-          std::cerr << "PathGraph::prune(): warning: a label range reaches past a prefix split; "
-                    << "pruning this step serially" << std::endl;
-          return declineParallel(fallback_reason, "a label range reaches past a prefix split");
+          size_type j = i + 1;
+          while(j < partitions.size() && partitions[j].upper_rank <= last) { j++; }
+          if(j >= partitions.size())
+          {
+            std::cerr << "PathGraph::prune(): warning: a label range reaches past the last partition; "
+                      << "pruning this step serially" << std::endl;
+            return declineParallel(fallback_reason, "a label range reaches past a prefix split");
+          }
+          found = true; stitch_first = i; stitch_last = j;
+          if(Verbosity::level >= Verbosity::EXTENDED && logged < 32)
+          {
+            logged++;
+            std::cerr << "PathGraph::prune(): partition " << i << " of " << partitions.size()
+                      << " (keys " << part.lower_rank << " to " << part.upper_rank
+                      << "): a label interval reaches key " << last << std::endl;
+          }
+          break;
         }
         nonempty.push_back(i);
       }
 
-      size_type stitch_first = 0, stitch_last = 0;
-      bool found = false;
       for(size_type n = 0; !found && n + 1 < nonempty.size(); n++)
       {
         const size_type i = nonempty[n];
