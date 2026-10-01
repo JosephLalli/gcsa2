@@ -1226,7 +1226,7 @@ static void compare_parallel_prune_failure_cleanup(const std::string& root)
 
 // Splitting at three leading characters gives the fixture's eight keys a
 // partition each. Ranks 0/1 share a start node and merge across AAA|AAC, so the
-// parallel attempt must notice and fall back to the exact serial result; with
+// parallel attempt must notice and stitch those partitions into one span; with
 // two start nodes per key nothing merges across keys, and eight partitions run
 // and publish the serial records.
 // Partitions start with a fresh merge heap, so records whose labels are equal
@@ -1268,7 +1268,7 @@ static void compare_split_depth_prune(const std::string& root)
     PathGraphMergeStats serial_stats, parallel_stats;
     serial.prune(lcp, GIGABYTE, group_budget, &serial_stats, 128, cache_budget, 1);
     parallel.prune(lcp, GIGABYTE, group_budget, &parallel_stats, 128, cache_budget, 4);
-    require(logical_prune_records(serial) == logical_prune_records(parallel));
+    require(label_ordered_records(serial) == label_ordered_records(parallel));
     require(parallel.unique == serial.unique && parallel.unsorted == serial.unsorted);
     // The merge across AAA/AAC is stitched into one partition, not a fallback.
     require(parallel_stats.prune_parallel_fallbacks == 0);
