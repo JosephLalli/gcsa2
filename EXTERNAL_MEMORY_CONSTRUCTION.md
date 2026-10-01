@@ -1144,13 +1144,14 @@ partition only if (a) the LCP across the right split exceeds the LCP across the 
 is the range's left LCP, and (b) every partition below that right LCP is also one merged range
 from the same start node and logical file; otherwise it stops at the first group that fails.
 `4bf5201` tests (a) and (b) exactly. On chr18 at depth 3, eight of 143 partitions were one merged
-range; seven failed (a) or (b), and one crossed: the end-marker root. All 26,623 keys beginning
-with `#` start at the graph's end node, so the serial merge collapses every subtree under `#`, and
-any deeper split inside `#` cuts a merged group.
+range; seven failed (a) or (b), and one crossed, inside the end-marker root. The keys beginning
+`#A`, `#C`, `#G` and `#T` (2,961 on chr18) all start at the end node's last offset, so the serial
+merge collapses each of those subtrees into one group and a depth-3 split inside one cuts it; the
+`##` keys start at other offsets, so the merge stops at each `#X` boundary.
 
 `0d6443e` replaces that fallback with stitching: the crossed span (the open partition through the
 last partition below the right LCP) is pruned again on one thread as one partition, and the check
-repeats until nothing crosses. On chr18 that span is the `#` root. A node whose label interval
+repeats until nothing crosses. On chr18 at depth 3 that is four stitches, one per `#X` subtree. A node whose label interval
 reaches past a split still sends the step to the serial prune; that trigger is possible from step
 2 on, when merged nodes carry label intervals, and is untested at depth greater than 1. Equal-label
 records from different shards may leave the parallel prune in a different order than the serial

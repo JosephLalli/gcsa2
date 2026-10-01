@@ -3987,8 +3987,8 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
     // because extendRange() stops at the first group that fails either test.
     // Such a span is one group in the serial pass, so prune it again as one
     // partition (stitch it) and repeat until no merged range crosses a split.
-    // Every key below the end marker '#' starts at the graph's end node, so
-    // the '#' root is always stitched back together this way.
+    // The keys below '#A', '#C', '#G' and '#T' all start at the end node's
+    // last offset, so a split inside one of those subtrees is always stitched.
     auto split_lcp = [&](size_type left, size_type right) -> range_type
     {
       return lcp.max_lcp(partitions[left].last_output.node, partitions[right].first_output.node,
