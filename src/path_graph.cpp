@@ -2642,6 +2642,9 @@ struct PathGraphInputCache
   // When every shard pair fits, open all pooled readers before consuming the
   // first heap head. Their deferred block-0 jobs then form large, independent
   // preads instead of a constructor-time sequence of read/decode stalls.
+  // A cache shared by consecutive mergers reports into the current one.
+  void setStats(PathGraphMergeStats* merge_stats) { this->stats = merge_stats; }
+
   void prime()
   {
     if(!(this->prefetch_pool) || this->max_pairs < this->graph.files()) { return; }
@@ -2955,7 +2958,10 @@ struct PathGraphMerger
   SpillableGroup<PriorityNode>                  buffer;
 
   // Input cache and priority queue.
-  PathGraphInputCache                           input_files;
+  // A merger owns its cache unless the caller lends one that outlives it, so
+  // consecutive partitions on one worker reuse decoded blocks.
+  std::unique_ptr<PathGraphInputCache>          owned_input;
+  PathGraphInputCache&                          input_files;
   std::vector<size_type>                        offsets, end_offsets;
   size_type                                     path_count;
   PriorityQueue<PriorityNode>                   inputs;
@@ -2968,7 +2974,8 @@ struct PathGraphMerger
     PathNode::rank_type lower_rank = 0,
     PathNode::rank_type upper_rank = PathLabel::NO_RANK,
     size_type max_prefetch_workers = PathGraphInputCache::MAX_PREFETCH_WORKERS,
-    const size_type* start_offsets = nullptr, const size_type* stop_offsets = nullptr);
+    const size_type* start_offsets = nullptr, const size_type* stop_offsets = nullptr,
+    PathGraphInputCache* shared_input = nullptr);
   void close();
 
   inline size_type size() const { return this->path_count; }
@@ -3021,13 +3028,15 @@ PathGraphMerger::PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lc
   size_type max_input_pairs, size_type input_cache_bytes,
   PathNode::rank_type lower_rank, PathNode::rank_type upper_rank,
   size_type max_prefetch_workers,
-  const size_type* start_offsets, const size_type* stop_offsets) :
+  const size_type* start_offsets, const size_type* stop_offsets,
+  PathGraphInputCache* shared_input) :
   graph(path_graph), lcp(kmer_lcp),
   ranges(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->range_spills))),
   buffer(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->priority_spills))),
-  input_files(path_graph, stats, max_input_pairs,
-    (input_cache_bytes == 0 ? group_buffer_bytes : input_cache_bytes),
-    max_prefetch_workers),
+  owned_input(shared_input != nullptr ? nullptr : new PathGraphInputCache(path_graph, stats,
+    max_input_pairs, (input_cache_bytes == 0 ? group_buffer_bytes : input_cache_bytes),
+    max_prefetch_workers)),
+  input_files(shared_input != nullptr ? *shared_input : *owned_input),
   offsets(path_graph.files()), end_offsets(path_graph.files()), path_count(0),
   inputs(path_graph.files())
 {
@@ -3037,6 +3046,7 @@ PathGraphMerger::PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lc
     // The input cache is a member, so it was constructed before this reset.
     stats->oversized_input_pair_bytes = this->input_files.oversized_pair_bytes;
   }
+  if(shared_input != nullptr) { shared_input->setStats(stats); }
   this->input_files.prime();
   auto lower_bound = [&](size_type file, PathNode::rank_type key) -> size_type
   {
@@ -3080,7 +3090,7 @@ PathGraphMerger::close()
 {
   this->ranges.clear();
   this->buffer.clear();
-  this->input_files.close();
+  if(this->owned_input) { this->input_files.close(); }
   this->offsets.clear();
   this->end_offsets.clear(); this->path_count = 0;
   this->inputs.clear();
@@ -3622,14 +3632,15 @@ prunePathRange(const PathGraph& source, const LCP& lcp,
   std::atomic<bool>* cancelled, PriorityNode* first_output,
   PriorityNode* last_output, bool* has_output, ProgressReporter* progress,
   bool* first_range_open = nullptr,
-  const size_type* start_offsets = nullptr, const size_type* stop_offsets = nullptr)
+  const size_type* start_offsets = nullptr, const size_type* stop_offsets = nullptr,
+  PathGraphInputCache* shared_input = nullptr)
 {
   PathGraphMerger merger(source, lcp, group_buffer_bytes, stats, input_pairs,
     input_cache_bytes, lower_rank, upper_rank,
     // Worker-level merge concurrency replaces the decoder pool. Keeping both
     // would oversubscribe CPUs and duplicate cache reservations.
     (cancelled == nullptr ? PathGraphInputCache::MAX_PREFETCH_WORKERS : 0),
-    start_offsets, stop_offsets);
+    start_offsets, stop_offsets, shared_input);
 
   auto write_output = [&](PriorityNode node)
   {
@@ -3775,7 +3786,7 @@ buildPrunePartition(PrunePartition& result, const PathGraph& source,
   const LCP& lcp, size_type size_limit, size_type group_buffer_bytes,
   size_type input_cache_bytes, size_type input_pairs, size_type output_pairs,
   const PruneOutputLayout& layout, std::atomic<size_type>& output_bytes,
-  std::atomic<bool>& cancelled)
+  std::atomic<bool>& cancelled, PathGraphInputCache* shared_input = nullptr)
 {
   PathGraphBuilder builder(layout.logical.size(), source.k(), source.step(),
     size_limit, group_buffer_bytes, output_pairs, &(result.stats));
@@ -3787,7 +3798,8 @@ buildPrunePartition(PrunePartition& result, const PathGraph& source,
     &(result.first_output), &(result.last_output), &(result.has_output), nullptr,
     &(result.first_range_open),
     (result.start_offsets.empty() ? nullptr : result.start_offsets.data()),
-    (result.stop_offsets.empty() ? nullptr : result.stop_offsets.data()));
+    (result.stop_offsets.empty() ? nullptr : result.stop_offsets.data()),
+    shared_input);
   builder.close();
 
   // Retain only the lightweight graph metadata between tasks. In particular,
@@ -4002,25 +4014,43 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   std::atomic<size_type> output_bytes(0), next_partition(0);
   std::atomic<bool> cancelled(false);
   std::vector<std::exception_ptr> errors(partitions.size());
+  // Workers take runs of adjacent partitions and keep one input cache across
+  // them. Adjacent partitions start in the same compressed blocks, and each
+  // shard's offsets only ascend within a worker, so a block one partition
+  // decoded serves the next instead of being decoded again. Four runs per
+  // worker keep the tail balanced.
+  const size_type run_length = std::max(static_cast<size_type>(1),
+    partitions.size() / (4 * workers));
   auto run = [&]()
   {
-    for(size_type i = next_partition.fetch_add(1, std::memory_order_relaxed);
-        i < partitions.size();
-        i = next_partition.fetch_add(1, std::memory_order_relaxed))
+    std::unique_ptr<PathGraphInputCache> shared_input;
+    for(size_type start = next_partition.fetch_add(run_length, std::memory_order_relaxed);
+        start < partitions.size();
+        start = next_partition.fetch_add(run_length, std::memory_order_relaxed))
     {
-      if(cancelled.load(std::memory_order_relaxed)) { return; }
-      try
+      const size_type stop = std::min(start + run_length, partitions.size());
+      for(size_type i = start; i < stop; i++)
       {
-        buildPrunePartition(partitions[i], source, lcp, size_limit,
-          worker_group, worker_cache, input_pairs, output_pairs, layout,
-          output_bytes, cancelled);
-      }
-      catch(...)
-      {
-        errors[i] = std::current_exception();
-        cancelled.store(true, std::memory_order_relaxed);
+        if(cancelled.load(std::memory_order_relaxed)) { return; }
+        try
+        {
+          if(!shared_input)
+          {
+            shared_input.reset(new PathGraphInputCache(source, nullptr, input_pairs,
+              worker_cache, 0));
+          }
+          buildPrunePartition(partitions[i], source, lcp, size_limit,
+            worker_group, worker_cache, input_pairs, output_pairs, layout,
+            output_bytes, cancelled, shared_input.get());
+        }
+        catch(...)
+        {
+          errors[i] = std::current_exception();
+          cancelled.store(true, std::memory_order_relaxed);
+        }
       }
     }
+    if(shared_input) { shared_input->close(); }
   };
 
   std::vector<std::thread> threads;
