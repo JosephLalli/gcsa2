@@ -1076,6 +1076,58 @@ against 0:07:48 serial while two runs of the same parallel code differed by
 0:00:42. `MergedGraph` still takes an explicit worker count, and its tests
 exercise both routes.
 
+### Descriptor budget and latency-tolerant I/O (2026-09-30 to 2026-10-01)
+
+**The descriptor-limit abort.** A joint chr2+chr18 build at 64 threads (vg
+`f28c31fba`, GCSA2 `4ab21ca`) aborted after 2:33:43 in step-1 compaction with
+"compressed block: open failure" from `compactLogicalJoinShards`. Transient
+systemd user services on this host start with a soft `RLIMIT_NOFILE` of 1,024,
+while concurrent compaction batches were sized against the 128-file merge
+ceiling (52 descriptors per chr2 batch, twenty batches wanting 1,040).
+`609d7d9` bounds concurrent batches by the ceiling divided by (2w + 4) for
+batch width w.
+
+**A separate concurrent open-file budget.** The 128-file ceiling
+(`--max-open-files`) still sizes every individual merge, because raising it
+shrinks every committed compression block and reshapes the compaction target.
+Work that runs concurrently is admitted against a second number,
+`ConstructionParameters::concurrent_open_files` (`build_gcsa
+--concurrent-open-files N`; default the soft `RLIMIT_NOFILE` minus the ceiling,
+never below the ceiling; `getConcurrentOpenFiles()` in `src/support.cpp`).
+`raiseOpenFileLimit()` lifts the soft limit to min(hard limit, 1,048,576) and is
+called first by `build_gcsa`, `vg index` and vg's autoindex GCSA recipe (vg
+branch `gcsa-descriptor-budget`). Raw-shard prune workers (`2fc9af5`) and
+compaction batches and join-range planners (`69aa6b6`) are admitted against
+it. Key-range distribution is not: `src/external_join.cpp` sets its descriptor
+budget to the ceiling minus two and needs nine descriptors per range worker,
+so at most 14 range workers run at once.
+
+Measured effect on the first prune of the joint input (four resumes, binary
+`69aa6b6`): the old admission ran it serially in 0:22:44.6 and 0:09:56.1; the
+budget admitted seven workers, 0:04:27.7 and 0:05:57.2, with identical pruned
+counts. The joint rebuild under the budget reproduced the vg-built baseline
+index byte for byte (`joint.gcsa` MD5 `39441e40a12472d8e005a0c7926b0e90`, LCP
+`f05d53df0d4d7b8aa5b71cd52f963b09`). Evidence:
+`hprc_v2_vg_rna/gcsa2_distribution_concurrency_20260928/step1_prune_workers_20260930/`
+and `joint_step4_resume_concurrent_20260930/`.
+
+**Latency-tolerant I/O (`1c0e542`, `2fd1694`), opt-in.**
+`GCSA_IO_DIRECT_WRITES=1` writes temporary streams with `O_DIRECT` through a
+writer pool (`GCSA_IO_DIRECT_WRITE_THREADS`, default 16;
+`GCSA_IO_DIRECT_WRITE_DEPTH`, default 4); tmpfs falls back to buffered writes
+with a one-time warning. With it set, the final path merge's outputs
+(`SequentialRecordWriter`) also bypass the page cache instead of syncing every
+64 MiB (`2fd1694`). `GCSA_IO_READAHEAD_BYTES=64M` gives each sequential reader
+a read-ahead window served by a shared pool (`GCSA_IO_READAHEAD_THREADS`,
+default 16). The motivation is the host's 100 MB `vm.dirty_bytes`, shared by
+every user: buffered writes stall in the dirty-page throttle, while reads are
+mostly served from the page cache (in one 2:14:47 window, 1,555 GB of
+application reads against 185 GB from the device). On a 97 MB synthetic graph
+the median whole build fell from 0:01:45.0 to 0:00:57.7 with direct writes and
+identical output; read-ahead alone showed no consistent effect. No controlled
+chromosome-scale timing exists yet; a chr18 merge-write comparison is recorded
+under `chr18_iteration_20261001/` in the evidence root.
+
 ## Build, test, and usage
 
 From the containing `vg` checkout, use its local toolchain wrapper. The GCSA2

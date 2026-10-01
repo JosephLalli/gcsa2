@@ -3976,32 +3976,91 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   // Validate the actual emitted neighbors. A malformed or unusual label range
   // that spans a planned root split cannot be published as independent shards;
   // discard the attempt and let the exact serial route decide the groups.
-  const PriorityNode* previous = nullptr;
-  for(size_type i = 0; i < partitions.size(); i++)
+  if(split_depth > 1)
   {
-    const PrunePartition& part = partitions[i];
-    if(!part.has_output) { continue; }
-    if(split_depth > 1)
+    std::vector<size_type> nonempty;
+    for(size_type i = 0; i < partitions.size(); i++)
     {
-      // Neighbors across a deeper split share fewer than split_depth leading
-      // characters, while every comparison inside a partition shares at least
-      // that many. So a group crosses a split only if a node's label interval
-      // reaches past it, or if the partition's first range merged all of the
-      // partition and might continue into the next one.
+      const PrunePartition& part = partitions[i];
+      if(!part.has_output) { continue; }
       if(part.last_output.node.lastLabel(0, part.last_output.label) >= part.upper_rank)
       {
         std::cerr << "PathGraph::prune(): warning: a label range reaches past a prefix split; "
                   << "pruning this step serially" << std::endl;
         return declineParallel(fallback_reason, "a label range reaches past a prefix split");
       }
-      if(part.first_range_open && i + 1 < partitions.size())
-      {
-        std::cerr << "PathGraph::prune(): warning: a merged range may continue past a prefix split; "
-                  << "pruning this step serially" << std::endl;
-        return declineParallel(fallback_reason, "a merged range may continue past a prefix split");
-      }
-      continue;
+      nonempty.push_back(i);
     }
+
+    // Every comparison inside a partition shares at least split_depth leading
+    // characters, so only a partition whose first range merged all of it can
+    // reach a split. The serial merger carries that range across only if
+    // (a) the LCP across the right split exceeds the LCP across the left one,
+    // which is the range's left_lcp; and (b) every partition below that right
+    // LCP is also one merged range from the same start node and logical file,
+    // because extendRange() stops at the first group that fails either test.
+    auto split_lcp = [&](size_type left, size_type right) -> range_type
+    {
+      return lcp.max_lcp(partitions[left].last_output.node, partitions[right].first_output.node,
+        partitions[left].last_output.label, partitions[right].first_output.label);
+    };
+    auto same_start = [&](size_type a, size_type b) -> bool
+    {
+      return partitions[a].first_output.node.from == partitions[b].first_output.node.from &&
+        source.logicalFile(partitions[a].first_output.file) ==
+        source.logicalFile(partitions[b].first_output.file);
+    };
+    size_type open = 0, closed_by_lcp = 0, closed_by_neighbor = 0, logged = 0;
+    for(size_type n = 0; n + 1 < nonempty.size(); n++)
+    {
+      const size_type i = nonempty[n];
+      if(!(partitions[i].first_range_open)) { continue; }
+      open++;
+      const range_type left = (n == 0 ? range_type(0, 0) : split_lcp(nonempty[n - 1], i));
+      const range_type right = split_lcp(i, nonempty[n + 1]);
+      bool crosses = (right > left);
+      size_type checked = n + 1;
+      if(crosses)
+      {
+        for(; checked < nonempty.size(); checked++)
+        {
+          const size_type j = nonempty[checked];
+          if(split_lcp(nonempty[checked - 1], j) < right) { break; }
+          if(!(partitions[j].first_range_open) || !same_start(i, j)) { crosses = false; break; }
+        }
+      }
+      if(!crosses && right <= left) { closed_by_lcp++; }
+      else if(!crosses) { closed_by_neighbor++; }
+      if(Verbosity::level >= Verbosity::EXTENDED && logged < 32)
+      {
+        logged++;
+        std::cerr << "PathGraph::prune(): merged partition " << i << " of " << partitions.size()
+                  << " (keys " << partitions[i].lower_rank << " to " << partitions[i].upper_rank
+                  << "): left split LCP (" << left.first << ", " << left.second
+                  << "), right split LCP (" << right.first << ", " << right.second << "), "
+                  << (crosses ? "continues past the split" :
+                      (right <= left ? "closed: right split is not deeper" :
+                       "closed: a later partition differs")) << std::endl;
+      }
+      if(crosses)
+      {
+        std::cerr << "PathGraph::prune(): warning: a merged range continues past a prefix split; "
+                  << "pruning this step serially" << std::endl;
+        return declineParallel(fallback_reason, "a merged range continues past a prefix split");
+      }
+    }
+    if(open > 0)
+    {
+      std::cerr << "PathGraph::prune(): " << open << " partition(s) merged into one range; "
+                << closed_by_lcp << " closed by a shallower right split, "
+                << closed_by_neighbor << " by a differing later partition" << std::endl;
+    }
+  }
+  const PriorityNode* previous = nullptr;
+  for(size_type i = 0; split_depth == 1 && i < partitions.size(); i++)
+  {
+    const PrunePartition& part = partitions[i];
+    if(!part.has_output) { continue; }
     if(previous != nullptr &&
        lcp.max_lcp(previous->node, part.first_output.node,
          previous->label, part.first_output.label) != range_type(0, 0))
