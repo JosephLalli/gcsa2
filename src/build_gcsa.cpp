@@ -73,6 +73,7 @@ atomicStore(const IndexType& index, const std::string& final_name)
 int
 main(int argc, char** argv)
 {
+  raiseOpenFileLimit();
   if(argc == 3 && std::string(argv[1]) == "gcsa-worker-task")
   {
     return externalPathJoinWorker(argv[2]);
@@ -110,6 +111,8 @@ main(int argc, char** argv)
     std::cerr << "      --join-partition-size SIZE maximum join working set (default 25% of memory goal)" << std::endl;
     std::cerr << "      --merge-fan-in N           maximum merge inputs" << std::endl;
     std::cerr << "      --max-open-files N         construction descriptor ceiling" << std::endl;
+    std::cerr << "      --concurrent-open-files N  descriptors raw-shard prune workers may share" << std::endl;
+    std::cerr << "                                 (default: the process limit less the ceiling)" << std::endl;
     std::cerr << "      --process-workers N        parallel external join worker processes" << std::endl;
     std::cerr << "      --temp-compression MODE    auto, none, or zstd (default auto)" << std::endl;
     std::cerr << "      --compression-block-size S independent compressed block size (default 16M)" << std::endl;
@@ -135,7 +138,7 @@ main(int argc, char** argv)
     OPT_DISK_LIMIT, OPT_IO_BUFFER, OPT_SORT_RUN, OPT_JOIN_PARTITION,
     OPT_MERGE_FAN_IN, OPT_MAX_OPEN_FILES, OPT_CHECKPOINT_RECORDS,
     OPT_CHECKPOINT_BYTES, OPT_VERIFY_WORKSPACE, OPT_CLEAN_OBSOLETE,
-    OPT_STOP_AFTER, OPT_PROCESS_WORKERS,
+    OPT_STOP_AFTER, OPT_PROCESS_WORKERS, OPT_CONCURRENT_OPEN_FILES,
     OPT_TEMP_COMPRESSION, OPT_COMPRESSION_BLOCK_SIZE,
     OPT_COMPRESSION_WORKERS, OPT_COMPRESSION_LEVEL
   };
@@ -150,6 +153,7 @@ main(int argc, char** argv)
     { "join-partition-size", required_argument, nullptr, OPT_JOIN_PARTITION },
     { "merge-fan-in", required_argument, nullptr, OPT_MERGE_FAN_IN },
     { "max-open-files", required_argument, nullptr, OPT_MAX_OPEN_FILES },
+    { "concurrent-open-files", required_argument, nullptr, OPT_CONCURRENT_OPEN_FILES },
     { "process-workers", required_argument, nullptr, OPT_PROCESS_WORKERS },
     { "temp-compression", required_argument, nullptr, OPT_TEMP_COMPRESSION },
     { "compression-block-size", required_argument, nullptr, OPT_COMPRESSION_BLOCK_SIZE },
@@ -215,6 +219,8 @@ main(int argc, char** argv)
       parameters.setMergeFanIn(std::stoull(optarg)); break;
     case OPT_MAX_OPEN_FILES:
       parameters.setMaxOpenFiles(std::stoull(optarg)); break;
+    case OPT_CONCURRENT_OPEN_FILES:
+      parameters.setConcurrentOpenFiles(std::stoull(optarg)); break;
     case OPT_PROCESS_WORKERS:
       parameters.setProcessWorkers(std::stoull(optarg)); break;
     case OPT_TEMP_COMPRESSION:
@@ -305,6 +311,9 @@ main(int argc, char** argv)
                 << (parameters.joinPartitionSizeIsAutomatic() ? " (auto)" : " (explicit)") << std::endl;
       printHeader("Join worker processes", INDENT);
       std::cout << parameters.getProcessWorkers() << std::endl;
+      printHeader("Open-file ceiling", INDENT);
+      std::cout << parameters.getMaxOpenFiles() << " (concurrent prune workers: "
+                << parameters.getConcurrentOpenFiles() << ")" << std::endl;
       printHeader("Temp compression", INDENT);
       std::cout << tempCompressionName(parameters.getTempCompression()) << std::endl;
       printHeader("Compression block", INDENT);

@@ -1,6 +1,8 @@
 #include <gcsa/support.h>
 #include <gcsa/internal.h>
 
+#include <sys/resource.h>
+
 namespace gcsa
 {
 
@@ -84,7 +86,7 @@ ConstructionParameters::ConstructionParameters() :
   resume(false), verify_workspace(false), clean_obsolete(false),
   io_buffer_size(IO_BUFFER_SIZE),
   sort_run_size(SORT_RUN_SIZE), join_partition_size(JOIN_PARTITION_SIZE),
-  merge_fan_in(MERGE_FAN_IN), max_open_files(MAX_OPEN_FILES),
+  merge_fan_in(MERGE_FAN_IN), max_open_files(MAX_OPEN_FILES), concurrent_open_files(0),
   process_workers(PROCESS_WORKERS),
   checkpoint_records(CHECKPOINT_RECORDS), checkpoint_bytes(CHECKPOINT_BYTES),
   temp_compression(TempCompression::AUTO),
@@ -238,6 +240,37 @@ ConstructionParameters::setMaxOpenFiles(size_type files)
   // The final event scan has more fixed streams than PathGraph pruning and
   // merging. Keep enough headroom for its bounded two-way sorter as well.
   this->max_open_files = std::max(MIN_OPEN_FILES, files);
+}
+
+void
+ConstructionParameters::setConcurrentOpenFiles(size_type files)
+{
+  this->concurrent_open_files = files;
+}
+
+size_type
+ConstructionParameters::getConcurrentOpenFiles() const
+{
+  if(this->concurrent_open_files != 0)
+  {
+    return std::max(this->concurrent_open_files, this->max_open_files);
+  }
+  struct rlimit limit;
+  if(::getrlimit(RLIMIT_NOFILE, &limit) != 0) { return this->max_open_files; }
+  const size_type soft = (limit.rlim_cur == RLIM_INFINITY ?
+    (static_cast<size_type>(1) << 20) : static_cast<size_type>(limit.rlim_cur));
+  return (soft > 2 * this->max_open_files ? soft - this->max_open_files : this->max_open_files);
+}
+
+void
+raiseOpenFileLimit()
+{
+  struct rlimit limit;
+  if(::getrlimit(RLIMIT_NOFILE, &limit) != 0) { return; }
+  const rlim_t target = std::min(limit.rlim_max, static_cast<rlim_t>(1) << 20);
+  if(limit.rlim_cur == RLIM_INFINITY || limit.rlim_cur >= target) { return; }
+  limit.rlim_cur = target;
+  static_cast<void>(::setrlimit(RLIMIT_NOFILE, &limit)); // An unchanged limit is still valid.
 }
 
 void

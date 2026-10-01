@@ -443,13 +443,16 @@ struct PathGraph
   // is separate from group_buffer_bytes because the two scale with different
   // things: the equal-label group and range deque with one label range, the
   // input cache with the shard count. Zero means "share group_buffer_bytes",
-  // which is what a raw generation wants.
+  // which is what a raw generation wants. concurrent_open_files is the
+  // descriptor budget concurrent workers may share when they hold raw shards
+  // open; zero, or anything below max_open_files, means max_open_files.
   void prune(const LCP& lcp, size_type size_limit,
     size_type group_buffer_bytes = MEGABYTE,
     PathGraphMergeStats* stats = nullptr,
     size_type max_open_files = 128,
     size_type input_cache_bytes = 0,
-    size_type prune_workers = 1);
+    size_type prune_workers = 1,
+    size_type concurrent_open_files = 0);
   void extend(size_type size_limit, size_type memory_limit);
 
   void debugExtend();

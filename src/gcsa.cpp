@@ -2207,7 +2207,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
       path_graph.prune(lcp, path_graph.remainingLimit(parameters.getLimitBytes()),
         prune_buffer, &merge_stats, parameters.getMaxOpenFiles(),
         pathMergeInputCacheBudget(parameters, path_graph),
-        prune_workers);
+        prune_workers, parameters.getConcurrentOpenFiles());
       const double prune_stop = readTimer();
       if(Verbosity::level >= Verbosity::BASIC)
       {

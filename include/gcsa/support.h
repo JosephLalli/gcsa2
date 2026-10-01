@@ -112,6 +112,7 @@ struct ConstructionParameters
   void setJoinPartitionSize(size_type bytes);
   void setMergeFanIn(size_type fan_in);
   void setMaxOpenFiles(size_type files);
+  void setConcurrentOpenFiles(size_type files);
   void setProcessWorkers(size_type workers);
   void setWorkerExecutable(const std::string& executable);
   void setCheckpointRecords(size_type records);
@@ -145,6 +146,11 @@ struct ConstructionParameters
   bool joinPartitionSizeIsAutomatic() const { return this->join_partition_size == 0; }
   size_type getMergeFanIn() const { return this->merge_fan_in; }
   size_type getMaxOpenFiles() const { return this->max_open_files; }
+  // Descriptors that concurrent prune workers holding raw shards may share.
+  // The max-open-files ceiling still sizes every merge and every other stage;
+  // this budget only admits workers. Zero derives it from the process's soft
+  // open-file limit less that ceiling, and it never falls below the ceiling.
+  size_type getConcurrentOpenFiles() const;
   size_type getProcessWorkers() const { return this->process_workers; }
   const std::string& getWorkerExecutable() const { return this->worker_executable; }
   size_type getCheckpointRecords() const { return this->checkpoint_records; }
@@ -181,7 +187,7 @@ struct ConstructionParameters
   std::string work_directory;
   bool resume, verify_workspace, clean_obsolete;
   size_type io_buffer_size, sort_run_size, join_partition_size;
-  size_type merge_fan_in, max_open_files;
+  size_type merge_fan_in, max_open_files, concurrent_open_files;
   size_type process_workers;
   std::string worker_executable;
   size_type checkpoint_records, checkpoint_bytes;
@@ -190,6 +196,11 @@ struct ConstructionParameters
   int compression_level;
   std::string stop_after;
 };
+
+// Raise the soft open-file limit to the hard limit (at most 2^20, Linux's default
+// nr_open). Service managers commonly start processes at 1,024, which is below
+// what concurrent construction can use; a process may raise its own soft limit.
+void raiseOpenFileLimit();
 
 //------------------------------------------------------------------------------
 
