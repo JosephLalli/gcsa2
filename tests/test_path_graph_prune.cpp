@@ -1144,6 +1144,24 @@ static void compare_parallel_prune(const std::string& root,
       require(limited_stats.prune_workers == 1);
       require(limited_stats.prune_partitions == 1);
       require(limited_stats.prune_parallel_fallbacks == 1);
+
+      // A separate budget for the workers admits them while the six-descriptor
+      // ceiling keeps sizing the merge: each worker holds the three raw input
+      // pairs, two output pairs and two spill descriptors, twelve in all.
+      PathGraph budgeted(0, 3, 0);
+      initialize_parallel_prune_graph(budgeted,
+        root + "/parallel-prune-worker-budget", storage);
+      PathGraphMergeStats budgeted_stats;
+      budgeted.prune(lcp, GIGABYTE, group_budget, &budgeted_stats, 6,
+        cache_budget, 4, 64);
+      require(logical_prune_records(serial) == logical_prune_records(budgeted));
+      require(budgeted.unique == serial.unique);
+      require(budgeted.unsorted == serial.unsorted);
+      require(budgeted_stats.prune_workers == 4);
+      require(budgeted_stats.prune_parallel_fallbacks == 0);
+      require(2 * budgeted_stats.max_open_input_pairs +
+        2 * budgeted_stats.max_open_output_pairs +
+        2 * budgeted_stats.prune_workers <= 64);
     }
   }
   omp_set_num_threads(previous_threads); omp_set_dynamic(previous_dynamic);

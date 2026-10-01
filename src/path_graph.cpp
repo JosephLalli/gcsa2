@@ -3774,7 +3774,8 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   size_type size_limit, size_type group_buffer_bytes,
   PathGraphMergeStats* stats, size_type max_open_files,
   size_type input_cache_bytes, size_type requested_workers,
-  const PruneOutputLayout& layout, const char** fallback_reason)
+  const PruneOutputLayout& layout, const char** fallback_reason,
+  size_type concurrent_open_files)
 {
   std::vector<std::pair<PathNode::rank_type, PathNode::rank_type>> ranges;
   if(requested_workers < 2 || source.size() == 0 || layout.logical.empty()) { return false; }
@@ -3790,7 +3791,6 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   size_type workers = std::min(requested_workers,
     static_cast<size_type>(std::max(1, omp_get_max_threads())));
   workers = std::min(workers, static_cast<size_type>(ranges.size()));
-  workers = std::min(workers, max_open_files / 6);
   workers = std::min(workers, group_buffer_bytes / minimum_group);
 
   bool all_framed = (source.files() > 0);
@@ -3826,6 +3826,13 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   {
     workers = std::min(workers, cache_budget / resident_per_worker);
   }
+  // Raw readers hold their descriptors for the whole pass, so the workers'
+  // descriptors are real and come from the separate concurrent budget. Framed
+  // readers open theirs transiently and stay under the merge ceiling, which
+  // also sizes each framed worker's input share below.
+  const size_type admission_files = (all_framed ? max_open_files :
+    std::max(max_open_files, concurrent_open_files));
+  workers = std::min(workers, admission_files / 6);
   if(!all_framed)
   {
     if(source.files() > (std::numeric_limits<size_type>::max() - 4) / 2)
@@ -3833,7 +3840,7 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
       return declineParallel(fallback_reason, "too many input shards for the open-file limit");
     }
     workers = std::min(workers,
-      max_open_files / (2 + 2 * source.files() + 2));
+      admission_files / (2 + 2 * source.files() + 2));
   }
   if(workers < 2)
   {
@@ -3846,7 +3853,7 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   size_type worker_open_files = 0, output_pairs = 0, input_pairs = 0;
   while(workers >= 2)
   {
-    worker_open_files = max_open_files / workers;
+    worker_open_files = admission_files / workers;
     output_pairs = pathMergeOutputPairs(worker_open_files, layout.logical.size());
     input_pairs = (all_framed ? pathMergeInputPairs(worker_open_files,
       layout.logical.size()) : source.files());
@@ -4063,7 +4070,7 @@ void
 PathGraph::prune(const LCP& lcp, size_type size_limit,
   size_type group_buffer_bytes, PathGraphMergeStats* stats,
   size_type max_open_files, size_type input_cache_bytes,
-  size_type prune_workers)
+  size_type prune_workers, size_type concurrent_open_files)
 {
   size_type old_path_count = this->size();
 
@@ -4080,7 +4087,7 @@ PathGraph::prune(const LCP& lcp, size_type size_limit,
   const char* fallback_reason = nullptr;
   if(buildPrunedGraphParallel(*this, lcp, size_limit, group_buffer_bytes,
        stats, max_open_files, input_cache_bytes, requested_workers, layout,
-       &fallback_reason))
+       &fallback_reason, concurrent_open_files))
   {
     if(Verbosity::level >= Verbosity::EXTENDED)
     {
