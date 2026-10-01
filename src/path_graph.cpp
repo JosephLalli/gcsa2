@@ -3978,20 +3978,6 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   // discard the attempt and let the exact serial route decide the groups.
   if(split_depth > 1)
   {
-    std::vector<size_type> nonempty;
-    for(size_type i = 0; i < partitions.size(); i++)
-    {
-      const PrunePartition& part = partitions[i];
-      if(!part.has_output) { continue; }
-      if(part.last_output.node.lastLabel(0, part.last_output.label) >= part.upper_rank)
-      {
-        std::cerr << "PathGraph::prune(): warning: a label range reaches past a prefix split; "
-                  << "pruning this step serially" << std::endl;
-        return declineParallel(fallback_reason, "a label range reaches past a prefix split");
-      }
-      nonempty.push_back(i);
-    }
-
     // Every comparison inside a partition shares at least split_depth leading
     // characters, so only a partition whose first range merged all of it can
     // reach a split. The serial merger carries that range across only if
@@ -3999,6 +3985,10 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
     // which is the range's left_lcp; and (b) every partition below that right
     // LCP is also one merged range from the same start node and logical file,
     // because extendRange() stops at the first group that fails either test.
+    // Such a span is one group in the serial pass, so prune it again as one
+    // partition (stitch it) and repeat until no merged range crosses a split.
+    // Every key below the end marker '#' starts at the graph's end node, so
+    // the '#' root is always stitched back together this way.
     auto split_lcp = [&](size_type left, size_type right) -> range_type
     {
       return lcp.max_lcp(partitions[left].last_output.node, partitions[right].first_output.node,
@@ -4010,50 +4000,96 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
         source.logicalFile(partitions[a].first_output.file) ==
         source.logicalFile(partitions[b].first_output.file);
     };
-    size_type open = 0, closed_by_lcp = 0, closed_by_neighbor = 0, logged = 0;
-    for(size_type n = 0; n + 1 < nonempty.size(); n++)
+    size_type stitches = 0, stitched_partitions = 0, logged = 0;
+    while(true)
     {
-      const size_type i = nonempty[n];
-      if(!(partitions[i].first_range_open)) { continue; }
-      open++;
-      const range_type left = (n == 0 ? range_type(0, 0) : split_lcp(nonempty[n - 1], i));
-      const range_type right = split_lcp(i, nonempty[n + 1]);
-      bool crosses = (right > left);
-      size_type checked = n + 1;
-      if(crosses)
+      std::vector<size_type> nonempty;
+      for(size_type i = 0; i < partitions.size(); i++)
       {
-        for(; checked < nonempty.size(); checked++)
+        const PrunePartition& part = partitions[i];
+        if(!part.has_output) { continue; }
+        if(part.last_output.node.lastLabel(0, part.last_output.label) >= part.upper_rank)
         {
-          const size_type j = nonempty[checked];
-          if(split_lcp(nonempty[checked - 1], j) < right) { break; }
-          if(!(partitions[j].first_range_open) || !same_start(i, j)) { crosses = false; break; }
+          std::cerr << "PathGraph::prune(): warning: a label range reaches past a prefix split; "
+                    << "pruning this step serially" << std::endl;
+          return declineParallel(fallback_reason, "a label range reaches past a prefix split");
+        }
+        nonempty.push_back(i);
+      }
+
+      size_type stitch_first = 0, stitch_last = 0;
+      bool found = false;
+      for(size_type n = 0; !found && n + 1 < nonempty.size(); n++)
+      {
+        const size_type i = nonempty[n];
+        if(!(partitions[i].first_range_open)) { continue; }
+        const range_type left = (n == 0 ? range_type(0, 0) : split_lcp(nonempty[n - 1], i));
+        const range_type right = split_lcp(i, nonempty[n + 1]);
+        bool crosses = (right > left);
+        size_type checked = n + 1;
+        if(crosses)
+        {
+          for(; checked < nonempty.size(); checked++)
+          {
+            const size_type j = nonempty[checked];
+            if(split_lcp(nonempty[checked - 1], j) < right) { break; }
+            if(!(partitions[j].first_range_open) || !same_start(i, j)) { crosses = false; break; }
+          }
+        }
+        if(Verbosity::level >= Verbosity::EXTENDED && logged < 32)
+        {
+          logged++;
+          std::cerr << "PathGraph::prune(): merged partition " << i << " of " << partitions.size()
+                    << " (keys " << partitions[i].lower_rank << " to " << partitions[i].upper_rank
+                    << "): left split LCP (" << left.first << ", " << left.second
+                    << "), right split LCP (" << right.first << ", " << right.second << "), "
+                    << (crosses ? "continues past the split" :
+                        (right <= left ? "closed: right split is not deeper" :
+                         "closed: a later partition differs")) << std::endl;
+        }
+        if(crosses)
+        {
+          found = true; stitch_first = i; stitch_last = nonempty[checked - 1];
         }
       }
-      if(!crosses && right <= left) { closed_by_lcp++; }
-      else if(!crosses) { closed_by_neighbor++; }
-      if(Verbosity::level >= Verbosity::EXTENDED && logged < 32)
+      if(!found) { break; }
+
+      // Release the replaced partitions' output reservations, then prune the
+      // span on this thread; the other workers have finished.
+      PrunePartition stitched;
+      stitched.lower_rank = partitions[stitch_first].lower_rank;
+      stitched.upper_rank = partitions[stitch_last].upper_rank;
+      for(size_type i = stitch_first; i <= stitch_last; i++)
       {
-        logged++;
-        std::cerr << "PathGraph::prune(): merged partition " << i << " of " << partitions.size()
-                  << " (keys " << partitions[i].lower_rank << " to " << partitions[i].upper_rank
-                  << "): left split LCP (" << left.first << ", " << left.second
-                  << "), right split LCP (" << right.first << ", " << right.second << "), "
-                  << (crosses ? "continues past the split" :
-                      (right <= left ? "closed: right split is not deeper" :
-                       "closed: a later partition differs")) << std::endl;
+        if(!(partitions[i].graph)) { continue; }
+        size_type released = partitions[i].graph->bytes();
+        output_bytes.fetch_sub(std::min(released, output_bytes.load(std::memory_order_relaxed)),
+          std::memory_order_relaxed);
       }
-      if(crosses)
+      try
       {
-        std::cerr << "PathGraph::prune(): warning: a merged range continues past a prefix split; "
-                  << "pruning this step serially" << std::endl;
-        return declineParallel(fallback_reason, "a merged range continues past a prefix split");
+        buildPrunePartition(stitched, source, lcp, size_limit, worker_group, worker_cache,
+          input_pairs, output_pairs, layout, output_bytes, cancelled);
       }
+      catch(const PruneSizeLimit&)
+      {
+        std::cerr << "PathGraphBuilder::write(): Size limit exceeded, construction aborted" << std::endl;
+        std::exit(EXIT_SIZE_LIMIT_EXCEEDED);
+      }
+      stitches++; stitched_partitions += stitch_last + 1 - stitch_first;
+      if(Verbosity::level >= Verbosity::EXTENDED)
+      {
+        std::cerr << "PathGraph::prune(): stitched partitions " << stitch_first << " to " << stitch_last
+                  << " (keys " << stitched.lower_rank << " to " << stitched.upper_rank << ")" << std::endl;
+      }
+      partitions[stitch_first] = std::move(stitched);
+      partitions.erase(partitions.begin() + stitch_first + 1, partitions.begin() + stitch_last + 1);
     }
-    if(open > 0)
+    if(stitches > 0)
     {
-      std::cerr << "PathGraph::prune(): " << open << " partition(s) merged into one range; "
-                << closed_by_lcp << " closed by a shallower right split, "
-                << closed_by_neighbor << " by a differing later partition" << std::endl;
+      std::cerr << "PathGraph::prune(): " << stitches << " stitch(es) re-pruned "
+                << stitched_partitions << " partition(s) into wider spans; " << partitions.size()
+                << " partition(s) remain" << std::endl;
     }
   }
   const PriorityNode* previous = nullptr;

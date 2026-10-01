@@ -1270,9 +1270,9 @@ static void compare_split_depth_prune(const std::string& root)
     parallel.prune(lcp, GIGABYTE, group_budget, &parallel_stats, 128, cache_budget, 4);
     require(logical_prune_records(serial) == logical_prune_records(parallel));
     require(parallel.unique == serial.unique && parallel.unsorted == serial.unsorted);
-    require(parallel_stats.prune_parallel_fallbacks == 1);
-    require(parallel_stats.prune_fallback_reason != nullptr &&
-      std::string(parallel_stats.prune_fallback_reason).find("prefix split") != std::string::npos);
+    // The merge across AAA/AAC is stitched into one partition, not a fallback.
+    require(parallel_stats.prune_parallel_fallbacks == 0);
+    require(parallel_stats.prune_partitions > 1 && parallel_stats.prune_partitions < 8);
   }
   {
     const std::vector<std::vector<PruneFixtureRecord>> records = distinct_start_prune_records();
