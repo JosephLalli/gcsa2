@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2966,7 +2967,8 @@ struct PathGraphMerger
     size_type input_cache_bytes = 0,
     PathNode::rank_type lower_rank = 0,
     PathNode::rank_type upper_rank = PathLabel::NO_RANK,
-    size_type max_prefetch_workers = PathGraphInputCache::MAX_PREFETCH_WORKERS);
+    size_type max_prefetch_workers = PathGraphInputCache::MAX_PREFETCH_WORKERS,
+    const size_type* start_offsets = nullptr, const size_type* stop_offsets = nullptr);
   void close();
 
   inline size_type size() const { return this->path_count; }
@@ -3018,7 +3020,8 @@ PathGraphMerger::PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lc
   size_type group_buffer_bytes, PathGraphMergeStats* stats,
   size_type max_input_pairs, size_type input_cache_bytes,
   PathNode::rank_type lower_rank, PathNode::rank_type upper_rank,
-  size_type max_prefetch_workers) :
+  size_type max_prefetch_workers,
+  const size_type* start_offsets, const size_type* stop_offsets) :
   graph(path_graph), lcp(kmer_lcp),
   ranges(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->range_spills))),
   buffer(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->priority_spills))),
@@ -3050,9 +3053,13 @@ PathGraphMerger::PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lc
   };
   for(size_type file = 0; file < path_graph.files(); file++)
   {
-    this->offsets[file] = (lower_rank == 0 ? 0 : lower_bound(file, lower_rank));
-    this->end_offsets[file] = (upper_rank == PathLabel::NO_RANK ?
-      path_graph.path_counts[file] : lower_bound(file, upper_rank));
+    // A caller that located the bounds for many partitions at once passes
+    // them in; searching again here costs block decodes per partition.
+    this->offsets[file] = (start_offsets != nullptr ? start_offsets[file] :
+      (lower_rank == 0 ? 0 : lower_bound(file, lower_rank)));
+    this->end_offsets[file] = (stop_offsets != nullptr ? stop_offsets[file] :
+      (upper_rank == PathLabel::NO_RANK ?
+        path_graph.path_counts[file] : lower_bound(file, upper_rank)));
     if(this->end_offsets[file] < this->offsets[file])
     {
       throw std::runtime_error("PathGraphMerger: invalid label-rank partition");
@@ -3614,13 +3621,15 @@ prunePathRange(const PathGraph& source, const LCP& lcp,
   std::atomic<size_type>* output_bytes, size_type size_limit,
   std::atomic<bool>* cancelled, PriorityNode* first_output,
   PriorityNode* last_output, bool* has_output, ProgressReporter* progress,
-  bool* first_range_open = nullptr)
+  bool* first_range_open = nullptr,
+  const size_type* start_offsets = nullptr, const size_type* stop_offsets = nullptr)
 {
   PathGraphMerger merger(source, lcp, group_buffer_bytes, stats, input_pairs,
     input_cache_bytes, lower_rank, upper_rank,
     // Worker-level merge concurrency replaces the decoder pool. Keeping both
     // would oversubscribe CPUs and duplicate cache reservations.
-    (cancelled == nullptr ? PathGraphInputCache::MAX_PREFETCH_WORKERS : 0));
+    (cancelled == nullptr ? PathGraphInputCache::MAX_PREFETCH_WORKERS : 0),
+    start_offsets, stop_offsets);
 
   auto write_output = [&](PriorityNode node)
   {
@@ -3754,6 +3763,8 @@ struct PrunePartition
   PathGraphMergeStats stats;
   PriorityNode first_output, last_output;
   bool has_output, first_range_open;
+  // Per-shard record offsets of lower_rank and upper_rank.
+  std::vector<size_type> start_offsets, stop_offsets;
 
   PrunePartition() : lower_rank(0), upper_rank(0), graph(), stats(),
     first_output(), last_output(), has_output(false), first_range_open(false) { }
@@ -3774,7 +3785,9 @@ buildPrunePartition(PrunePartition& result, const PathGraph& source,
     group_buffer_bytes, input_cache_bytes, input_pairs, layout, builder,
     &(result.stats), &output_bytes, size_limit, &cancelled,
     &(result.first_output), &(result.last_output), &(result.has_output), nullptr,
-    &(result.first_range_open));
+    &(result.first_range_open),
+    (result.start_offsets.empty() ? nullptr : result.start_offsets.data()),
+    (result.stop_offsets.empty() ? nullptr : result.stop_offsets.data()));
   builder.close();
 
   // Retain only the lightweight graph metadata between tasks. In particular,
@@ -3782,6 +3795,73 @@ buildPrunePartition(PrunePartition& result, const PathGraph& source,
   // would turn a worker bound into a partition-count bound.
   result.graph.reset(new PathGraph(0, source.k(), source.step()));
   result.graph->swap(builder.graph);
+}
+
+/*
+  Locate every partition bound in every shard once, before the workers start.
+  Each worker's merger would otherwise binary-search every shard for its own
+  two bounds, and on framed shards every probe that lands in a new block
+  decodes the whole block: at 131 partitions over 33 chr18 shards that setup
+  was 95% of the prune. Bounds ascend, so each shard is walked once with a
+  galloping search from the previous bound, decoding each block about once.
+*/
+void
+locatePruneBounds(const PathGraph& source, std::vector<PrunePartition>& partitions,
+  size_type pair_buffer_bytes, size_type threads)
+{
+  const size_type files = source.files(), parts = partitions.size();
+  if(parts == 0) { return; }
+  for(PrunePartition& part : partitions)
+  {
+    part.start_offsets.assign(files, 0); part.stop_offsets.assign(files, 0);
+  }
+  threads = std::max(static_cast<size_type>(1), std::min(threads, files));
+  std::atomic<size_type> next_file(0);
+  std::vector<std::exception_ptr> errors(threads);
+  auto run = [&](size_type thread)
+  {
+    try
+    {
+      PathGraphInputCache input(source, nullptr, 1, pair_buffer_bytes, 0);
+      PriorityNode probe;
+      for(size_type file = next_file++; file < files; file = next_file++)
+      {
+        probe.file = file;
+        const size_type count = source.path_counts[file];
+        auto below = [&](size_type offset, PathNode::rank_type key) -> bool
+        {
+          input.read(file, offset, probe.node, probe.label);
+          return (probe.firstLabel(0) < key);
+        };
+        size_type low = 0; // Every record before low is below the current key.
+        for(size_type i = 0; i <= parts; i++)
+        {
+          const PathNode::rank_type key = (i < parts ?
+            partitions[i].lower_rank : partitions[parts - 1].upper_rank);
+          if(key != 0)
+          {
+            size_type high = low, step = 1;
+            while(high < count && below(high, key)) { low = high + 1; high = low + step; step *= 2; }
+            high = std::min(high, count);
+            while(low < high)
+            {
+              size_type mid = low + (high - low) / 2;
+              if(below(mid, key)) { low = mid + 1; } else { high = mid; }
+            }
+          }
+          if(i < parts) { partitions[i].start_offsets[file] = low; }
+          if(i > 0) { partitions[i - 1].stop_offsets[file] = low; }
+        }
+      }
+      input.close();
+    }
+    catch(...) { errors[thread] = std::current_exception(); }
+  };
+  std::vector<std::thread> pool;
+  for(size_type thread = 1; thread < threads; thread++) { pool.emplace_back(run, thread); }
+  run(0);
+  for(std::thread& worker : pool) { worker.join(); }
+  for(const std::exception_ptr& error : errors) { if(error) { std::rethrow_exception(error); } }
 }
 
 // Declines a requested parallel prune or merge. The serial route that follows
@@ -3908,6 +3988,15 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   {
     partitions[i].lower_rank = ranges[i].first;
     partitions[i].upper_rank = ranges[i].second;
+  }
+  const auto locate_start = std::chrono::steady_clock::now();
+  locatePruneBounds(source, partitions, (pair_bytes > 0 ? pair_bytes : raw_pair_budget), workers);
+  if(Verbosity::level >= Verbosity::EXTENDED)
+  {
+    std::cerr << "PathGraph::prune(): located " << partitions.size() << " partition bounds in "
+              << source.files() << " shard(s) in "
+              << std::chrono::duration<double>(std::chrono::steady_clock::now() - locate_start).count()
+              << " seconds" << std::endl;
   }
 
   std::atomic<size_type> output_bytes(0), next_partition(0);
@@ -4077,6 +4166,8 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
       PrunePartition stitched;
       stitched.lower_rank = partitions[stitch_first].lower_rank;
       stitched.upper_rank = partitions[stitch_last].upper_rank;
+      stitched.start_offsets = partitions[stitch_first].start_offsets;
+      stitched.stop_offsets = partitions[stitch_last].stop_offsets;
       for(size_type i = stitch_first; i <= stitch_last; i++)
       {
         if(!(partitions[i].graph)) { continue; }
