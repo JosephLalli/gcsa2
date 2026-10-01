@@ -4351,6 +4351,7 @@ struct SequentialRecordWriter
 {
   std::string name;
   int descriptor;
+  std::unique_ptr<OutputStream> direct; // Set when temp writes bypass the page cache.
   std::vector<Element> buffer;
   off_t written, released;
 
@@ -4358,10 +4359,20 @@ struct SequentialRecordWriter
   constexpr static off_t CACHE_FLUSH = 64 * MEGABYTE;
 
   SequentialRecordWriter(const std::string& filename, size_type buffer_bytes) :
-    name(filename), descriptor(-1), buffer(), written(0), released(0)
+    name(filename), descriptor(-1), direct(), buffer(), written(0), released(0)
   {
     size_type records = std::max(static_cast<size_type>(1), buffer_bytes / sizeof(Element));
     this->buffer.reserve(records);
+    if(OutputStream::directWrites())
+    {
+      // The writer pool keeps blocks in flight while the merge continues,
+      // instead of this thread waiting in the dirty-page throttle and in an
+      // fdatasync every CACHE_FLUSH bytes.
+      this->direct.reset(new OutputStream(this->name,
+        std::ios_base::binary | std::ios_base::out | std::ios_base::trunc));
+      if(!this->direct->is_open()) { throw std::runtime_error("SameFromSet: cannot create raw set file"); }
+      return;
+    }
     this->descriptor = ::open(this->name.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0600);
     if(this->descriptor < 0) { throw std::runtime_error("SameFromSet: cannot create raw set file"); }
 #if defined(POSIX_FADV_SEQUENTIAL)
@@ -4379,6 +4390,20 @@ struct SequentialRecordWriter
 
   void close()
   {
+    if(this->direct)
+    {
+      this->flush();
+      this->direct->close();
+      const bool failed = this->direct->fail();
+      this->direct.reset();
+      if(failed) { throw std::runtime_error("SameFromSet: cannot close raw set file"); }
+      // The same durability at close as the buffered route.
+      int synced = ::open(this->name.c_str(), O_RDONLY);
+      const bool sync_failed = (synced < 0 || ::fdatasync(synced) != 0);
+      if(synced >= 0) { ::close(synced); }
+      if(sync_failed) { throw std::runtime_error("SameFromSet: raw set sync failed"); }
+      return;
+    }
     if(this->descriptor < 0) { return; }
     this->flush(); this->syncAndTrim(true);
     if(::close(this->descriptor) != 0)
@@ -4395,6 +4420,14 @@ private:
     if(this->buffer.empty()) { return; }
     const char* data = reinterpret_cast<const char*>(this->buffer.data());
     size_type bytes = this->buffer.size() * sizeof(Element), done = 0;
+    if(this->direct)
+    {
+      this->direct->write(data, static_cast<std::streamsize>(bytes));
+      if(!*this->direct) { throw std::runtime_error("SameFromSet: raw set write failed"); }
+      DiskIO::write_volume += bytes;
+      this->written += static_cast<off_t>(bytes); this->buffer.clear();
+      return;
+    }
     while(done < bytes)
     {
       ssize_t result = ::write(this->descriptor, data + done, bytes - done);
