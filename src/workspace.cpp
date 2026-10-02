@@ -218,15 +218,34 @@ BuildWorkspace::ArtifactRef BuildWorkspace::ArtifactWriter::finish(uint64_t reco
 BuildWorkspace::ArtifactWriter BuildWorkspace::open_artifact(const ArtifactIdentity& i,logical_file_id_t l,physical_shard_id_t s,const std::string& so,const std::string& kr){return ArtifactWriter(this,i,l,s,so,kr);}
 void BuildWorkspace::commit_artifact(logical_file_id_t l,physical_shard_id_t s,uint64_t r,const std::vector<uint8_t>& p){ArtifactIdentity i;ArtifactWriter w=open_artifact(i,l,s);w.write(p.data(),p.size());ArtifactRef ref=w.finish(r);std::vector<ArtifactRef> a(1,ref);commit_task(i.task,i.phase,a);}
 void BuildWorkspace::commit_task(const std::string& task,const std::string& phase,const std::vector<ArtifactRef>& a,const std::vector<std::string>& deps){if(a.empty())throw std::runtime_error("cannot commit empty task completion record");std::string final=completion_path(task,phase),tmp=final+partial_suffix();int fd=open(tmp.c_str(),O_CREAT|O_EXCL|O_WRONLY,0644);if(fd<0)throw err("cannot create completion record",tmp);try{std::ostringstream x;x<<"version=1\nfingerprint="<<fingerprint_<<"\n";for(size_t n=0;n<a.size();++n){std::string p=artifact_path(a[n].identity,a[n].logical,a[n].shard);if(!exists(p))throw err("completion references missing artifact",p);x<<"artifact\t"<<base(p)<<"\t"<<a[n].records<<"\t"<<a[n].bytes<<"\t"<<a[n].checksum<<"\n";}for(size_t n=0;n<deps.size();++n)x<<"dependency\t"<<deps[n]<<"\n";std::string text=x.str();write_all(fd,text.data(),text.size(),tmp);sync_file(fd,tmp);crash_if_requested("task-before-rename");if(rename(tmp.c_str(),final.c_str())!=0)throw err("cannot publish completion record",final);sync_dir(directory_);crash_if_requested("task-after-rename");}catch(...){close(fd);unlink(tmp.c_str());throw;}}
-void BuildWorkspace::retire_marked(const std::string& predecessor,const std::string& successor)
+BuildWorkspace::CompletionReferences BuildWorkspace::completion_references(const std::string& directory)
+{
+  CompletionReferences result;DIR* d=opendir(directory.c_str());if(d==0)throw err("cannot open workspace",directory);
+  try {
+    for(dirent* entry;(entry=readdir(d));) { std::string name=entry->d_name,path=directory+"/"+name;
+      if(name.size()<=9||name.substr(name.size()-9)!=".complete")continue;
+      std::set<std::string>& names=result.by_record[path];
+      std::istringstream input(read_text_file(path));std::string line;
+      while(std::getline(input,line)) { if(line.compare(0,9,"artifact\t")!=0)continue;size_t end=line.find('\t',9);if(end==std::string::npos)continue;std::string artifact=line.substr(9,end-9);if(names.insert(artifact).second)result.listing[artifact]++; }
+    }
+  } catch(...) { closedir(d);throw; }
+  closedir(d);return result;
+}
+void BuildWorkspace::retire_marked(const std::string& predecessor,const std::string& successor,const CompletionReferences* references)
 {
   // Validate the successor before every unlink, including resume after a crash.
   committed_artifact_names(successor,fingerprint_);
   std::set<std::string> obsolete=committed_artifact_names(predecessor,fingerprint_,false);
-  std::set<std::string> shared=referenced_by_other_tasks(directory_,predecessor);
+  // An artifact is shared when a completion record other than the
+  // predecessor's lists it. With an index, that is any listing beyond the
+  // predecessor's own; without one, scan every record now.
+  std::set<std::string> shared;if(references==0)shared=referenced_by_other_tasks(directory_,predecessor);
+  const std::set<std::string>* own=0;
+  if(references!=0){std::map<std::string,std::set<std::string>>::const_iterator r=references->by_record.find(predecessor);if(r!=references->by_record.end())own=&(r->second);}
   for(std::set<std::string>::const_iterator i=obsolete.begin();i!=obsolete.end();++i)
   {
-    if(shared.find(*i)!=shared.end())continue;
+    if(references==0){if(shared.find(*i)!=shared.end())continue;}
+    else { std::map<std::string,size_t>::const_iterator n=references->listing.find(*i);size_t self=(own!=0&&own->count(*i)!=0)?1:0;if(n!=references->listing.end()&&n->second>self)continue; }
     std::string path=directory_+"/"+*i;
     if(unlink(path.c_str())==0)crash_if_requested("retire-after-remove");
     else if(errno!=ENOENT)throw err("cannot retire obsolete artifact",path);
@@ -236,6 +255,12 @@ void BuildWorkspace::retire_marked(const std::string& predecessor,const std::str
 void BuildWorkspace::retire_obsolete(const std::string& predecessor_task,
   const std::string& predecessor_phase,const std::string& successor_task,
   const std::string& successor_phase)
+{
+  retire_obsolete(predecessor_task,predecessor_phase,successor_task,successor_phase,0);
+}
+void BuildWorkspace::retire_obsolete(const std::string& predecessor_task,
+  const std::string& predecessor_phase,const std::string& successor_task,
+  const std::string& successor_phase,const CompletionReferences* references)
 {
   const std::string predecessor=completion_path(predecessor_task,predecessor_phase);
   const std::string successor=completion_path(successor_task,successor_phase);
@@ -248,7 +273,7 @@ void BuildWorkspace::retire_obsolete(const std::string& predecessor_task,
     if(record.complete)return;
     // The marker is the durable deletion intent. Its replay path accepts
     // already-missing predecessor artifacts, making direct retries idempotent.
-    retire_marked(predecessor,successor);
+    retire_marked(predecessor,successor,references);
     complete_retirement_record(final);
     return;
   }
@@ -274,7 +299,7 @@ void BuildWorkspace::retire_obsolete(const std::string& predecessor_task,
     if(rename(temporary.c_str(),final.c_str())!=0)throw err("cannot publish retirement record",final);
     sync_dir(directory_);
   } catch(...) { if(fd>=0)close(fd);unlink(temporary.c_str());throw; }
-  retire_marked(predecessor,successor);
+  retire_marked(predecessor,successor,references);
   complete_retirement_record(final);
 }
 
@@ -304,6 +329,10 @@ BuildWorkspace::retire_obsolete_family(
   closedir(directory);
   std::sort(tasks.begin(),tasks.end());
   tasks.erase(std::unique(tasks.begin(),tasks.end()),tasks.end());
+  // One reference index serves the whole family (see CompletionReferences);
+  // a join family has hundreds of members per doubling step, and rereading
+  // every completion record for each of them grew as members times records.
+  CompletionReferences references;bool indexed=false;
   for(const std::string& task:tasks)
   {
     if(task==successor_task && predecessor_phase==successor_phase)continue;
@@ -318,8 +347,9 @@ BuildWorkspace::retire_obsolete_family(
     // A prior retirement journal may already have removed this task. Avoid
     // publishing a redundant marker for a predecessor with nothing left.
     if(!remains)continue;
+    if(!indexed){references=completion_references(directory_);indexed=true;}
     this->retire_obsolete(task,predecessor_phase,
-      successor_task,successor_phase);
+      successor_task,successor_phase,&references);
   }
 }
 uint64_t

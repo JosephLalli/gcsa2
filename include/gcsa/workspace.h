@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -112,7 +113,15 @@ private:
   std::string directory_,fingerprint_; Settings semantic_,operational_;
   std::string completion_path(const std::string&,const std::string&) const;
   std::string retirement_path(const std::string&,const std::string&,const std::string&,const std::string&) const;
-  void retire_marked(const std::string&,const std::string&);
+  // The artifact names each task completion record lists, keyed by the
+  // record's path, and how many records list each name. Retirement keeps a
+  // predecessor artifact that any other record lists; a family retirement
+  // builds this once instead of rereading every record per retired task, which
+  // is valid because retirement never creates or removes a completion record.
+  struct CompletionReferences { std::map<std::string,std::set<std::string>> by_record; std::map<std::string,size_t> listing; };
+  static CompletionReferences completion_references(const std::string& directory);
+  void retire_marked(const std::string&,const std::string&,const CompletionReferences* references=0);
+  void retire_obsolete(const std::string&,const std::string&,const std::string&,const std::string&,const CompletionReferences*);
   static std::string safe(const std::string&);
   void ensure_completed(const ArtifactIdentity&,const std::string&,uint64_t) const;
   uint64_t committed_artifact_checksum(const ArtifactIdentity&,

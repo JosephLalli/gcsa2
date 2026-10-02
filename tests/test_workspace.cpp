@@ -237,5 +237,16 @@ int main() {
   resumed.retire_obsolete_family("step-04-join-","join-partition","step-04","extend");
   resumed.retire_obsolete_family("step-04-join-","join-partition","step-04","extend");
   require(access(family_path_a.c_str(),F_OK)!=0&&access(family_path_b.c_str(),F_OK)!=0&&access(family_path_successor.c_str(),F_OK)==0);
+  // A family member's artifact that another completion record still lists
+  // survives a family retirement exactly as it survives a single one; the
+  // family answers that from one reference index built for all its members.
+  ArtifactIdentity family_c("step-05-join-c","join-partition","paths","bin"),family_d("step-05-join-d","join-partition","paths","bin"),family_next("step-05","extend","paths","bin");
+  BuildWorkspace::ArtifactWriter family_writer_c=resumed.open_artifact(family_c,logical_file_id_t(51),physical_shard_id_t(1));family_writer_c.write(payload.data(),19);BuildWorkspace::ArtifactRef family_ref_c=family_writer_c.finish(1);resumed.commit_task(family_c.task,family_c.phase,std::vector<BuildWorkspace::ArtifactRef>(1,family_ref_c));
+  BuildWorkspace::ArtifactWriter family_writer_d=resumed.open_artifact(family_d,logical_file_id_t(51),physical_shard_id_t(2));family_writer_d.write(payload.data(),23);BuildWorkspace::ArtifactRef family_ref_d=family_writer_d.finish(1);resumed.commit_task(family_d.task,family_d.phase,std::vector<BuildWorkspace::ArtifactRef>(1,family_ref_d));
+  BuildWorkspace::ArtifactWriter family_writer_next=resumed.open_artifact(family_next,logical_file_id_t(51),physical_shard_id_t(3));family_writer_next.write(payload.data(),29);BuildWorkspace::ArtifactRef family_ref_next=family_writer_next.finish(1);resumed.commit_task(family_next.task,family_next.phase,std::vector<BuildWorkspace::ArtifactRef>(1,family_ref_next));
+  resumed.commit_task("keeper","phase",std::vector<BuildWorkspace::ArtifactRef>(1,family_ref_c));
+  const std::string family_path_c=resumed.artifact_path(family_c,logical_file_id_t(51),physical_shard_id_t(1)),family_path_d=resumed.artifact_path(family_d,logical_file_id_t(51),physical_shard_id_t(2)),family_path_next=resumed.artifact_path(family_next,logical_file_id_t(51),physical_shard_id_t(3));
+  resumed.retire_obsolete_family("step-05-join-","join-partition","step-05","extend");
+  require(access(family_path_c.c_str(),F_OK)==0&&access(family_path_d.c_str(),F_OK)!=0&&access(family_path_next.c_str(),F_OK)==0);
   DiskBudget disk(root,1,0); std::string why; require(!disk.can_reserve(2,&why) && !why.empty()); return 0;
 }
