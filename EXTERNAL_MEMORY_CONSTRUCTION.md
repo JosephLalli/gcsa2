@@ -1214,8 +1214,17 @@ thread ran 75% against 71% of a longer scan and waited no more, so it does the d
 block checksums itself whenever it outruns the one-buffer read-ahead. Decoding through
 `CompressedBlockPrefetchPool` is the untested remedy. Whole-build times (0:36:57 against 0:40:20)
 are within this host's spread: preprocessing, which no change touches, differed by 0:02:16
-between the two runs. Not yet run: the default depth 1 with this code (queued), and any joint
-chr2+chr18 build.
+between the two runs.
+
+At the default depth 1 each prune writes seven shards, which capped whole-shard readers at seven
+threads (distribution 0:06:09 against 0:05:02 on chr18); `5b4d225` gives readers chunks of shards
+(`PathShardReader::restrict`), and chr18 distribution then took 0:02:45. A complete joint
+chr2+chr18 build with `5b4d225` (default depth, compressed merge off) matched the 9/30 index MD5 and
+its blocks summed to 3:45:44 at 6.08 mean threads: joins 1:16:35 (33.9%, about 9 of 32 workers),
+construction 0:40:54, merge 0:29:52, preprocessing 0:22:05, prune 0:19:05 (0:27:38 on 9/30),
+distribution 0:17:19 (0:37:12 on 9/30), compaction 0:16:54. The merge's drop from 1:08:05 is host
+write pressure (dirty-page throttle in 36% of its samples on 9/30, 0% now), not code. Record:
+`hprc_v2_vg_rna/gcsa2_distribution_concurrency_20260928/joint_chr2_chr18_5b4d225_20261002/`.
 
 ## Build, test, and usage
 
