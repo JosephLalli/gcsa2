@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
@@ -22,6 +23,7 @@
 #include <random>
 #include <sstream>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 #include <unordered_set>
 
@@ -87,22 +89,48 @@ retireBeforeFrontier(BuildWorkspace& workspace,
   }
 }
 
+// FNV-1a over every byte of the file in order, the value BuildWorkspace::checksum()
+// gives for the whole file; the semantic fingerprint records it per input.
+//
+// The joint chr2+chr18 fingerprint read 19.4 GB in 0:02:10 at 0.41 cores,
+// about 150 MB/s: one synchronous read per buffer, no read-ahead, one file
+// after another. The digest itself runs at about 0.77 GB/s on one core and is
+// byte-serial, so a file cannot be split, but reading in slices behind a
+// ReadAhead keeps the device busy while the digest runs, and the caller
+// checksums the files concurrently. The ReadAhead borrows this descriptor and
+// is destroyed, draining its pieces in flight, before the descriptor closes.
 std::uint64_t
 constructionFileChecksum(const std::string& filename, size_type buffer_bytes)
 {
-  std::ifstream input;
-  input.rdbuf()->pubsetbuf(nullptr, 0);
-  input.open(filename.c_str(), std::ios_base::binary);
-  if(!input) { throw std::runtime_error("GCSA::GCSA(): cannot checksum " + filename); }
-  std::vector<std::uint8_t> buffer(std::max(static_cast<size_type>(1), buffer_bytes));
+  int descriptor = ::open(filename.c_str(), O_RDONLY | O_CLOEXEC);
+  if(descriptor < 0) { throw std::runtime_error("GCSA::GCSA(): cannot checksum " + filename); }
+#if defined(POSIX_FADV_SEQUENTIAL)
+  // Advice is non-semantic; unsupported filesystems may safely ignore it.
+  static_cast<void>(::posix_fadvise(descriptor, 0, 0, POSIX_FADV_SEQUENTIAL));
+#endif
+  // Slices larger than this buy nothing once read-ahead runs ahead of them,
+  // and every input file holds one while the fingerprint runs.
+  constexpr size_type SLICE_BYTES = 16 * MEGABYTE;
   std::uint64_t checksum = 1469598103934665603ULL;
-  while(input)
+  try
   {
-    input.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
-    std::streamsize bytes = input.gcount();
-    if(bytes > 0) { checksum = BuildWorkspace::checksum(buffer.data(), bytes, checksum); }
+    ReadAhead read_ahead(descriptor);
+    std::vector<std::uint8_t> buffer(std::max(static_cast<size_type>(1),
+      std::min(buffer_bytes, SLICE_BYTES)));
+    std::uint64_t offset = 0;
+    while(true)
+    {
+      read_ahead.advance(offset);
+      ssize_t bytes = ::read(descriptor, buffer.data(), buffer.size());
+      if(bytes < 0 && errno == EINTR) { continue; }
+      if(bytes < 0) { throw std::runtime_error("GCSA::GCSA(): failed to checksum " + filename); }
+      if(bytes == 0) { break; }
+      checksum = BuildWorkspace::checksum(buffer.data(), static_cast<size_type>(bytes), checksum);
+      offset += static_cast<std::uint64_t>(bytes);
+    }
   }
-  if(!input.eof()) { throw std::runtime_error("GCSA::GCSA(): failed to checksum " + filename); }
+  catch(...) { ::close(descriptor); throw; }
+  ::close(descriptor);
   return checksum;
 }
 
@@ -110,6 +138,38 @@ BuildWorkspace::Settings
 constructionSemanticSettings(const InputGraph& graph,
   const ConstructionParameters& parameters, size_type checksum_buffer)
 {
+  // Checksum every input and the mapping concurrently, one file per thread,
+  // before assembling the settings. The loop below then runs in the original
+  // order and rethrows a file's checksum error where the serial version would
+  // have thrown it, after that file's stat, so errors and their order are
+  // unchanged.
+  std::vector<std::string> checksum_names(graph.filenames.begin(), graph.filenames.end());
+  if(!graph.mapping_name.empty()) { checksum_names.push_back(graph.mapping_name); }
+  std::vector<std::uint64_t> checksums(checksum_names.size(), 0);
+  std::vector<std::exception_ptr> checksum_errors(checksum_names.size());
+  {
+    std::atomic<size_type> next_file(0);
+    const auto checksum_files = [&]()
+    {
+      for(size_type file = next_file++; file < checksum_names.size(); file = next_file++)
+      {
+        try { checksums[file] = constructionFileChecksum(checksum_names[file], checksum_buffer); }
+        catch(...) { checksum_errors[file] = std::current_exception(); }
+      }
+    };
+    const size_type threads = std::min(checksum_names.size(),
+      static_cast<size_type>(std::max(1, omp_get_max_threads())));
+    std::vector<std::thread> helpers;
+    for(size_type i = 1; i < threads; i++) { helpers.emplace_back(checksum_files); }
+    checksum_files();
+    for(std::thread& helper : helpers) { helper.join(); }
+  }
+  const auto file_checksum = [&](size_type file)
+  {
+    if(checksum_errors[file]) { std::rethrow_exception(checksum_errors[file]); }
+    return checksums[file];
+  };
+
   BuildWorkspace::Settings settings;
   settings["gcsa_format"] = std::to_string(Version::GCSA_VERSION);
   settings["lcp_format"] = std::to_string(Version::LCP_VERSION);
@@ -141,8 +201,7 @@ constructionSemanticSettings(const InputGraph& graph,
     std::string prefix = "input_" + std::to_string(file) + "_";
     settings[prefix + "path"] = graph.filenames[file];
     settings[prefix + "bytes"] = std::to_string(static_cast<std::uint64_t>(info.st_size));
-    settings[prefix + "checksum"] = std::to_string(
-      constructionFileChecksum(graph.filenames[file], checksum_buffer));
+    settings[prefix + "checksum"] = std::to_string(file_checksum(file));
     settings[prefix + "logical_id"] = std::to_string(file);
   }
   settings["mapping_path"] = graph.mapping_name;
@@ -154,8 +213,7 @@ constructionSemanticSettings(const InputGraph& graph,
       throw std::runtime_error("GCSA::GCSA(): cannot stat " + graph.mapping_name);
     }
     settings["mapping_bytes"] = std::to_string(static_cast<std::uint64_t>(info.st_size));
-    settings["mapping_checksum"] = std::to_string(
-      constructionFileChecksum(graph.mapping_name, checksum_buffer));
+    settings["mapping_checksum"] = std::to_string(file_checksum(graph.files()));
   }
   return settings;
 }
