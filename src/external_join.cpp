@@ -59,6 +59,9 @@ constexpr std::uint32_t JOIN_GROUP_FORMAT_VERSION = 1;
 constexpr std::uint32_t JOIN_GROUP_FRAMED_FORMAT_VERSION = 2;
 constexpr size_type JOIN_BASE_FIXED_BYTES = 32 * KILOBYTE;
 constexpr size_type JOIN_LABEL_COUNT = PathLabel::LABEL_LENGTH + 1;
+// Records a distribution reader collects for one range's sorter before taking
+// its lock.
+constexpr size_type JOIN_RANGE_BATCH_RECORDS = 1024;
 constexpr size_type JOIN_HEADER_BYTES = 8 + 4 + 4 + 4 + 8;
 constexpr size_type JOIN_FOOTER_BYTES = 8 + 8 + 8;
 constexpr size_type JOIN_RECORD_BYTES =
@@ -5525,15 +5528,17 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
   PathGraph next(0, 2 * graph.k(), graph.step() + 1);
   size_type next_physical = 0, committed_bytes = 0;
 
-  // Key-range distribution runs several range workers at once, each holding a
-  // shard reader pair and two sorters that share the distribution lifetime's
-  // memory. Descriptors bound the workers as well: during a merge one sorter
-  // has fan_in run readers, its run writer and two sidecar writers open, and
-  // the shard reader two more. The largest count that admits a merge fan-in of
-  // at least four wins, so a range's runs merge in one pass. Range workers
-  // run concurrently, so their descriptors come from the concurrent budget, as
-  // compaction batches and range planners do; the 128-file merge ceiling held
-  // distribution to 14 workers and a merge fan-in of four.
+  // Key-range distribution reads each logical input once. Reader threads take
+  // whole shards and route every record to the sorters of the key range its
+  // join key falls in, so all of a pass's ranges keep two live sorters each and
+  // share the distribution lifetime's memory with the readers' decoders and
+  // batches. If that leaves a sorter below its minimum, ranges are handled in
+  // groups, one read of the input per group. (Each range used to scan every
+  // shard itself: on chr18, 64 ranges read the input 64 times per step.)
+  // Records keep the ordinal the sequential scan would give them, and the
+  // sort order ends in that ordinal, so the runs do not depend on which reader
+  // delivered a record first. Readers and the sorters' merges run concurrently,
+  // so their descriptors come from the concurrent open-file budget.
   const size_type thread_limit = static_cast<size_type>(std::max(1, omp_get_max_threads()));
   const size_type descriptor_budget = std::max(parameters.getMaxOpenFiles(),
     parameters.getConcurrentOpenFiles()) - 2;
@@ -5541,23 +5546,43 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
     source_codec_bytes, "distribution lifetime bytes");
   TempFileCodecParameters requested_range_codec = parameters.getTempFileCodecParameters();
   requested_range_codec.workers = 1;
-  auto admit_range_workers = [&](size_type ranges, size_type& fan_in,
-    size_type& sorter_budget, TempFileCodecParameters& codec) -> size_type
+  struct RangePasses
   {
-    for(size_type active = std::min(ranges, thread_limit); active >= 2; active--)
+    size_type readers, finishers, group, batch, sorter_budget, fan_in;
+    TempFileCodecParameters codec;
+  };
+  auto plan_range_passes = [&](size_type ranges, size_type shards) -> RangePasses
+  {
+    RangePasses result{ 1, 1, 0, 1, 0, 0, requested_range_codec };
+    const size_type readers = std::max(static_cast<size_type>(1),
+      std::min({ thread_limit, shards, descriptor_budget / 8 }));
+    for(size_type group = ranges; group >= 2; group--)
     {
-      if(descriptor_budget / active < 4 + 5) { continue; }
-      const size_type per_worker = total_distribution / active;
-      if(per_worker <= source_codec_bytes) { continue; }
-      const size_type budget = (per_worker - source_codec_bytes) / 2;
+      // Batches take at most a sixty-fourth of the lifetime's memory.
+      const size_type batch = std::max(static_cast<size_type>(1),
+        std::min(JOIN_RANGE_BATCH_RECORDS,
+          total_distribution / (64 * readers * 2 * group * sizeof(JoinRecord))));
+      const size_type reader_bytes = checkedJoinMultiply(readers,
+        checkedJoinAdd(source_codec_bytes, checkedJoinMultiply(2 * group,
+          batch * sizeof(JoinRecord), "range batch bytes"),
+          "range reader bytes"), "range readers bytes");
+      if(reader_bytes >= total_distribution) { continue; }
+      const size_type budget = (total_distribution - reader_bytes) / (2 * group);
       TempFileCodecParameters candidate = boundedJoinRunCodec(requested_range_codec,
         budget, (parameters.getProcessWorkers() > 1 ? memory_budget : 0));
       if(budget < joinRunSortMinimumBudget(candidate)) { continue; }
-      fan_in = std::min(join_fan_in, descriptor_budget / active - 5);
-      sorter_budget = budget; codec = candidate;
-      return active;
+      // Finishing merges each sorter's runs within that sorter's own budget,
+      // so it may use more threads than there are readers.
+      const size_type finishers = std::max(static_cast<size_type>(1),
+        std::min(thread_limit, 2 * group));
+      result.readers = readers; result.finishers = finishers; result.group = group;
+      result.batch = batch; result.sorter_budget = budget;
+      result.fan_in = std::min(join_fan_in, std::max(static_cast<size_type>(4),
+        descriptor_budget / std::max(readers, finishers) - 5));
+      result.codec = candidate;
+      return result;
     }
-    return static_cast<size_type>(1);
+    return result;
   };
 
   for(const auto& group : groups)
@@ -5567,64 +5592,158 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
 
     const JoinRangePlan range_plan = loadOrCreateJoinRangePlan(graph, group.second,
       logical, thread_limit, workspace, checkpoint_task, stats);
-    size_type range_fan_in = 0, range_sort_budget = 0;
-    TempFileCodecParameters range_codec = requested_range_codec;
-    const size_type active_ranges = (range_plan.ranges() > 1 ?
-      admit_range_workers(range_plan.ranges(), range_fan_in, range_sort_budget, range_codec) :
-      static_cast<size_type>(1));
+    const RangePasses passes = (range_plan.ranges() > 1 ?
+      plan_range_passes(range_plan.ranges(), group.second.size()) :
+      RangePasses{ 1, 1, 0, 1, 0, 0, requested_range_codec });
+    const size_type active_ranges = (passes.group >= 2 ? passes.readers : 1);
+    const bool range_scan = (passes.group >= 2);
     if(stats != nullptr)
     {
       stats->distribution_ranges = std::max(stats->distribution_ranges,
-        (active_ranges > 1 ? range_plan.ranges() : static_cast<size_type>(1)));
+        (range_scan ? range_plan.ranges() : static_cast<size_type>(1)));
       stats->distribution_concurrency = std::max(stats->distribution_concurrency,
         active_ranges);
     }
 
-    if(active_ranges > 1)
+    if(range_scan)
     {
       const size_type ranges = range_plan.ranges();
+      const std::vector<size_type>& shards = group.second;
       std::vector<JoinRun> lefts(ranges), rights(ranges);
       std::vector<char> finished(ranges, 0);
       std::vector<ExternalPathJoinStats> range_stats(ranges);
-      std::vector<std::exception_ptr> errors(ranges);
-      std::atomic<size_type> next_range(0);
-      auto run = [&]()
+      std::vector<std::uint64_t> ordinal_base(shards.size(), 0);
+      for(size_type i = 1; i < shards.size(); i++)
       {
-        for(size_type range = next_range++; range < ranges; range = next_range++)
-        {
-          try
-          {
-            ExternalPathJoinStats* out = (stats != nullptr ? &range_stats[range] : nullptr);
-            ExternalJoinSorter right_sorter(logical, RIGHT_BY_FROM, range_sort_budget,
-              range_fan_in, parameters.getVerifyWorkspace(), out, range_codec, false);
-            ExternalJoinSorter left_sorter(logical, LEFT_BY_TO, range_sort_budget,
-              range_fan_in, parameters.getVerifyWorkspace(), out, range_codec, false);
-            scanJoinRange(graph, group.second, logical, range_plan, range,
-              right_sorter, left_sorter, out);
-            rights[range] = right_sorter.finish();
-            lefts[range] = left_sorter.finish();
-            finished[range] = 1;
-          }
-          catch(...) { errors[range] = std::current_exception(); }
-        }
+        ordinal_base[i] = ordinal_base[i - 1] + graph.path_counts[shards[i - 1]];
+      }
+      auto range_of = [&](node_type key) -> size_type
+      {
+        return static_cast<size_type>(std::upper_bound(range_plan.boundaries.begin(),
+          range_plan.boundaries.end(), key) - range_plan.boundaries.begin());
       };
-      std::vector<std::thread> threads;
-      // A thread that cannot start leaves its ranges to the others: the shared
-      // queue, not the thread count, decides which ranges run.
-      try { for(size_type t = 1; t < active_ranges; t++) { threads.emplace_back(run); } }
-      catch(const std::system_error&) { }
-      run();
-      for(std::thread& thread : threads) { thread.join(); }
-      for(size_type range = 0; range < ranges; range++)
+      size_type right_records = 0, left_records = 0;
+      std::exception_ptr failure;
+      try
       {
-        if(errors[range])
+        for(size_type first = 0; first < ranges; first += passes.group)
         {
-          for(size_type other = 0; other < ranges; other++)
+          const size_type count = std::min(passes.group, ranges - first);
+          std::vector<std::unique_ptr<ExternalJoinSorter>> right_sorters(count), left_sorters(count);
+          std::vector<std::mutex> locks(2 * count);
+          for(size_type i = 0; i < count; i++)
           {
-            if(finished[other]) { removeJoinRun(lefts[other]); removeJoinRun(rights[other]); }
+            ExternalPathJoinStats* out = (stats != nullptr ? &range_stats[first + i] : nullptr);
+            right_sorters[i].reset(new ExternalJoinSorter(logical, RIGHT_BY_FROM,
+              passes.sorter_budget, passes.fan_in, parameters.getVerifyWorkspace(), out,
+              passes.codec, false));
+            left_sorters[i].reset(new ExternalJoinSorter(logical, LEFT_BY_TO,
+              passes.sorter_budget, passes.fan_in, parameters.getVerifyWorkspace(), out,
+              passes.codec, false));
           }
-          std::rethrow_exception(errors[range]);
+
+          // Read every shard once; route each record to its ranges' sorters.
+          std::atomic<size_type> next_shard(0);
+          std::atomic<bool> stop(false);
+          std::vector<std::exception_ptr> errors(passes.readers);
+          std::vector<size_type> right_counts(passes.readers, 0), left_counts(passes.readers, 0);
+          auto scan = [&](size_type reader_id)
+          {
+            try
+            {
+              std::vector<std::vector<JoinRecord>> right_batch(count), left_batch(count);
+              auto deliver = [&](std::vector<JoinRecord>& batch, ExternalJoinSorter& sorter,
+                std::mutex& lock)
+              {
+                std::lock_guard<std::mutex> guard(lock);
+                for(const JoinRecord& record : batch) { sorter.add(record); }
+                batch.clear();
+              };
+              for(size_type i = next_shard++; i < shards.size() && !stop; i = next_shard++)
+              {
+                PathShardReader reader(graph, shards[i], true);
+                JoinRecord record;
+                std::uint64_t ordinal = ordinal_base[i];
+                while(reader.read(record))
+                {
+                  record.logical = logical; record.ordinal = ordinal++;
+                  const size_type right = range_of(record.node.from);
+                  if(right >= first && right < first + count)
+                  {
+                    record.key = record.node.from;
+                    std::vector<JoinRecord>& batch = right_batch[right - first];
+                    batch.push_back(record); right_counts[reader_id]++;
+                    if(batch.size() >= passes.batch)
+                    {
+                      deliver(batch, *(right_sorters[right - first]), locks[2 * (right - first)]);
+                    }
+                  }
+                  if(record.node.sorted()) { continue; }
+                  const size_type left = range_of(record.node.to);
+                  if(left >= first && left < first + count)
+                  {
+                    record.key = record.node.to;
+                    std::vector<JoinRecord>& batch = left_batch[left - first];
+                    batch.push_back(record); left_counts[reader_id]++;
+                    if(batch.size() >= passes.batch)
+                    {
+                      deliver(batch, *(left_sorters[left - first]), locks[2 * (left - first) + 1]);
+                    }
+                  }
+                }
+              }
+              for(size_type i = 0; i < count; i++)
+              {
+                if(!right_batch[i].empty()) { deliver(right_batch[i], *(right_sorters[i]), locks[2 * i]); }
+                if(!left_batch[i].empty()) { deliver(left_batch[i], *(left_sorters[i]), locks[2 * i + 1]); }
+              }
+            }
+            catch(...) { errors[reader_id] = std::current_exception(); stop = true; }
+          };
+          std::vector<std::thread> threads;
+          try { for(size_type r = 1; r < passes.readers; r++) { threads.emplace_back(scan, r); } }
+          catch(const std::system_error&) { }
+          scan(0);
+          for(std::thread& thread : threads) { thread.join(); }
+          for(const std::exception_ptr& error : errors) { if(error) { std::rethrow_exception(error); } }
+          for(size_type r = 0; r < passes.readers; r++)
+          {
+            right_records += right_counts[r]; left_records += left_counts[r];
+          }
+
+          // Finish the sorters (their run merges) on the same number of threads.
+          std::atomic<size_type> next_task(0);
+          std::vector<std::exception_ptr> finish_errors(passes.finishers);
+          auto finish = [&](size_type worker)
+          {
+            try
+            {
+              for(size_type task = next_task++; task < 2 * count; task = next_task++)
+              {
+                const size_type i = task / 2;
+                if(task % 2 == 0) { rights[first + i] = right_sorters[i]->finish(); }
+                else { lefts[first + i] = left_sorters[i]->finish(); }
+              }
+            }
+            catch(...) { finish_errors[worker] = std::current_exception(); }
+          };
+          threads.clear();
+          try { for(size_type r = 1; r < passes.finishers; r++) { threads.emplace_back(finish, r); } }
+          catch(const std::system_error&) { }
+          finish(0);
+          for(std::thread& thread : threads) { thread.join(); }
+          for(const std::exception_ptr& error : finish_errors) { if(error) { std::rethrow_exception(error); } }
+          for(size_type i = 0; i < count; i++) { finished[first + i] = 1; }
         }
+      }
+      catch(...) { failure = std::current_exception(); }
+      if(failure)
+      {
+        for(size_type range = 0; range < ranges; range++)
+        {
+          if(finished[range]) { removeJoinRun(lefts[range]); removeJoinRun(rights[range]); }
+        }
+        std::rethrow_exception(failure);
       }
       if(stats != nullptr)
       {
@@ -5632,10 +5751,12 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
         {
           mergeJoinScanStats(*stats, range_stats[range]);
         }
+        stats->right_records += right_records;
+        stats->left_records += left_records;
         stats->max_bytes_resident = std::max(stats->max_bytes_resident,
-          checkedJoinMultiply(active_ranges,
-            checkedJoinAdd(2 * range_sort_budget, source_codec_bytes, "range worker bytes"),
-            "concurrent range worker bytes"));
+          checkedJoinAdd(checkedJoinMultiply(2 * passes.group, passes.sorter_budget,
+            "range sorter bytes"), checkedJoinMultiply(passes.readers, source_codec_bytes,
+            "range reader bytes"), "range distribution bytes"));
       }
       for(size_type range = 0; range < ranges; range++)
       {
