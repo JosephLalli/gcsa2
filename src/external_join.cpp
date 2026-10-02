@@ -5530,9 +5530,13 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
   // memory. Descriptors bound the workers as well: during a merge one sorter
   // has fan_in run readers, its run writer and two sidecar writers open, and
   // the shard reader two more. The largest count that admits a merge fan-in of
-  // at least four wins, so a range's runs merge in one pass.
+  // at least four wins, so a range's runs merge in one pass. Range workers
+  // run concurrently, so their descriptors come from the concurrent budget, as
+  // compaction batches and range planners do; the 128-file merge ceiling held
+  // distribution to 14 workers and a merge fan-in of four.
   const size_type thread_limit = static_cast<size_type>(std::max(1, omp_get_max_threads()));
-  const size_type descriptor_budget = parameters.getMaxOpenFiles() - 2;
+  const size_type descriptor_budget = std::max(parameters.getMaxOpenFiles(),
+    parameters.getConcurrentOpenFiles()) - 2;
   const size_type total_distribution = checkedJoinAdd(maximum_distribution_sort,
     source_codec_bytes, "distribution lifetime bytes");
   TempFileCodecParameters requested_range_codec = parameters.getTempFileCodecParameters();
