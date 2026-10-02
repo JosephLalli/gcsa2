@@ -8,13 +8,16 @@
 #include <gcsa/internal.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <fstream>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <type_traits>
+#include <unistd.h>
 #include <vector>
 
 namespace gcsa
@@ -127,18 +130,47 @@ private:
   std::uint64_t digest_;
 };
 
+// A read-only descriptor that RawReader's ReadAhead can borrow. It is a member
+// declared before the ReadAhead, so the read-ahead is destroyed first and has
+// waited for its pieces in flight before the descriptor closes.
+struct InputDescriptor
+{
+  int value;
+
+  explicit InputDescriptor(const std::string& name) :
+    value(::open(name.c_str(), O_RDONLY | O_CLOEXEC))
+  {
+    if(this->value < 0) { throw std::runtime_error("external preprocessing: cannot open " + name); }
+#if defined(POSIX_FADV_SEQUENTIAL)
+    // Advice is non-semantic; unsupported filesystems may safely ignore it.
+    static_cast<void>(::posix_fadvise(this->value, 0, 0, POSIX_FADV_SEQUENTIAL));
+#endif
+  }
+
+  ~InputDescriptor() { if(this->value >= 0) { ::close(this->value); } }
+
+  InputDescriptor(const InputDescriptor&) = delete;
+  InputDescriptor& operator=(const InputDescriptor&) = delete;
+};
+
+/*
+  Reads the sorted KMer stream and the unique key and start streams for the
+  mapping pass and the start-node and last-character scans. One synchronous
+  read per buffer with no read-ahead leaves these passes at whatever the
+  kernel's own read-ahead delivers on a busy shared device, so it reads in
+  slices and advances a ReadAhead before each, as the sorter's readSliced
+  does. The ReadAhead borrows this reader's descriptor and adds none to the
+  descriptor budget.
+*/
 class RawReader
 {
 public:
   RawReader(const std::string& name, size_type record_bytes,
     size_type expected_records, size_type buffer_bytes) :
-    name_(name), input_(), buffer_(), record_bytes_(record_bytes),
-    records_(0), offset_(0), remaining_(expected_records)
+    name_(name), record_bytes_(checkedWidth(record_bytes)), input_(name),
+    read_ahead_(input_.value), buffer_(), records_(0), offset_(0),
+    remaining_(expected_records), position_(0)
   {
-    if(record_bytes_ == 0) { throw std::invalid_argument("external preprocessing: zero record width"); }
-    input_.rdbuf()->pubsetbuf(nullptr, 0);
-    input_.open(name.c_str(), std::ios_base::binary);
-    if(!input_) { throw std::runtime_error("external preprocessing: cannot open " + name); }
     size_type records_per_buffer = std::max(static_cast<size_type>(1),
       buffer_bytes / record_bytes_);
     buffer_.resize(records_per_buffer * record_bytes_);
@@ -151,8 +183,7 @@ public:
       if(remaining_ == 0) { return false; }
       size_type capacity = buffer_.size() / record_bytes_;
       size_type count = std::min(capacity, remaining_);
-      input_.read(reinterpret_cast<char*>(buffer_.data()), count * record_bytes_);
-      if(input_.gcount() != static_cast<std::streamsize>(count * record_bytes_))
+      if(this->readSliced(buffer_.data(), count * record_bytes_) != count * record_bytes_)
       {
         throw std::runtime_error("external preprocessing: truncated stream " + name_);
       }
@@ -170,18 +201,44 @@ public:
       throw std::runtime_error("external preprocessing: stream was not fully consumed " + name_);
     }
     std::vector<std::uint8_t> extra(record_bytes_);
-    input_.read(reinterpret_cast<char*>(extra.data()), record_bytes_);
-    if(input_.gcount() != 0)
+    if(this->readSliced(extra.data(), record_bytes_) != 0)
     {
       throw std::runtime_error("external preprocessing: trailing records in " + name_);
     }
   }
 
 private:
+  constexpr static size_type SLICE_BYTES = 16 * MEGABYTE;
+
+  static size_type checkedWidth(size_type record_bytes)
+  {
+    if(record_bytes == 0) { throw std::invalid_argument("external preprocessing: zero record width"); }
+    return record_bytes;
+  }
+
+  // Reads up to `bytes`, stopping early only at the end of the file.
+  size_type readSliced(std::uint8_t* data, size_type bytes)
+  {
+    size_type done = 0;
+    while(done < bytes)
+    {
+      read_ahead_.advance(position_);
+      ssize_t got = ::read(input_.value, data + done, std::min(SLICE_BYTES, bytes - done));
+      if(got < 0 && errno == EINTR) { continue; }
+      if(got < 0) { throw std::runtime_error("external preprocessing: cannot read " + name_); }
+      if(got == 0) { break; }
+      done += static_cast<size_type>(got); position_ += static_cast<std::uint64_t>(got);
+    }
+    return done;
+  }
+
   std::string name_;
-  std::ifstream input_;
+  size_type record_bytes_;
+  InputDescriptor input_;
+  ReadAhead read_ahead_;
   std::vector<std::uint8_t> buffer_;
-  size_type record_bytes_, records_, offset_, remaining_;
+  size_type records_, offset_, remaining_;
+  std::uint64_t position_;
 };
 
 struct InitialKMerRecord
