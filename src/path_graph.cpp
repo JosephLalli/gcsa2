@@ -1367,8 +1367,8 @@ pathMergeInputBudget(const ConstructionParameters& parameters,
   {
     // Raw shards hold no decoded blocks, but this budget also sizes the
     // merger's equal-label range and priority groups, which spill to disk once
-    // they outgrow it, and, with no separate input cache, the raw readers'
-    // windows. Capping it at --io-buffer-size (64 MiB) left each of step 1's
+    // they outgrow it. (Raw read windows are sized separately and do not grow
+    // with it.) Capping it at --io-buffer-size (64 MiB) left each of step 1's
     // seven prune workers about 9 MiB: on the joint chr2+chr18 graph that
     // prune wrote 97.7 GiB of spill and output for 23.9 GB of output, at 1.23
     // cores, while the framed steps after it, funded from the same sixteenth

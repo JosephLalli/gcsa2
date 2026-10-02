@@ -100,7 +100,7 @@ size_type pathMergeInputCacheBudget(const ConstructionParameters& parameters,
 // the ceiling: a workspace whose block needs more than a sixteenth of it is
 // reported with the limit it does need, not silently over-allocated. A raw
 // (unframed) generation gets that sixteenth as well, because the same budget
-// sizes the merger's spillable equal-label groups and its raw read windows.
+// sizes the merger's spillable equal-label range and priority groups.
 size_type pathMergeInputBudget(const ConstructionParameters& parameters,
   const PathGraph& source);
 
