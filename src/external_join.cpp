@@ -1774,6 +1774,8 @@ mergeJoinRuns(const std::vector<JoinRun>& inputs, logical_file_id_t logical,
   return output.finish();
 }
 
+void mergeJoinScanStats(ExternalPathJoinStats& into, const ExternalPathJoinStats& from);
+
 class ExternalJoinSorter
 {
 public:
@@ -1827,6 +1829,44 @@ public:
   {
     this->buffer.push_back(record);
     if(this->buffer.size() == this->run_records) { this->flush(); }
+  }
+
+  // For several producers sharing this sorter under a lock. append() takes a
+  // record and, once the run buffer is full, hands the buffer to the caller,
+  // who sorts and writes it with writeRun() outside the lock and registers the
+  // run with adoptRun() under it again. A detached buffer and the new one fit
+  // the budget, which reserves twice the run size for sorting.
+  bool append(const JoinRecord& record, std::vector<JoinRecord>& full)
+  {
+    this->buffer.push_back(record);
+    if(this->buffer.size() < this->run_records) { return false; }
+    full.swap(this->buffer);
+    this->buffer.clear(); this->buffer.reserve(this->run_records);
+    return true;
+  }
+
+  // Touches only settings fixed at construction, so it may run concurrently
+  // with append(); its writer counts into the caller's local statistics.
+  JoinRun writeRun(std::vector<JoinRecord>& records, ExternalPathJoinStats& local) const
+  {
+    sequentialSort(records.begin(), records.end(), joinRecordLess);
+    std::string name = TempFile::getName("gcsa_join_run");
+    JoinFileWriter writer(name, this->logical_id, this->key_kind,
+      records.size(), this->codec, &local);
+    for(const JoinRecord& record : records) { writer.writeRecord(record); }
+    JoinRun run = writer.finish();
+    std::vector<JoinRecord>().swap(records);
+    return run;
+  }
+
+  void adoptRun(const JoinRun& run, const ExternalPathJoinStats& local)
+  {
+    if(this->statistics != nullptr)
+    {
+      mergeJoinScanStats(*(this->statistics), local);
+      this->statistics->initial_runs++;
+    }
+    this->addRun(run, 0);
   }
 
   JoinRun finish()
@@ -5652,12 +5692,29 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
             try
             {
               std::vector<std::vector<JoinRecord>> right_batch(count), left_batch(count);
+              // Only appending holds the range's lock. A full run buffer is
+              // sorted and written by the reader that filled it, unlocked, so
+              // the other readers keep appending to that range meanwhile.
               auto deliver = [&](std::vector<JoinRecord>& batch, ExternalJoinSorter& sorter,
                 std::mutex& lock)
               {
-                std::lock_guard<std::mutex> guard(lock);
-                for(const JoinRecord& record : batch) { sorter.add(record); }
+                std::vector<std::vector<JoinRecord>> full_runs;
+                {
+                  std::lock_guard<std::mutex> guard(lock);
+                  for(const JoinRecord& record : batch)
+                  {
+                    std::vector<JoinRecord> full;
+                    if(sorter.append(record, full)) { full_runs.push_back(std::move(full)); }
+                  }
+                }
                 batch.clear();
+                for(std::vector<JoinRecord>& records : full_runs)
+                {
+                  ExternalPathJoinStats local;
+                  JoinRun run = sorter.writeRun(records, local);
+                  std::lock_guard<std::mutex> guard(lock);
+                  sorter.adoptRun(run, local);
+                }
               };
               for(size_type i = next_shard++; i < shards.size() && !stop; i = next_shard++)
               {
