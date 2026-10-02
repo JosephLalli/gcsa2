@@ -81,7 +81,12 @@ public:
     permutation of their offsets. It is safe exactly when the comparator
     inspects the whole record: no equal-but-distinct records exist, so the
     input-order tie-break it drops cannot be observed in the output. Leave it
-    false for a comparator that orders on a key only.
+    false for a comparator that orders on a key only, with one exception: a
+    sortAndReduce() caller whose declared order refines the comparator (records
+    the comparator orders stay in that order) and whose reducer produces the
+    same output for any order within a comparator-equal group. The merge and
+    the grouping still use the comparator, so groups stay contiguous and only
+    the unobservable order inside them changes.
 
     Two things improve. Every comparison loses an indirect call to two random
     offsets. And the offset array, which is as large as the data for an

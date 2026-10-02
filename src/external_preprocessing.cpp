@@ -355,9 +355,19 @@ ExternalInputPreprocessor::prepare()
       keys.close(); starts.close();
     }
 
-    // No total order here: compareKeyLabel orders on the label alone, so keys
-    // that differ in their predecessor/successor bits compare equal and the
-    // sorter's input-order tie-break is observable.
+    // compareKeyLabel orders on the label alone, so keys that differ in their
+    // predecessor/successor bits compare equal, and the run sorter would keep
+    // their input order with an offset permutation and one indirect call per
+    // comparison: 0:13:01 on one core for the joint chr2+chr18 keys, against
+    // 0:00:34 for the start sort over the same 809 million eight-byte records.
+    // That order cannot be observed. The label is the key's top bits
+    // (Key::label() is key >> 16), so ordering by the whole key is also an
+    // order by label, and the merge and the grouping below still use
+    // compareKeyLabel, so every label group stays contiguous. Within a group
+    // the reducer keeps the label and ORs the low 16 bits (Key::merge()),
+    // which commutes, so each group's output is the same in any order.
+    // Declaring the whole-key order lets run formation sort the keys as
+    // scalars in place, the order the legacy readKeys() uses as well.
     key_type merged_key = 0;
     ExternalFixedRecordSorter::sortAndReduce(key_source, this->key_name_,
       sizeof(key_type), this->sortBudget(), this->parameters_.getMergeFanIn(),
@@ -368,7 +378,8 @@ ExternalInputPreprocessor::prepare()
         if(first) { merged_key = key; }
         else { merged_key = Key::merge(merged_key, key); }
         if(last) { output.write(reinterpret_cast<const char*>(&merged_key), sizeof(merged_key)); }
-      }, &this->stats_.key_sort);
+      }, &this->stats_.key_sort, true,
+      ExternalFixedRecordSorter::RecordOrder::ASCENDING_U64);
     ExternalFixedRecordSorter::sortAndReduce(start_source, this->start_name_,
       sizeof(node_type), this->sortBudget(), this->parameters_.getMergeFanIn(),
       compareNode,
