@@ -2328,14 +2328,19 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   }
   PathGraphMergeStats final_merge_stats;
   SubPhaseProbe merge_probe("merge/merged-graph");
-  // With temporary compression on, the serial merge writes its paths, ranks
-  // and start nodes framed, compressed on one thread per stream; the final
-  // scan reads each of them about twice, so this cuts both writes and reads.
+  // Opt-in (GCSA_IO_COMPRESS_MERGE=1, with temporary compression on): the
+  // serial merge writes its paths, ranks and start nodes framed, compressed on
+  // one thread per stream. On chr18 that cut the merge's writes from 25.8 to
+  // 4.1 GiB and the final scan's device reads from 72.7 to 15.3 GiB, but the
+  // CPU-bound scan took 0:01:27 longer, so it stays off by default.
   const TempFileCodecParameters merge_codec = parameters.getTempFileCodecParameters();
+  const char* compress_merge = std::getenv("GCSA_IO_COMPRESS_MERGE");
+  const bool framed_merge = parameters.externalMemory() && compress_merge != nullptr &&
+    std::string(compress_merge) == "1";
   MergedGraph merged_graph(path_graph, mapper, lcp,
     path_graph.remainingLimit(parameters.getLimitBytes()), merge_buffer,
     &final_merge_stats, parameters.getMaxOpenFiles(), merge_cache, merge_workers,
-    (parameters.externalMemory() ? &merge_codec : nullptr));
+    (framed_merge ? &merge_codec : nullptr));
   merge_probe.report();
   reportFinalMergeStats(final_merge_stats);
   this->header.path_nodes = merged_graph.size();
