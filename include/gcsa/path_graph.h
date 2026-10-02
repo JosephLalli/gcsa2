@@ -494,7 +494,8 @@ struct MergedGraph
     PathGraphMergeStats* stats = nullptr,
     size_type max_open_files = 128,
     size_type input_cache_bytes = 0,
-    size_type merge_workers = 1);
+    size_type merge_workers = 1,
+    const TempFileCodecParameters* output_codec = nullptr);
   ~MergedGraph();
 
   void clear();

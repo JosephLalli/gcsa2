@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include <gcsa/utils.h>
+#include <gcsa/compressed_block.h>
 
 namespace gcsa
 {
@@ -342,6 +343,8 @@ struct ReadBuffer
   bool                    release_file_cache;
   size_type               cache_released;
   std::unique_ptr<ReadAhead> read_ahead;  // guarded by mtx after open()
+  // Set when the file is framed (compressed); reads then go through it, under mtx.
+  std::unique_ptr<CompressedBlockReader> compressed;
 
   // Reader thread.
   std::vector<Element>    read_buffer;
@@ -415,10 +418,34 @@ void
 ReadBuffer<Element>::open(const std::string& filename, size_type buffer_bytes,
   bool release_cache)
 {
-  if(this->descriptor >= 0)
+  if(this->descriptor >= 0 || this->compressed)
   {
     std::cerr << "ReadBuffer::open(): The file is already open" << std::endl;
     std::exit(EXIT_FAILURE);
+  }
+
+  if(CompressedBlockReader::isFramed(filename))
+  {
+    // A framed file is read sequentially through its decoder after one
+    // seek, which readAt() serves without decoding a block twice.
+    this->compressed.reset(new CompressedBlockReader(filename));
+    const std::uint64_t logical = this->compressed->logicalSize();
+    if(logical % sizeof(Element) != 0 || logical > std::numeric_limits<size_type>::max())
+    {
+      std::cerr << "ReadBuffer::open(): Invalid input file " << filename << std::endl;
+      this->compressed.reset();
+      std::exit(EXIT_FAILURE);
+    }
+    this->elements = static_cast<size_type>(logical) / sizeof(Element);
+    this->file_offset = 0;
+    this->release_file_cache = false;
+    this->cache_released = 0;
+    this->buffer_elements = std::max((size_type)1, buffer_bytes / sizeof(Element));
+    this->minimum_elements = std::max((size_type)1, this->buffer_elements / 2);
+    sdsl::util::clear(this->read_buffer);
+    this->read_buffer.reserve(this->buffer_elements);
+    this->reader_thread = std::thread(readerThread<Element>, this);
+    return;
   }
 
   this->descriptor = ::open(filename.c_str(), O_RDONLY);
@@ -473,6 +500,7 @@ ReadBuffer<Element>::close()
   this->releaseCache(this->elements, true);
   if(this->descriptor >= 0) { ::close(this->descriptor); }
   this->descriptor = -1;
+  this->compressed.reset();
   this->elements = 0;
   this->file_offset = 0;
   this->release_file_cache = false; this->cache_released = 0;
@@ -575,8 +603,18 @@ ReadBuffer<Element>::readBlock(size_type offset, Element* target,
     std::exit(EXIT_FAILURE);
   }
 
-  size_type done = 0;
   std::uint8_t* data = reinterpret_cast<std::uint8_t*>(target);
+  if(this->compressed)
+  {
+    if(this->compressed->readAt(byte_offset, data, bytes) != bytes)
+    {
+      std::cerr << "ReadBuffer::readBlock(): Unexpected EOF" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    DiskIO::read_volume += bytes;
+    return;
+  }
+  size_type done = 0;
   while(done < bytes)
   {
     size_type request = std::min(bytes - done,

@@ -2,6 +2,9 @@
 #include <gcsa/path_graph_external.h>
 #include <gcsa/compressed_block.h>
 #include <gcsa/support.h>
+#include <gcsa/internal.h>
+
+#include <cstring>
 
 #include <cstdlib>
 #include <cstdio>
@@ -883,6 +886,37 @@ static void write_parallel_merged_fixture(const std::string& name)
   writeBinary(output, kmers, 3); output.close(); require(static_cast<bool>(output));
 }
 
+// Every record of a raw or framed file, read through ReadBuffer as the final
+// scan reads it.
+template<class Element>
+static std::vector<char> buffered_contents(const std::string& name)
+{
+  ReadBuffer<Element> reader; reader.open(name);
+  std::vector<char> result(reader.size() * sizeof(Element));
+  for(size_type i = 0; i < reader.size(); i++)
+  {
+    Element value = reader[i];
+    std::memcpy(result.data() + i * sizeof(Element), &value, sizeof(Element));
+  }
+  reader.close();
+  return result;
+}
+
+static void require_same_merged_records(const MergedGraph& expected,
+  const MergedGraph& actual)
+{
+  require(expected.size() == actual.size());
+  require(expected.ranks() == actual.ranks());
+  require(expected.extra() == actual.extra());
+  require(expected.next == actual.next);
+  require(expected.next_from == actual.next_from);
+  require(buffered_contents<PathNode>(expected.path_name) == buffered_contents<PathNode>(actual.path_name));
+  require(buffered_contents<PathNode::rank_type>(expected.rank_name) ==
+    buffered_contents<PathNode::rank_type>(actual.rank_name));
+  require(buffered_contents<range_type>(expected.from_name) == buffered_contents<range_type>(actual.from_name));
+  require(contents(expected.lcp_name) == contents(actual.lcp_name));
+}
+
 static void require_same_merged_graph(const MergedGraph& expected,
   const MergedGraph& actual)
 {
@@ -934,6 +968,17 @@ static void compare_parallel_merged_graph(const std::string& base)
     // must discard its local partitions and complete through the serial route.
     MergedGraph scratch_limited(paths, mapper, lcp, serial.bytes(),
       parallel_budget, &scratch_limited_stats, 128, 0, 4);
+
+    // The serial merge with temporary compression writes paths, ranks and start
+    // nodes framed (small blocks, so records span several), and the LCP raw.
+    const TempFileCodecParameters framed_codec(TempCompression::ZSTD, 64 * KILOBYTE, 1, 1);
+    MergedGraph framed(paths, mapper, lcp, GIGABYTE, MEGABYTE,
+      nullptr, 128, 0, 1, &framed_codec);
+    require(CompressedBlockReader::isFramed(framed.path_name));
+    require(CompressedBlockReader::isFramed(framed.rank_name));
+    require(CompressedBlockReader::isFramed(framed.from_name));
+    require(!CompressedBlockReader::isFramed(framed.lcp_name));
+    require_same_merged_records(serial, framed);
 
     require_same_merged_graph(serial, two);
     require_same_merged_graph(serial, four);

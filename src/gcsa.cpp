@@ -2328,9 +2328,14 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   }
   PathGraphMergeStats final_merge_stats;
   SubPhaseProbe merge_probe("merge/merged-graph");
+  // With temporary compression on, the serial merge writes its paths, ranks
+  // and start nodes framed, compressed on one thread per stream; the final
+  // scan reads each of them about twice, so this cuts both writes and reads.
+  const TempFileCodecParameters merge_codec = parameters.getTempFileCodecParameters();
   MergedGraph merged_graph(path_graph, mapper, lcp,
     path_graph.remainingLimit(parameters.getLimitBytes()), merge_buffer,
-    &final_merge_stats, parameters.getMaxOpenFiles(), merge_cache, merge_workers);
+    &final_merge_stats, parameters.getMaxOpenFiles(), merge_cache, merge_workers,
+    (parameters.externalMemory() ? &merge_codec : nullptr));
   merge_probe.report();
   reportFinalMergeStats(final_merge_stats);
   this->header.path_nodes = merged_graph.size();

@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <condition_variable>
+#include <deque>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -5077,20 +5079,122 @@ initializeMergedGraphNext(MergedGraph& graph, const DeBruijnGraph& mapper)
   graph.next_from[mapper.alpha.sigma] = ~(size_type)0;
 }
 
+size_type
+mergedGraphOutputBufferBytes(size_type group_buffer_bytes)
+{
+  return std::max(static_cast<size_type>(1), group_buffer_bytes / 8);
+}
+
+/*
+  Writes records to a framed (compressed) file on its own thread. The serial
+  path merge only copies records into a batch and hands full batches over a
+  short queue; compression and the write happen on the stream's thread, so the
+  merge thread does not wait on either unless the queue is full.
+*/
+template<class Element>
+struct CompressedRecordStream
+{
+  constexpr static size_type QUEUE_DEPTH = 4;
+
+  std::unique_ptr<CompressedBlockWriter> writer;
+  std::vector<Element> batch;
+  size_type batch_records;
+  std::deque<std::vector<Element>> queue;
+  std::mutex mtx;
+  std::condition_variable ready, room;
+  bool closing;
+  std::exception_ptr error;
+  std::thread worker;
+
+  CompressedRecordStream(const std::string& filename, size_type buffer_bytes,
+    const TempFileCodecParameters& codec) :
+    writer(new CompressedBlockWriter(filename, codec.block_size,
+      CompressedBlockWriter::ZSTD, codec.level, 1)),
+    batch(), batch_records(std::max(static_cast<size_type>(1), buffer_bytes / sizeof(Element))),
+    queue(), closing(false), error()
+  {
+    this->batch.reserve(this->batch_records);
+    this->worker = std::thread([this]() { this->run(); });
+  }
+
+  ~CompressedRecordStream() { this->stop(); }
+
+  void pushBack(const Element& value)
+  {
+    this->batch.push_back(value);
+    if(this->batch.size() >= this->batch_records) { this->handOff(); }
+  }
+
+  void close()
+  {
+    if(!(this->batch.empty())) { this->handOff(); }
+    this->stop();
+    if(this->error) { std::rethrow_exception(this->error); }
+    this->writer->finish();
+  }
+
+private:
+  void handOff()
+  {
+    std::unique_lock<std::mutex> lock(this->mtx);
+    this->room.wait(lock, [this]() { return this->queue.size() < QUEUE_DEPTH || this->error; });
+    if(this->error) { std::rethrow_exception(this->error); }
+    this->queue.push_back(std::move(this->batch));
+    this->batch = std::vector<Element>();
+    this->batch.reserve(this->batch_records);
+    this->ready.notify_one();
+  }
+
+  void stop()
+  {
+    {
+      std::lock_guard<std::mutex> lock(this->mtx);
+      this->closing = true;
+    }
+    this->ready.notify_one();
+    if(this->worker.joinable()) { this->worker.join(); }
+  }
+
+  void run()
+  {
+    while(true)
+    {
+      std::vector<Element> records;
+      {
+        std::unique_lock<std::mutex> lock(this->mtx);
+        this->ready.wait(lock, [this]() { return !(this->queue.empty()) || this->closing; });
+        if(this->queue.empty()) { return; }
+        records = std::move(this->queue.front()); this->queue.pop_front();
+      }
+      this->room.notify_one();
+      try
+      {
+        for(const Element& record : records) { this->writer->writeRecord(&record, sizeof(Element)); }
+      }
+      catch(...)
+      {
+        std::lock_guard<std::mutex> lock(this->mtx);
+        this->error = std::current_exception();
+        this->room.notify_all();
+        return;
+      }
+    }
+  }
+};
+
+template<class PathWriter, class RankWriter, class FromWriter>
 static void
 buildMergedGraphSerial(MergedGraph& result, const PathGraph& source,
   const DeBruijnGraph& mapper, const LCP& kmer_lcp, size_type size_limit,
   size_type group_buffer_bytes, PathGraphMergeStats* stats,
-  size_type max_open_files, size_type input_cache_bytes)
+  size_type max_open_files, size_type input_cache_bytes,
+  PathWriter& path_file, RankWriter& rank_file, FromWriter& from_file)
 {
   constexpr size_type fixed_descriptors = 14;
   size_type input_pairs = std::max(static_cast<size_type>(1),
     (max_open_files - fixed_descriptors) / 2);
-  size_type output_buffer_bytes = std::max(static_cast<size_type>(1),
-    group_buffer_bytes / 8);
-  SequentialRecordWriter<PathNode> path_file(result.path_name, output_buffer_bytes);
-  SequentialRecordWriter<PathNode::rank_type> rank_file(result.rank_name, output_buffer_bytes);
-  SequentialRecordWriter<range_type> from_file(result.from_name, output_buffer_bytes);
+  size_type output_buffer_bytes = mergedGraphOutputBufferBytes(group_buffer_bytes);
+  // The LCP stream stays raw: its consumer, the LCP array builder, reads it raw.
   SequentialRecordWriter<uint8_t> lcp_file(result.lcp_name, output_buffer_bytes);
 
   PathGraphMerger merger(source, kmer_lcp, group_buffer_bytes, stats, input_pairs,
@@ -5878,7 +5982,8 @@ buildMergedGraphParallel(MergedGraph& result, const PathGraph& source,
 MergedGraph::MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper,
   const LCP& kmer_lcp, size_type size_limit, size_type group_buffer_bytes,
   PathGraphMergeStats* stats, size_type max_open_files,
-  size_type input_cache_bytes, size_type merge_workers) :
+  size_type input_cache_bytes, size_type merge_workers,
+  const TempFileCodecParameters* output_codec) :
   path_name(TempFile::getName(PREFIX)), rank_name(TempFile::getName(PREFIX)),
   from_name(TempFile::getName(PREFIX)), lcp_name(TempFile::getName(PREFIX)),
   path_count(0), rank_count(0), from_count(0),
@@ -5904,8 +6009,27 @@ MergedGraph::MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper,
   {
     this->path_count = 0; this->rank_count = 0; this->from_count = 0;
     initializeMergedGraphNext(*this, mapper);
-    buildMergedGraphSerial(*this, source, mapper, kmer_lcp, size_limit,
-      group_buffer_bytes, stats, max_open_files, input_cache_bytes);
+    const size_type output_buffer_bytes = mergedGraphOutputBufferBytes(group_buffer_bytes);
+    if(output_codec != nullptr && output_codec->enabled())
+    {
+      // Paths, ranks and start nodes are framed, each compressed on its own
+      // thread; every reader goes through ReadBuffer, which reads both forms.
+      CompressedRecordStream<PathNode> path_file(this->path_name, output_buffer_bytes, *output_codec);
+      CompressedRecordStream<PathNode::rank_type> rank_file(this->rank_name, output_buffer_bytes, *output_codec);
+      CompressedRecordStream<range_type> from_file(this->from_name, output_buffer_bytes, *output_codec);
+      buildMergedGraphSerial(*this, source, mapper, kmer_lcp, size_limit,
+        group_buffer_bytes, stats, max_open_files, input_cache_bytes,
+        path_file, rank_file, from_file);
+    }
+    else
+    {
+      SequentialRecordWriter<PathNode> path_file(this->path_name, output_buffer_bytes);
+      SequentialRecordWriter<PathNode::rank_type> rank_file(this->rank_name, output_buffer_bytes);
+      SequentialRecordWriter<range_type> from_file(this->from_name, output_buffer_bytes);
+      buildMergedGraphSerial(*this, source, mapper, kmer_lcp, size_limit,
+        group_buffer_bytes, stats, max_open_files, input_cache_bytes,
+        path_file, rank_file, from_file);
+    }
     if(stats != nullptr) { stats->merge_fallback_reason = fallback_reason; }
   }
 
