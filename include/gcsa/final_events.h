@@ -231,13 +231,21 @@ void serializeRedundantPointers(std::ostream& out,
 /*
   Serialize final components directly from immutable event streams. Members
   are encoded concurrently when the thread, memory, and descriptor budgets
-  permit. Bounded pipes preserve GCSA::load() order without retaining the
-  completed index or writing component temporary files. The result has the
+  permit, longest first, and may finish in any order: each is spooled in a
+  bounded buffer, continuing in a temporary file when larger, and the spools
+  are appended in GCSA::load() order. Temporary disk is at most about the
+  index size, and the completed index is never retained. The result has the
   normal public .gcsa format and is published with a synced atomic rename.
+
+  max_concurrent is the most encoders that ran at once, out_of_order the
+  components that finished while a component before them had not, and
+  spilled/spilled_bytes the components that outgrew their buffers.
 */
 struct FinalComponentStats
 {
   size_type tasks = 0, workers = 1, buffer_limit_bytes = 0;
+  size_type max_concurrent = 0, out_of_order = 0;
+  size_type spilled = 0, spilled_bytes = 0;
   RedundancyCountStats redundancy;
 };
 

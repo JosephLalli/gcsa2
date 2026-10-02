@@ -930,37 +930,68 @@ int main()
   require(packed.sampleCount() == 3 && packed.sample(2) == 100);
 
   // Parallel encoders must preserve the native byte stream, including empty
-  // rank supports. Memory and descriptor allowances bound worker admission.
+  // rank supports. Memory, threads and the concurrent descriptor budget bound
+  // worker admission; pin the budget so it does not follow the shell's limit.
   const int saved_threads = omp_get_max_threads();
   omp_set_num_threads(4);
   ConstructionParameters parallel_parameters = parameters;
   parallel_parameters.setMemoryLimitBytes(4 * MEGABYTE);
   parallel_parameters.setMaxOpenFiles(128);
+  parallel_parameters.setConcurrentOpenFiles(128);
   const auto read_bytes = [](const std::string& filename)
   {
     std::ifstream input(filename, std::ios_base::binary);
     require(static_cast<bool>(input));
     std::ostringstream bytes; bytes << input.rdbuf(); return bytes.str();
   };
+  // Spools must never outlive the store that created them.
+  const auto component_spools = [&]()
+  {
+    size_type found = 0;
+    for(const auto& entry : std::filesystem::directory_iterator(std::string(root)))
+    {
+      if(entry.path().filename().string().rfind("gcsa_final_component", 0) == 0)
+      {
+        found++;
+      }
+    }
+    return found;
+  };
   FinalComponentStats component_stats;
   storeFinalComponents(observed.header, alphabet, restored, restored_metadata,
     parallel_parameters, packed_name, &component_stats);
   require(component_stats.workers == 3 && component_stats.buffer_limit_bytes > 0);
+  require(component_stats.max_concurrent >= 1 && component_stats.max_concurrent <= 3);
+  // Every member of this four-path index fits in its in-memory spool.
+  require(component_stats.spilled == 0 && component_spools() == 0);
+  require(component_stats.redundancy.stream_passes == 1);
   require(read_bytes(packed_name) == expected_bytes.str());
   storeFinalComponents(observed.header, alphabet, restored, restored_metadata,
     parameters, packed_name, &component_stats);
   require(component_stats.workers == 1);
+  // At the 64-descriptor floor, (64 - 4) / (2 sigma + 5) encoders fit even
+  // with eight threads.
   ConstructionParameters descriptor_limited = parallel_parameters;
   descriptor_limited.setMaxOpenFiles(64);
+  descriptor_limited.setConcurrentOpenFiles(64);
   omp_set_num_threads(8);
   storeFinalComponents(observed.header, alphabet, restored, restored_metadata,
     descriptor_limited, packed_name, &component_stats);
   require(component_stats.workers == 3);
-  omp_set_num_threads(4);
   require(read_bytes(packed_name) == expected_bytes.str());
+  // A concurrent budget above the 128-file ceiling admits an encoder for
+  // every component; the ceiling alone admitted six.
+  ConstructionParameters descriptor_wide = parallel_parameters;
+  descriptor_wide.setConcurrentOpenFiles(1024);
+  omp_set_num_threads(32);
+  storeFinalComponents(observed.header, alphabet, restored, restored_metadata,
+    descriptor_wide, packed_name, &component_stats);
+  require(component_stats.workers == component_stats.tasks);
+  require(read_bytes(packed_name) == expected_bytes.str());
+  omp_set_num_threads(4);
 
-  // A late encoder failure must wake blocked producers, join every worker,
-  // remove the partial file, and preserve an already published index.
+  // A late encoder failure must stop dispatch, join every worker, remove the
+  // partial file and every spool, and preserve an already published index.
   writeInteger(restored.occurrences, 0, restored_metadata.paths);
   bool parallel_failure_rejected = false;
   try
@@ -973,10 +1004,12 @@ int main()
   require(read_bytes(packed_name) == expected_bytes.str());
   require(!std::filesystem::exists(packed_name + "." +
     std::to_string(static_cast<unsigned long long>(::getpid())) + ".partial"));
+  require(component_spools() == 0);
   writeInteger(restored.occurrences, 0, 0);
 
-  // Force queue backpressure with components larger than each bounded pipe.
-  // Raw and framed inputs must produce the same serial and parallel bytes.
+  // Components larger than each spool buffer continue in temporary files, and
+  // encoders finish out of output order. Raw and framed inputs must produce
+  // the same serial and parallel bytes.
   std::string previous_large_bytes;
   for(bool framed : { false, true })
   {
@@ -1008,7 +1041,6 @@ int main()
     GCSAHeader large_header = observed.header;
     large_header.path_nodes = paths; large_header.edges = paths;
     const std::string large_name = std::string(root) + "/large-packed.gcsa";
-    // A small queue limit relative to output size exercises blocked encoders.
     omp_set_num_threads(1);
     storeFinalComponents(large_header, alphabet, large_files, large_metadata,
       large_parameters, large_name, &component_stats);
@@ -1019,10 +1051,17 @@ int main()
       large_parameters, large_name, &component_stats);
     require(component_stats.workers >= 2);
     require(read_bytes(large_name) == serial_bytes);
+    // Longest-first dispatch hands out twelve nonempty components before
+    // component 0, so with at most three encoders at least ten finish before
+    // it does.
+    require(component_stats.out_of_order >= 10);
+    require(component_spools() == 0);
     if(!framed)
     {
-      // Component 1 fails after producing more bytes than its pipe holds;
-      // later component producers can be blocked when cancellation arrives.
+      // Small spool buffers relative to this output force temporary files.
+      require(component_stats.spilled > 0 && component_stats.spilled_bytes > 0);
+      // Component 1 fails after spilling past its buffer; dispatch stops,
+      // every encoder is joined and every spool is removed.
       writeByte(large_files.bwt_masks, 1, 0);
       bool rejected_parallel_mask = false;
       try
@@ -1033,6 +1072,7 @@ int main()
       catch(const std::runtime_error&) { rejected_parallel_mask = true; }
       require(rejected_parallel_mask && component_stats.workers >= 2);
       require(read_bytes(large_name) == serial_bytes);
+      require(component_spools() == 0);
       writeByte(large_files.bwt_masks, 1, 1U << 1);
     }
     if(framed) { require(serial_bytes == previous_large_bytes); }
