@@ -4975,16 +4975,18 @@ restoreJoinPartition(const BuildWorkspace& workspace, const std::string& task,
 struct ActiveJoinWorker
 {
   pid_t pid;
-  size_type shard, maximum_stored_bytes;
+  logical_file_id_t logical;
+  size_type job, shard, maximum_stored_bytes;
   JoinPartition partition;
   std::string task_file, checkpoint_name;
   MemoryBudget::Reservation reservation;
 
-  ActiveJoinWorker(pid_t process, size_type output_shard,
-    const JoinPartition& range, const std::string& task,
+  ActiveJoinWorker(pid_t process, logical_file_id_t input, size_type range_job,
+    size_type output_shard, const JoinPartition& range, const std::string& task,
     const std::string& checkpoint, size_type stored_limit,
     MemoryBudget::Reservation memory) :
-    pid(process), shard(output_shard), maximum_stored_bytes(stored_limit),
+    pid(process), logical(input), job(range_job), shard(output_shard),
+    maximum_stored_bytes(stored_limit),
     partition(range), task_file(task),
     checkpoint_name(checkpoint),
     reservation(std::move(memory)) { }
@@ -5141,13 +5143,32 @@ removeWorkerTemporaries(const std::string& directory, pid_t pid)
 // planner cut them into. The serial distribution is the single range.
 struct RangeJoin
 {
+  logical_file_id_t logical;
   JoinRun left, right;
   std::vector<JoinPartition> partitions;
 };
 
+/*
+  One worker pool for the partitions of every logical input of a doubling step.
+  `jobs` lists the inputs in ascending logical order and, within an input, its
+  key ranges in plan order, exactly as the per-input pools used to receive them.
+
+  Each input's pool used to drain before the next input's distribution began,
+  so every input left a tail of one to three workers per step (20-50 s each on
+  the joint chr2+chr18 build), and chr18's joins ran after chr2's at 12-25 of
+  the 64 threads. At whole-genome scale there are 24 inputs. Distribution and
+  planning still run one input at a time, because each takes the whole memory
+  goal; only their partitions share the pool.
+
+  Output shards are appended, and so numbered, in the same input-major plan
+  order as before, and partition task names, checkpoints and counts are the
+  per-input ones, so the shards and their resume records are unchanged; only
+  the launch order spans inputs. A key range's join runs are removed as soon as
+  its last partition is collected, because the pool otherwise holds every
+  input's runs on disk at once rather than one input's.
+*/
 void
-runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
-  logical_file_id_t logical,
+runJoinWorkerPartitions(std::vector<RangeJoin>& jobs,
   size_type size_limit, const ConstructionParameters& parameters,
   size_type label_fan_in, PathGraph& next, size_type& next_physical,
   size_type& committed_bytes, ExternalPathJoinStats* stats,
@@ -5157,9 +5178,16 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
   {
     throw joinError("process workers require a worker executable");
   }
-  size_type total_partitions = 0, pair_reader_bytes = 0;
-  for(const RangeJoin& job : jobs)
+  size_type total_partitions = 0, pair_reader_bytes = 0, pooled_inputs = 0;
+  for(size_type j = 0; j < jobs.size(); j++)
   {
+    const RangeJoin& job = jobs[j];
+    // Shard numbering depends on this order; see above.
+    if(j > 0 && job.logical < jobs[j - 1].logical)
+    {
+      throw joinError("pooled join ranges are not in logical input order");
+    }
+    if(j == 0 || jobs[j - 1].logical != job.logical) { pooled_inputs++; }
     total_partitions = checkedJoinAdd(total_partitions, job.partitions.size(),
       "join partitions of all key ranges");
     pair_reader_bytes = std::max(pair_reader_bytes,
@@ -5199,26 +5227,44 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
   size_type planned_bytes = 0;
   size_type largest_peak = 0, largest_paths = 0, largest_ranks = 0;
   size_type planned_paths = 0, planned_ranks = 0;
-  for(const RangeJoin& job : jobs) for(const JoinPartition& partition : job.partitions)
+  struct InputPlan
   {
-    const size_type peak_bytes = externalPathGraphShardPeakBytes(
-      partition.expected_paths, partition.expected_ranks,
-      sort_budget, worker_codec);
-    planned_bytes = checkedJoinAdd(planned_bytes, peak_bytes,
-      "all worker peak output bytes");
-    planned_paths = checkedJoinAdd(planned_paths, partition.expected_paths,
-      "all partition expected paths");
-    planned_ranks = checkedJoinAdd(planned_ranks, partition.expected_ranks,
-      "all partition expected ranks");
-    if(peak_bytes > largest_peak)
+    logical_file_id_t logical;
+    size_type partitions, bytes, largest;
+  };
+  std::vector<InputPlan> input_plans;
+  for(const RangeJoin& job : jobs)
+  {
+    if(input_plans.empty() || input_plans.back().logical != job.logical)
     {
-      largest_peak = peak_bytes;
-      largest_paths = partition.expected_paths;
-      largest_ranks = partition.expected_ranks;
+      input_plans.push_back(InputPlan{ job.logical, 0, 0, 0 });
     }
-    if(partition.expected_ranks > (static_cast<size_type>(1) << 40))
+    InputPlan& input = input_plans.back();
+    for(const JoinPartition& partition : job.partitions)
     {
-      throw joinError("one join partition exceeds the 40-bit rank pointer range");
+      const size_type peak_bytes = externalPathGraphShardPeakBytes(
+        partition.expected_paths, partition.expected_ranks,
+        sort_budget, worker_codec);
+      planned_bytes = checkedJoinAdd(planned_bytes, peak_bytes,
+        "all worker peak output bytes");
+      planned_paths = checkedJoinAdd(planned_paths, partition.expected_paths,
+        "all partition expected paths");
+      planned_ranks = checkedJoinAdd(planned_ranks, partition.expected_ranks,
+        "all partition expected ranks");
+      input.partitions++;
+      input.bytes = checkedJoinAdd(input.bytes, peak_bytes,
+        "one input's worker peak output bytes");
+      input.largest = std::max(input.largest, peak_bytes);
+      if(peak_bytes > largest_peak)
+      {
+        largest_peak = peak_bytes;
+        largest_paths = partition.expected_paths;
+        largest_ranks = partition.expected_ranks;
+      }
+      if(partition.expected_ranks > (static_cast<size_type>(1) << 40))
+      {
+        throw joinError("one join partition exceeds the 40-bit rank pointer range");
+      }
     }
   }
 
@@ -5243,23 +5289,58 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
               << " paths and " << largest_ranks << " ranks; mean "
               << formatBytes(planned_bytes / total_partitions)
               << " per partition" << std::endl;
+    if(pooled_inputs > 1)
+    {
+      std::cerr << "externalPathGraphExtend(): one worker pool for "
+                << total_partitions << " partitions of " << pooled_inputs
+                << " logical inputs, " << concurrency << " workers" << std::endl;
+    }
   }
-  if(planned_bytes > size_limit || committed_bytes > size_limit - planned_bytes)
+  /*
+    Each input's plan must fit by itself, as it had to when every input had its
+    own pool; this fails before any worker starts. The pool's sum is not
+    required to fit: a peak is the incompressible worst case, and a committed
+    pair is usually far smaller (step 4 of the joint chr2+chr18 build committed
+    37.0 GiB for chr2's 533.7 GiB plan), so the old per-input check, which
+    charged earlier inputs their stored bytes, admitted far more than the sum of
+    peaks would. Launches are instead admitted one at a time below, against the
+    stored bytes of collected partitions plus the peaks of running ones, which
+    bounds the disk at every instant. With a single input this check is the old
+    one and launches are not admitted again.
+  */
+  for(const InputPlan& input : input_plans)
   {
-    // Report the arithmetic. Without it an operator cannot tell whether to
-    // raise --gcsa-disk-limit, and by how much, or whether the plan itself is
-    // pathological -- the difference between a one-flag fix and a bug.
-    throw joinError("configured disk limit exceeded by deterministic partition plan"
-      ": " + std::to_string(total_partitions) + " partitions plan " +
-      formatBytes(planned_bytes) + " (largest " + formatBytes(largest_peak) +
-      ", mean " + formatBytes(planned_bytes / total_partitions) + "), " +
-      formatBytes(committed_bytes) + " already committed, against a remaining "
-      "limit of " + formatBytes(size_limit));
+    if(input.bytes > size_limit || committed_bytes > size_limit - input.bytes)
+    {
+      // Report the arithmetic. Without it an operator cannot tell whether to
+      // raise --gcsa-disk-limit, and by how much, or whether the plan itself is
+      // pathological -- the difference between a one-flag fix and a bug.
+      throw joinError("configured disk limit exceeded by deterministic partition plan"
+        ": " + (pooled_inputs > 1 ? "logical input " +
+          std::to_string(input.logical.value) + ": " : std::string()) +
+        std::to_string(input.partitions) + " partitions plan " +
+        formatBytes(input.bytes) + " (largest " + formatBytes(input.largest) +
+        ", mean " + formatBytes(input.bytes / std::max(static_cast<size_type>(1),
+          input.partitions)) + "), " +
+        formatBytes(committed_bytes) + " already committed, against a remaining "
+        "limit of " + formatBytes(size_limit));
+    }
   }
 
   MemoryBudget memory(parameters.getMemoryLimitBytes(), safety_margin);
   std::vector<ActiveJoinWorker> active;
   active.reserve(concurrency);
+  // Peaks admitted for the running workers; committed_bytes holds what the
+  // collected and restored partitions actually store.
+  size_type running_peak_bytes = 0;
+  // Partitions of each key range not yet collected or restored. At zero, no
+  // worker can still read the range's runs.
+  std::vector<size_type> outstanding(jobs.size(), 0);
+  for(size_type j = 0; j < jobs.size(); j++) { outstanding[j] = jobs[j].partitions.size(); }
+  auto partition_done = [&](size_type job)
+  {
+    if(--outstanding[job] == 0) { removeJoinRun(jobs[job].left); removeJoinRun(jobs[job].right); }
+  };
   // Step 4 of a chromosome-scale build spends hours here. Partitions are the
   // natural progress unit: each is a committed, resumable unit of work, so the
   // count is meaningful across a resume as well as within one run.
@@ -5343,7 +5424,7 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
     { throw joinError("worker payload changed after writer close", result_file); }
     if(workspace != nullptr && !worker.checkpoint_name.empty())
     {
-      checkpointJoinPartition(*workspace, worker.checkpoint_name, logical,
+      checkpointJoinPartition(*workspace, worker.checkpoint_name, worker.logical,
         worker.partition, next.path_names[worker.shard],
         next.rank_names[worker.shard], checkpoint_buffer,
         &result.path_checksum, &result.rank_checksum);
@@ -5356,6 +5437,7 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
     next.path_count += result.paths; next.rank_count += result.ranks;
     committed_bytes = checkedJoinAdd(committed_bytes, result.stored_bytes,
       "committed worker output bytes");
+    running_peak_bytes -= worker.maximum_stored_bytes;
     DiskIO::read_volume += result.bytes_read;
     DiskIO::write_volume += result.bytes_written;
     if(stats != nullptr)
@@ -5388,30 +5470,35 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
     std::remove(result_file.c_str());
     TempFile::remove(worker.task_file);
     partition_progress.advance();
+    const size_type job = worker.job;
     active.erase(active.begin() + index);
+    partition_done(job);
   };
 
   try
   {
-    // Output shards are numbered in plan order, as before. Completed partitions
-    // are restored first; the rest launch largest first, so a long partition
-    // starts early instead of becoming the step's tail.
+    // Output shards are numbered in plan order, input by input, as when each
+    // input had its own pool. Completed partitions are restored first; the rest
+    // launch largest first across all inputs, so a long partition starts early
+    // instead of becoming the step's tail, and one input's small partitions
+    // fill the slots another input's tail leaves idle.
     struct PlannedPartition
     {
-      const RangeJoin* job; const JoinPartition* partition;
+      size_type job; const JoinPartition* partition;
       size_type shard, peak; std::string checkpoint; bool restored;
     };
     std::vector<PlannedPartition> planned;
     planned.reserve(total_partitions);
-    for(const RangeJoin& job : jobs) for(const JoinPartition& partition : job.partitions)
+    for(size_type j = 0; j < jobs.size(); j++) for(const JoinPartition& partition : jobs[j].partitions)
     {
+      const RangeJoin& job = jobs[j];
       PlannedPartition item;
-      item.job = &job; item.partition = &partition;
+      item.job = j; item.partition = &partition;
       item.peak = externalPathGraphShardPeakBytes(partition.expected_paths,
         partition.expected_ranks, sort_budget, worker_codec);
-      item.shard = appendOutputShard(next, logical, physical_shard_id_t(next_physical++));
+      item.shard = appendOutputShard(next, job.logical, physical_shard_id_t(next_physical++));
       item.checkpoint = (checkpoint_task.empty() ? std::string() :
-        joinPartitionTaskName(checkpoint_task, logical, partition,
+        joinPartitionTaskName(checkpoint_task, job.logical, partition,
           job.left.checksum, job.right.checksum));
       item.restored = (workspace != nullptr && !item.checkpoint.empty() &&
         workspace->task_completed(item.checkpoint, "join-partition"));
@@ -5428,8 +5515,9 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
     for(size_type item_index : sequence)
     {
       const PlannedPartition& item = planned[item_index];
-      const JoinRun& left = item.job->left;
-      const JoinRun& right = item.job->right;
+      const logical_file_id_t logical = jobs[item.job].logical;
+      const JoinRun& left = jobs[item.job].left;
+      const JoinRun& right = jobs[item.job].right;
       const JoinPartition& partition = *(item.partition);
       const size_type peak_output_bytes = item.peak;
       const size_type shard = item.shard;
@@ -5483,9 +5571,31 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
           stats->direct_label_records += partition.expected_paths;
           stats->intermediate_path_bytes_avoided += partition.expected_bytes;
         }
+        partition_done(item.job);
         continue;
       }
       while(active.size() >= concurrency) { collect_one(); }
+      // Several inputs: admit the launch against the stored bytes of finished
+      // partitions plus the peaks of running ones. A collected worker's charge
+      // drops from its peak to what it stored, so waiting frees disk. A single
+      // input keeps the old admission, its whole plan checked once above.
+      const auto disk_admits = [&]()
+      {
+        return peak_output_bytes <= size_limit && committed_bytes <= size_limit - peak_output_bytes &&
+          running_peak_bytes <= size_limit - peak_output_bytes - committed_bytes;
+      };
+      while(pooled_inputs > 1 && !active.empty() && !disk_admits())
+      {
+        if(stats != nullptr) { stats->join_pool_disk_waits++; }
+        collect_one();
+      }
+      if(pooled_inputs > 1 && !disk_admits())
+      {
+        throw joinError("configured disk limit cannot admit join partition: it plans " +
+          formatBytes(peak_output_bytes) + ", " + formatBytes(committed_bytes) +
+          " already committed, against a remaining limit of " + formatBytes(size_limit),
+          partition_checkpoint);
+      }
       ExternalJoinWorkerTask task;
       task.logical = logical; task.left = left; task.right = right;
       task.partition = partition;
@@ -5511,9 +5621,25 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
         TempFile::remove(task_file);
         throw;
       }
-      active.emplace_back(child, shard, partition, task_file,
+      active.emplace_back(child, logical, item.job, shard, partition, task_file,
         partition_checkpoint, peak_output_bytes,
         std::move(reservation));
+      running_peak_bytes += peak_output_bytes;
+      if(stats != nullptr && pooled_inputs > 1)
+      {
+        // Evidence that the pool spans inputs: the most logical inputs with a
+        // worker running at the same moment. Per-input pools never exceed one.
+        std::vector<logical_file_id_t> running;
+        for(const ActiveJoinWorker& worker : active)
+        {
+          if(std::find(running.begin(), running.end(), worker.logical) == running.end())
+          {
+            running.push_back(worker.logical);
+          }
+        }
+        stats->join_pool_concurrent_inputs = std::max(stats->join_pool_concurrent_inputs,
+          static_cast<size_type>(running.size()));
+      }
     }
     while(!active.empty()) { collect_one(); }
     partition_progress.finish();
@@ -5537,6 +5663,12 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
   if(stats != nullptr)
   {
     stats->join_partitions += total_partitions;
+    stats->join_pool_inputs = std::max(stats->join_pool_inputs, pooled_inputs);
+    for(const InputPlan& input : input_plans)
+    {
+      stats->join_largest_input_plan_bytes = std::max(stats->join_largest_input_plan_bytes,
+        input.bytes);
+    }
     stats->max_bytes_resident = std::max(stats->max_bytes_resident,
       static_cast<size_type>(memory.stats().maximum));
   }
@@ -5713,6 +5845,17 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
     }
     return result;
   };
+
+  // With process workers, every input's planned key ranges wait here for the
+  // step's one worker pool (runJoinWorkerPartitions()). The guard removes their
+  // join runs if a later input's distribution or planning throws; removing a
+  // run clears its names, so the pool's own removals are not repeated.
+  std::vector<RangeJoin> pooled_jobs;
+  struct PooledRunGuard
+  {
+    std::vector<RangeJoin>& jobs;
+    ~PooledRunGuard() { for(RangeJoin& job : this->jobs) { removeJoinRun(job.left); removeJoinRun(job.right); } }
+  } pooled_guard{ pooled_jobs };
 
   for(const auto& group : groups)
   {
@@ -5934,6 +6077,7 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
           continue;
         }
         RangeJoin job;
+        job.logical = logical;
         job.left = lefts[range]; job.right = rights[range];
         jobs.push_back(job);
       }
@@ -6009,6 +6153,7 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
           "compressed distribution scan peak"));
     }
     RangeJoin job;
+    job.logical = logical;
     job.left = left; job.right = right;
     jobs.push_back(job);
     }
@@ -6095,9 +6240,18 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
         }
         if(!productive.empty()) { jobs.swap(productive); }
       }
-      runJoinWorkerPartitions(jobs, logical, size_limit,
-        parameters, label_fan_in, next, next_physical, committed_bytes, stats,
-        workspace, checkpoint_task);
+      if(groups.size() > 1 && Verbosity::level >= Verbosity::EXTENDED)
+      {
+        // Marks where each input's distribution and planning ended, now that
+        // the "partition plan" line is printed once for the pooled step.
+        size_type partitions = 0;
+        for(const RangeJoin& job : jobs) { partitions += job.partitions.size(); }
+        std::cerr << "externalPathGraphExtend(): logical input " << logical.value
+                  << " planned " << partitions << " partitions in " << jobs.size()
+                  << " key ranges" << std::endl;
+      }
+      for(RangeJoin& job : jobs) { pooled_jobs.push_back(std::move(job)); }
+      jobs.clear();
     }
     else for(const RangeJoin& job : jobs)
     {
@@ -6149,6 +6303,12 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
     }
     for(RangeJoin& job : jobs) { removeJoinRun(job.left); removeJoinRun(job.right); }
   }
+  if(!pooled_jobs.empty())
+  {
+    runJoinWorkerPartitions(pooled_jobs, size_limit, parameters, label_fan_in,
+      next, next_physical, committed_bytes, stats, workspace, checkpoint_task);
+  }
+  for(RangeJoin& job : pooled_jobs) { removeJoinRun(job.left); removeJoinRun(job.right); }
 
   MemoryBudget compaction_memory(memory_budget, memory_budget / 16);
   compactLogicalJoinShards(next, size_limit, parameters, label_fan_in,

@@ -175,6 +175,12 @@ struct ExternalPathJoinStats
   // the most range workers that ran at once, and range plans restored from
   // the workspace.
   size_type distribution_ranges, distribution_concurrency, restored_range_plans;
+  // Process-worker joins: the logical inputs whose partitions shared one worker
+  // pool, the most of them that had a worker running at the same moment, the
+  // largest one input's planned peak output bytes (the least disk limit the
+  // step admits), and the workers collected early to free disk for a launch.
+  size_type join_pool_inputs, join_pool_concurrent_inputs;
+  size_type join_largest_input_plan_bytes, join_pool_disk_waits;
 
   ExternalPathJoinStats() :
     left_records(0), right_records(0), sorted_bypass(0), generated_records(0),
@@ -195,7 +201,9 @@ struct ExternalPathJoinStats
     distribution_sort_budget(0), label_sort_budget(0), join_block_budget(0),
     max_records_resident(0), max_bytes_resident(0),
     compaction_batches(0), compaction_concurrency(0),
-    distribution_ranges(0), distribution_concurrency(0), restored_range_plans(0) { }
+    distribution_ranges(0), distribution_concurrency(0), restored_range_plans(0),
+    join_pool_inputs(0), join_pool_concurrent_inputs(0),
+    join_largest_input_plan_bytes(0), join_pool_disk_waits(0) { }
 };
 
 // Prefix doubling with a bounded external sort-merge join. Input shards with
