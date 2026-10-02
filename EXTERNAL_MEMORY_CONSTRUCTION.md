@@ -1181,6 +1181,42 @@ partitions start in the same block. On the SSD the four chr18 prunes then took 6
 counts at every step). Framed-shard workers stay limited to 9 to 11 by memory: each keeps one
 decoded block pair per shard (about 2.2 GB for 33 shards) within the prune's input-cache budget.
 
+### Repeated reads: single-pass distribution and compressed merge output (2026-10-01, branch `prune-chunk-setup`)
+
+**Distribution read the input once per key range.** `scanJoinRange` had every key-range worker read
+and decompress every shard of its logical input and keep only its own range's records, so with 64
+ranges the input was read 64 times per doubling step: on chr18 the distribution blocks issued
+324-577 GiB of read requests per step for 4.9-8.9 GB of pruned paths (77% of the build's 2,183 GiB
+of read requests). Raising the worker cap (`88ee230`: range workers against the concurrent
+open-file budget, 64 at once instead of 14) did not help, because the repeated reads, not the cap,
+were the limit (running threads 13.1 against 14.0, 29.6 more waiting on page I/O). `00c81a7` reads
+each shard once: reader threads take whole shards and route each record to its range's sorter; all
+ranges' sorters share the 64 GiB distribution budget, and records keep their sequential-scan
+ordinals, on which `joinRecordLess` ends, so runs do not depend on reader scheduling. That alone was
+slower, because every reader appends to every range and a sorter sorted and wrote a full run while
+holding its lock (1-3 threads running, 70-87 waiting); `c02a9d8` sorts and writes runs outside the
+lock. The `88ee230` admission is still what sizes the readers and the merge fan-in.
+
+**Merged-graph output, compressed (opt-in).** `f9d4679` lets the serial merge write paths, ranks and
+start nodes framed, each stream compressed on its own thread (`CompressedRecordStream`); the LCP stays
+raw; `ReadBuffer` reads framed files. `4842598` fixed `MergedGraphReader::seek`, which tested the
+descriptor to decide whether a reader was open, so framed readers never seeked and construction RSS
+reached 110.9 GiB on chr18 (`ReadBuffer::isOpen()`), and a double count of framed reads in the
+logged scan volume. `e40e008` makes it opt-in, `GCSA_IO_COMPRESS_MERGE=1`.
+
+**Measured on chr18 (depth 3, sampled, nice 0, index MD5 identical in every run).** Against
+`1dde002`: distribution plus join planning 0:02:59 against 0:05:12 over four steps (13.5-18.2 mean
+cores against 8.1-10.5); read requests for the whole build 482.0 against 2,182.8 GiB; distribution
+writes up about 3.5 GiB per step (about 0.5 GiB per sorter) and peak RSS 31.2 against 27.1 GiB. With
+compressed merge output, the merge wrote 4.1 against 25.8 GiB in the same time and the final-event
+scan's device reads fell from 72.7 to 15.3 GiB, but the scan took 0:08:51 against 0:07:24: its main
+thread ran 75% against 71% of a longer scan and waited no more, so it does the decompression and
+block checksums itself whenever it outruns the one-buffer read-ahead. Decoding through
+`CompressedBlockPrefetchPool` is the untested remedy. Whole-build times (0:36:57 against 0:40:20)
+are within this host's spread: preprocessing, which no change touches, differed by 0:02:16
+between the two runs. Not yet run: the default depth 1 with this code (queued), and any joint
+chr2+chr18 build.
+
 ## Build, test, and usage
 
 From the containing `vg` checkout, use its local toolchain wrapper. The GCSA2
