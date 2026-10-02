@@ -1222,8 +1222,10 @@ threads (distribution 0:06:09 against 0:05:02 on chr18); `5b4d225` gives readers
 chr2+chr18 build with `5b4d225` (default depth, compressed merge off) matched the 9/30 index MD5 and
 its blocks summed to 3:45:44 at 6.08 mean threads: joins 1:16:35 (33.9%, about 9 of 32 workers),
 construction 0:40:54, merge 0:29:52, preprocessing 0:22:05, prune 0:19:05 (0:27:38 on 9/30),
-distribution 0:17:19 (0:37:12 on 9/30), compaction 0:16:54. The merge's drop from 1:08:05 is host
-write pressure (dirty-page throttle in 36% of its samples on 9/30, 0% now), not code. Record:
+distribution 0:17:19 (0:37:12 on 9/30), compaction 0:16:54. The merge's drop from 1:08:05 mixes host
+write pressure (dirty-page throttle in 36% of its samples on 9/30, 0% now) with code: the 9/30 merge
+ran `69aa6b6`, which lacks `2fd1694` (direct-I/O merge writes), so the split is not established
+(corrected 2026-10-02; an earlier version of this paragraph said "not code"). Record:
 `hprc_v2_vg_rna/gcsa2_distribution_concurrency_20260928/joint_chr2_chr18_5b4d225_20261002/`.
 
 **Join workers collected as they finish (`2527f48`).** The joins in that build averaged 9.28 of 32
@@ -1235,6 +1237,54 @@ numbered in plan order. The joint build then matched the same index and summed t
 0:32:53 at 27.09 mean workers (1:16:36 before), with construction 0:40:59, preprocessing 0:31:10,
 merge 0:29:04, prune 0:24:03, distribution 0:17:24 and compaction 0:15:44. Serial phases are now
 53.8% of the build. Record: `joint_chr2_chr18_2527f48_20261002/`.
+
+### Serial-phase fixes (2026-10-02, branch `serial-phase-fixes`)
+
+Four read-only investigations of the `2527f48` joint build (samples, logs, a chr21 profile, source)
+found five causes of serial or wasted time small enough to fix directly. Each fix leaves the output
+bytes unchanged by construction, and each commit passed all 16 test targets.
+
+- **`87bd442`, key sort.** The preprocessing key sort compared labels only, so run formation kept an
+  offset permutation with one indirect call per comparison: 0:13:01 at one core for the joint keys,
+  against 0:00:34 for the start sort over the same 809 million eight-byte records. It now declares
+  the whole-u64 order. That is exact because the label is `key >> 16` (ordering by the whole key also
+  orders by label), the merge and grouping still use the label comparator, and the reducer ORs the
+  low 16 bits (`Key::merge`), which commutes. `external_sort.h` documents when a reducer makes a
+  declared order safe without a byte-level total order.
+- **`082a57e`, start-node reader.** `MergedGraphReader::init()` starts `from` at the component's first
+  start node, and `seek()` indexed `from_nodes` there before moving the `ReadBuffer`, which therefore
+  read every element from offset 0 into its window first. The final scan's per-component readers
+  did this during setup (about 88 s on the joint graph, RSS 15.5 to 32.1 GiB until the scan ended,
+  an estimated 47 GiB of reads). It now seeks first.
+- **`047d538`, raw-shard prune groups.** `pathMergeInputBudget()` capped a raw generation at
+  `--io-buffer-size` (64 MiB); that budget sizes the merger's range and priority groups, so step 1's
+  seven workers got about 9 MiB each and spilled (97.7 GiB written for 23.9 GB of output, 1.23
+  cores). Raw generations now get a sixteenth of `--memory-limit`, as framed ones do (the raw read
+  windows are sized separately and unchanged; `ca7f29d` corrects a comment that said otherwise). Spill
+  files are written back with `sync_file_range()` on the flushed range instead of `fdatasync()`,
+  which waited for an ext4 journal commit on every flush of an appended file.
+- **`9272bd9`, retirement.** Keeping artifacts another completion record lists reread every
+  `.complete` file per retired task, so a family retirement cost members times records (14-16 s
+  after steps 1-3 and 152 s after step 4 of the joint build). `retire_obsolete_family()` builds one
+  index; retirement never creates or removes completion records, so it is exact for the family.
+  Single retirements and recovery keep the per-call scan. New `test_workspace` case: a family
+  artifact listed by an unrelated record survives.
+- **`60a0abd`, parallel in-place sorts.** Runs of 2^20 records or more sort with `parallelQuickSort`,
+  only on the process's main thread and outside OpenMP regions (prune and merge workers are
+  `std::thread`s). Every in-place caller declares a total order, so equal records are byte-identical.
+  New `test_external_sort` case compares 3M and 1.5M-record parallel sorts with `std::sort`.
+
+Letting a drained spilled group return to memory was not implemented: the larger budget removed
+step 1's spills on chr18 (0 against 4 path-group spills).
+
+**Checks.** A preprocessing-only build (`--stop-after initial`) of the joint k-mers with `87bd442`
+reproduced the 9/30 reference checkpoint markers byte for byte (unique keys, start nodes, every
+initial path shard). Both it and the chr18 identity build ran in `/dev/shm` at nice 10, so their
+timings are indicative only: chr18 preprocessing 64.9 s against 400.7 s, and step-1 prune 24.6 s
+against 107.6 s, for `60a0abd` against the `2527f48` chr18 build (SSD, nice 0). The chr18 identity
+result and the joint timing build are recorded in
+`hprc_v2_vg_rna/gcsa2_distribution_concurrency_20260928/serial_phase_fixes_20261002/` and
+`joint_chr2_chr18_60a0abd_20261002/`. vg integration test 58 was not run (vg was not relinked).
 
 ## Build, test, and usage
 
