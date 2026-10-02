@@ -1170,6 +1170,17 @@ compares per-label multisets for that reason. Whether such reordering occurred i
 was not checked, so their identical indexes do not by themselves establish that the index is
 insensitive to it.
 
+**Partition setup (2026-10-01, branch `prune-chunk-setup`).** The depth-3 slowdown was merger
+setup: each partition binary-searched every input shard for its bounds, and on framed shards each
+probe in a new 16 MiB block decoded the whole block. At step 2 on chr18 (143 partitions, 33
+shards) that was 2,613 of 2,742 summed worker seconds. `f678b6c` locates all bounds once per shard
+with a galloping search and passes them to the workers and stitched spans; `1dde002` gives each
+worker runs of adjacent partitions sharing one input cache, since about 18 adjacent depth-3
+partitions start in the same block. On the SSD the four chr18 prunes then took 66.9, 37.1, 49.6 and
+58.5 s at depth 3 against 78.3, 54.8, 56.7 and 67.4 s at depth 1 (one run each, identical pruned
+counts at every step). Framed-shard workers stay limited to 9 to 11 by memory: each keeps one
+decoded block pair per shard (about 2.2 GB for 33 shards) within the prune's input-cache budget.
+
 ## Build, test, and usage
 
 From the containing `vg` checkout, use its local toolchain wrapper. The GCSA2
