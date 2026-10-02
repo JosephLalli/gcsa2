@@ -6,6 +6,7 @@
 
 #include <gcsa/external_sort.h>
 #include <gcsa/internal.h>
+#include <gcsa/utils.h>
 
 #include <algorithm>
 #include <array>
@@ -17,6 +18,7 @@
 #include <numeric>
 #include <queue>
 #include <stdexcept>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <vector>
 
@@ -377,6 +379,27 @@ struct HeapCompare
   }
 };
 
+// In-place run formation sorts on one thread unless it can safely use the
+// others. Every in-place caller has declared a total order, under which equal
+// records are byte-identical, so every correct sort writes the same bytes and
+// a parallel one changes only the time; on the joint chr2+chr18 build the
+// start, initial k-mer and redundancy sorts ran at one core while 63 idled.
+// Prune and merge workers are std::threads that can each reach a sorter, and
+// a nested team in each would oversubscribe the cores they already occupy, so
+// only the process's main thread fans out: the build's coordinator, or a join
+// worker process whose OpenMP width its coordinator has already divided.
+constexpr size_type PARALLEL_SORT_RECORDS = size_type(1) << 20;
+
+bool
+sortInParallel(size_type count)
+{
+  if(count < PARALLEL_SORT_RECORDS || omp_get_max_threads() < 2 || omp_in_parallel())
+  {
+    return false;
+  }
+  return (static_cast<pid_t>(::syscall(SYS_gettid)) == ::getpid());
+}
+
 // The comparator still receives the addresses of whole records, so its
 // semantics are unchanged; only the permutation goes away. std::array is
 // trivially copyable and padding-free, so the tuple and the record have the
@@ -388,11 +411,12 @@ sortAsWords(std::uint8_t* records, size_type count,
 {
   typedef std::array<std::uint64_t, WORDS> word_record;
   word_record* values = reinterpret_cast<word_record*>(records);
-  std::sort(values, values + count,
-    [&compare](const word_record& left, const word_record& right)
-    {
-      return compare(&left, &right) < 0;
-    });
+  auto less = [&compare](const word_record& left, const word_record& right)
+  {
+    return compare(&left, &right) < 0;
+  };
+  if(sortInParallel(count)) { parallelQuickSort(values, values + count, less); }
+  else { std::sort(values, values + count, less); }
 }
 
 void
@@ -406,7 +430,8 @@ sortRecordsInPlace(std::uint8_t* records, size_type count, const SortPlan& plan,
     // and vectorises. Identical ordering to a comparator that decodes the same
     // eight bytes as a little-endian unsigned value.
     std::uint64_t* values = reinterpret_cast<std::uint64_t*>(records);
-    std::sort(values, values + count);
+    if(sortInParallel(count)) { parallelQuickSort(values, values + count); }
+    else { std::sort(values, values + count); }
     return;
   }
   switch(plan.record_bytes / sizeof(std::uint64_t))

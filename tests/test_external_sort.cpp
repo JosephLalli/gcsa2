@@ -1,6 +1,8 @@
 #include <gcsa/external_sort.h>
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -219,6 +221,68 @@ int main()
     require(readBytes(via_fast) == sorted_bytes);
     std::remove(u64_input.c_str()); std::remove(via_cmp.c_str());
     std::remove(via_fast.c_str());
+  }
+
+  // A run of at least 2^20 records formed on the main thread is sorted in
+  // parallel. Under a declared total order equal records are byte-identical,
+  // so the parallel result must equal a serial std::sort byte for byte, with
+  // many duplicates, for both the scalar path and the comparator path.
+  {
+    const std::string big_input = std::string(root) + "/big-u64.bin";
+    const std::string big_sorted = std::string(root) + "/big-u64-sorted.bin";
+    std::vector<std::uint64_t> values;
+    for(std::uint64_t i = 0; i < (std::uint64_t(3) << 20); i++)
+    {
+      values.push_back(((1181783497276652981ULL * (i + 1)) ^ (i << 17)) % 1000003);
+    }
+    {
+      std::ofstream out(big_input.c_str(), std::ios_base::binary);
+      out.write(reinterpret_cast<const char*>(values.data()),
+        values.size() * sizeof(std::uint64_t));
+    }
+    auto compare_u64 = [](const void* left, const void* right)
+    {
+      std::uint64_t a, b;
+      std::memcpy(&a, left, sizeof(a)); std::memcpy(&b, right, sizeof(b));
+      return (a < b ? -1 : (a > b ? 1 : 0));
+    };
+    ExternalFixedRecordSortStats big_stats;
+    ExternalFixedRecordSorter::sort(big_input, big_sorted, sizeof(std::uint64_t),
+      256 * MEGABYTE, 2, compare_u64, &big_stats, true,
+      ExternalFixedRecordSorter::RecordOrder::ASCENDING_U64);
+    require(big_stats.runs == 1);
+    std::sort(values.begin(), values.end());
+    require(readBytes(big_sorted) == std::string(reinterpret_cast<const char*>(values.data()),
+      values.size() * sizeof(std::uint64_t)));
+    std::remove(big_input.c_str()); std::remove(big_sorted.c_str());
+
+    typedef std::array<std::uint64_t, 4> Wide;
+    const std::string wide_input = std::string(root) + "/big-wide.bin";
+    const std::string wide_sorted = std::string(root) + "/big-wide-sorted.bin";
+    std::vector<Wide> wide;
+    for(std::uint64_t i = 0; i < (std::uint64_t(3) << 19); i++)
+    {
+      std::uint64_t h = (1181783497276652981ULL * (i % 700001 + 1)) ^ (i % 700001);
+      wide.push_back(Wide{ h % 97, h % 1009, h, h >> 7 });
+    }
+    {
+      std::ofstream out(wide_input.c_str(), std::ios_base::binary);
+      out.write(reinterpret_cast<const char*>(wide.data()), wide.size() * sizeof(Wide));
+    }
+    auto compare_wide = [](const void* left, const void* right)
+    {
+      Wide a, b;
+      std::memcpy(&a, left, sizeof(a)); std::memcpy(&b, right, sizeof(b));
+      return (a < b ? -1 : (b < a ? 1 : 0));
+    };
+    ExternalFixedRecordSortStats wide_stats;
+    ExternalFixedRecordSorter::sort(wide_input, wide_sorted, sizeof(Wide),
+      256 * MEGABYTE, 2, compare_wide, &wide_stats, true);
+    require(wide_stats.runs == 1);
+    std::sort(wide.begin(), wide.end());
+    require(readBytes(wide_sorted) == std::string(reinterpret_cast<const char*>(wide.data()),
+      wide.size() * sizeof(Wide)));
+    std::remove(wide_input.c_str()); std::remove(wide_sorted.c_str());
   }
 
   // A width the in-place sorter cannot handle falls back to the permutation.
