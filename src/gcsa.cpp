@@ -661,6 +661,15 @@ MergedGraphReader::seek(bool seek_labels)
     this->rank = this->paths[this->path].pointer();
     if(seek_labels) { this->labels.seek(this->rank); }
   }
+  // Move the window before walking. init() starts `from` at the component's
+  // first start node, deep in the stream for every component but the first,
+  // and indexing a ReadBuffer beyond its window first reads every element in
+  // between into it. Without this seek the final scan's per-component readers
+  // read each stream prefix from offset 0 into memory during setup; on the
+  // joint chr2+chr18 graph that setup took about 88 s while RSS rose from
+  // 15.5 to 32.1 GiB and stayed there until the scan ended, consistent with
+  // an estimated 47 GiB of prefix reads. The walk itself is unchanged.
+  this->from_nodes.seek(this->from);
   while(this->from < this->from_nodes.size() && this->from_nodes[this->from].first < this->path)
   {
     this->from++;
