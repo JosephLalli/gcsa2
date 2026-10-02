@@ -78,14 +78,21 @@ int compareU64(const void* left, const void* right)
 }
 
 // Unique eight-byte values, reduced the way the preprocessing start stream is.
-void reduceUnique(const std::string& input, const std::string& output, size_type budget)
+// Returns what the output tap received, which must be the file's bytes.
+std::string reduceUnique(const std::string& input, const std::string& output, size_type budget)
 {
+  std::string tapped;
   ExternalFixedRecordSorter::sortAndReduce(input, output, sizeof(std::uint64_t),
     budget, 2, compareU64,
     [](const void* value, bool first, bool, std::ostream& stream)
     {
       if(first) { stream.write(static_cast<const char*>(value), sizeof(std::uint64_t)); }
-    }, nullptr, true, ExternalFixedRecordSorter::RecordOrder::ASCENDING_U64);
+    }, nullptr, true, ExternalFixedRecordSorter::RecordOrder::ASCENDING_U64,
+    [&tapped](const void* data, size_type bytes)
+    {
+      tapped.append(static_cast<const char*>(data), bytes);
+    });
+  return tapped;
 }
 
 std::vector<Record> readRecords(const std::string& name)
@@ -138,14 +145,21 @@ int main()
     if(child == 0)
     {
       setenv("GCSA_IO_DIRECT_WRITES", "1", 1);
-      try { reduceUnique(many, direct, many_budget); }
+      try
+      {
+        const std::string tapped = reduceUnique(many, direct, many_budget);
+        if(tapped != readBytes(direct)) { ::_exit(3); }
+      }
       catch(...) { ::_exit(2); }
       ::_exit(0);
     }
     int status = 0;
     require(waitpid(child, &status, 0) == child);
     require(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-    reduceUnique(many, buffered, many_budget);
+    // The output tap sees exactly the file's bytes in order, here across
+    // dozens of periodic drains of the buffered stream.
+    const std::string tapped = reduceUnique(many, buffered, many_budget);
+    require(tapped == readBytes(buffered));
     std::sort(values.begin(), values.end());
     values.erase(std::unique(values.begin(), values.end()), values.end());
     require(values.size() * sizeof(std::uint64_t) > 2 * 4 * MEGABYTE);
@@ -386,6 +400,16 @@ int main()
     }
     require(!odd_input_stream.read(reinterpret_cast<char*>(&observed), sizeof(observed)));
     std::remove(odd_input.c_str()); std::remove(odd_sorted.c_str());
+  }
+
+  // An empty input writes an empty file and never calls the tap.
+  {
+    const std::string empty_input = std::string(root) + "/empty.bin";
+    const std::string empty_reduced = std::string(root) + "/empty-reduced.bin";
+    { std::ofstream out(empty_input.c_str(), std::ios_base::binary); }
+    require(reduceUnique(empty_input, empty_reduced, budget).empty());
+    require(readBytes(empty_reduced).empty());
+    std::remove(empty_input.c_str()); std::remove(empty_reduced.c_str());
   }
 
   bool rejected = false;

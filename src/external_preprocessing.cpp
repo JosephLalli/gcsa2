@@ -9,13 +9,18 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fcntl.h>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <unistd.h>
 #include <vector>
@@ -58,6 +63,183 @@ recordCount(const std::string& name, size_type record_bytes)
   }
   return static_cast<size_type>(static_cast<std::uint64_t>(bytes) / record_bytes);
 }
+
+/*
+  Passes a byte stream to a sink on one helper thread, in order: the producer
+  fills one buffer while the helper hands the other to the sink, so the sink's
+  writes and checksums overlap the producer's work instead of following it.
+  Two buffers of buffer_bytes each; write() blocks only while the helper is
+  still busy with the previous buffer. finish() hands over the last bytes,
+  waits for the sink, and rethrows the first exception the sink threw; the
+  destructor stops the helper without finishing, for unwinding.
+*/
+class BackgroundWriter
+{
+public:
+  typedef std::function<void(const std::uint8_t* data, size_type bytes)> Sink;
+
+  BackgroundWriter(size_type buffer_bytes, Sink sink) :
+    sink_(std::move(sink)), filling_(std::max(static_cast<size_type>(1), buffer_bytes)),
+    draining_(filling_.size()), used_(0), pending_(0), busy_(false), stopping_(false),
+    error_(), helper_()
+  {
+    this->helper_ = std::thread(&BackgroundWriter::drain, this);
+  }
+
+  ~BackgroundWriter() { this->stop(); }
+
+  void write(const void* data, size_type bytes)
+  {
+    if(this->used_ + bytes <= this->filling_.size())
+    {
+      std::memcpy(this->filling_.data() + this->used_, data, bytes);
+      this->used_ += bytes; return;
+    }
+    this->writeSplit(static_cast<const std::uint8_t*>(data), bytes);
+  }
+
+  void finish()
+  {
+    if(this->used_ > 0) { this->handOver(); }
+    this->stop();
+    if(this->error_) { std::rethrow_exception(this->error_); }
+  }
+
+  BackgroundWriter(const BackgroundWriter&) = delete;
+  BackgroundWriter& operator=(const BackgroundWriter&) = delete;
+
+private:
+  void writeSplit(const std::uint8_t* data, size_type bytes)
+  {
+    while(bytes > 0)
+    {
+      if(this->used_ == this->filling_.size()) { this->handOver(); }
+      const size_type take = std::min(bytes, this->filling_.size() - this->used_);
+      std::memcpy(this->filling_.data() + this->used_, data, take);
+      this->used_ += take; data += take; bytes -= take;
+    }
+  }
+
+  // Waits for the helper to finish the previous buffer, then gives it this one.
+  void handOver()
+  {
+    std::unique_lock<std::mutex> lock(this->mutex_);
+    this->idle_.wait(lock, [this]() { return !this->busy_; });
+    if(this->error_) { std::rethrow_exception(this->error_); }
+    this->filling_.swap(this->draining_);
+    this->pending_ = this->used_; this->used_ = 0; this->busy_ = true;
+    lock.unlock();
+    this->ready_.notify_one();
+  }
+
+  // Waits for the buffer in flight and joins the helper.
+  void stop()
+  {
+    if(!this->helper_.joinable()) { return; }
+    {
+      std::unique_lock<std::mutex> lock(this->mutex_);
+      this->idle_.wait(lock, [this]() { return !this->busy_; });
+      this->stopping_ = true;
+    }
+    this->ready_.notify_one();
+    this->helper_.join();
+  }
+
+  void drain()
+  {
+    std::unique_lock<std::mutex> lock(this->mutex_);
+    while(true)
+    {
+      this->ready_.wait(lock, [this]() { return this->busy_ || this->stopping_; });
+      if(!this->busy_) { return; }
+      lock.unlock();
+      std::exception_ptr error;
+      try { this->sink_(this->draining_.data(), this->pending_); }
+      catch(...) { error = std::current_exception(); }
+      lock.lock();
+      if(error && !this->error_) { this->error_ = error; }
+      this->busy_ = false;
+      this->idle_.notify_all();
+    }
+  }
+
+  Sink sink_;
+  std::vector<std::uint8_t> filling_, draining_;
+  size_type used_, pending_;
+  bool busy_, stopping_;
+  std::exception_ptr error_;
+  std::mutex mutex_;
+  std::condition_variable ready_, idle_;
+  std::thread helper_;
+};
+
+/*
+  Copies one reduced key or start stream into its workspace artifact while the
+  sorter writes the stream's working file, through the sorter's output tap.
+  The working file is still needed, because the mapper and LCP builders and
+  the later scans read a raw stream from offset zero; what this removes is the
+  separate checkpoint pass that read the file back and wrote and checksummed
+  the artifact afterwards (0:00:36-0:02:40 for the joint chr2+chr18 streams).
+  The artifact receives exactly the working file's bytes, in order, so its
+  payload, length, checksum and header are those the copy pass produced.
+
+  The artifact stays a .partial file until finish(), which preprocessing calls
+  where it used to copy, after both reductions and the empty-key check, so
+  the artifact renames, their crash points and the task commit keep their
+  order. A crash or an exception before then leaves only a partial file, which
+  the ArtifactWriter removes when unwinding and recovery removes after a crash.
+*/
+class ArtifactCopy
+{
+public:
+  ArtifactCopy() : writer_(), copy_(), bytes_(0) { }
+
+  void open(BuildWorkspace& workspace, const ArtifactIdentity& identity,
+    physical_shard_id_t shard, size_type buffer_bytes)
+  {
+    this->writer_ = workspace.open_artifact(identity, logical_file_id_t(0), shard,
+      "value", "all");
+    this->copy_.reset(new BackgroundWriter(buffer_bytes,
+      [this](const std::uint8_t* data, size_type bytes) { this->writer_.write(data, bytes); }));
+  }
+
+  // The sorter's tap; empty, so the sorter copies nothing, when not opened.
+  ExternalFixedRecordSorter::OutputTap tap()
+  {
+    if(!this->copy_) { return ExternalFixedRecordSorter::OutputTap(); }
+    return [this](const void* data, size_type bytes)
+    {
+      this->copy_->write(data, bytes); this->bytes_ += bytes;
+    };
+  }
+
+  // Waits until the artifact has every byte and releases the helper and its
+  // buffers before the next phase reserves memory.
+  void drain()
+  {
+    if(!this->copy_) { return; }
+    this->copy_->finish(); this->copy_.reset();
+  }
+
+  BuildWorkspace::ArtifactRef finish(size_type records, size_type bytes)
+  {
+    this->drain();
+    if(bytes != this->bytes_)
+    {
+      throw std::runtime_error("external preprocessing: reduced stream and its artifact copy differ in length");
+    }
+    return this->writer_.finish(records);
+  }
+
+  ArtifactCopy(const ArtifactCopy&) = delete;
+  ArtifactCopy& operator=(const ArtifactCopy&) = delete;
+
+private:
+  BuildWorkspace::ArtifactWriter writer_;
+  // Declared after the writer it feeds, so it stops before the writer closes.
+  std::unique_ptr<BackgroundWriter> copy_;
+  size_type bytes_;
+};
 
 class RawWriter
 {
@@ -289,32 +471,6 @@ mapStart(node_type node, const NodeMapping& mapping)
   return Node::encode(mapping(Node::id(node)), Node::offset(node), Node::rc(node));
 }
 
-BuildWorkspace::ArtifactRef
-checkpointStream(BuildWorkspace& workspace, const ArtifactIdentity& identity,
-  physical_shard_id_t shard, const std::string& name, size_type records,
-  size_type buffer_bytes)
-{
-  std::ifstream input;
-  input.rdbuf()->pubsetbuf(nullptr, 0);
-  input.open(name.c_str(), std::ios_base::binary);
-  if(!input) { throw std::runtime_error("external preprocessing: cannot checkpoint " + name); }
-  BuildWorkspace::ArtifactWriter writer = workspace.open_artifact(identity,
-    logical_file_id_t(0), shard, "value", "all");
-  std::vector<std::uint8_t> buffer(std::max(static_cast<size_type>(1), buffer_bytes));
-  while(input)
-  {
-    input.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
-    std::streamsize bytes = input.gcount();
-    if(bytes > 0)
-    {
-      DiskIO::read_volume += static_cast<size_type>(bytes);
-      writer.write(buffer.data(), static_cast<size_type>(bytes));
-    }
-  }
-  if(!input.eof()) { throw std::runtime_error("external preprocessing: failed while checkpointing " + name); }
-  return writer.finish(records);
-}
-
 physical_shard_id_t
 physicalId(logical_file_id_t logical, std::uint64_t local_shard)
 {
@@ -387,6 +543,12 @@ ExternalInputPreprocessor::prepare()
 
   std::string key_source = TempFile::getName("gcsa_key_source");
   std::string start_source = TempFile::getName("gcsa_start_source");
+  // With a workspace, each reduced stream is copied into its artifact while
+  // it is written (see ArtifactCopy). During a reduction the sorter holds its
+  // run reader and one output buffer, two of the fan-in + 1 buffers its merges
+  // reserve, so a copy's two io-sized buffers (each at most sortBudget()/8)
+  // fit in the working set the sort already reserved.
+  ArtifactCopy key_copy, start_copy;
   try
   {
     {
@@ -412,6 +574,10 @@ ExternalInputPreprocessor::prepare()
       keys.close(); starts.close();
     }
 
+    if(this->workspace_ != nullptr)
+    {
+      key_copy.open(*this->workspace_, keyArtifact(), physical_shard_id_t(0), io_bytes);
+    }
     // compareKeyLabel orders on the label alone, so keys that differ in their
     // predecessor/successor bits compare equal, and the run sorter would keep
     // their input order with an offset permutation and one indirect call per
@@ -436,7 +602,12 @@ ExternalInputPreprocessor::prepare()
         else { merged_key = Key::merge(merged_key, key); }
         if(last) { output.write(reinterpret_cast<const char*>(&merged_key), sizeof(merged_key)); }
       }, &this->stats_.key_sort, true,
-      ExternalFixedRecordSorter::RecordOrder::ASCENDING_U64);
+      ExternalFixedRecordSorter::RecordOrder::ASCENDING_U64, key_copy.tap());
+    key_copy.drain();
+    if(this->workspace_ != nullptr)
+    {
+      start_copy.open(*this->workspace_, startArtifact(), physical_shard_id_t(1), io_bytes);
+    }
     ExternalFixedRecordSorter::sortAndReduce(start_source, this->start_name_,
       sizeof(node_type), this->sortBudget(), this->parameters_.getMergeFanIn(),
       compareNode,
@@ -444,7 +615,8 @@ ExternalInputPreprocessor::prepare()
       {
         if(first) { output.write(reinterpret_cast<const char*>(value), sizeof(node_type)); }
       }, &this->stats_.start_sort, true,
-      ExternalFixedRecordSorter::RecordOrder::ASCENDING_U64);
+      ExternalFixedRecordSorter::RecordOrder::ASCENDING_U64, start_copy.tap());
+    start_copy.drain();
     TempFile::remove(key_source);
     TempFile::remove(start_source);
   }
@@ -463,10 +635,10 @@ ExternalInputPreprocessor::prepare()
   if(this->workspace_ != nullptr)
   {
     std::vector<BuildWorkspace::ArtifactRef> artifacts;
-    artifacts.push_back(checkpointStream(*this->workspace_, keyArtifact(),
-      physical_shard_id_t(0), this->key_name_, this->key_count_, io_bytes));
-    artifacts.push_back(checkpointStream(*this->workspace_, startArtifact(),
-      physical_shard_id_t(1), this->start_name_, this->start_count_, io_bytes));
+    artifacts.push_back(key_copy.finish(this->key_count_,
+      this->key_count_ * sizeof(key_type)));
+    artifacts.push_back(start_copy.finish(this->start_count_,
+      this->start_count_ * sizeof(node_type)));
     this->workspace_->commit_task(PREPROCESS_TASK, PREPROCESS_PHASE, artifacts);
   }
   this->stats_.unique_keys = this->key_count_;
