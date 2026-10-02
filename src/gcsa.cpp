@@ -23,6 +23,7 @@
 #include <random>
 #include <sstream>
 #include <sys/stat.h>
+#include <system_error>
 #include <thread>
 #include <unistd.h>
 #include <unordered_set>
@@ -160,7 +161,15 @@ constructionSemanticSettings(const InputGraph& graph,
     const size_type threads = std::min(checksum_names.size(),
       static_cast<size_type>(std::max(1, omp_get_max_threads())));
     std::vector<std::thread> helpers;
-    for(size_type i = 1; i < threads; i++) { helpers.emplace_back(checksum_files); }
+    try
+    {
+      for(size_type i = 1; i < threads; i++) { helpers.emplace_back(checksum_files); }
+    }
+    catch(const std::system_error&)
+    {
+      // A process thread limit can refuse a helper. The helpers already
+      // running and this thread still checksum every file.
+    }
     checksum_files();
     for(std::thread& helper : helpers) { helper.join(); }
   }
