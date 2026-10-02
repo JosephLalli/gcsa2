@@ -98,7 +98,9 @@ size_type pathMergeInputCacheBudget(const ConstructionParameters& parameters,
 // declares its own block size and nothing rewrites it, so this raises the
 // buffer to hold one decoded path/rank pair of source. --memory-limit remains
 // the ceiling: a workspace whose block needs more than a sixteenth of it is
-// reported with the limit it does need, not silently over-allocated.
+// reported with the limit it does need, not silently over-allocated. A raw
+// (unframed) generation gets that sixteenth as well, because the same budget
+// sizes the merger's spillable equal-label groups and its raw read windows.
 size_type pathMergeInputBudget(const ConstructionParameters& parameters,
   const PathGraph& source);
 

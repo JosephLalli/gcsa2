@@ -1362,7 +1362,20 @@ pathMergeInputBudget(const ConstructionParameters& parameters,
 {
   const size_type requested = pathMergeInputBudget(parameters);
   const size_type pair_bytes = pathGraphFramedPairBytes(source);
-  if(pair_bytes == 0) { return requested; }
+  const size_type ceiling = pathMergeCeilingBudget(parameters);
+  if(pair_bytes == 0)
+  {
+    // Raw shards hold no decoded blocks, but this budget also sizes the
+    // merger's equal-label range and priority groups, which spill to disk once
+    // they outgrow it, and, with no separate input cache, the raw readers'
+    // windows. Capping it at --io-buffer-size (64 MiB) left each of step 1's
+    // seven prune workers about 9 MiB: on the joint chr2+chr18 graph that
+    // prune wrote 97.7 GiB of spill and output for 23.9 GB of output, at 1.23
+    // cores, while the framed steps after it, funded from the same sixteenth
+    // of --memory-limit as below, did not spill. Group sizes change only where
+    // records are stored, never the merge order or the output.
+    return std::max(requested, ceiling);
+  }
 
   // --io-buffer-size sizes stream buffers; it was never a memory ceiling, and
   // no entry point above this library exposes it, so a generation whose blocks
@@ -1375,7 +1388,6 @@ pathMergeInputBudget(const ConstructionParameters& parameters,
   // entry short of the shard count misses on every record. A sixteenth of
   // --memory-limit remains the bound, since the merger keeps a range deque, a
   // priority group and an output cache of the same size beside this one.
-  const size_type ceiling = pathMergeCeilingBudget(parameters);
   const size_type pairs = std::max(static_cast<size_type>(1),
     std::min(pathMergeInputPairs(parameters), source.files()));
   size_type wanted = (pair_bytes > ceiling / pairs ? ceiling : pairs * pair_bytes);
@@ -1961,6 +1973,39 @@ externalPathGraphSortMinimumBudget()
 struct PathGraphMerger;
 
 /*
+  Spill files are scratch: nothing reads them after a crash, so they need no
+  durability boundary. They are written back only so that the
+  POSIX_FADV_DONTNEED which follows can drop their pages, which a cgroup
+  charges like any other memory and which stay resident while dirty.
+  fdatasync() achieved that, but an appended file also has a new size to
+  commit, so every call waited for an ext4 journal commit: step 1 of the
+  joint chr2+chr18 prune flushed every ~4.5 MiB and its blocked thread time
+  was mostly journal commits or the dirty-page throttle. sync_file_range()
+  writes back and waits for exactly the written range and leaves the
+  metadata alone. A file system that does not support it gets fdatasync().
+*/
+static void
+writeBackSpillRange(int file, off_t offset, size_type bytes, const char* failure)
+{
+  if(bytes == 0) { return; }
+#if defined(SYNC_FILE_RANGE_WRITE)
+  if(::sync_file_range(file, offset, static_cast<off_t>(bytes),
+       SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE |
+       SYNC_FILE_RANGE_WAIT_AFTER) == 0)
+  {
+    return;
+  }
+  if(errno != ENOSYS && errno != EINVAL && errno != ESPIPE)
+  {
+    throw std::runtime_error(failure);
+  }
+#else
+  static_cast<void>(offset);
+#endif
+  if(::fdatasync(file) != 0) { throw std::runtime_error(failure); }
+}
+
+/*
   PathGraphMerger normally only needs a sliding window. An equal-label range
   can, however, be arbitrarily long before prune() decides how to emit it.
   Keep that range addressable on disk once its resident budget is exhausted.
@@ -2057,7 +2102,8 @@ struct SpillableGroup
     if(!this->spilled()) { this->memory[this->head + i - this->offset] = value; return; }
     if(i >= this->disk_elements) { this->memory[i - this->disk_elements] = value; return; }
     this->flush(); this->write(&value, 1, i);
-    if(::fdatasync(this->file) != 0) { throw std::runtime_error("PathGraph::prune(): spill sync failed"); }
+    writeBackSpillRange(this->file, this->fileOffset(i), bytesFor(1),
+      "PathGraph::prune(): spill sync failed");
     this->discard(i, 1); sdsl::util::clear(this->read_cache);
   }
 
@@ -2096,12 +2142,13 @@ private:
     {
       sdsl::util::clear(this->memory); this->head = 0; return;
     }
-    this->write(this->memory.data() + this->head, this->liveSize(),
-      this->disk_elements);
-    this->disk_elements += this->liveSize();
+    const size_type start = this->disk_elements, count = this->liveSize();
+    this->write(this->memory.data() + this->head, count, start);
+    this->disk_elements += count;
     sdsl::util::clear(this->memory); this->head = 0;
     this->memory.reserve(std::max(static_cast<size_type>(1), this->write_bytes / sizeof(Element)));
-    if(::fdatasync(this->file) != 0) { throw std::runtime_error("PathGraph::prune(): spill sync failed"); }
+    writeBackSpillRange(this->file, this->fileOffset(start), bytesFor(count),
+      "PathGraph::prune(): spill sync failed");
     this->discard(this->advised_write, this->disk_elements - this->advised_write);
     this->advised_write = this->disk_elements;
   }
@@ -2369,7 +2416,8 @@ private:
     this->write(this->memory.data(), this->memory.size(), this->disk_end);
     size_type start = this->disk_end; this->disk_end += this->memory.size();
     sdsl::util::clear(this->memory); this->memory.reserve(this->write_records);
-    if(::fdatasync(this->file) != 0) { throw std::runtime_error("PathGraphMerger: range spill sync failed"); }
+    writeBackSpillRange(this->file, fileOffset(start), bytesFor(this->disk_end - start),
+      "PathGraphMerger: range spill sync failed");
     this->discard(start, this->disk_end - start);
   }
 
