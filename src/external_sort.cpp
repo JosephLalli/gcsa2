@@ -326,16 +326,21 @@ struct RunReader
   {
     trimReadCache(this->cache.value, this->bytes_read, this->cache_released,
       this->bytes_read == this->total_bytes);
-    read_ahead.advance(static_cast<std::uint64_t>(this->bytes_read));
-    input.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
-    std::streamsize bytes = input.gcount();
-    if(bytes < 0 || static_cast<size_type>(bytes) % record_bytes != 0)
+    // A refill can be a gigabyte (a reduction's one reader gets a whole merge
+    // buffer), and the read-ahead window moves only where a read starts, so
+    // one synchronous read left all but the window's first 64 MiB to the
+    // kernel: 100-200 MB/s on the joint key and start reductions, against
+    // 1.3-2.1 GB/s for readSliced in run formation. Slices move the window
+    // along with the read.
+    const size_type bytes = readSliced(input, buffer.data(), buffer.size(),
+      static_cast<std::uint64_t>(this->bytes_read), read_ahead);
+    if(bytes % record_bytes != 0)
     {
       fail("truncated run");
     }
-    DiskIO::read_volume += static_cast<size_type>(bytes);
-    this->bytes_read += bytes;
-    records = static_cast<size_type>(bytes) / record_bytes;
+    DiskIO::read_volume += bytes;
+    this->bytes_read += static_cast<off_t>(bytes);
+    records = bytes / record_bytes;
     offset = 0; at_end = (records == 0);
   }
 
