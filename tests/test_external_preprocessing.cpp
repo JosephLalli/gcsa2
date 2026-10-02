@@ -159,6 +159,16 @@ int main()
       require(initial.physicalShard(file).value >> 32 == logical.value);
       saw_first = saw_first || logical == logical_file_id_t(0);
       saw_second = saw_second || logical == logical_file_id_t(1);
+      // Checkpoint adoption trusts the digest each shard's writer computed on
+      // its helper thread, so it must be the checksum of the file as closed.
+      const std::string path_bytes = readBytes(initial.path_names[file]);
+      const std::string rank_bytes = readBytes(initial.rank_names[file]);
+      require(initial.path_checksums[file].matches(initial.path_names[file], path_bytes.size()));
+      require(initial.rank_checksums[file].matches(initial.rank_names[file], rank_bytes.size()));
+      require(initial.path_checksums[file].value ==
+        BuildWorkspace::checksum(path_bytes.data(), path_bytes.size()));
+      require(initial.rank_checksums[file].value ==
+        BuildWorkspace::checksum(rank_bytes.data(), rank_bytes.size()));
       std::vector<PathNode> paths;
       std::vector<PathNode::rank_type> ranks;
       initial.read(paths, ranks, file);

@@ -241,16 +241,28 @@ private:
   size_type bytes_;
 };
 
+/*
+  Writes a raw record stream, optionally with the FNV-1a digest of every byte
+  that checkpoint adoption reuses instead of rereading the file. The writes
+  and the digest run on a BackgroundWriter's helper thread, so the producer
+  only copies records into a buffer. On the main thread the digest alone was
+  the largest cost of the mapping pass: the initial path and rank shards are
+  32 bytes per k-mer (24.1 GiB for the joint chr2+chr18 build) at about
+  0.77 GB/s. The bytes, their order and the digest are unchanged; the stream
+  is complete, and the digest final, once close() returns.
+*/
 class RawWriter
 {
 public:
   RawWriter(const std::string& name, size_type buffer_bytes, bool track_digest = false) :
-    name_(name), output_(), buffer_(std::max(static_cast<size_type>(1), buffer_bytes)), used_(0),
-    track_digest_(track_digest), digest_(1469598103934665603ULL)
+    name_(name), output_(), track_digest_(track_digest), digest_(1469598103934665603ULL),
+    background_()
   {
     output_.setFileBuffer(nullptr, 0);
     output_.open(name.c_str(), std::ios_base::binary | std::ios_base::trunc);
     if(!output_) { throw std::runtime_error("external preprocessing: cannot create " + name); }
+    background_.reset(new BackgroundWriter(buffer_bytes,
+      [this](const std::uint8_t* data, size_type bytes) { this->sink(data, bytes); }));
   }
 
   ~RawWriter()
@@ -260,17 +272,7 @@ public:
 
   void write(const void* record, size_type bytes)
   {
-    if(bytes > buffer_.size())
-    {
-      this->flush();
-      output_.write(reinterpret_cast<const char*>(record), bytes);
-      if(!output_) { throw std::runtime_error("external preprocessing: cannot write " + name_); }
-      if(track_digest_) { digest_ = BuildWorkspace::checksum(record, bytes, digest_); }
-      DiskIO::write_volume += bytes;
-      return;
-    }
-    if(used_ + bytes > buffer_.size()) { this->flush(); }
-    std::memcpy(buffer_.data() + used_, record, bytes); used_ += bytes;
+    background_->write(record, bytes);
   }
 
   template<class Record>
@@ -279,20 +281,16 @@ public:
     this->write(&record, sizeof(Record));
   }
 
-  void flush()
-  {
-    if(used_ == 0) { return; }
-    output_.write(reinterpret_cast<const char*>(buffer_.data()), used_);
-    if(!output_) { throw std::runtime_error("external preprocessing: cannot write " + name_); }
-    if(track_digest_) { digest_ = BuildWorkspace::checksum(buffer_.data(), used_, digest_); }
-    DiskIO::write_volume += used_;
-    used_ = 0;
-  }
-
   void close()
   {
     if(!output_.is_open()) { return; }
-    this->flush(); output_.close();
+    // The helper writes to output_, so it must stop before output_ closes,
+    // also when it failed.
+    std::unique_ptr<BackgroundWriter> background(std::move(background_));
+    try { if(background) { background->finish(); } }
+    catch(...) { background.reset(); output_.close(); throw; }
+    background.reset();
+    output_.close();
     if(!output_) { throw std::runtime_error("external preprocessing: cannot close " + name_); }
   }
 
@@ -304,12 +302,23 @@ public:
   }
 
 private:
+  // Runs on the helper thread, which alone touches output_ and digest_ until
+  // close() has joined it.
+  void sink(const std::uint8_t* data, size_type bytes)
+  {
+    output_.write(reinterpret_cast<const char*>(data), bytes);
+    if(!output_) { throw std::runtime_error("external preprocessing: cannot write " + name_); }
+    if(track_digest_) { digest_ = BuildWorkspace::checksum(data, bytes, digest_); }
+    DiskIO::write_volume += bytes;
+  }
+
   std::string name_;
   OutputStream output_;
-  std::vector<std::uint8_t> buffer_;
-  size_type used_;
   bool track_digest_;
   std::uint64_t digest_;
+  // Declared last, so a writer destroyed without close() stops its helper
+  // before the stream it writes to.
+  std::unique_ptr<BackgroundWriter> background_;
 };
 
 // A read-only descriptor that RawReader's ReadAhead can borrow. It is a member
@@ -787,9 +796,10 @@ ExternalInputPreprocessor::buildInitialPathGraph(PathGraph& result)
         compareInitialKMer, &kmer_stats, true);
       this->stats_.logical_kmer_sorts++;
 
-      // Mapping uses two bounded readers and two bounded path/rank writers.
-      // ioBufferBytes() is at most sortBudget()/8, so their four explicit
-      // buffers stay below half the sort budget. The subsequent succinct
+      // Mapping uses two bounded readers and two bounded path/rank writers,
+      // each writer double-buffered for its helper thread. ioBufferBytes() is
+      // at most sortBudget()/8, so their six explicit buffers stay within
+      // three quarters of the sort budget. The subsequent succinct
       // vectors (mapper/LCP/start set) are final index support, not temporary
       // preprocessing working state, and are intentionally outside this
       // spill-stage accounting.
