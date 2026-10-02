@@ -1968,6 +1968,7 @@ public:
     path_name(graph.path_names.at(file)), rank_name(graph.rank_names.at(file)),
     path_descriptor(-1), rank_descriptor(-1), path_count(graph.path_counts.at(file)),
     rank_count(graph.rank_counts.at(file)), path_offset(0), rank_offset(0),
+    path_end(graph.path_counts.at(file)),
     path_cache_released(0), rank_cache_released(0), retain_cache(shared_cache),
     path_buffer(std::max(static_cast<size_type>(1), JOIN_IO_BUFFER_BYTES / sizeof(PathNode))),
     rank_buffer(std::max(static_cast<size_type>(1),
@@ -2031,11 +2032,47 @@ public:
     }
   }
 
+  // Read only paths [first, end): the reader starts at the first path's ranks.
+  // Lets several readers share one large shard.
+  void restrict(size_type first, size_type end)
+  {
+    if(first > end || end > this->path_count)
+    {
+      throw joinError("path shard range is out of bounds", this->path_name);
+    }
+    this->path_end = end;
+    this->path_offset = first;
+    this->path_buffer_records = 0; this->rank_buffer_records = 0;
+    if(first == end) { return; }
+    PathNode node;
+    if(this->compressed_path)
+    {
+      if(this->compressed_path->readAt(first * sizeof(PathNode), &node, sizeof(node)) != sizeof(node))
+      {
+        throw joinError("short compressed path shard", this->path_name);
+      }
+      this->compressed_path->seekUncompressedByte(first * sizeof(PathNode));
+    }
+    else
+    {
+      preadAll(this->path_descriptor, &node, sizeof(node), first * sizeof(PathNode), this->path_name);
+    }
+    if(node.pointer() > this->rank_count)
+    {
+      throw joinError("invalid path or rank pointer", this->path_name);
+    }
+    this->rank_offset = node.pointer();
+    if(this->compressed_rank)
+    {
+      this->compressed_rank->seekUncompressedByte(this->rank_offset * sizeof(PathNode::rank_type));
+    }
+  }
+
   bool read(JoinRecord& record)
   {
-    if(this->path_offset >= this->path_count)
+    if(this->path_offset >= this->path_end)
     {
-      if(this->rank_offset != this->rank_count)
+      if(this->path_end == this->path_count && this->rank_offset != this->rank_count)
       {
         throw joinError("path shard rank count mismatch", this->rank_name);
       }
@@ -2071,7 +2108,7 @@ private:
   {
     this->path_buffer_first = this->path_offset;
     this->path_buffer_records = std::min(this->path_buffer.size(),
-      this->path_count - this->path_buffer_first);
+      this->path_end - this->path_buffer_first);
     const size_type bytes = this->path_buffer_records * sizeof(PathNode);
     if(this->compressed_path)
     {
@@ -2141,7 +2178,7 @@ private:
 
   std::string path_name, rank_name;
   int path_descriptor, rank_descriptor;
-  size_type path_count, rank_count, path_offset, rank_offset;
+  size_type path_count, rank_count, path_offset, rank_offset, path_end;
   off_t path_cache_released, rank_cache_released;
   bool retain_cache;
   std::vector<PathNode> path_buffer;
@@ -5569,7 +5606,7 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
   size_type next_physical = 0, committed_bytes = 0;
 
   // Key-range distribution reads each logical input once. Reader threads take
-  // whole shards and route every record to the sorters of the key range its
+  // chunks of shards and route every record to the sorters of the key range its
   // join key falls in, so all of a pass's ranges keep two live sorters each and
   // share the distribution lifetime's memory with the readers' decoders and
   // batches. If that leaves a sorter below its minimum, ranges are handled in
@@ -5591,11 +5628,11 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
     size_type readers, finishers, group, batch, sorter_budget, fan_in;
     TempFileCodecParameters codec;
   };
-  auto plan_range_passes = [&](size_type ranges, size_type shards) -> RangePasses
+  auto plan_range_passes = [&](size_type ranges, size_type chunks) -> RangePasses
   {
     RangePasses result{ 1, 1, 0, 1, 0, 0, requested_range_codec };
     const size_type readers = std::max(static_cast<size_type>(1),
-      std::min({ thread_limit, shards, descriptor_budget / 8 }));
+      std::min({ thread_limit, chunks, descriptor_budget / 8 }));
     for(size_type group = ranges; group >= 2; group--)
     {
       // Batches take at most a sixty-fourth of the lifetime's memory.
@@ -5632,8 +5669,26 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
 
     const JoinRangePlan range_plan = loadOrCreateJoinRangePlan(graph, group.second,
       logical, thread_limit, workspace, checkpoint_task, stats);
+    // Readers take chunks of shards, not whole shards, so a step with few
+    // large shards (seven at the first-character prune split) still uses the
+    // threads: about four chunks per thread over the whole input.
+    struct ShardChunk { size_type shard, first, end; };
+    std::vector<ShardChunk> chunks;
+    {
+      const size_type total = countJoinRecords(graph, group.second);
+      const size_type chunk_records = std::max(static_cast<size_type>(1),
+        total / std::max(static_cast<size_type>(1), 4 * thread_limit));
+      for(size_type i = 0; i < group.second.size(); i++)
+      {
+        const size_type count = graph.path_counts[group.second[i]];
+        for(size_type first = 0; first < count; first += chunk_records)
+        {
+          chunks.push_back(ShardChunk{ i, first, std::min(count, first + chunk_records) });
+        }
+      }
+    }
     const RangePasses passes = (range_plan.ranges() > 1 ?
-      plan_range_passes(range_plan.ranges(), group.second.size()) :
+      plan_range_passes(range_plan.ranges(), chunks.size()) :
       RangePasses{ 1, 1, 0, 1, 0, 0, requested_range_codec });
     const size_type active_ranges = (passes.group >= 2 ? passes.readers : 1);
     const bool range_scan = (passes.group >= 2);
@@ -5682,8 +5737,8 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
               passes.codec, false));
           }
 
-          // Read every shard once; route each record to its ranges' sorters.
-          std::atomic<size_type> next_shard(0);
+          // Read every shard once, in chunks; route each record to its ranges' sorters.
+          std::atomic<size_type> next_chunk(0);
           std::atomic<bool> stop(false);
           std::vector<std::exception_ptr> errors(passes.readers);
           std::vector<size_type> right_counts(passes.readers, 0), left_counts(passes.readers, 0);
@@ -5716,11 +5771,13 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
                   sorter.adoptRun(run, local);
                 }
               };
-              for(size_type i = next_shard++; i < shards.size() && !stop; i = next_shard++)
+              for(size_type c = next_chunk++; c < chunks.size() && !stop; c = next_chunk++)
               {
-                PathShardReader reader(graph, shards[i], true);
+                const ShardChunk& chunk = chunks[c];
+                PathShardReader reader(graph, shards[chunk.shard], true);
+                reader.restrict(chunk.first, chunk.end);
                 JoinRecord record;
-                std::uint64_t ordinal = ordinal_base[i];
+                std::uint64_t ordinal = ordinal_base[chunk.shard] + chunk.first;
                 while(reader.read(record))
                 {
                   record.logical = logical; record.ordinal = ordinal++;

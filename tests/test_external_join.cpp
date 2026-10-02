@@ -976,8 +976,8 @@ int main(int argc, char** argv)
     externalPathGraphExtend(direct_chain, GIGABYTE, range_parameters, &direct_chain_stats);
     omp_set_num_threads(1);
     require(direct_chain_stats.distribution_ranges == 4);
-    // One reader per shard: the single shard is read once for all four ranges.
-    require(direct_chain_stats.distribution_concurrency == 1);
+    // The single shard is read once, in chunks, by one reader per thread.
+    require(direct_chain_stats.distribution_concurrency == 4);
     require(direct_chain_stats.left_records == serial_chain_stats.left_records);
     require(direct_chain_stats.right_records == serial_chain_stats.right_records);
     require(direct_chain_stats.max_bytes_resident <= range_parameters.getMemoryLimitBytes());
@@ -1002,7 +1002,7 @@ int main(int argc, char** argv)
       &worker_chain_stats, &range_workspace, "step-ranges");
     omp_set_num_threads(1);
     require(worker_chain_stats.distribution_ranges == 4);
-    require(worker_chain_stats.distribution_concurrency == 1); // one reader for one shard
+    require(worker_chain_stats.distribution_concurrency == 4); // one reader per thread, in chunks
     require(worker_chain_stats.restored_range_plans == 0);
     require(worker_chain_stats.join_partitions >= 4);
     require(worker_chain_stats.worker_processes == worker_chain_stats.join_partitions);
@@ -1020,7 +1020,7 @@ int main(int argc, char** argv)
     omp_set_num_threads(1);
     require(resumed_chain_stats.restored_range_plans == 1);
     require(resumed_chain_stats.distribution_ranges == 4);
-    require(resumed_chain_stats.distribution_concurrency == 1); // one reader for one shard
+    require(resumed_chain_stats.distribution_concurrency == 2); // one reader per thread, in chunks
     require(resumed_chain_stats.restored_radix_plans > 0);
     require(resumed_chain_stats.restored_partitions == worker_chain_stats.join_partitions);
     require(resumed_chain_stats.worker_processes == 0);
