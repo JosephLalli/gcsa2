@@ -1123,24 +1123,66 @@ componentBufferBytes(const ConstructionParameters& parameters, size_type readers
     std::min(parameters.getIOBufferSize(), share));
 }
 
-class RedundancyPositionReader
+/*
+  SadaCount marks slot + (events at slots <= slot) for each suffix-tree slot,
+  which depends only on the number of redundancy events per slot. The event
+  stream is therefore counted in emission order instead of being sorted. Each
+  slot gets one byte; an increment that wraps a byte to zero appends the slot
+  to a wrap list, so a slot's count is its byte plus 256 per listed wrap. The
+  list can never hold more than redundant / 256 entries, so it is reserved up
+  front whatever the distribution. A goal too small for one byte per slot
+  counts consecutive windows of slots, reading the stream once per window;
+  the positions, and so the serialized bytes, are the same.
+*/
+class RedundancyCounts
 {
 public:
-  RedundancyPositionReader(const std::string& filename, size_type paths,
+  RedundancyCounts(const std::string& filename, size_type paths,
     size_type redundant, const ConstructionParameters& parameters) :
-    slots_(paths > 0 ? paths - 1 : 0), redundant_(redundant), slot_(0),
-    cumulative_(0), budget_(parameters.getMemoryLimitBytes(),
-      parameters.getMemoryLimitBytes() / 8), input_(new BufferedEventReader(filename, 8, redundant,
-      componentBufferBytes(parameters, 1), budget_, "final-redundancy-reader")),
-    current_(0), available_(input_->nextInteger(current_)), finished_(false)
+    filename_(filename), slots_(paths > 0 ? paths - 1 : 0),
+    redundant_(redundant), reader_bytes_(componentBufferBytes(parameters, 1)),
+    window_(0), first_(0), last_(0), slot_(0), cumulative_(0),
+    wrap_capacity_(redundant / 256), wrap_count_(0), wrap_cursor_(0),
+    budget_(parameters.getMemoryLimitBytes(),
+      parameters.getMemoryLimitBytes() / 8),
+    reservation_(), counts_(), wraps_(), stats_()
   {
+    requireFileSize(filename_, redundant_, 8);
+    if(slots_ == 0 && redundant_ != 0)
+    {
+      throw eventError("redundancy rank exceeds suffix-tree slot universe", filename_);
+    }
+    // Leave room for the reader each pass constructs, sized as
+    // BufferedEventReader sizes itself, before the counts take the rest.
+    size_type reader = std::max(static_cast<size_type>(8),
+      reader_bytes_ - reader_bytes_ % 8);
+    if(CompressedBlockReader::isFramed(filename_))
+    {
+      reader += CompressedBlockReader::workingMemoryEstimate(
+        static_cast<size_type>(CompressedBlockReader::declaredBlockSize(filename_)));
+    }
+    const size_type wrap_bytes = checkedBytes(wrap_capacity_,
+      sizeof(size_type), filename_);
+    const size_type available = budget_.available();
+    if(slots_ > 0 && (available <= reader || available - reader <= wrap_bytes))
+    {
+      throw eventError("memory limit cannot hold redundancy counts", filename_);
+    }
+    window_ = (slots_ > 0 ? std::min(slots_, available - reader - wrap_bytes) : 0);
+    reservation_ = budget_.reserve(window_ + wrap_bytes, "final-redundancy-counts");
+    counts_.reset(new std::uint8_t[std::max(static_cast<size_type>(1), window_)]);
+    wraps_.reset(new size_type[std::max(static_cast<size_type>(1), wrap_capacity_)]);
+    stats_.slots = slots_; stats_.window_slots = window_;
   }
 
-  ~RedundancyPositionReader()
+  // Restart the slot sequence. One window covering every slot is reused;
+  // windowed counts are recounted on demand.
+  void rewind()
   {
-    if(!finished_)
+    slot_ = cumulative_ = wrap_cursor_ = 0;
+    if(stats_.stream_passes == 0 || first_ != 0 || last_ != slots_)
     {
-      try { finish(); } catch(...) { }
+      first_ = last_ = 0;
     }
   }
 
@@ -1148,35 +1190,63 @@ public:
   {
     if(slot_ == slots_)
     {
-      finish(); return false;
+      if(cumulative_ != redundant_)
+      {
+        throw eventError("redundancy counts do not match metadata", filename_);
+      }
+      return false;
     }
-    if(available_ && current_ < slot_)
+    if(slot_ == last_) { count(slot_); }
+    size_type events = counts_[slot_ - first_];
+    while(wrap_cursor_ < wrap_count_ && wraps_[wrap_cursor_] == slot_)
     {
-      throw eventError("redundancy stream is not nondecreasing");
+      events += 256; wrap_cursor_++;
     }
-    while(available_ && current_ == slot_)
-    {
-      cumulative_++; available_ = input_->nextInteger(current_);
-    }
+    cumulative_ += events;
     position = slot_ + cumulative_;
     slot_++; return true;
   }
 
-private:
-  size_type slots_, redundant_, slot_, cumulative_;
-  MemoryBudget budget_;
-  std::unique_ptr<BufferedEventReader> input_;
-  std::uint64_t current_;
-  bool available_, finished_;
+  const RedundancyCountStats& stats() const { return stats_; }
 
-  void finish()
+private:
+  std::string filename_;
+  size_type slots_, redundant_, reader_bytes_;
+  size_type window_, first_, last_, slot_, cumulative_;
+  size_type wrap_capacity_, wrap_count_, wrap_cursor_;
+  MemoryBudget budget_;
+  MemoryBudget::Reservation reservation_;
+  std::unique_ptr<std::uint8_t[]> counts_;
+  std::unique_ptr<size_type[]> wraps_;
+  RedundancyCountStats stats_;
+
+  void count(size_type first)
   {
-    if(finished_) { return; }
-    if(slot_ != slots_ || available_ || cumulative_ != redundant_)
+    first_ = first; last_ = first + std::min(window_, slots_ - first);
+    std::memset(counts_.get(), 0, last_ - first_);
+    wrap_count_ = wrap_cursor_ = 0;
+    BufferedEventReader input(filename_, 8, redundant_, reader_bytes_, budget_,
+      "final-redundancy-reader");
+    std::uint64_t value = 0;
+    while(input.nextInteger(value))
     {
-      throw eventError("redundancy rank exceeds suffix-tree slot universe");
+      if(value >= slots_)
+      {
+        throw eventError("redundancy rank exceeds suffix-tree slot universe", filename_);
+      }
+      if(value < first_ || value >= last_) { continue; }
+      if(++counts_[value - first_] == 0)
+      {
+        if(wrap_count_ == wrap_capacity_)
+        {
+          throw eventError("redundancy wrap list exceeds its bound", filename_);
+        }
+        wraps_[wrap_count_++] = static_cast<size_type>(value);
+      }
     }
-    input_->finish(); finished_ = true;
+    input.finish();
+    std::sort(wraps_.get(), wraps_.get() + wrap_count_);
+    stats_.stream_passes++; stats_.wraps += wrap_count_;
   }
 };
 
@@ -1197,14 +1267,6 @@ residentMemoryUsage()
   }
 #endif
   return 0;
-}
-
-int
-compareEncoded64(const void* left, const void* right)
-{
-  std::uint64_t a = get64(static_cast<const std::uint8_t*>(left));
-  std::uint64_t b = get64(static_cast<const std::uint8_t*>(right));
-  return (a < b ? -1 : (a > b ? 1 : 0));
 }
 
 } // namespace
@@ -1477,7 +1539,8 @@ FinalEventChecksums::FinalEventChecksums(size_type sigma) :
   sample_positions(1469598103934665603ULL),
   sample_ids(1469598103934665603ULL),
   sample_ends(1469598103934665603ULL),
-  occurrences(1469598103934665603ULL)
+  occurrences(1469598103934665603ULL),
+  redundant(1469598103934665603ULL)
 {
 }
 
@@ -1695,7 +1758,8 @@ serializeOccurrencePointers(std::ostream& out,
 
 void
 serializeRedundantPointers(std::ostream& out, const std::string& redundancy_file,
-  size_type paths, size_type redundant, const ConstructionParameters& parameters)
+  size_type paths, size_type redundant, const ConstructionParameters& parameters,
+  RedundancyCountStats* stats)
 {
   if(paths == 0 && redundant != 0)
   {
@@ -1707,20 +1771,19 @@ serializeRedundantPointers(std::ostream& out, const std::string& redundancy_file
     throw eventError("redundancy bitvector length overflows");
   }
   const size_type bits = slots + redundant;
+  // Both members walk the same counts, so the stream is read once unless the
+  // goal forced windows.
+  RedundancyCounts counts(redundancy_file, paths, redundant, parameters);
+  serializePlainBitVector(out, bits, [&](size_type& position)
   {
-    RedundancyPositionReader input(redundancy_file, paths, redundant, parameters);
-    serializePlainBitVector(out, bits, [&](size_type& position)
-    {
-      return input.next(position);
-    });
-  }
+    return counts.next(position);
+  });
+  counts.rewind();
+  serializeSelectMCL(out, bits, slots, [&](size_type& position)
   {
-    RedundancyPositionReader input(redundancy_file, paths, redundant, parameters);
-    serializeSelectMCL(out, bits, slots, [&](size_type& position)
-    {
-      return input.next(position);
-    });
-  }
+    return counts.next(position);
+  });
+  if(stats != nullptr) { *stats = counts.stats(); }
 }
 
 FinalEventFiles::FinalEventFiles(size_type sigma) :
@@ -1865,8 +1928,9 @@ struct FinalEventWriter::Impl
     occurrences.reset(new BufferedEventWriter(files.occurrences,
       codec.enabled() ? codec.block_size : buffer_bytes, budget,
       "final-event-occurrence", codec));
-    // The external sorter consumes this stream before publication. Keep it raw
-    // so the sorted output remains compatible with its fixed-record interface.
+    // Kept raw: the writer's incremental checksum then adopts it without the
+    // full reread a framed stream needs, and component construction reads it
+    // once to count events per slot.
     const TempFileCodecParameters raw_codec;
     redundant.reset(new BufferedEventWriter(files.redundant,
       buffer_bytes, budget, "final-event-redundancy", raw_codec));
@@ -1987,38 +2051,8 @@ FinalEventWriter::checksums() const
   result.sample_ids = this->impl_->sample_ids->checksum();
   result.sample_ends = this->impl_->sample_ends->checksum();
   result.occurrences = this->impl_->occurrences->checksum();
+  result.redundant = this->impl_->redundant->checksum();
   return result;
-}
-
-void
-sortFinalRedundancy(FinalEventFiles& files,
-  const ConstructionParameters& parameters,
-  ExternalFixedRecordSortStats* stats)
-{
-  std::string sorted = TempFile::getName("gcsa_final_redundant_sorted");
-  try
-  {
-    size_type usable_memory = parameters.getMemoryLimitBytes() -
-      parameters.getMemoryLimitBytes() / 8;
-    size_type budget = std::min(usable_memory, parameters.getSortRunSize());
-    const size_type sorter_descriptors = 4;
-    if(parameters.getMaxOpenFiles() < sorter_descriptors + 2 * 2)
-    {
-      throw eventError("max-open-files cannot hold redundancy sort streams");
-    }
-    size_type fan_in = std::min(parameters.getMergeFanIn(),
-      (parameters.getMaxOpenFiles() - sorter_descriptors) / 2);
-    // compareEncoded64 decodes the whole eight-byte record, so equal implies
-    // byte-identical and the run may be sorted in place.
-    ExternalFixedRecordSorter::sort(files.redundant, sorted, 8, budget,
-      fan_in, compareEncoded64, stats, true,
-      ExternalFixedRecordSorter::RecordOrder::ASCENDING_U64);
-    TempFile::remove(files.redundant); files.redundant = sorted;
-  }
-  catch(...)
-  {
-    TempFile::remove(sorted); throw;
-  }
 }
 
 void
@@ -2143,7 +2177,8 @@ checkpointFinalEvents(BuildWorkspace& workspace,
     (checksums == nullptr || CompressedBlockReader::isFramed(files.occurrences)) ? nullptr : &(checksums->occurrences)));
   artifacts.push_back(checkpointFile(workspace,
     streamArtifact("redundancy", "path-rank-u64le-v1"), physical_shard_id_t(6),
-    files.redundant, metadata.redundant, buffer_bytes, "path-rank"));
+    files.redundant, metadata.redundant, buffer_bytes, "emission-order",
+    (checksums == nullptr || CompressedBlockReader::isFramed(files.redundant)) ? nullptr : &(checksums->redundant)));
   workspace.commit_task(FINAL_TASK, FINAL_PHASE, artifacts);
 }
 
@@ -2439,6 +2474,7 @@ storeFinalComponents(const GCSAHeader& header,
     write(alphabet);
 
     const size_type component_tasks = 2 * metadata.sigma + 6;
+    RedundancyCountStats redundancy_stats;
     const auto encode = [&](size_type task, std::ostream& out,
       const ConstructionParameters& parameters)
     {
@@ -2615,12 +2651,21 @@ storeFinalComponents(const GCSAHeader& header,
           throw eventError("redundancy bitvector length overflows");
         }
         serializeRedundantPointers(out, files.redundant, metadata.paths,
-          metadata.redundant, parameters);
+          metadata.redundant, parameters, &redundancy_stats);
         if(!out) { throw eventError("cannot write partial final index", partial); }
       }
       if(!out) { throw eventError("cannot encode final component", partial); }
     };
     writeFinalComponents(out, files, metadata, parameters, component_tasks, encode, stats);
+    if(stats != nullptr) { stats->redundancy = redundancy_stats; }
+    if(Verbosity::level >= Verbosity::EXTENDED)
+    {
+      std::cerr << "GCSA::storeFinalComponents(): redundancy counts for "
+                << redundancy_stats.slots << " slots in windows of "
+                << redundancy_stats.window_slots << ", "
+                << redundancy_stats.stream_passes << " stream pass(es), "
+                << redundancy_stats.wraps << " byte wrap(s)" << std::endl;
+    }
 
     out.flush();
     out.close();

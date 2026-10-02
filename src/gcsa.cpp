@@ -187,8 +187,7 @@ constructionOperationalSettings(const ConstructionParameters& parameters)
 //
 // The construction path has four timers, and each spans several distinct
 // operations: "Merging" covers the mapper build and the merged-graph merge,
-// "Construction" covers the final-event scan, the redundancy sort and the
-// component build. A phase total therefore cannot say which operation costs
+// "Construction" covers the final-event scan and the component build. A phase total therefore cannot say which operation costs
 // what, which is exactly the question an optimization pass has to answer.
 // These probes print under EXTENDED verbosity only and serialize nothing.
 struct SubPhaseProbe
@@ -1696,18 +1695,8 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
     {
       throw std::runtime_error("GCSA::GCSA(): final event path count mismatch");
     }
-    ExternalFixedRecordSortStats redundancy_sort_stats;
-    SubPhaseProbe redundancy_probe("construct/redundancy-sort");
-    sortFinalRedundancy(files, parameters, &redundancy_sort_stats);
-    redundancy_probe.report();
-    if(Verbosity::level >= Verbosity::EXTENDED)
-    {
-      std::cerr << "GCSA::GCSA(): redundancy sort: "
-                << redundancy_sort_stats.runs << " runs, "
-                << redundancy_sort_stats.merge_passes << " merge passes, "
-                << inGigabytes(redundancy_sort_stats.max_bytes_resident)
-                << " GB resident at peak" << std::endl;
-    }
+    // The redundancy stream is committed unsorted: component construction
+    // needs only its per-slot counts.
     writeFinalEventMetadata(files, metadata);
     checkpointFinalEvents(workspace, files, metadata, checkpoint_buffer,
       &event_checksums);
