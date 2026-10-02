@@ -765,7 +765,15 @@ consumeRun(const std::string& run, const SortPlan& plan,
     std::memcpy(previous.data(), reader.current(), plan.record_bytes);
     reader.advance();
     processed++;
-    if(processed % CACHE_CHECK_RECORDS == 0)
+    // Only a buffered stream needs the periodic check: its flushed prefix has
+    // to be synced before the page cache can drop it. A direct stream leaves
+    // nothing in the cache, and its flush is not free: it waits for every
+    // block in flight, pads the partial 4 MiB tail block, writes it and
+    // truncates, and the next records rewrite that block. Flushing every
+    // 65,536 records wrote 27.9-29.5 GB per joint chr2+chr18 reduction for
+    // 3.2-4.3 GB of output. Full blocks are written as they fill, and the
+    // final trim below still flushes the tail once.
+    if(!output.direct() && processed % CACHE_CHECK_RECORDS == 0)
     {
       output.flush();
       std::streamoff position = output.tellp();

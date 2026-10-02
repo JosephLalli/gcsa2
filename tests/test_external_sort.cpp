@@ -9,6 +9,7 @@
 #include <iterator>
 #include <map>
 #include <string>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
@@ -69,6 +70,24 @@ int compareOddRecord(const void* left, const void* right)
   return (a.tag < b.tag ? -1 : (a.tag > b.tag ? 1 : 0));
 }
 
+int compareU64(const void* left, const void* right)
+{
+  std::uint64_t a, b;
+  std::memcpy(&a, left, sizeof(a)); std::memcpy(&b, right, sizeof(b));
+  return (a < b ? -1 : (a > b ? 1 : 0));
+}
+
+// Unique eight-byte values, reduced the way the preprocessing start stream is.
+void reduceUnique(const std::string& input, const std::string& output, size_type budget)
+{
+  ExternalFixedRecordSorter::sortAndReduce(input, output, sizeof(std::uint64_t),
+    budget, 2, compareU64,
+    [](const void* value, bool first, bool, std::ostream& stream)
+    {
+      if(first) { stream.write(static_cast<const char*>(value), sizeof(std::uint64_t)); }
+    }, nullptr, true, ExternalFixedRecordSorter::RecordOrder::ASCENDING_U64);
+}
+
 std::vector<Record> readRecords(const std::string& name)
 {
   std::ifstream input(name.c_str(), std::ios_base::binary);
@@ -89,6 +108,53 @@ int main()
   const std::string input = std::string(root) + "/input.bin";
   const std::string sorted = std::string(root) + "/sorted.bin";
   const std::string reduced = std::string(root) + "/reduced.bin";
+
+  // A direct-I/O reduction must write the bytes a buffered one does. Its
+  // periodic cache check is skipped, so full 4 MiB blocks go out as they fill
+  // and only the final flush pads and truncates the tail. GCSA_IO_DIRECT_WRITES
+  // is read once per process, so the direct run is a child forked before this
+  // process opens any output stream. Two million records with 1.57 million
+  // distinct values pass the 65,536-record check many times and leave three full
+  // blocks and a partial tail; a filesystem without O_DIRECT falls back to
+  // buffered output and still has to match.
+  {
+    const std::string many = std::string(root) + "/many-u64.bin";
+    const std::string direct = std::string(root) + "/many-direct.bin";
+    const std::string buffered = std::string(root) + "/many-buffered.bin";
+    std::vector<std::uint64_t> values;
+    for(std::uint64_t i = 0; i < 2000000; i++)
+    {
+      values.push_back(((1181783497276652981ULL * (i + 1)) ^ (i << 17)) % 4000037);
+    }
+    {
+      std::ofstream out(many.c_str(), std::ios_base::binary);
+      out.write(reinterpret_cast<const char*>(values.data()),
+        values.size() * sizeof(std::uint64_t));
+    }
+    // Several runs and a merge before the reduction.
+    const size_type many_budget = 4 * MEGABYTE;
+    pid_t child = fork();
+    require(child >= 0);
+    if(child == 0)
+    {
+      setenv("GCSA_IO_DIRECT_WRITES", "1", 1);
+      try { reduceUnique(many, direct, many_budget); }
+      catch(...) { ::_exit(2); }
+      ::_exit(0);
+    }
+    int status = 0;
+    require(waitpid(child, &status, 0) == child);
+    require(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    reduceUnique(many, buffered, many_budget);
+    std::sort(values.begin(), values.end());
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+    require(values.size() * sizeof(std::uint64_t) > 2 * 4 * MEGABYTE);
+    std::string unique_bytes(reinterpret_cast<const char*>(values.data()),
+      values.size() * sizeof(std::uint64_t));
+    require(readBytes(buffered) == unique_bytes);
+    require(readBytes(direct) == unique_bytes);
+    std::remove(many.c_str()); std::remove(direct.c_str()); std::remove(buffered.c_str());
+  }
 
   std::vector<Record> records;
   std::map<std::uint64_t, Summary> expected;
