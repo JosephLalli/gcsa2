@@ -1226,6 +1226,16 @@ distribution 0:17:19 (0:37:12 on 9/30), compaction 0:16:54. The merge's drop fro
 write pressure (dirty-page throttle in 36% of its samples on 9/30, 0% now), not code. Record:
 `hprc_v2_vg_rna/gcsa2_distribution_concurrency_20260928/joint_chr2_chr18_5b4d225_20261002/`.
 
+**Join workers collected as they finish (`2527f48`).** The joins in that build averaged 9.28 of 32
+workers because `runJoinWorkerPartitions` collected workers in launch order: it blocked in `waitpid`
+on the oldest worker, so slots behind a long partition stayed empty (in step 4 one worker ran alone
+for about 18 minutes). `2527f48` reaps whichever worker exits first (polling with `WNOHANG`, blocking
+on `waitid(WNOWAIT)`) and launches partitions in decreasing planned size, with output shards still
+numbered in plan order. The joint build then matched the same index and summed to 3:14:49: joins
+0:32:53 at 27.09 mean workers (1:16:36 before), with construction 0:40:59, preprocessing 0:31:10,
+merge 0:29:04, prune 0:24:03, distribution 0:17:24 and compaction 0:15:44. Serial phases are now
+53.8% of the build. Record: `joint_chr2_chr18_2527f48_20261002/`.
+
 ## Build, test, and usage
 
 From the containing `vg` checkout, use its local toolchain wrapper. The GCSA2
