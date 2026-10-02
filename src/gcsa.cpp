@@ -655,7 +655,7 @@ MergedGraphReader::seek(bool seek_labels)
     this->from = this->from_nodes.size();
     return;
   }
-  if(this->paths.descriptor >= 0)
+  if(this->paths.isOpen())
   {
     this->paths.seek(this->path);
     this->rank = this->paths[this->path].pointer();

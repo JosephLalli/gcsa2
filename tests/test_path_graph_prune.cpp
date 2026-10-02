@@ -979,6 +979,14 @@ static void compare_parallel_merged_graph(const std::string& base)
     require(CompressedBlockReader::isFramed(framed.from_name));
     require(!CompressedBlockReader::isFramed(framed.lcp_name));
     require_same_merged_records(serial, framed);
+    {
+      // Readers decide whether to seek by isOpen(); a framed file has no
+      // descriptor, and a descriptor test left its windows untrimmed.
+      ReadBuffer<PathNode> framed_paths; framed_paths.open(framed.path_name);
+      require(framed_paths.isOpen() && framed_paths.descriptor < 0);
+      framed_paths.close();
+      require(!framed_paths.isOpen());
+    }
 
     require_same_merged_graph(serial, two);
     require_same_merged_graph(serial, four);

@@ -365,6 +365,8 @@ struct ReadBuffer
     size_type buffer_bytes = DEFAULT_BUFFER_BYTES,
     bool release_cache = false);
   void close();
+  // A framed file has no descriptor of its own; test this, not the descriptor.
+  inline bool isOpen() const { return (this->descriptor >= 0 || this->compressed != nullptr); }
 
   inline size_type size() const { return this->elements; }
 
@@ -606,12 +608,13 @@ ReadBuffer<Element>::readBlock(size_type offset, Element* target,
   std::uint8_t* data = reinterpret_cast<std::uint8_t*>(target);
   if(this->compressed)
   {
+    // The block reader counts the bytes it reads from disk; counting the
+    // decoded bytes here as well would report reads that never happened.
     if(this->compressed->readAt(byte_offset, data, bytes) != bytes)
     {
       std::cerr << "ReadBuffer::readBlock(): Unexpected EOF" << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    DiskIO::read_volume += bytes;
     return;
   }
   size_type done = 0;
