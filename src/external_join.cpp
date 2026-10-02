@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <csignal>
 #include <cstdint>
@@ -5264,14 +5265,37 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
   // count is meaningful across a resume as well as within one run.
   ProgressReporter partition_progress("join partitions", total_partitions,
     "partitions");
+  // Collect whichever worker finishes first. Waiting on the oldest one left
+  // every slot behind a long partition idle: on the joint chr2+chr18 input one
+  // step-4 worker ran alone for about 18 minutes. Output shards are numbered
+  // when partitions are planned and every count below is a sum, so the order
+  // of collection does not change the output.
   auto collect_one = [&]()
   {
     if(active.empty()) { return; }
-    ActiveJoinWorker& worker = active.front();
+    size_type index = active.size();
     int status = 0;
-    pid_t waited;
-    do { waited = ::waitpid(worker.pid, &status, 0); }
-    while(waited < 0 && errno == EINTR);
+    pid_t waited = -1;
+    while(index == active.size())
+    {
+      for(size_type i = 0; i < active.size(); i++)
+      {
+        pid_t polled;
+        do { polled = ::waitpid(active[i].pid, &status, WNOHANG); }
+        while(polled < 0 && errno == EINTR);
+        if(polled == active[i].pid || polled < 0) { index = i; waited = polled; break; }
+      }
+      if(index < active.size()) { break; }
+      // Block until some child exits, without reaping it, then poll again.
+      siginfo_t info; std::memset(&info, 0, sizeof(info));
+      int ready;
+      do { ready = ::waitid(P_ALL, 0, &info, WEXITED | WNOWAIT); }
+      while(ready < 0 && errno == EINTR);
+      bool ours = false;
+      for(const ActiveJoinWorker& candidate : active) { ours = ours || (candidate.pid == info.si_pid); }
+      if(ready < 0 || !ours) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+    }
+    ActiveJoinWorker& worker = active[index];
     const pid_t reaped = worker.pid;
     worker.pid = -1;
     if(waited < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != EXIT_SUCCESS)
@@ -5364,25 +5388,53 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
     std::remove(result_file.c_str());
     TempFile::remove(worker.task_file);
     partition_progress.advance();
-    active.erase(active.begin());
+    active.erase(active.begin() + index);
   };
 
   try
   {
+    // Output shards are numbered in plan order, as before. Completed partitions
+    // are restored first; the rest launch largest first, so a long partition
+    // starts early instead of becoming the step's tail.
+    struct PlannedPartition
+    {
+      const RangeJoin* job; const JoinPartition* partition;
+      size_type shard, peak; std::string checkpoint; bool restored;
+    };
+    std::vector<PlannedPartition> planned;
+    planned.reserve(total_partitions);
     for(const RangeJoin& job : jobs) for(const JoinPartition& partition : job.partitions)
     {
-      const JoinRun& left = job.left;
-      const JoinRun& right = job.right;
-      const size_type peak_output_bytes = externalPathGraphShardPeakBytes(
-        partition.expected_paths, partition.expected_ranks,
-        sort_budget, worker_codec);
-      size_type shard = appendOutputShard(next, logical,
-        physical_shard_id_t(next_physical++));
-      std::string partition_checkpoint = (checkpoint_task.empty() ? std::string() :
+      PlannedPartition item;
+      item.job = &job; item.partition = &partition;
+      item.peak = externalPathGraphShardPeakBytes(partition.expected_paths,
+        partition.expected_ranks, sort_budget, worker_codec);
+      item.shard = appendOutputShard(next, logical, physical_shard_id_t(next_physical++));
+      item.checkpoint = (checkpoint_task.empty() ? std::string() :
         joinPartitionTaskName(checkpoint_task, logical, partition,
-          left.checksum, right.checksum));
-      if(workspace != nullptr && !partition_checkpoint.empty() &&
-         workspace->task_completed(partition_checkpoint, "join-partition"))
+          job.left.checksum, job.right.checksum));
+      item.restored = (workspace != nullptr && !item.checkpoint.empty() &&
+        workspace->task_completed(item.checkpoint, "join-partition"));
+      planned.push_back(item);
+    }
+    std::vector<size_type> sequence;
+    sequence.reserve(planned.size());
+    for(size_type i = 0; i < planned.size(); i++) { if(planned[i].restored) { sequence.push_back(i); } }
+    const size_type first_launch = sequence.size();
+    for(size_type i = 0; i < planned.size(); i++) { if(!planned[i].restored) { sequence.push_back(i); } }
+    std::stable_sort(sequence.begin() + first_launch, sequence.end(),
+      [&planned](size_type a, size_type b) { return planned[a].peak > planned[b].peak; });
+
+    for(size_type item_index : sequence)
+    {
+      const PlannedPartition& item = planned[item_index];
+      const JoinRun& left = item.job->left;
+      const JoinRun& right = item.job->right;
+      const JoinPartition& partition = *(item.partition);
+      const size_type peak_output_bytes = item.peak;
+      const size_type shard = item.shard;
+      const std::string& partition_checkpoint = item.checkpoint;
+      if(item.restored)
       {
         // Do not overlap restore buffers with fully admitted child working
         // sets. Completed tasks are cheap to restore and never respawn.
