@@ -27,12 +27,15 @@ scanKeys(const std::string& name, size_type expected_records,
   input.rdbuf()->pubsetbuf(nullptr, 0);
   input.open(name.c_str(), std::ios_base::binary);
   if(!input) { throw std::runtime_error("DeBruijnGraph: cannot open key stream " + name); }
+  // Reuse the opt-in shared I/O pool. Advancing between DiskIO slices keeps
+  // reads in flight even when this pass requests one large bounded buffer.
+  ReadAhead read_ahead(name);
   std::vector<key_type> buffer(records_per_block);
   size_type seen = 0;
   while(seen < expected_records)
   {
     size_type count = std::min(records_per_block, expected_records - seen);
-    if(!DiskIO::read(input, buffer.data(), count))
+    if(!DiskIO::read(input, buffer.data(), count, true, &read_ahead))
     {
       throw std::runtime_error("DeBruijnGraph: truncated key stream " + name);
     }

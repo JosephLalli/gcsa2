@@ -1360,6 +1360,48 @@ branch of the accepted set alone has not yet been built or gated. The unexplaine
 against 15.7-26 s) is untouched by these changes and recorded, not attributed. Records:
 `joint_chr2_chr18_parallel_phases_0da9176_20261002/README.md` and the decision record above.
 
+### Cleanup and mapper candidate (2026-10-03, unpromoted)
+
+The user authorized a bounded cleanup/mapper improvement after the completed
+parallel-phase gate. Isolated branch `codex/gcsa-cleanup-mapper`, worktree
+`deps/gcsa2/.claude/worktrees/cleanup-mapper`, is based on `242dbb6` (code
+`0da9176`) and still contains the excluded P2 merge and P8 pool. It is not
+an accepted-only integration. Current requests are `-T 32 --process-workers 32`;
+this introduces no hard 32-worker ceiling.
+
+Family retirement uses one v2 journal instead of a durable transaction per
+member. Durable intent precedes all deletions; a directory sync precedes the
+completed journal. One reference index protects all shared artifacts. Resume
+reads v1 and v2 journals, revalidates successor/predecessor markers and rejects
+changed family membership even when the successor is a later checkpoint.
+Completion records must remain immutable and the workspace have one writer;
+this change adds no lock. Old builders reject v2 journals safely but cannot
+resume a workspace containing them. Public index formats are unchanged.
+
+Mapper construction attaches the existing opt-in read-ahead pool to its
+unchanged two-pass key scan. Buffers, record/error checks, serialized mapper
+and logical read counters are unchanged. Test helpers now respect SSD TMPDIR.
+
+Local builds and workspace/preprocessing/construction-resume regressions pass,
+including five crash boundaries, sharing, malformed/missing successors,
+cross-successor membership and legacy coexistence. An established 6,147-record
+fixture query-verified and reproduced baseline GCSA/LCP bytes in both fresh
+and stopped/resumed builds at 32 threads/32 requested workers. A small final
+ABBA comparison (two observations per arm) measured 128-partition cleanup
+means 0.183884/0.013280 seconds. A traced 16-partition pair reduced durability
+calls from 80 to 5, with 16 unlinks in both arms. A 32 MiB cold-file mapper
+pair measured means 0.217375/0.144271 seconds with identical serialization,
+but variable shared-host timing does not establish chromosome performance.
+
+The complete receipt, source patch, tests, diagnostic attempts and limitations
+are at
+`/mnt/ssd/lalli/hprc_v2_vg_rna/gcsa2_distribution_concurrency_20260928/cleanup_mapper_20261003/README.md`.
+The ad hoc preliminary fixture failed in the baseline before testing this
+candidate and remains diagnostic evidence. No chromosome/joint/whole-genome
+rerun or production/annotation change occurred; the earlier fixed joint-run
+budget is unchanged. Implementation is recorded on the isolated branch and
+remains unpromoted.
+
 ## Build, test, and usage
 
 From the containing `vg` checkout, use its local toolchain wrapper. The GCSA2

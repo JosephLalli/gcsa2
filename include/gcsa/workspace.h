@@ -87,7 +87,9 @@ public:
     const std::string& successor_phase);
   // Retire every committed task in one deterministic task-name family. This
   // is used after a complete extend checkpoint supersedes its per-partition
-  // join outputs and sampled partition plan.
+  // join outputs and sampled partition plan. One v2 journal freezes membership
+  // and batches durability barriers; legacy v1 journals remain replayable.
+  // The caller must not add family members or mutate markers during cleanup.
   void retire_obsolete_family(const std::string& predecessor_task_prefix,
     const std::string& predecessor_phase,const std::string& successor_task,
     const std::string& successor_phase);
@@ -120,7 +122,9 @@ private:
   // is valid because retirement never creates or removes a completion record.
   struct CompletionReferences { std::map<std::string,std::set<std::string>> by_record; std::map<std::string,size_t> listing; };
   static CompletionReferences completion_references(const std::string& directory);
-  void retire_marked(const std::string&,const std::string&,const CompletionReferences* references=0);
+  void retire_marked(const std::string&,const std::string&,const CompletionReferences* references=0,
+    bool synchronize=true,bool validate_successor=true);
+  void retire_marked_family(const std::vector<std::string>&,const std::string&);
   void retire_obsolete(const std::string&,const std::string&,const std::string&,const std::string&,const CompletionReferences*);
   static std::string safe(const std::string&);
   void ensure_completed(const ArtifactIdentity&,const std::string&,uint64_t) const;

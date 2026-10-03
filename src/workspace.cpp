@@ -145,31 +145,54 @@ std::set<std::string> referenced_by_other_tasks(const std::string& directory,
   }
   closedir(d);return result;
 }
+void crash_if_requested(const char* point);
+
 struct RetirementRecord
 {
-  std::string predecessor,successor;
-  bool complete;
+  std::vector<std::string> predecessors;
+  std::string successor, family_prefix, family_phase;
+  bool complete, family;
 };
 RetirementRecord read_retirement_record(const std::string& path,
   const std::string& expected_fingerprint) {
   std::istringstream input(read_text_file(path));std::string line;
-  bool version=false,fingerprint=false,complete=false;RetirementRecord result;
+  unsigned version=0;bool fingerprint=false,complete=false;RetirementRecord result;
+  std::set<std::string> members;
   while(std::getline(input,line)) {
-    if(line=="version=1")version=true;
-    else if(line=="fingerprint="+expected_fingerprint)fingerprint=true;
-    else if(line.compare(0,12,"predecessor=")==0)result.predecessor=line.substr(12);
-    else if(line.compare(0,10,"successor=")==0)result.successor=line.substr(10);
-    else if(line=="complete=1")complete=true;
+    if(line=="version=1" && version==0)version=1;
+    else if(line=="version=2" && version==0)version=2;
+    else if(line=="fingerprint="+expected_fingerprint && !fingerprint)fingerprint=true;
+    else if(line.compare(0,12,"predecessor=")==0) {
+      std::string member=line.substr(12);
+      if(!members.insert(member).second)throw err("duplicate retirement member",path);
+      result.predecessors.push_back(member);
+    }
+    else if(line.compare(0,10,"successor=")==0 && result.successor.empty())result.successor=line.substr(10);
+    else if(line.compare(0,14,"family_prefix=")==0 && result.family_prefix.empty())result.family_prefix=line.substr(14);
+    else if(line.compare(0,13,"family_phase=")==0 && result.family_phase.empty())result.family_phase=line.substr(13);
+    else if(line=="complete=1" && !complete)complete=true;
+    else throw err("corrupt retirement record",path);
   }
-  if(!version||!fingerprint||result.predecessor.empty()||result.successor.empty()||
-    result.predecessor!=base(result.predecessor)||result.successor!=base(result.successor)||
-    result.predecessor.size()<9||result.successor.size()<9||
-    result.predecessor.substr(result.predecessor.size()-9)!=".complete"||
-    result.successor.substr(result.successor.size()-9)!=".complete")
+  const auto completion_name=[](const std::string& name) {
+    return name==base(name) && name.size()>9 &&
+      name.substr(name.size()-9)==".complete";
+  };
+  if(version==0 || !fingerprint || result.predecessors.empty() ||
+    !completion_name(result.successor) ||
+    (version==1 && (result.predecessors.size()!=1 || !result.family_prefix.empty() || !result.family_phase.empty())) ||
+    (version==2 && (result.family_prefix.empty() || result.family_phase.empty())))
   {throw err("corrupt retirement record",path);}
-  result.complete=complete;return result;
+  const std::string suffix="--"+result.family_phase+".complete";
+  for(const std::string& member:result.predecessors) {
+    if(!completion_name(member) || member==result.successor ||
+      (version==2 && (member.size()<result.family_prefix.size()+suffix.size() ||
+        member.compare(0,result.family_prefix.size(),result.family_prefix)!=0 ||
+        member.compare(member.size()-suffix.size(),suffix.size(),suffix)!=0)))
+    {throw err("corrupt retirement member",path);}
+  }
+  result.complete=complete;result.family=(version==2);return result;
 }
-void complete_retirement_record(const std::string& path) {
+void complete_retirement_record(const std::string& path,bool family=false) {
   std::string text=read_text_file(path);
   if(text.find("complete=1\n")!=std::string::npos)return;
   if(text.empty()||text.back()!='\n')text+='\n';
@@ -182,6 +205,7 @@ void complete_retirement_record(const std::string& path) {
     if(fdatasync(fd)!=0)throw err("fdatasync failed",temporary);
     int completed_fd=fd;fd=-1;
     if(close(completed_fd)!=0)throw err("close failed",temporary);
+    if(family)crash_if_requested("retire-family-before-complete-rename");
     if(rename(temporary.c_str(),path.c_str())!=0)
       throw err("cannot complete retirement record",path);
     sync_dir(parent(path));
@@ -231,10 +255,11 @@ BuildWorkspace::CompletionReferences BuildWorkspace::completion_references(const
   } catch(...) { closedir(d);throw; }
   closedir(d);return result;
 }
-void BuildWorkspace::retire_marked(const std::string& predecessor,const std::string& successor,const CompletionReferences* references)
+void BuildWorkspace::retire_marked(const std::string& predecessor,const std::string& successor,
+  const CompletionReferences* references,bool synchronize,bool validate_successor)
 {
-  // Validate the successor before every unlink, including resume after a crash.
-  committed_artifact_names(successor,fingerprint_);
+  // A family validates its immutable successor once before all deletions.
+  if(validate_successor)committed_artifact_names(successor,fingerprint_);
   std::set<std::string> obsolete=committed_artifact_names(predecessor,fingerprint_,false);
   // An artifact is shared when a completion record other than the
   // predecessor's lists it. With an index, that is any listing beyond the
@@ -250,7 +275,22 @@ void BuildWorkspace::retire_marked(const std::string& predecessor,const std::str
     if(unlink(path.c_str())==0)crash_if_requested("retire-after-remove");
     else if(errno!=ENOENT)throw err("cannot retire obsolete artifact",path);
   }
+  if(synchronize)sync_dir(directory_);
+}
+void
+BuildWorkspace::retire_marked_family(const std::vector<std::string>& predecessors,
+  const std::string& successor)
+{
+  // No writer changes completion records during retirement. Validate every
+  // marker before the first unlink, including recovery from a pending journal.
+  CompletionReferences references=completion_references(directory_);
+  committed_artifact_names(successor,fingerprint_);
+  for(const std::string& predecessor:predecessors)
+    committed_artifact_names(directory_+"/"+predecessor,fingerprint_,false);
+  for(const std::string& predecessor:predecessors)
+    retire_marked(directory_+"/"+predecessor,successor,&references,false,false);
   sync_dir(directory_);
+  crash_if_requested("retire-family-after-deletion-sync");
 }
 void BuildWorkspace::retire_obsolete(const std::string& predecessor_task,
   const std::string& predecessor_phase,const std::string& successor_task,
@@ -268,7 +308,7 @@ void BuildWorkspace::retire_obsolete(const std::string& predecessor_task,
   if(exists(final))
   {
     RetirementRecord record=read_retirement_record(final,fingerprint_);
-    if(record.predecessor!=base(predecessor)||record.successor!=base(successor))
+    if(record.family || record.predecessors.front()!=base(predecessor)||record.successor!=base(successor))
       throw err("retirement record identity mismatch",final);
     if(record.complete)return;
     // The marker is the durable deletion intent. Its replay path accepts
@@ -312,12 +352,19 @@ BuildWorkspace::retire_obsolete_family(
 {
   const std::string prefix=safe(predecessor_task_prefix);
   const std::string suffix="--"+safe(predecessor_phase)+".complete";
+  const std::string journal_prefix="retire-family--"+prefix+"--"+
+    safe(predecessor_phase)+"--after--";
   std::vector<std::string> tasks;
+  std::vector<std::string> prior_journals;
   DIR* directory=opendir(directory_.c_str());
   if(directory==0)throw err("cannot open workspace",directory_);
   for(dirent* entry;(entry=readdir(directory));)
   {
     std::string name=entry->d_name;
+    if(name.size()>journal_prefix.size()+8 &&
+      name.compare(0,journal_prefix.size(),journal_prefix)==0 &&
+      name.compare(name.size()-8,8,".retired")==0)
+      prior_journals.push_back(directory_+"/"+name);
     if(name.size()<prefix.size()+suffix.size() ||
        name.compare(0,prefix.size(),prefix)!=0 ||
        name.compare(name.size()-suffix.size(),suffix.size(),suffix)!=0)
@@ -329,28 +376,82 @@ BuildWorkspace::retire_obsolete_family(
   closedir(directory);
   std::sort(tasks.begin(),tasks.end());
   tasks.erase(std::unique(tasks.begin(),tasks.end()),tasks.end());
-  // One reference index serves the whole family (see CompletionReferences);
-  // a join family has hundreds of members per doubling step, and rereading
-  // every completion record for each of them grew as members times records.
-  CompletionReferences references;bool indexed=false;
+  const std::string successor=completion_path(successor_task,successor_phase);
+  const std::string final=directory_+"/retire-family--"+prefix+"--"+
+    safe(predecessor_phase)+"--after--"+safe(successor_task)+"--"+
+    safe(successor_phase)+".retired";
+  std::set<std::string> current_members;
+  for(const std::string& task:tasks)
+    if(!(task==successor_task && predecessor_phase==successor_phase))
+      current_members.insert(base(completion_path(task,predecessor_phase)));
+  // A resume can revisit this family with a later authoritative frontier.
+  // Its frozen membership belongs to the family, not to one successor name.
+  for(const std::string& prior:prior_journals)
+  {
+    if(prior==final)continue;
+    RetirementRecord record=read_retirement_record(prior,fingerprint_);
+    if(!record.family || record.family_prefix!=prefix ||
+      record.family_phase!=safe(predecessor_phase) ||
+      std::set<std::string>(record.predecessors.begin(),record.predecessors.end())!=current_members)
+      throw err("committed retirement family changed membership",prior);
+    if(!record.complete)
+    {
+      retire_marked_family(record.predecessors,directory_+"/"+record.successor);
+      complete_retirement_record(prior,true);
+    }
+  }
+  if(exists(final))
+  {
+    RetirementRecord record=read_retirement_record(final,fingerprint_);
+    if(!record.family || record.successor!=base(successor) ||
+      record.family_prefix!=prefix || record.family_phase!=safe(predecessor_phase))
+      throw err("retirement family identity mismatch",final);
+    std::set<std::string> members(record.predecessors.begin(),record.predecessors.end());
+    if(members!=current_members)
+      throw err("committed retirement family changed membership",final);
+    if(record.complete)return;
+    retire_marked_family(record.predecessors,successor);
+    complete_retirement_record(final,true);
+    return;
+  }
+
+  std::vector<std::string> members;
+  bool any_remaining=false;
   for(const std::string& task:tasks)
   {
     if(task==successor_task && predecessor_phase==successor_phase)continue;
     const std::string predecessor=completion_path(task,predecessor_phase);
-    std::set<std::string> artifacts=committed_artifact_names(
-      predecessor,fingerprint_,false);
-    bool remains=false;
+    std::set<std::string> artifacts=committed_artifact_names(predecessor,fingerprint_,false);
     for(const std::string& artifact:artifacts)
-    {
-      if(exists(directory_+"/"+artifact)){remains=true;break;}
-    }
-    // A prior retirement journal may already have removed this task. Avoid
-    // publishing a redundant marker for a predecessor with nothing left.
-    if(!remains)continue;
-    if(!indexed){references=completion_references(directory_);indexed=true;}
-    this->retire_obsolete(task,predecessor_phase,
-      successor_task,successor_phase,&references);
+      if(exists(directory_+"/"+artifact)){any_remaining=true;break;}
+    // Keep the exact frozen family membership in the journal, even if a
+    // previous per-task retirement has already removed this member's files.
+    members.push_back(base(predecessor));
   }
+  if(!any_remaining)return;
+  committed_artifact_names(successor,fingerprint_);
+  const std::string temporary=final+partial_suffix();
+  int fd=open(temporary.c_str(),O_CREAT|O_EXCL|O_WRONLY,0644);
+  if(fd<0)throw err("cannot create retirement family record",temporary);
+  try
+  {
+    std::ostringstream text;
+    text<<"version=2\nfingerprint="<<fingerprint_<<"\nfamily_prefix="<<prefix
+        <<"\nfamily_phase="<<safe(predecessor_phase)<<"\nsuccessor="<<base(successor)<<"\n";
+    for(const std::string& member:members)text<<"predecessor="<<member<<"\n";
+    const std::string data=text.str();write_all(fd,data.data(),data.size(),temporary);
+    if(fdatasync(fd)!=0)throw err("fdatasync failed",temporary);
+    int closing=fd;fd=-1;
+    if(close(closing)!=0)throw err("close failed",temporary);
+    crash_if_requested("retire-family-before-marker-rename");
+    if(rename(temporary.c_str(),final.c_str())!=0)
+      throw err("cannot publish retirement family record",final);
+    sync_dir(directory_);
+    crash_if_requested("retire-family-after-marker-sync");
+  }
+  catch(...){if(fd>=0)close(fd);unlink(temporary.c_str());throw;}
+  retire_marked_family(members,successor);
+  complete_retirement_record(final,true);
 }
 uint64_t
 BuildWorkspace::committed_artifact_checksum(const ArtifactIdentity& identity,
@@ -816,9 +917,9 @@ BuildWorkspace::recover()
     try { record=read_retirement_record(path,fingerprint_); }
     catch(...) { closedir(directory);throw; }
     if(record.complete)continue;
-    retire_marked(directory_+"/"+record.predecessor,
-      directory_+"/"+record.successor);
-    complete_retirement_record(path);
+    if(record.family)retire_marked_family(record.predecessors,directory_+"/"+record.successor);
+    else retire_marked(directory_+"/"+record.predecessors.front(),directory_+"/"+record.successor);
+    complete_retirement_record(path,record.family);
   }
 
   // A completion record is the commit point. Renamed artifacts without one

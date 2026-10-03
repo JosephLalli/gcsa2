@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <filesystem>
+#include <memory>
 #include <iterator>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -75,10 +77,161 @@ static void crash_retirement(const std::string& root,
   require(WIFEXITED(status)&&WEXITSTATUS(status)==86);
 }
 
+// Every family has two exclusive payloads and one payload referenced both by
+// another retiring member and an unrelated task.
+struct RetirementFamilyFixture
+{
+  std::string root, frontier, exclusive_a, exclusive_b, shared, internal_shared;
+  BuildWorkspace::Settings semantic;
+  std::unique_ptr<BuildWorkspace> workspace;
+  RetirementFamilyFixture()
+  {
+    const char* tmp=std::getenv("TMPDIR");
+    std::string pattern=std::string(tmp!=nullptr?tmp:"/tmp")+"/gcsa-retire-family-XXXXXX";
+    std::vector<char> name(pattern.begin(),pattern.end());name.push_back('\0');
+    require(mkdtemp(name.data())!=nullptr);root=name.data();
+    semantic["fixture"]="retirement-family";
+    workspace.reset(new BuildWorkspace(root,semantic,BuildWorkspace::Settings(),BuildWorkspace::NEW_WORKSPACE));
+    auto a=add("step-join-a","join-partition",1);
+    auto b=add("step-join-b","join-partition",2);
+    auto c=add("step-join-c","join-partition",3);
+    auto successor=add("step","extend",4);
+    auto d=add("step-join-d","join-partition",5);
+    workspace->commit_task("step-join-a","join-partition",{a,d});
+    workspace->commit_task("step-join-c","join-partition",{c,b});
+    workspace->commit_task("keeper","phase",{b});
+    exclusive_a=path(a);shared=path(b);exclusive_b=path(c);frontier=path(successor);internal_shared=path(d);
+  }
+  BuildWorkspace::ArtifactRef add(const std::string& task,const std::string& phase,uint64_t shard)
+  {
+    ArtifactIdentity id(task,phase,"payload","family-test");
+    auto writer=workspace->open_artifact(id,logical_file_id_t(0),physical_shard_id_t(shard));
+    const char payload[]="immutable artifact";writer.write(payload,sizeof(payload));
+    auto ref=writer.finish(1);workspace->commit_task(task,phase,{ref});return ref;
+  }
+  std::string path(const BuildWorkspace::ArtifactRef& ref) const
+  {return workspace->artifact_path(ref.identity,ref.logical,ref.shard);}
+  std::string journal() const
+  {return root+"/retire-family--step-join---join-partition--after--step--extend.retired";}
+  void retire() {workspace->retire_obsolete_family("step-join-","join-partition","step","extend");}
+  void crash(const char* point)
+  {
+    pid_t child=fork();require(child>=0);
+    if(child==0)
+    {
+      setenv("GCSA_WORKSPACE_CRASH_POINT",point,1);
+      try {retire();} catch(...) {::_exit(88);}
+      ::_exit(87);
+    }
+    int status=0;require(waitpid(child,&status,0)==child);
+    require(WIFEXITED(status)&&WEXITSTATUS(status)==86);
+  }
+  void check(bool retired) const
+  {
+    require(std::filesystem::exists(frontier)&&std::filesystem::exists(shared)&&std::filesystem::exists(internal_shared));
+    require(std::filesystem::exists(exclusive_a)!=retired);
+    require(std::filesystem::exists(exclusive_b)!=retired);
+  }
+};
+static std::string file_text(const std::string& path)
+{
+  std::ifstream input(path);require(static_cast<bool>(input));
+  return std::string(std::istreambuf_iterator<char>(input),std::istreambuf_iterator<char>());
+}
+static void replace_text(const std::string& path,const std::string& text)
+{
+  std::ofstream output(path);output<<text;output.close();require(static_cast<bool>(output));
+}
+static bool recovery_rejected(RetirementFamilyFixture& fixture)
+{
+  try {BuildWorkspace recovered(fixture.root,fixture.semantic);} catch(const std::runtime_error&) {return true;}
+  return false;
+}
+static void test_retirement_families()
+{
+  for(const char* point:{"retire-family-before-marker-rename",
+      "retire-family-after-marker-sync","retire-after-remove",
+      "retire-family-after-deletion-sync","retire-family-before-complete-rename"})
+  {
+    RetirementFamilyFixture fixture;fixture.crash(point);
+    const bool intent=std::string(point)!="retire-family-before-marker-rename";
+    {BuildWorkspace recovered(fixture.root,fixture.semantic);}
+    fixture.check(intent);
+    fixture.retire();fixture.retire();fixture.check(true);
+    require(file_text(fixture.journal()).find("complete=1\n")!=std::string::npos);
+  }
+  // No deletion follows a missing payload or malformed successor marker.
+  for(bool missing_payload:{false,true})
+  {
+    RetirementFamilyFixture fixture;fixture.crash("retire-family-after-marker-sync");
+    if(missing_payload)require(unlink(fixture.frontier.c_str())==0);
+    else replace_text(fixture.root+"/step--extend.complete","broken successor\n");
+    require(recovery_rejected(fixture));
+    require(std::filesystem::exists(fixture.exclusive_a)&&std::filesystem::exists(fixture.exclusive_b));
+  }
+  // Duplicate, unsafe, out-of-family and self-retiring members fail closed.
+  for(unsigned kind=0;kind<4;kind++)
+  {
+    RetirementFamilyFixture fixture;fixture.crash("retire-family-after-marker-sync");
+    const std::string valid=file_text(fixture.journal());std::string invalid=valid;
+    if(kind==0)invalid+="predecessor=step-join-a--join-partition.complete\n";
+    else if(kind==1)invalid+="predecessor=../unsafe.complete\n";
+    else if(kind==2)invalid+="predecessor=keeper--phase.complete\n";
+    else invalid+="predecessor=step--extend.complete\n";
+    replace_text(fixture.journal(),invalid);require(recovery_rejected(fixture));fixture.check(false);
+    replace_text(fixture.journal(),valid);{BuildWorkspace recovered(fixture.root,fixture.semantic);}
+    fixture.check(true);
+  }
+  // Pending legacy v1 and new v2 journals coexist during recovery.
+  {
+    RetirementFamilyFixture fixture;auto legacy=fixture.add("legacy","phase",5);
+    fixture.crash("retire-family-after-marker-sync");
+    replace_text(fixture.root+"/legacy.retired","version=1\nfingerprint="+
+      fixture.workspace->fingerprint()+"\npredecessor=legacy--phase.complete\nsuccessor=step--extend.complete\n");
+    {BuildWorkspace recovered(fixture.root,fixture.semantic);}
+    fixture.check(true);require(!std::filesystem::exists(fixture.path(legacy)));
+  }
+  // A completed family cannot silently cover an unexpected new member.
+  {
+    RetirementFamilyFixture fixture;fixture.retire();
+    auto late=fixture.add("step-join-late","join-partition",6);
+    bool rejected=false;try{fixture.retire();}catch(const std::runtime_error&){rejected=true;}
+    require(rejected&&std::filesystem::exists(fixture.path(late)));fixture.check(true);
+  }
+  // A family member already retired through a v1 journal is still named in
+  // the v2 frozen family. Missing payloads are accepted, shared ones survive.
+  {
+    RetirementFamilyFixture fixture;
+    fixture.workspace->retire_obsolete("step-join-a","join-partition","step","extend");
+    require(!std::filesystem::exists(fixture.exclusive_a)&&std::filesystem::exists(fixture.exclusive_b));
+    fixture.retire();fixture.check(true);
+    {BuildWorkspace recovered(fixture.root,fixture.semantic);}
+    fixture.check(true);
+  }
+  // Resume cleanup often points to a later frontier. The original family
+  // membership remains frozen across that change of successor.
+  {
+    RetirementFamilyFixture fixture;fixture.retire();
+    auto next=fixture.add("later-step","extend",7);
+    fixture.workspace->retire_obsolete_family("step-join-","join-partition","later-step","extend");
+    auto newer=fixture.add("new-frontier","extend",8);
+    auto late=fixture.add("step-join-late","join-partition",6);
+    bool rejected=false;
+    try{fixture.workspace->retire_obsolete_family("step-join-","join-partition","new-frontier","extend");}
+    catch(const std::runtime_error&){rejected=true;}
+    require(rejected&&std::filesystem::exists(fixture.path(late))&&
+      std::filesystem::exists(fixture.path(next))&&std::filesystem::exists(fixture.path(newer)));
+  }
+}
+
 int main() {
+  test_retirement_families();
   MemoryBudget b(100,10); MemoryBudget::Reservation first=b.reserve(90,"first"); std::atomic<bool> started(false),got(false);
   std::thread waiter([&]{started=true;MemoryBudget::Reservation second=b.reserve(1,"second");got=true;}); while(!started) std::this_thread::yield(); std::this_thread::sleep_for(std::chrono::milliseconds(25)); require(!got); first=MemoryBudget::Reservation(); waiter.join(); require(got && b.stats().current==0 && b.stats().maximum==90); bool over=false; try { b.reserve(91,"too-large"); } catch(const std::runtime_error&) { over=true; } require(over);
-  char root[]="/tmp/gcsa-workspace-XXXXXX"; require(mkdtemp(root)); BuildWorkspace::Settings sem,op; sem["k"]="64"; op["threads"]="2"; BuildWorkspace w(root,sem,op,BuildWorkspace::NEW_WORKSPACE); require(access((std::string(root)+"/build.json").c_str(),F_OK)==0);
+  const char* tmp=std::getenv("TMPDIR");
+  const std::string pattern=std::string(tmp!=nullptr?tmp:"/tmp")+"/gcsa-workspace-XXXXXX";
+  std::vector<char> root_name(pattern.begin(),pattern.end());root_name.push_back('\0');
+  char* root=root_name.data();require(mkdtemp(root)); BuildWorkspace::Settings sem,op; sem["k"]="64"; op["threads"]="2"; BuildWorkspace w(root,sem,op,BuildWorkspace::NEW_WORKSPACE); require(access((std::string(root)+"/build.json").c_str(),F_OK)==0);
   bool new_refused=false, semantic_refused=false; try { BuildWorkspace again(root,sem,op,BuildWorkspace::NEW_WORKSPACE); } catch(const std::runtime_error&) { new_refused=true; } BuildWorkspace::Settings changed=sem; changed["k"]="65"; try { BuildWorkspace bad(root,changed); } catch(const std::runtime_error&) { semantic_refused=true; } require(new_refused && semantic_refused); BuildWorkspace resumed(root,sem,BuildWorkspace::Settings());
   ArtifactIdentity id("phase/task","sort stage","relative/path","payload-kind"); require(!resumed.task_completed(id.task,id.phase)); std::vector<uint8_t> payload(2*1024*1024+17); for(size_t n=0;n<payload.size();++n) payload[n]=uint8_t(n); BuildWorkspace::ArtifactWriter writer=resumed.open_artifact(id,logical_file_id_t(7),physical_shard_id_t(9),"key","a-z"); writer.write(&payload[0],1024*1024); writer.write(&payload[1024*1024],payload.size()-1024*1024); BuildWorkspace::ArtifactRef ref=writer.finish(3); std::vector<BuildWorkspace::ArtifactRef> refs(1,ref); resumed.commit_task(id.task,id.phase,refs,std::vector<std::string>(1,"input-checksum")); resumed.validate_artifact(id,logical_file_id_t(7),physical_shard_id_t(9)); require(resumed.task_completed(id.task,id.phase)); require(resumed.read_artifact_payload(id,logical_file_id_t(7),physical_shard_id_t(9),payload.size())==payload); std::string restored=std::string(root)+"/restored.payload"; resumed.restore_artifact(id,logical_file_id_t(7),physical_shard_id_t(9),restored,7777); { std::ifstream input(restored.c_str(),std::ios::binary); std::vector<uint8_t> copy((std::istreambuf_iterator<char>(input)),std::istreambuf_iterator<char>()); require(copy==payload); } require(unlink(restored.c_str())==0);
   // Same-filesystem raw checkpoints are published and restored by hard link:

@@ -1,4 +1,5 @@
 #include <gcsa/external_preprocessing.h>
+#include <gcsa/internal.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -7,6 +8,7 @@
 #include <fstream>
 #include <iterator>
 #include <set>
+#include <sstream>
 #include <string>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -72,7 +74,12 @@ int main()
 {
   omp_set_num_threads(1);
   Verbosity::set(Verbosity::SILENT);
-  char root[] = "/tmp/gcsa-external-preprocess-XXXXXX";
+  const char* tmp = std::getenv("TMPDIR");
+  const std::string pattern = std::string(tmp != nullptr ? tmp : "/tmp") +
+    "/gcsa-external-preprocess-XXXXXX";
+  std::vector<char> root_name(pattern.begin(), pattern.end());
+  root_name.push_back('\0');
+  char* root = root_name.data();
   require(mkdtemp(root) != nullptr);
   TempFile::setDirectory(root);
   const std::string first = std::string(root) + "/first.graph";
@@ -255,6 +262,44 @@ int main()
   }
   require(readBytes(crash_root + "/" + PREPROCESS_MARKER) ==
     readBytes(std::string(root) + "/" + PREPROCESS_MARKER));
+
+  // Mapper scan slices must preserve the exact succinct representation and
+  // logical read counters, with or without the opt-in advisory read-ahead.
+  // Run after all fork-based checks so no child inherits a live helper pool.
+  {
+    std::vector<key_type> keys;
+    for(size_type i=0;i<259;i++)
+    {
+      const key_type edge=key_type(1)<<(i%5);
+      keys.push_back((i<<16)|(edge<<8)|edge);
+    }
+    const std::string name=std::string(root)+"/mapper.keys";
+    {std::ofstream output(name,std::ios::binary);
+      output.write(reinterpret_cast<const char*>(keys.data()),keys.size()*sizeof(key_type));}
+    DeBruijnGraph reference(keys,16,Alphabet());
+    std::ostringstream reference_bytes;reference.serialize(reference_bytes);
+    for(size_type buffer:{size_type(1),size_type(17),size_type(64*KILOBYTE)})
+    {
+      const size_type before=DiskIO::read_volume.load();
+      DeBruijnGraph streamed(name,keys.size(),16,Alphabet(),buffer);
+      require(DiskIO::read_volume.load()-before==2*keys.size()*sizeof(key_type));
+      std::ostringstream bytes;streamed.serialize(bytes);
+      require(bytes.str()==reference_bytes.str());
+    }
+    for(size_type expected:{keys.size()-1,keys.size()+1})
+    {
+      bool rejected=false;
+      try{DeBruijnGraph invalid(name,expected,16,Alphabet(),17);}
+      catch(const std::runtime_error&){rejected=true;}
+      require(rejected);
+    }
+    // An incomplete record must fail rather than leave a prefetch task alive.
+    {std::ofstream output(name,std::ios::binary|std::ios::app);output.put('x');}
+    bool rejected=false;
+    try{DeBruijnGraph invalid(name,keys.size(),16,Alphabet(),17);}
+    catch(const std::runtime_error&){rejected=true;}
+    require(rejected);
+  }
 
   std::filesystem::remove_all(root);
   return 0;
