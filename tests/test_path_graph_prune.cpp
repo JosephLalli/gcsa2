@@ -21,7 +21,13 @@
 
 using namespace gcsa;
 
-static void require(bool value) { if(!value) { std::abort(); } }
+// Name the failing line: the requires are inlined into a few large functions,
+// where a core file's backtrace cannot tell them apart.
+static void require_at(bool value, int line)
+{
+  if(!value) { std::fprintf(stderr, "test_path_graph_prune: requirement at line %d failed\n", line); std::abort(); }
+}
+#define require(value) require_at((value), __LINE__)
 
 // A framed reader must consume one descriptor, not an istream descriptor plus
 // a second pread/cache-advice descriptor. Lowering the process ceiling makes
@@ -1003,10 +1009,16 @@ static void compare_parallel_merged_graph(const std::string& base)
     require(serial_stats.merge_fallback_reason == nullptr);
     require(scratch_limited_stats.merge_fallback_reason != nullptr &&
       std::string(scratch_limited_stats.merge_fallback_reason).find("disk") != std::string::npos);
-    // Seven alphabet components are scheduled, including the empty $, N, and
-    // # intervals; A is deliberately much larger than C/G/T.
-    require(four_stats.merge_partitions == mapper.alpha.sigma);
-    require(four_stats.merge_partitions > four.size());
+    // Each key is a key range at the default prefix depth of four. The two
+    // keys of every root component have the same start set and merge into one
+    // node, so each pair is stitched into one range; A is deliberately much
+    // larger than C/G/T and spills inside its stitched range.
+    require(four_stats.merge_split_depth == 4);
+    require(four_stats.merge_stitches == 4);
+    require(four_stats.merge_partitions == four.size());
+    require(four_stats.merge_records == paths.size());
+    require(four_stats.merge_largest_records == 5000);
+    require(four_stats.merge_fallback_reason == nullptr);
     require(four_stats.priority_spills > 0);
     require(four_stats.from_set_sorts > 0);
     require(four_stats.prefetch_workers == 0);
@@ -1052,15 +1064,21 @@ static void compare_parallel_merged_graph(const std::string& base)
       PathGraphMergeStats wide_stats;
       size_type before = DiskIO::read_volume;
       ScopedFileLimit limit(128);
-      MergedGraph merged(wide, mapper, lcp, GIGABYTE, MEGABYTE,
+      // Each worker gets a quarter of the group buffer. Four MiB keeps the
+      // A component's 10,000 records resident in every worker, so the read
+      // volume below measures the input cache rather than spill re-reads.
+      MergedGraph merged(wide, mapper, lcp, GIGABYTE, 4 * MEGABYTE,
         &wide_stats, 128, 256 * MEGABYTE, 4);
       size_type read_bytes = DiskIO::read_volume - before;
       require_same_merged_graph(serial, merged);
       require(wide_stats.merge_workers == 4);
+      require(wide_stats.priority_spills == 0);
       require(wide_stats.max_open_input_pairs <= 4);
       require(wide_stats.max_input_buffer_bytes <= 256 * MEGABYTE);
-      // Allow all workers' boundary probes plus ordered-output assembly. This
-      // bound is far below repeatedly decoding a shard per merged record.
+      // Allow the shard passes, every worker's and every stitched span's
+      // boundary blocks, and ordered-output assembly (about twelve times the
+      // stored input here, with each component stitched). This bound is far
+      // below repeatedly decoding a shard per merged record.
       require(read_bytes < 32 * stored_bytes + 8 * serial.bytes());
       // A mixed old/new workspace cannot use the all-framed descriptor mode.
       // Its 57 persistent pairs only fit one worker under the same FD cap.
@@ -1086,8 +1104,9 @@ static void compare_parallel_merged_graph(const std::string& base)
       require(mixed_stats.merge_fallback_reason != nullptr);
     }
 
-    // A completely empty frontier still takes the parallel assembly route,
-    // creates four valid empty streams, and preserves the serial next tables.
+    // A completely empty frontier has nothing to divide: the serial merge
+    // writes four valid empty streams and the serial next tables, and that is
+    // not a fallback.
     PathGraph empty_paths(2, input.k(), 0);
     PathGraphMergeStats empty_serial_stats, empty_parallel_stats;
     MergedGraph empty_serial(empty_paths, mapper, lcp, GIGABYTE,
@@ -1097,11 +1116,231 @@ static void compare_parallel_merged_graph(const std::string& base)
     require_same_merged_graph(empty_serial, empty_parallel);
     require(empty_parallel.size() == 0 && empty_parallel.ranks() == 0 &&
       empty_parallel.extra() == 0);
-    require(empty_parallel_stats.merge_workers == 4);
-    require(empty_parallel_stats.merge_partitions == mapper.alpha.sigma);
+    require(empty_parallel_stats.merge_workers == 1);
+    require(empty_parallel_stats.merge_fallback_reason == nullptr);
   }
   omp_set_num_threads(previous_threads); omp_set_dynamic(previous_dynamic);
   std::remove(input_name.c_str());
+}
+
+// A record of a handwritten final-merge input: one key rank, with a label
+// interval when last differs from rank.
+struct MergeFixtureRecord
+{
+  size_type shard;
+  PathNode::rank_type rank, last;
+  node_type from;
+  byte_type predecessors;
+};
+
+static void initialize_merge_fixture(PathGraph& graph, const std::string& base,
+  const std::vector<MergeFixtureRecord>& records, size_type shards, bool framed)
+{
+  std::vector<std::vector<MergeFixtureRecord>> by_shard(shards);
+  for(const MergeFixtureRecord& record : records) { by_shard[record.shard].push_back(record); }
+  for(size_type shard = 0; shard < shards; shard++)
+  {
+    std::stable_sort(by_shard[shard].begin(), by_shard[shard].end(),
+      [](const MergeFixtureRecord& a, const MergeFixtureRecord& b) { return a.rank < b.rank; });
+    const std::string path_name = base + "." + std::to_string(shard) + ".path";
+    const std::string rank_name = base + "." + std::to_string(shard) + ".rank";
+    std::ofstream raw_paths, raw_ranks;
+    std::unique_ptr<CompressedBlockWriter> framed_paths, framed_ranks;
+    if(framed)
+    {
+      framed_paths.reset(new CompressedBlockWriter(path_name, 4 * KILOBYTE, CompressedBlockWriter::ZSTD));
+      framed_ranks.reset(new CompressedBlockWriter(rank_name, 4 * KILOBYTE, CompressedBlockWriter::ZSTD));
+    }
+    else
+    {
+      raw_paths.open(path_name.c_str(), std::ios_base::binary);
+      raw_ranks.open(rank_name.c_str(), std::ios_base::binary);
+    }
+    for(size_type i = 0; i < by_shard[shard].size(); i++)
+    {
+      const MergeFixtureRecord& record = by_shard[shard][i];
+      PathNode node; node.from = record.from;
+      node.to = Node::encode(20000 + 100 * shard + i, 0);
+      node.fields = 0; node.setPredecessors(record.predecessors);
+      node.setOrder(1); node.setLCP(record.last == record.rank ? 1 : 0);
+      node.setPointer(2 * i);
+      PathNode::rank_type label[2] = { record.rank,
+        static_cast<PathNode::rank_type>(record.last == record.rank ? 0 : record.last) };
+      if(framed)
+      {
+        framed_paths->writeRecord(&node, sizeof(node));
+        framed_ranks->writeRecord(label, sizeof(label));
+      }
+      else
+      {
+        raw_paths.write(reinterpret_cast<const char*>(&node), sizeof(node));
+        raw_ranks.write(reinterpret_cast<const char*>(label), sizeof(label));
+      }
+    }
+    if(framed) { framed_paths->finish(); framed_ranks->finish(); }
+    graph.path_names.push_back(path_name); graph.rank_names.push_back(rank_name);
+    graph.path_counts.push_back(by_shard[shard].size());
+    graph.rank_counts.push_back(2 * by_shard[shard].size());
+    graph.path_checksums.push_back(ClosedPayloadChecksum());
+    graph.rank_checksums.push_back(ClosedPayloadChecksum());
+    graph.logical_file_ids.push_back(logical_file_id_t(0));
+    graph.physical_shard_ids.push_back(physical_shard_id_t(shard));
+    graph.path_count += by_shard[shard].size();
+    graph.rank_count += 2 * by_shard[shard].size();
+  }
+}
+
+static MergeFixtureRecord merge_record(size_type shard, PathNode::rank_type rank,
+  size_type from, PathNode::rank_type last = PathLabel::NO_RANK, byte_type predecessors = 1)
+{
+  return { shard, rank, (last == PathLabel::NO_RANK ? rank : last),
+    Node::encode(from, 0), predecessors };
+}
+
+/*
+  Handwritten merge inputs over the eight keys AAA, AAC, CAA, CAC, GAA, GAC,
+  TAA and TAC (ranks 0 to 7), in three shards. At prefix depth three, and at
+  the default four, every key is a key range, and the records give each range
+  a part:
+
+    0, 1  AAA and AAC each merge into one node with the same start nodes, so
+          the AAA group continues across the AAA|AAC split: a crossing, which
+          must be stitched (the LCP across that split, (0, 2), is deeper than
+          the left border, (0, 0)).
+    2, 3  CAA and CAC each merge into one node too, but with different start
+          nodes: the CAA group is open, the right split is deeper, and the
+          later range differs, so nothing crosses. CAC's first LCP byte is the
+          border (0, 2), which its worker cannot see and wrote as zero.
+    4     GAA holds no records: an empty range between two that hold some.
+    5     GAC holds equal labels from all three shards.
+    6, 7  TAA's only record has a label interval reaching TAC, so its range
+          must be stitched through TAC's.
+
+  Equal-label records spread over shards everywhere, and the partitioned
+  merge must reproduce all four serial streams and both next tables byte for
+  byte, at depths 4, 3, 2 and 1, from raw and framed shards.
+*/
+static void compare_partitioned_merge(const std::string& root)
+{
+  Alphabet alpha;
+  std::vector<key_type> keys = parallel_prune_keys(alpha);
+  LCP lcp(keys, 3);
+  DeBruijnGraph mapper(keys, 3, alpha);
+  const std::vector<MergeFixtureRecord> records = {
+    merge_record(0, 0, 100), merge_record(0, 0, 101), merge_record(0, 0, 102), merge_record(0, 0, 103),
+    merge_record(1, 0, 100), merge_record(1, 0, 101), merge_record(1, 0, 103),
+    merge_record(1, 1, 100), merge_record(1, 1, 102), merge_record(2, 1, 101), merge_record(2, 1, 103),
+    merge_record(0, 2, 200), merge_record(0, 2, 201),
+    merge_record(2, 3, 300), merge_record(2, 3, 301),
+    merge_record(0, 5, 500), merge_record(1, 5, 501, PathLabel::NO_RANK, 2), merge_record(2, 5, 500),
+    merge_record(1, 6, 600, 7),
+    merge_record(2, 7, 600), merge_record(0, 7, 601)
+  };
+  int previous_threads = omp_get_max_threads();
+  int previous_dynamic = omp_get_dynamic();
+  omp_set_dynamic(0); omp_set_num_threads(std::max(4, previous_threads));
+  for(bool framed : { false, true })
+  {
+    const std::string tag = (framed ? "framed" : "raw");
+    PathGraph paths(0, 3, 0);
+    initialize_merge_fixture(paths, root + "/partitioned-merge-" + tag, records, 3, framed);
+    PathGraphMergeStats serial_stats;
+    MergedGraph serial(paths, mapper, lcp, GIGABYTE, MEGABYTE, &serial_stats, 128, 0, 1);
+    // Ranks 0 and 1 merge into one node; 2, 3, 5, 6 and 7 are a node each:
+    // six nodes, and CAC's border is (0, 2).
+    require(serial.size() == 6);
+    {
+      std::vector<char> lcp_bytes = contents(serial.lcp_name);
+      require(lcp_bytes.size() == 6 && lcp_bytes[2] == 2);
+    }
+    for(const char* depth : { "4", "3", "2", "1" })
+    {
+      require(::setenv("GCSA_MERGE_SPLIT_DEPTH", depth, 1) == 0);
+      // Framed workers each hold every shard's decoded block pair (about
+      // 200 KiB each for these 4 KiB blocks), which the group buffer
+      // cannot fund; give them an input cache.
+      PathGraphMergeStats stats;
+      MergedGraph parallel(paths, mapper, lcp, GIGABYTE, MEGABYTE, &stats, 128, 64 * MEGABYTE, 4);
+      require_same_merged_graph(serial, parallel);
+      require(stats.merge_fallback_reason == nullptr);
+      require(stats.merge_workers >= 2);
+      require(stats.merge_records == paths.size());
+      if(std::string(depth) == "4" || std::string(depth) == "3")
+      {
+        // AAA|AAC crosses and TAA's interval reaches TAC: eight ranges, two
+        // stitches, six left.
+        require(stats.merge_split_depth == static_cast<size_type>(std::stoul(depth)));
+        require(stats.merge_stitches == 2);
+        require(stats.merge_partitions == 6);
+      }
+      else
+      {
+        // At depths two and one the root components are the ranges, and no
+        // group or interval crosses between them.
+        require(stats.merge_stitches == 0);
+        require(stats.merge_partitions == 4);
+      }
+    }
+    require(::unsetenv("GCSA_MERGE_SPLIT_DEPTH") == 0);
+    remove_inputs(root + "/partitioned-merge-" + tag, 3);
+  }
+
+  // Equal labels whose records differ only in what the merge unions (start
+  // nodes, predecessor bits) leave a merge heap in an order that depends on its
+  // history. Shard 1 holds AAA then AAC, shard 0 only AAC: the serial heap,
+  // having popped shard 1's AAA, emits shard 1's AAC first, while the heap the
+  // AAC range starts with emits shard 0's first. Both orders give the same
+  // node.
+  {
+    const std::vector<MergeFixtureRecord> order_records = {
+      merge_record(1, 0, 900), merge_record(0, 1, 901, PathLabel::NO_RANK, 4),
+      merge_record(1, 1, 902, PathLabel::NO_RANK, 2), merge_record(0, 2, 903), merge_record(1, 3, 904)
+    };
+    PathGraph paths(0, 3, 0);
+    initialize_merge_fixture(paths, root + "/merge-tie-order", order_records, 2, false);
+    PathGraphMergeStats serial_stats, parallel_stats;
+    MergedGraph serial(paths, mapper, lcp, GIGABYTE, MEGABYTE, &serial_stats, 128, 0, 1);
+    MergedGraph parallel(paths, mapper, lcp, GIGABYTE, MEGABYTE, &parallel_stats, 128, 0, 4);
+    require_same_merged_graph(serial, parallel);
+    require(parallel_stats.merge_fallback_reason == nullptr && parallel_stats.merge_workers >= 2);
+    remove_inputs(root + "/merge-tie-order", 2);
+  }
+
+  // The same shape, but shard 0's AAC record has a label interval, so the
+  // range's last record decides its LCP and its node's label, and that record
+  // depends on the heap's history. The partitioned merge must notice and
+  // decline, and the serial merge it then runs is the reference.
+  {
+    const std::vector<MergeFixtureRecord> tie_records = {
+      merge_record(1, 0, 900), merge_record(0, 1, 901, 2), merge_record(1, 1, 902),
+      merge_record(0, 3, 903), merge_record(1, 3, 904)
+    };
+    PathGraph paths(0, 3, 0);
+    initialize_merge_fixture(paths, root + "/merge-tie-sensitive", tie_records, 2, false);
+    PathGraphMergeStats serial_stats, parallel_stats;
+    MergedGraph serial(paths, mapper, lcp, GIGABYTE, MEGABYTE, &serial_stats, 128, 0, 1);
+    MergedGraph parallel(paths, mapper, lcp, GIGABYTE, MEGABYTE, &parallel_stats, 128, 0, 4);
+    require_same_merged_graph(serial, parallel);
+    require(parallel_stats.merge_workers == 1);
+    require(parallel_stats.merge_fallback_reason != nullptr &&
+      std::string(parallel_stats.merge_fallback_reason).find("equal labels") != std::string::npos);
+    remove_inputs(root + "/merge-tie-sensitive", 2);
+  }
+
+  // GCSA_SERIAL_MERGE is read by the construction driver, not here; a
+  // compressed merge output is the serial merge's alone.
+  {
+    PathGraph paths(0, 3, 0);
+    initialize_merge_fixture(paths, root + "/merge-framed-output", records, 3, false);
+    const TempFileCodecParameters framed_codec(TempCompression::ZSTD, 64 * KILOBYTE, 1, 1);
+    PathGraphMergeStats serial_stats, framed_stats;
+    MergedGraph serial(paths, mapper, lcp, GIGABYTE, MEGABYTE, &serial_stats, 128, 0, 1);
+    MergedGraph framed(paths, mapper, lcp, GIGABYTE, MEGABYTE, &framed_stats, 128, 0, 4, &framed_codec);
+    require_same_merged_records(serial, framed);
+    require(framed_stats.merge_workers == 1 && framed_stats.merge_fallback_reason != nullptr);
+    remove_inputs(root + "/merge-framed-output", 3);
+  }
+  omp_set_num_threads(previous_threads); omp_set_dynamic(previous_dynamic);
 }
 
 static std::vector<std::vector<PruneFixtureRecord>> distinct_start_prune_records()
@@ -1424,6 +1663,10 @@ int main()
   // empty and highly skewed root components, spills its dominant group, and
   // contains adjacent distinct-label groups that must not be cut apart.
   compare_parallel_merged_graph(std::string(root) + "/parallel-merged");
+  // Handwritten partitioned-merge inputs: crossings at splits, ranges that
+  // merge whole without crossing, empty ranges, LCP bytes across splits, label
+  // intervals past a split, and equal labels in heap-dependent order.
+  compare_partitioned_merge(root);
   // Repeated-round pruning uses exact zero-LCP root partitions. Exercise raw,
   // framed, and mixed input generations, retained physical output shards,
   // logical-file semantics, forced spills, bounded-resource fallback, final
