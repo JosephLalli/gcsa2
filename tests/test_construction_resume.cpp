@@ -6,7 +6,9 @@
 #include <gcsa/lcp.h>
 #include <gcsa/path_graph.h>
 
+#include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -546,24 +548,36 @@ main()
       external_minimum + 64 * MEGABYTE);
     enableSmallFramedStreams(parameters);
     InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
-    std::ostringstream overlap_log;
-    std::streambuf* old_stderr = std::cerr.rdbuf(overlap_log.rdbuf());
+    // The LCP thread logs while the main thread does. Redirecting std::cerr
+    // into one stringbuf, as the cases above do, would make that a data race,
+    // so capture descriptor 2 in a file and keep cerr's synchronized buffer.
+    const std::string log_name = overlap_root + "/overlap.log";
+    std::cerr.flush(); std::fflush(stderr);
+    const int saved_stderr = ::dup(2);
+    const int log_descriptor = ::open(log_name.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    require(saved_stderr >= 0 && log_descriptor >= 0);
+    require(::dup2(log_descriptor, 2) >= 0); ::close(log_descriptor);
+    const auto restore_stderr = [&]()
+    {
+      std::cerr.flush(); std::fflush(stderr);
+      ::dup2(saved_stderr, 2); ::close(saved_stderr);
+      Verbosity::set(Verbosity::SILENT);
+    };
     Verbosity::set(Verbosity::EXTENDED);
     try
     {
       GCSA::buildAndStore(graph, parameters, overlap_prefix + GCSA::EXTENSION,
         overlap_prefix + LCPArray::EXTENSION);
     }
-    catch(...)
-    {
-      std::cerr.rdbuf(old_stderr); Verbosity::set(Verbosity::SILENT); throw;
-    }
-    std::cerr.rdbuf(old_stderr); Verbosity::set(Verbosity::SILENT);
-    const size_type started = overlap_log.str().find(
+    catch(...) { restore_stderr(); throw; }
+    restore_stderr();
+    const std::vector<char> log_bytes = readFile(log_name);
+    const std::string overlap_log(log_bytes.begin(), log_bytes.end());
+    const size_type started = overlap_log.find(
       "Building the LCP array during the final-event scan");
     require(started != std::string::npos);
-    require(started < overlap_log.str().find("subphase construct/final-event-scan"));
-    require(overlap_log.str().find("subphase construct/lcp-join") != std::string::npos);
+    require(started < overlap_log.find("subphase construct/final-event-scan"));
+    require(overlap_log.find("subphase construct/lcp-join") != std::string::npos);
     GCSA index; LCPArray lcp;
     require(sdsl::load_from_file(index, overlap_prefix + GCSA::EXTENSION));
     require(sdsl::load_from_file(lcp, overlap_prefix + LCPArray::EXTENSION));
