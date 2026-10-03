@@ -3677,28 +3677,87 @@ pruneSplitDepth()
   return (depth == 0 ? 1 : static_cast<size_type>(std::min<unsigned long long>(depth, 16)));
 }
 
+/*
+  Runs visit(file, input) once for every shard, on up to `threads` threads that
+  each read through their own single-pair input cache, and rethrows the first
+  error. The shard passes before a parallel prune or merge are independent per
+  shard, and each decodes whole framed blocks, so they belong on every thread
+  the memory allows rather than on the workers alone.
+*/
+template<class Visit>
+void
+forEachShard(const PathGraph& source, size_type pair_buffer_bytes,
+  size_type threads, Visit visit)
+{
+  const size_type files = source.files();
+  if(files == 0) { return; }
+  threads = std::max(static_cast<size_type>(1), std::min(threads, files));
+  std::atomic<size_type> next_file(0);
+  std::vector<std::exception_ptr> errors(threads);
+  auto run = [&](size_type thread)
+  {
+    try
+    {
+      PathGraphInputCache input(source, nullptr, 1, pair_buffer_bytes, 0);
+      for(size_type file = next_file++; file < files; file = next_file++)
+      {
+        visit(file, input);
+      }
+      input.close();
+    }
+    catch(...) { errors[thread] = std::current_exception(); }
+  };
+  std::vector<std::thread> pool;
+  for(size_type thread = 1; thread < threads; thread++)
+  {
+    try { pool.emplace_back(run, thread); }
+    catch(const std::system_error&) { break; } // The started threads and this one finish the queue.
+  }
+  run(0);
+  for(std::thread& worker : pool) { worker.join(); }
+  for(const std::exception_ptr& error : errors) { if(error) { std::rethrow_exception(error); } }
+}
+
+// Threads for the shard passes: every OpenMP thread, as many as shards, and
+// no more single-pair caches than the input cache budget holds at once.
+size_type
+shardPassThreads(const PathGraph& source, size_type pair_bytes, size_type cache_budget)
+{
+  size_type threads = static_cast<size_type>(std::max(1, omp_get_max_threads()));
+  threads = std::min(threads, std::max(static_cast<size_type>(1), source.files()));
+  if(pair_bytes > 0) { threads = std::min(threads, std::max(static_cast<size_type>(1), cache_budget / pair_bytes)); }
+  return threads;
+}
+
+// Merge inputs are sorted within each physical shard, so the last record has
+// its largest first rank. Read exactly that record through the normal random-
+// access path before workers create output; otherwise lower_bound(total_keys)
+// could silently exclude a corrupt out-of-domain tail from every partition.
+bool
+shardTailsInDomain(const PathGraph& source, const LCP& lcp,
+  size_type pair_buffer_bytes, size_type threads)
+{
+  std::atomic<bool> in_domain(true);
+  forEachShard(source, pair_buffer_bytes, threads,
+    [&](size_type file, PathGraphInputCache& input)
+    {
+      if(source.path_counts[file] == 0 || !in_domain.load(std::memory_order_relaxed)) { return; }
+      PriorityNode tail; tail.file = file;
+      input.read(file, source.path_counts[file] - 1, tail.node, tail.label);
+      if(tail.firstLabel(0) >= lcp.total_keys) { in_domain.store(false, std::memory_order_relaxed); }
+    });
+  return in_domain.load();
+}
+
 void
 validatePruneShardTails(const PathGraph& source, const LCP& lcp,
-  size_type pair_buffer_bytes)
+  size_type pair_buffer_bytes, size_type threads)
 {
-  // Prune inputs are sorted within each physical shard, so the last record has
-  // its largest first rank. Read exactly that record through the normal random-
-  // access path before workers create output; otherwise lower_bound(total_keys)
-  // could silently exclude a corrupt out-of-domain tail from every partition.
-  PathGraphInputCache input(source, nullptr, 1, pair_buffer_bytes, 1);
-  PriorityNode tail;
-  for(size_type file = 0; file < source.files(); file++)
+  if(!shardTailsInDomain(source, lcp, pair_buffer_bytes, threads))
   {
-    if(source.path_counts[file] == 0) { continue; }
-    tail.file = file;
-    input.read(file, source.path_counts[file] - 1, tail.node, tail.label);
-    if(tail.firstLabel(0) >= lcp.total_keys)
-    {
-      throw std::runtime_error(
-        "PathGraph::prune(): input label rank is outside the LCP key domain");
-    }
+    throw std::runtime_error(
+      "PathGraph::prune(): input label rank is outside the LCP key domain");
   }
-  input.close();
 }
 
 template<bool report_progress>
@@ -3894,66 +3953,65 @@ buildPrunePartition(PrunePartition& result, const PathGraph& source,
   Each worker's merger would otherwise binary-search every shard for its own
   two bounds, and on framed shards every probe that lands in a new block
   decodes the whole block: at 131 partitions over 33 chr18 shards that setup
-  was 95% of the prune. Bounds ascend, so each shard is walked once with a
-  galloping search from the previous bound, decoding each block about once.
+  was 95% of the prune. Bounds ascend, so each shard is walked once from the
+  previous bound. Shards are independent, so the pass runs on every thread the
+  caller allows (it ran on the prune's seven workers and took 4.7 to 5.9 s per
+  chr18 step). Partition is any type with lower_rank, upper_rank, start_offsets
+  and stop_offsets; the prune and the final merge share this pass.
+
+  The walk only moves forward, so each reader's single decoded block is
+  decoded once. A galloping search overshoots and then binary-searches back
+  across block boundaries, decoding the same 16 MiB blocks again on each
+  crossing, which matters once bounds are a fraction of a block apart (the
+  final merge's 123 to 441 key ranges over 51 chr18 shards). Here the stride
+  doubles up to a cap of about a sixteenth of the expected gap between
+  bounds (at least 4,096 records), and the bound is then found by a forward
+  scan of at most one stride from the last record below it.
 */
+template<class Partition>
 void
-locatePruneBounds(const PathGraph& source, std::vector<PrunePartition>& partitions,
+locatePartitionBounds(const PathGraph& source, std::vector<Partition>& partitions,
   size_type pair_buffer_bytes, size_type threads)
 {
   const size_type files = source.files(), parts = partitions.size();
   if(parts == 0) { return; }
-  for(PrunePartition& part : partitions)
+  for(Partition& part : partitions)
   {
     part.start_offsets.assign(files, 0); part.stop_offsets.assign(files, 0);
   }
-  threads = std::max(static_cast<size_type>(1), std::min(threads, files));
-  std::atomic<size_type> next_file(0);
-  std::vector<std::exception_ptr> errors(threads);
-  auto run = [&](size_type thread)
-  {
-    try
+  forEachShard(source, pair_buffer_bytes, threads,
+    [&](size_type file, PathGraphInputCache& input)
     {
-      PathGraphInputCache input(source, nullptr, 1, pair_buffer_bytes, 0);
-      PriorityNode probe;
-      for(size_type file = next_file++; file < files; file = next_file++)
+      PriorityNode probe; probe.file = file;
+      const size_type count = source.path_counts[file];
+      auto below = [&](size_type offset, PathNode::rank_type key) -> bool
       {
-        probe.file = file;
-        const size_type count = source.path_counts[file];
-        auto below = [&](size_type offset, PathNode::rank_type key) -> bool
+        input.read(file, offset, probe.node, probe.label);
+        return (probe.firstLabel(0) < key);
+      };
+      const size_type max_step = std::max(static_cast<size_type>(4096), count / ((parts + 1) * 16));
+      size_type low = 0; // Every record before low is below the current key.
+      for(size_type i = 0; i <= parts; i++)
+      {
+        const PathNode::rank_type key = (i < parts ?
+          partitions[i].lower_rank : partitions[parts - 1].upper_rank);
+        if(key != 0)
         {
-          input.read(file, offset, probe.node, probe.label);
-          return (probe.firstLabel(0) < key);
-        };
-        size_type low = 0; // Every record before low is below the current key.
-        for(size_type i = 0; i <= parts; i++)
-        {
-          const PathNode::rank_type key = (i < parts ?
-            partitions[i].lower_rank : partitions[parts - 1].upper_rank);
-          if(key != 0)
+          for(size_type step = 1; low < count; step = std::min(2 * step, max_step))
           {
-            size_type high = low, step = 1;
-            while(high < count && below(high, key)) { low = high + 1; high = low + step; step *= 2; }
-            high = std::min(high, count);
-            while(low < high)
+            const size_type probe = std::min(low + step, count) - 1;
+            if(!below(probe, key))
             {
-              size_type mid = low + (high - low) / 2;
-              if(below(mid, key)) { low = mid + 1; } else { high = mid; }
+              while(low < probe && below(low, key)) { low++; }
+              break;
             }
+            low = probe + 1;
           }
-          if(i < parts) { partitions[i].start_offsets[file] = low; }
-          if(i > 0) { partitions[i - 1].stop_offsets[file] = low; }
         }
+        if(i < parts) { partitions[i].start_offsets[file] = low; }
+        if(i > 0) { partitions[i - 1].stop_offsets[file] = low; }
       }
-      input.close();
-    }
-    catch(...) { errors[thread] = std::current_exception(); }
-  };
-  std::vector<std::thread> pool;
-  for(size_type thread = 1; thread < threads; thread++) { pool.emplace_back(run, thread); }
-  run(0);
-  for(std::thread& worker : pool) { worker.join(); }
-  for(const std::exception_ptr& error : errors) { if(error) { std::rethrow_exception(error); } }
+    });
 }
 
 // Declines a requested parallel prune or merge. The serial route that follows
@@ -4072,8 +4130,12 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
     return declineParallel(fallback_reason, "input cache cannot hold each worker's windows");
   }
 
-  validatePruneShardTails(source, lcp,
-    (pair_bytes > 0 ? pair_bytes : raw_pair_budget));
+  // The shard passes run before any worker and hold one input pair (two
+  // descriptors) per thread, so they may use more threads than the workers.
+  const size_type pass_pair = (pair_bytes > 0 ? pair_bytes : raw_pair_budget);
+  const size_type pass_threads = std::max(workers, std::min(admission_files / 2,
+    shardPassThreads(source, pair_bytes, cache_budget)));
+  validatePruneShardTails(source, lcp, pass_pair, pass_threads);
 
   std::vector<PrunePartition> partitions(ranges.size());
   for(size_type i = 0; i < ranges.size(); i++)
@@ -4082,7 +4144,7 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
     partitions[i].upper_rank = ranges[i].second;
   }
   const auto locate_start = std::chrono::steady_clock::now();
-  locatePruneBounds(source, partitions, (pair_bytes > 0 ? pair_bytes : raw_pair_budget), workers);
+  locatePartitionBounds(source, partitions, pass_pair, pass_threads);
   if(Verbosity::level >= Verbosity::EXTENDED)
   {
     std::cerr << "PathGraph::prune(): located " << partitions.size() << " partition bounds in "
