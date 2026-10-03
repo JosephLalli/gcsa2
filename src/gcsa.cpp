@@ -2015,7 +2015,16 @@ reportFinalMergeStats(const PathGraphMergeStats& final_merge_stats)
     std::cerr << "MergedGraph: "
               << final_merge_stats.merge_workers << " worker(s)"
               << fallbackReason(final_merge_stats.merge_fallback_reason) << " over "
-              << final_merge_stats.merge_partitions << " root partition(s); "
+              << final_merge_stats.merge_partitions << " key range(s)";
+    if(final_merge_stats.merge_records > 0)
+    {
+      std::cerr << " (prefix depth " << final_merge_stats.merge_split_depth << ", "
+                << final_merge_stats.merge_stitches << " stitch(es), largest range "
+                << (100.0 * static_cast<double>(final_merge_stats.merge_largest_records) /
+                    static_cast<double>(final_merge_stats.merge_records))
+                << "% of " << final_merge_stats.merge_records << " records)";
+    }
+    std::cerr << "; "
               << final_merge_stats.priority_spills << " path-group spills, "
               << final_merge_stats.range_spills << " range spills, "
               << final_merge_stats.from_set_sorts << " external from-set sorts (peak "
@@ -2480,15 +2489,27 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
               << " MB, framed input cache " << inMegabytes(merge_cache)
               << " MB over " << path_graph.files() << " shard(s)" << std::endl;
   }
-  // The partitioned merge copies every partition into place, doubling the
-  // merge's scratch writes, and its chr21 gain did not clear run-to-run
-  // spread; it runs only when requested.
-  const char* parallel_merge = std::getenv("GCSA_EXPERIMENTAL_PARALLEL_MERGE");
+  // The external route merges key ranges on every thread the budgets admit;
+  // the result is the serial merge's, or the merge declines and runs serially
+  // (MergedGraph names why). GCSA_SERIAL_MERGE=1 forces the serial merge, for
+  // comparisons and as a fallback.
+  const char* serial_merge = std::getenv("GCSA_SERIAL_MERGE");
   size_type merge_workers = 1;
-  if(parameters.externalMemory() && parallel_merge != nullptr && std::string(parallel_merge) == "1")
+  if(parameters.externalMemory() && !(serial_merge != nullptr && std::string(serial_merge) == "1"))
   {
     merge_workers = static_cast<size_type>(std::max(1, omp_get_max_threads()));
   }
+  // Each merge worker holds a decoded block pair of every shard (3.3 GB as
+  // estimated on the chr18 frontier, 4.3 GiB on the joint chr2+chr18 one), so
+  // the input cache, not the threads, sets the worker count. Nothing else of
+  // that size is resident while the merge runs: the doubling generation is on
+  // disk and the final scan has not begun. The workers therefore share three
+  // quarters of the memory goal instead of the quarter the serial merge's
+  // prefetch pool is capped at; the group buffer (a sixteenth) is divided
+  // among them, not multiplied, and the rest covers the mapper, the LCP
+  // support and the output buffers.
+  const size_type merge_worker_cache = std::max(merge_cache,
+    parameters.getMemoryLimitBytes() / 4 * 3);
   PathGraphMergeStats final_merge_stats;
   SubPhaseProbe merge_probe("merge/merged-graph");
   // Opt-in (GCSA_IO_COMPRESS_MERGE=1, with temporary compression on): the
@@ -2503,7 +2524,8 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   MergedGraph merged_graph(path_graph, mapper, lcp,
     path_graph.remainingLimit(parameters.getLimitBytes()), merge_buffer,
     &final_merge_stats, parameters.getMaxOpenFiles(), merge_cache, merge_workers,
-    (framed_merge ? &merge_codec : nullptr));
+    (framed_merge ? &merge_codec : nullptr), parameters.getConcurrentOpenFiles(),
+    merge_worker_cache);
   merge_probe.report();
   reportFinalMergeStats(final_merge_stats);
   this->header.path_nodes = merged_graph.size();
