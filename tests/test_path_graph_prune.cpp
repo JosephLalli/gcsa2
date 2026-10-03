@@ -1134,7 +1134,8 @@ struct MergeFixtureRecord
 };
 
 static void initialize_merge_fixture(PathGraph& graph, const std::string& base,
-  const std::vector<MergeFixtureRecord>& records, size_type shards, bool framed)
+  const std::vector<MergeFixtureRecord>& records, size_type shards, bool framed,
+  const std::vector<logical_file_id_t>* logical = nullptr)
 {
   std::vector<std::vector<MergeFixtureRecord>> by_shard(shards);
   for(const MergeFixtureRecord& record : records) { by_shard[record.shard].push_back(record); }
@@ -1183,7 +1184,7 @@ static void initialize_merge_fixture(PathGraph& graph, const std::string& base,
     graph.rank_counts.push_back(2 * by_shard[shard].size());
     graph.path_checksums.push_back(ClosedPayloadChecksum());
     graph.rank_checksums.push_back(ClosedPayloadChecksum());
-    graph.logical_file_ids.push_back(logical_file_id_t(0));
+    graph.logical_file_ids.push_back(logical == nullptr ? logical_file_id_t(0) : (*logical)[shard]);
     graph.physical_shard_ids.push_back(physical_shard_id_t(shard));
     graph.path_count += by_shard[shard].size();
     graph.rank_count += 2 * by_shard[shard].size();
@@ -1364,14 +1365,24 @@ static const char* prune_storage_name(PruneFixtureStorage storage)
   return "mixed";
 }
 
+static std::map<logical_file_id_t, std::vector<LogicalPruneRecord>>
+label_ordered_records(const PathGraph& graph);
+
+// roots: GCSA_PRUNE_ROOT_PARTITIONS=1, one partition per zero-LCP root. The
+// default balanced prune cuts the eight keys into seven spans (TAA and TAC are
+// the last root and stay whole), a unit each for four workers, and stitches
+// AAA with AAC and GAA with GAC, whose groups merge across their splits: five
+// units over five spans. Spans start fresh merge heaps, so the balanced
+// prune's equal labels from several shards are compared as multisets.
 static void compare_parallel_prune(const std::string& root,
-  PruneFixtureStorage storage)
+  PruneFixtureStorage storage, bool roots)
 {
   Alphabet alpha;
   std::vector<key_type> keys = parallel_prune_keys(alpha);
   LCP lcp(keys, 3);
   DeBruijnGraph mapper(keys, 3, alpha);
-  const std::string tag = prune_storage_name(storage);
+  if(roots) { require(::setenv("GCSA_PRUNE_ROOT_PARTITIONS", "1", 1) == 0); }
+  const std::string tag = std::string(prune_storage_name(storage)) + (roots ? "-roots" : "-balanced");
   const size_type group_budget = 4 * KILOBYTE;
   const size_type cache_budget = 64 * MEGABYTE;
 
@@ -1391,7 +1402,8 @@ static void compare_parallel_prune(const std::string& root,
     parallel.prune(lcp, GIGABYTE, group_budget, &parallel_stats, 128,
       cache_budget, 4);
 
-    require(logical_prune_records(serial) == logical_prune_records(parallel));
+    if(roots) { require(logical_prune_records(serial) == logical_prune_records(parallel)); }
+    else { require(label_ordered_records(serial) == label_ordered_records(parallel)); }
     require(serial.size() == parallel.size());
     require(serial.ranks() == parallel.ranks());
     require(serial.ranges() == parallel.ranges());
@@ -1402,7 +1414,10 @@ static void compare_parallel_prune(const std::string& root,
     require(parallel.files() > serial.files());
     require(parallel_stats.prune_requested_workers == 4);
     require(parallel_stats.prune_workers == 4);
-    require(parallel_stats.prune_partitions == 4);
+    require(parallel_stats.prune_partitions == (roots ? 4 : 5));
+    require(parallel_stats.prune_spans == (roots ? 4 : 5));
+    require(parallel_stats.prune_stitches == (roots ? 0 : 2));
+    require(parallel_stats.prune_split_depth == (roots ? 1 : 4));
     require(parallel_stats.prune_parallel_fallbacks == 0);
     require(parallel_stats.priority_spills > 0);
     require(parallel_stats.prefetch_workers == 0);
@@ -1442,7 +1457,7 @@ static void compare_parallel_prune(const std::string& root,
       // before opening worker outputs and retain the exact serial result.
       PathGraph limited(0, 3, 0);
       initialize_parallel_prune_graph(limited,
-        root + "/parallel-prune-low-fd", storage);
+        root + "/parallel-prune-low-fd-" + tag, storage);
       PathGraphMergeStats limited_stats;
       limited.prune(lcp, GIGABYTE, group_budget, &limited_stats, 6,
         cache_budget, 4);
@@ -1457,11 +1472,12 @@ static void compare_parallel_prune(const std::string& root,
       // pairs, two output pairs and two spill descriptors, twelve in all.
       PathGraph budgeted(0, 3, 0);
       initialize_parallel_prune_graph(budgeted,
-        root + "/parallel-prune-worker-budget", storage);
+        root + "/parallel-prune-worker-budget-" + tag, storage);
       PathGraphMergeStats budgeted_stats;
       budgeted.prune(lcp, GIGABYTE, group_budget, &budgeted_stats, 6,
         cache_budget, 4, 64);
-      require(logical_prune_records(serial) == logical_prune_records(budgeted));
+      if(roots) { require(logical_prune_records(serial) == logical_prune_records(budgeted)); }
+      else { require(label_ordered_records(serial) == label_ordered_records(budgeted)); }
       require(budgeted.unique == serial.unique);
       require(budgeted.unsorted == serial.unsorted);
       require(budgeted_stats.prune_workers == 4);
@@ -1471,6 +1487,7 @@ static void compare_parallel_prune(const std::string& root,
         2 * budgeted_stats.prune_workers <= 64);
     }
   }
+  if(roots) { require(::unsetenv("GCSA_PRUNE_ROOT_PARTITIONS") == 0); }
   omp_set_num_threads(previous_threads); omp_set_dynamic(previous_dynamic);
 }
 
@@ -1552,6 +1569,9 @@ static void compare_split_depth_prune(const std::string& root)
   int previous_threads = omp_get_max_threads();
   int previous_dynamic = omp_get_dynamic();
   omp_set_dynamic(0); omp_set_num_threads(std::max(4, previous_threads));
+  // The split depth belongs to the root partitioning; the balanced prune has
+  // its own candidate depth.
+  require(::setenv("GCSA_PRUNE_ROOT_PARTITIONS", "1", 1) == 0);
   require(::setenv("GCSA_EXPERIMENTAL_PRUNE_SPLIT_DEPTH", "3", 1) == 0);
   {
     PathGraph serial(0, 3, 0), parallel(0, 3, 0);
@@ -1583,6 +1603,251 @@ static void compare_split_depth_prune(const std::string& root)
     require(parallel_stats.prune_workers == 4);
   }
   require(::unsetenv("GCSA_EXPERIMENTAL_PRUNE_SPLIT_DEPTH") == 0);
+  require(::unsetenv("GCSA_PRUNE_ROOT_PARTITIONS") == 0);
+  omp_set_num_threads(previous_threads); omp_set_dynamic(previous_dynamic);
+}
+
+static std::vector<key_type> balanced_prune_keys(Alphabet& alpha)
+{
+  const std::vector<std::string> labels = {
+    "AAAA", "ACAA", "ACCA", "ACCC", "CAAA", "CAAC",
+    "CCAA", "CCAC", "GAAA", "GAAC", "TAAA", "TAAC"
+  };
+  std::vector<key_type> result;
+  for(const std::string& label : labels)
+  {
+    comp_type comp = alpha.char2comp[label.front()];
+    byte_type edge = static_cast<byte_type>(1 << comp);
+    result.push_back(Key::encode(alpha, label, edge, edge));
+  }
+  std::sort(result.begin(), result.end());
+  return result;
+}
+
+// The logical-7 output shards of a pruned graph, each as the set of key ranks
+// its records start with, in shard order.
+static std::vector<std::set<PathNode::rank_type>> shard_ranks(const PathGraph& graph,
+  logical_file_id_t logical)
+{
+  std::vector<std::set<PathNode::rank_type>> result;
+  for(size_type file = 0; file < graph.files(); file++)
+  {
+    if(graph.logicalFile(file) != logical) { continue; }
+    std::vector<PathNode> paths;
+    std::vector<PathNode::rank_type> labels;
+    graph.read(paths, labels, file);
+    std::set<PathNode::rank_type> ranks;
+    for(const PathNode& node : paths) { ranks.insert(labels[node.pointer()]); }
+    result.push_back(ranks);
+  }
+  return result;
+}
+
+/*
+  Twelve 4-mer keys, ranks 0 to 11, whose neighbours share 1, 2, 3, 0, 3, 1,
+  3, 0, 3, 0 and 3 characters. At the default candidate depth every key is a
+  span except TAAA and TAAC, the last root, which stay one: eleven spans. The
+  records, in three shards of logical inputs 7, 7 and 8, give the spans these
+  parts:
+
+    1, 2, 3  ACAA and ACCA hold records from one start node, ACCC from another.
+             The serial pass keeps ACAA and ACCA apart: the ACAA group's LCP
+             (0, 2) does not exceed the right border of ACCA, (0, 3), so the
+             group would have to take ACCC as well, which differs. One merger
+             over a unit holding ACAA and ACCA and ending before ACCC sees no
+             right border and merges them, which is why each span runs through
+             a merger of its own.
+    4, 5     CAAA and CAAC share a start node: a crossing, stitched.
+    6, 7     CCAA's record has a label interval reaching CCAC: stitched.
+    8        equal labels from two shards and two start nodes.
+    10, 11   TAAA and TAAC share a start node inside the whole last root.
+
+  Every grouping into units must give the serial records (as a multiset per
+  label, since spans start fresh merge heaps) and exactly the same record
+  sequence as every other grouping, because spans, not units, decide.
+*/
+static void compare_balanced_prune(const std::string& root)
+{
+  Alphabet alpha;
+  std::vector<key_type> keys = balanced_prune_keys(alpha);
+  LCP lcp(keys, 4);
+  DeBruijnGraph mapper(keys, 4, alpha);
+  const std::vector<logical_file_id_t> logical = {
+    logical_file_id_t(7), logical_file_id_t(7), logical_file_id_t(8)
+  };
+  const std::vector<MergeFixtureRecord> records = {
+    merge_record(0, 0, 900), merge_record(1, 0, 900),
+    merge_record(0, 1, 100), merge_record(1, 1, 100), merge_record(0, 1, 100),
+    merge_record(1, 2, 100), merge_record(0, 2, 100),
+    merge_record(0, 3, 200),
+    merge_record(0, 4, 400), merge_record(1, 4, 400),
+    merge_record(1, 5, 400),
+    merge_record(1, 6, 600, 7),
+    merge_record(0, 7, 601), merge_record(2, 7, 601),
+    merge_record(0, 8, 800), merge_record(2, 8, 801),
+    merge_record(2, 9, 900),
+    merge_record(0, 10, 1000), merge_record(1, 10, 1000),
+    merge_record(1, 11, 1000)
+  };
+  const size_type group_budget = 4 * KILOBYTE;
+  const size_type cache_budget = 64 * MEGABYTE;
+  int previous_threads = omp_get_max_threads();
+  int previous_dynamic = omp_get_dynamic();
+  omp_set_dynamic(0); omp_set_num_threads(std::max(4, previous_threads));
+
+  for(bool framed : { false, true })
+  {
+    const std::string tag = (framed ? "framed" : "raw");
+    PathGraph serial(0, 4, 0);
+    initialize_merge_fixture(serial, root + "/balanced-serial-" + tag, records, 3, framed, &logical);
+    PathGraphMergeStats serial_stats;
+    serial.prune(lcp, GIGABYTE, group_budget, &serial_stats, 128, cache_budget, 1);
+    const auto serial_records = label_ordered_records(serial);
+    // ACAA and ACCA stay two nodes.
+    {
+      const auto& sevens = serial_records.at(logical_file_id_t(7));
+      size_type ranks_1_2 = 0;
+      for(const LogicalPruneRecord& record : sevens)
+      {
+        if(record.label.front() == 1 || record.label.front() == 2) { ranks_1_2++; }
+      }
+      require(ranks_1_2 == 2);
+    }
+    PathGraphMergeStats final_serial_stats;
+    MergedGraph serial_final(serial, mapper, lcp, GIGABYTE, MEGABYTE, &final_serial_stats, 128, cache_budget, 1);
+
+    std::map<logical_file_id_t, std::vector<LogicalPruneRecord>> sequence;
+    bool unit_ends_before_accc = false, stitch_across_units = false;
+    for(size_type workers : { 2, 3, 4 })
+    {
+      for(const char* per_worker : { "1", "2", "3", "4" })
+      {
+        require(::setenv("GCSA_PRUNE_UNITS_PER_WORKER", per_worker, 1) == 0);
+        const std::string name = root + "/balanced-" + tag + "-" + std::to_string(workers) + "-" + per_worker;
+        PathGraph parallel(0, 4, 0);
+        initialize_merge_fixture(parallel, name, records, 3, framed, &logical);
+        PathGraphMergeStats stats;
+        parallel.prune(lcp, GIGABYTE, group_budget, &stats, 128, cache_budget, workers);
+        require(stats.prune_parallel_fallbacks == 0 && stats.prune_fallback_reason == nullptr);
+        require(label_ordered_records(parallel) == serial_records);
+        require(stats.prune_workers >= 2 && stats.prune_workers <= workers);
+        require(stats.prune_split_depth == 4);
+        require(stats.prune_stitches == 2 && stats.prune_spans == 9);
+        require(stats.prune_tie_sensitive_ranges == 0);
+        require(parallel.size() == serial.size() && parallel.ranks() == serial.ranks());
+        require(parallel.ranges() == serial.ranges());
+        require(parallel.unique == serial.unique && parallel.redundant == serial.redundant);
+        require(parallel.unsorted == serial.unsorted);
+        require(parallel.nondeterministic == serial.nondeterministic);
+        const auto exact = logical_prune_records(parallel);
+        if(sequence.empty()) { sequence = exact; }
+        else { require(exact == sequence); }
+        for(const std::set<PathNode::rank_type>& ranks : shard_ranks(parallel, logical_file_id_t(7)))
+        {
+          if(ranks.count(1) && ranks.count(2) && !ranks.count(3)) { unit_ends_before_accc = true; }
+        }
+        // Eleven units of one span each, two stitches merging two each.
+        if(std::string(per_worker) == "4" && workers >= 3)
+        {
+          require(stats.prune_partitions == 9);
+          stitch_across_units = true;
+        }
+        if(workers == 4 && std::string(per_worker) == "2")
+        {
+          PathGraphMergeStats final_stats;
+          MergedGraph parallel_final(parallel, mapper, lcp, GIGABYTE, MEGABYTE, &final_stats, 128, cache_budget, 1);
+          require_same_merged_graph(serial_final, parallel_final);
+        }
+      }
+    }
+    require(::unsetenv("GCSA_PRUNE_UNITS_PER_WORKER") == 0);
+    require(unit_ends_before_accc && stitch_across_units);
+
+    // The root partitioning at the same depth runs the same spans except that
+    // it splits TAAA from TAAC and stitches them back: the same records in the
+    // same order.
+    {
+      require(::setenv("GCSA_PRUNE_ROOT_PARTITIONS", "1", 1) == 0);
+      require(::setenv("GCSA_EXPERIMENTAL_PRUNE_SPLIT_DEPTH", "4", 1) == 0);
+      PathGraph parallel(0, 4, 0);
+      initialize_merge_fixture(parallel, root + "/balanced-roots-" + tag, records, 3, framed, &logical);
+      PathGraphMergeStats stats;
+      parallel.prune(lcp, GIGABYTE, group_budget, &stats, 128, cache_budget, 4);
+      require(stats.prune_parallel_fallbacks == 0);
+      require(stats.prune_stitches == 3 && stats.prune_spans == 9 && stats.prune_partitions == 9);
+      require(logical_prune_records(parallel) == sequence);
+      require(::unsetenv("GCSA_EXPERIMENTAL_PRUNE_SPLIT_DEPTH") == 0);
+      require(::unsetenv("GCSA_PRUNE_ROOT_PARTITIONS") == 0);
+    }
+
+    // At candidate depth 2 the spans are the prefixes AA, AC, CA, CC, GA and
+    // TA; nothing crosses between them, and CCAA's interval stays inside the
+    // CC span.
+    {
+      require(::setenv("GCSA_PRUNE_CANDIDATE_DEPTH", "2", 1) == 0);
+      PathGraph parallel(0, 4, 0);
+      initialize_merge_fixture(parallel, root + "/balanced-depth2-" + tag, records, 3, framed, &logical);
+      PathGraphMergeStats stats;
+      parallel.prune(lcp, GIGABYTE, group_budget, &stats, 128, cache_budget, 4);
+      require(stats.prune_parallel_fallbacks == 0);
+      require(stats.prune_split_depth == 2 && stats.prune_spans == 6 && stats.prune_stitches == 0);
+      require(label_ordered_records(parallel) == serial_records);
+      require(::unsetenv("GCSA_PRUNE_CANDIDATE_DEPTH") == 0);
+    }
+  }
+
+  // Equal labels from two shards that differ in their label's LCP (one is an
+  // interval) are counted: a merge heap started at a split could order them
+  // differently than the serial pass.
+  {
+    const std::vector<MergeFixtureRecord> tie_records = {
+      merge_record(0, 0, 900), merge_record(0, 3, 300), merge_record(1, 3, 301, 4),
+      merge_record(0, 8, 800), merge_record(1, 9, 900)
+    };
+    PathGraph parallel(0, 4, 0);
+    initialize_merge_fixture(parallel, root + "/balanced-tie", tie_records, 2, false);
+    PathGraphMergeStats stats;
+    parallel.prune(lcp, GIGABYTE, group_budget, &stats, 128, cache_budget, 4);
+    require(stats.prune_parallel_fallbacks == 0);
+    require(stats.prune_tie_sensitive_ranges == 1);
+  }
+
+  // The balanced prune's workers divide the prune share of the cache and are
+  // admitted against the concurrent descriptor budget; the root partitioning
+  // keeps the caller's input cache and, for framed shards, --max-open-files.
+  {
+    const std::string base = root + "/balanced-admission";
+    PathGraph probe(0, 3, 0);
+    initialize_parallel_prune_graph(probe, base + "-probe", FIXTURE_FRAMED);
+    size_type pair_bytes = 0;
+    for(size_type file = 0; file < probe.files(); file++)
+    {
+      pair_bytes = std::max(pair_bytes,
+        CompressedBlockReader::workingMemoryEstimate(CompressedBlockReader::declaredBlockSize(probe.path_names[file])) +
+        CompressedBlockReader::workingMemoryEstimate(CompressedBlockReader::declaredBlockSize(probe.rank_names[file])));
+    }
+    const size_type two_workers = 2 * pair_bytes * probe.files() + pair_bytes;
+    std::vector<key_type> small_keys = parallel_prune_keys(alpha);
+    LCP small_lcp(small_keys, 3);
+    auto workers_for = [&](bool roots, size_type max_open_files, size_type concurrent,
+      size_type input_cache, size_type parallel_cache) -> size_type
+    {
+      static size_type serial_number = 0;
+      if(roots) { require(::setenv("GCSA_PRUNE_ROOT_PARTITIONS", "1", 1) == 0); }
+      PathGraph graph(0, 3, 0);
+      initialize_parallel_prune_graph(graph, base + "-" + std::to_string(serial_number++), FIXTURE_FRAMED);
+      PathGraphMergeStats stats;
+      graph.prune(small_lcp, GIGABYTE, group_budget, &stats, max_open_files, input_cache, 4,
+        concurrent, parallel_cache);
+      if(roots) { require(::unsetenv("GCSA_PRUNE_ROOT_PARTITIONS") == 0); }
+      return stats.prune_workers;
+    };
+    require(workers_for(true, 128, 0, two_workers, cache_budget) == 2);
+    require(workers_for(false, 128, 0, two_workers, 0) == 2);
+    require(workers_for(false, 128, 0, two_workers, cache_budget) == 4);
+    require(workers_for(true, 16, 128, cache_budget, cache_budget) == 2);
+    require(workers_for(false, 16, 128, cache_budget, cache_budget) == 4);
+  }
   omp_set_num_threads(previous_threads); omp_set_dynamic(previous_dynamic);
 }
 
@@ -1671,10 +1936,18 @@ int main()
   // framed, and mixed input generations, retained physical output shards,
   // logical-file semantics, forced spills, bounded-resource fallback, final
   // merge equality, checksum provenance, and exception cleanup.
-  compare_parallel_prune(root, FIXTURE_RAW);
-  compare_parallel_prune(root, FIXTURE_FRAMED);
-  compare_parallel_prune(root, FIXTURE_MIXED);
+  for(bool roots : { true, false })
+  {
+    compare_parallel_prune(root, FIXTURE_RAW, roots);
+    compare_parallel_prune(root, FIXTURE_FRAMED, roots);
+    compare_parallel_prune(root, FIXTURE_MIXED, roots);
+  }
   compare_split_depth_prune(root);
+  // Balanced units over quantile groupings of prefix-depth spans: a grouping
+  // that would be wrong for one merger per unit, stitches across units, label
+  // intervals past a split, the kept-whole last root, tie counting, and the
+  // prune's cache share and descriptor admission.
+  compare_balanced_prune(root);
   compare_parallel_prune_failure_cleanup(root);
   rmdir(root.c_str());
   return 0;

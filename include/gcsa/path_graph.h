@@ -324,6 +324,13 @@ struct PathGraphMergeStats
   // which bound the merge's parallel speedup.
   size_type merge_split_depth, merge_stitches;
   size_type merge_records, merge_largest_records;
+  // The partitioned prune: the prefix depth its key ranges (spans) were cut
+  // at, how many spans it ran, how many it pruned again as one span because a
+  // group crossed a split (stitches), and the equal-label ranges whose records
+  // from several shards differ in their label's LCP or last rank, the only
+  // ranges a merge heap restarted at a split could emit differently.
+  size_type prune_split_depth, prune_spans, prune_stitches;
+  size_type prune_tie_sensitive_ranges;
   // Why a requested parallel prune or merge ran serially (a string literal),
   // or null when it ran in parallel or was not requested.
   const char* prune_fallback_reason = nullptr;
@@ -345,7 +352,9 @@ struct PathGraphMergeStats
     prune_requested_workers(0), prune_workers(0), prune_partitions(0),
     prune_parallel_fallbacks(0), merge_workers(0), merge_partitions(0),
     merge_split_depth(0), merge_stitches(0),
-    merge_records(0), merge_largest_records(0) { }
+    merge_records(0), merge_largest_records(0),
+    prune_split_depth(0), prune_spans(0), prune_stitches(0),
+    prune_tie_sensitive_ranges(0) { }
 };
 
 //------------------------------------------------------------------------------
@@ -452,15 +461,19 @@ struct PathGraph
   // things: the equal-label group and range deque with one label range, the
   // input cache with the shard count. Zero means "share group_buffer_bytes",
   // which is what a raw generation wants. concurrent_open_files is the
-  // descriptor budget concurrent workers may share when they hold raw shards
-  // open; zero, or anything below max_open_files, means max_open_files.
+  // descriptor budget concurrent workers may share; zero, or anything below
+  // max_open_files, means max_open_files. parallel_cache_bytes is what the
+  // workers of the balanced partitioned prune divide for their decoded input
+  // blocks (zero means input_cache_bytes); the caller sizes it for a phase in
+  // which nothing else of that size is resident.
   void prune(const LCP& lcp, size_type size_limit,
     size_type group_buffer_bytes = MEGABYTE,
     PathGraphMergeStats* stats = nullptr,
     size_type max_open_files = 128,
     size_type input_cache_bytes = 0,
     size_type prune_workers = 1,
-    size_type concurrent_open_files = 0);
+    size_type concurrent_open_files = 0,
+    size_type parallel_cache_bytes = 0);
   void extend(size_type size_limit, size_type memory_limit);
 
   void debugExtend();

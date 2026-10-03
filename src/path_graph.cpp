@@ -20,6 +20,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <stdexcept>
 #include <thread>
@@ -3829,7 +3830,8 @@ prunePathRange(const PathGraph& source, const LCP& lcp,
   PriorityNode* last_output, bool* has_output, ProgressReporter* progress,
   bool* first_range_open = nullptr,
   const size_type* start_offsets = nullptr, const size_type* stop_offsets = nullptr,
-  PathGraphInputCache* shared_input = nullptr)
+  PathGraphInputCache* shared_input = nullptr,
+  PathNode::rank_type* max_last_rank = nullptr, size_type* tie_sensitive_ranges = nullptr)
 {
   PathGraphMerger merger(source, lcp, group_buffer_bytes, stats, input_pairs,
     input_cache_bytes, lower_rank, upper_rank,
@@ -3837,6 +3839,9 @@ prunePathRange(const PathGraph& source, const LCP& lcp,
     // would oversubscribe CPUs and duplicate cache reservations.
     (cancelled == nullptr ? PathGraphInputCache::MAX_PREFETCH_WORKERS : 0),
     start_offsets, stop_offsets, shared_input);
+  // A partition reports the last label ranks it read and its tie-sensitive
+  // ranges (PathGraphMerger::track_ranges); the serial pass needs neither.
+  merger.track_ranges = (max_last_rank != nullptr || tie_sensitive_ranges != nullptr);
 
   auto write_output = [&](PriorityNode node)
   {
@@ -3915,6 +3920,8 @@ prunePathRange(const PathGraph& source, const LCP& lcp,
       progress->advance(range.second - range.first + 1);
     }
   }
+  if(max_last_rank != nullptr) { *max_last_rank = merger.max_last_rank; }
+  if(tie_sensitive_ranges != nullptr) { *tie_sensitive_ranges = merger.tie_sensitive_ranges; }
   merger.close();
 }
 
@@ -3963,46 +3970,241 @@ pruneConcurrentPeak(const std::vector<PathGraphMergeStats>& parts,
   return result;
 }
 
-struct PrunePartition
+/*
+  The partitioned prune's two granularities. A span is a key range the
+  exactness argument is made over: a range cut at the split depth, whose
+  records each run through a merger of their own, and whose first and last
+  outputs the crossing test reads. A unit is what one worker prunes in one go:
+  adjacent spans, merged one after another into one output builder and read
+  through one input cache. Units only decide where records are stored and who
+  computes them; every decision of the prune is made inside a span.
+*/
+struct PruneSpan
 {
   PathNode::rank_type lower_rank, upper_rank;
-  std::unique_ptr<PathGraph> graph;
-  PathGraphMergeStats stats;
-  PriorityNode first_output, last_output;
-  bool has_output, first_range_open;
   // Per-shard record offsets of lower_rank and upper_rank.
   std::vector<size_type> start_offsets, stop_offsets;
+  size_type records;
+  PriorityNode first_output, last_output;
+  bool has_output, first_range_open;
+  // The largest first rank of any label's last rank the span read.
+  PathNode::rank_type max_last_rank;
+  size_type tie_sensitive_ranges;
 
-  PrunePartition() : lower_rank(0), upper_rank(0), graph(), stats(),
-    first_output(), last_output(), has_output(false), first_range_open(false) { }
+  PruneSpan() : lower_rank(0), upper_rank(0), records(0), first_output(),
+    last_output(), has_output(false), first_range_open(false), max_last_rank(0),
+    tie_sensitive_ranges(0) { }
 };
 
-void
-buildPrunePartition(PrunePartition& result, const PathGraph& source,
-  const LCP& lcp, size_type size_limit, size_type group_buffer_bytes,
-  size_type input_cache_bytes, size_type input_pairs, size_type output_pairs,
-  const PruneOutputLayout& layout, std::atomic<size_type>& output_bytes,
-  std::atomic<bool>& cancelled, PathGraphInputCache* shared_input = nullptr)
+struct PruneUnit
 {
+  size_type first_span, last_span; // [first_span, last_span)
+  size_type records;
+  std::unique_ptr<PathGraph> graph;
+  PathGraphMergeStats stats;
+
+  PruneUnit() : first_span(0), last_span(0), records(0), graph(), stats() { }
+};
+
+// A unit's statistics over its spans: counts add up, and the peaks are the
+// largest of any span, because the spans run one after another.
+void
+addPruneSpanStats(PathGraphMergeStats& total, const PathGraphMergeStats& part)
+{
+  addPruneStats(total, part);
+  total.max_open_input_pairs = std::max(total.max_open_input_pairs, part.max_open_input_pairs);
+  total.max_open_output_pairs = std::max(total.max_open_output_pairs, part.max_open_output_pairs);
+  total.max_input_buffer_bytes = std::max(total.max_input_buffer_bytes, part.max_input_buffer_bytes);
+  total.prefetch_workers = std::max(total.prefetch_workers, part.prefetch_workers);
+  total.max_prefetch_bytes = std::max(total.max_prefetch_bytes, part.max_prefetch_bytes);
+  total.oversized_input_pair_bytes = std::max(total.oversized_input_pair_bytes,
+    part.oversized_input_pair_bytes);
+  total.max_from_set_nodes = std::max(total.max_from_set_nodes, part.max_from_set_nodes);
+}
+
+/*
+  Prunes the unit's spans in key order into one builder, each span through a
+  merger of its own, so a span's output is exactly what pruning it alone would
+  write. Each merger starts with the left border (0, 0) and ends with no right
+  neighbour, as a partition always has, and the crossing test in
+  buildPrunedGraphParallel() is exact for that. One merger reading across the
+  splits inside a unit would not be: a range starting at an inner split has a
+  left LCP below the split depth, so its group LCP can fall below the LCP
+  across the unit's end, and the serial pass then decides the group by
+  records past that end, where a merger that ends there closes it. Records
+  of one span start in the blocks the previous span read last, so the shared
+  cache decodes nothing twice inside a unit.
+*/
+void
+buildPruneUnit(PruneUnit& unit, std::vector<PruneSpan>& spans,
+  const PathGraph& source, const LCP& lcp, size_type size_limit,
+  size_type group_buffer_bytes, size_type input_cache_bytes,
+  size_type input_pairs, size_type output_pairs,
+  const PruneOutputLayout& layout, std::atomic<size_type>& output_bytes,
+  std::atomic<bool>& cancelled, PathGraphInputCache* shared_input)
+{
+  unit.stats = PathGraphMergeStats();
   PathGraphBuilder builder(layout.logical.size(), source.k(), source.step(),
-    size_limit, group_buffer_bytes, output_pairs, &(result.stats));
+    size_limit, group_buffer_bytes, output_pairs, &(unit.stats));
   builder.graph.logical_file_ids = layout.logical;
   builder.graph.physical_shard_ids = layout.physical;
-  prunePathRange<false>(source, lcp, result.lower_rank, result.upper_rank,
-    group_buffer_bytes, input_cache_bytes, input_pairs, layout, builder,
-    &(result.stats), &output_bytes, size_limit, &cancelled,
-    &(result.first_output), &(result.last_output), &(result.has_output), nullptr,
-    &(result.first_range_open),
-    (result.start_offsets.empty() ? nullptr : result.start_offsets.data()),
-    (result.stop_offsets.empty() ? nullptr : result.stop_offsets.data()),
-    shared_input);
+  // Each merger points the lent cache at its own statistics; do not leave it
+  // pointing at a span's once the span is done.
+  struct StatsRelease
+  {
+    PathGraphInputCache* input;
+    ~StatsRelease() { if(this->input != nullptr) { this->input->setStats(nullptr); } }
+  };
+  for(size_type s = unit.first_span; s < unit.last_span; s++)
+  {
+    PruneSpan& span = spans[s];
+    span.has_output = false; span.first_range_open = false;
+    span.max_last_rank = 0; span.tie_sensitive_ranges = 0;
+    if(span.records == 0) { continue; }
+    PathGraphMergeStats span_stats;
+    {
+      StatsRelease release = { shared_input };
+      prunePathRange<false>(source, lcp, span.lower_rank, span.upper_rank,
+        group_buffer_bytes, input_cache_bytes, input_pairs, layout, builder,
+        &span_stats, &output_bytes, size_limit, &cancelled,
+        &(span.first_output), &(span.last_output), &(span.has_output), nullptr,
+        &(span.first_range_open),
+        (span.start_offsets.empty() ? nullptr : span.start_offsets.data()),
+        (span.stop_offsets.empty() ? nullptr : span.stop_offsets.data()),
+        shared_input, &(span.max_last_rank), &(span.tie_sensitive_ranges));
+    }
+    addPruneSpanStats(unit.stats, span_stats);
+  }
   builder.close();
 
   // Retain only the lightweight graph metadata between tasks. In particular,
   // do not retain every completed builder's output-cache vector capacity; that
-  // would turn a worker bound into a partition-count bound.
-  result.graph.reset(new PathGraph(0, source.k(), source.step()));
-  result.graph->swap(builder.graph);
+  // would turn a worker bound into a unit-count bound.
+  unit.graph.reset(new PathGraph(0, source.k(), source.step()));
+  unit.graph->swap(builder.graph);
+}
+
+// The balanced prune cuts its spans where adjacent keys share fewer than this
+// many leading characters; GCSA_PRUNE_CANDIDATE_DEPTH (1 to 16) overrides it.
+// On the chr18 merge frontier depth 4 gives 441 ranges with the '#' subtree
+// whole, the largest holding 1.1% of the records, against 3.2% at depth 3:
+// fine enough for two units per worker at several dozen workers.
+constexpr size_type PRUNE_CANDIDATE_DEPTH = 4;
+
+// Units per admitted worker. One per worker leaves the step waiting on the
+// largest; the joint chr2+chr18 prunes ended with 56-78 s at about 1.8
+// threads that way. Every unit start decodes one block pair of every shard
+// that its neighbour also decodes, so more units cost decoding.
+constexpr size_type PRUNE_UNITS_PER_WORKER = 2;
+
+// GCSA_PRUNE_UNITS_PER_WORKER (1 to 64) overrides PRUNE_UNITS_PER_WORKER.
+size_type
+pruneUnitsPerWorker()
+{
+  const char* value = std::getenv("GCSA_PRUNE_UNITS_PER_WORKER");
+  if(value == nullptr || *value == '\0') { return PRUNE_UNITS_PER_WORKER; }
+  const unsigned long long units = std::strtoull(value, nullptr, 10);
+  return static_cast<size_type>(std::max<unsigned long long>(1, std::min<unsigned long long>(units, 64)));
+}
+
+// GCSA_PRUNE_ROOT_PARTITIONS=1 restores the earlier partitioned prune for
+// comparisons and as a fallback: one unit per span, the spans cut at
+// GCSA_EXPERIMENTAL_PRUNE_SPLIT_DEPTH (default 1, the zero-LCP roots), the
+// workers dividing the caller's input cache rather than the prune share, and
+// framed workers admitted against --max-open-files.
+bool
+pruneRootPartitionsRequested()
+{
+  const char* value = std::getenv("GCSA_PRUNE_ROOT_PARTITIONS");
+  return (value != nullptr && std::string(value) == "1");
+}
+
+size_type
+pruneCandidateDepth()
+{
+  const char* value = std::getenv("GCSA_PRUNE_CANDIDATE_DEPTH");
+  if(value == nullptr || *value == '\0') { return PRUNE_CANDIDATE_DEPTH; }
+  const unsigned long long depth = std::strtoull(value, nullptr, 10);
+  return (depth == 0 ? 1 : static_cast<size_type>(std::min<unsigned long long>(depth, 16)));
+}
+
+/*
+  Spans for the balanced prune: pruneRootPartitions() at the candidate depth,
+  except that the last root's subtree stays whole. In a GCSA input the last
+  character is the end marker '#'. Its keys below '#A', '#C', '#G' and '#T'
+  all start at the end node's last offset, so the serial pass collapses each
+  of those subtrees into one group and every split inside one is stitched
+  (four at depth 3 on chr18), while the subtree holds 26,623 of chr18's 112
+  million keys. Splits inside it share fewer than `depth` characters, but its
+  left border is a zero-LCP split and nothing follows it, so a merger started
+  at it sees the serial pass's borders on both sides. With a single root
+  there is nothing to keep whole.
+*/
+bool
+pruneCandidateRanges(const LCP& lcp, size_type depth,
+  std::vector<std::pair<PathNode::rank_type, PathNode::rank_type>>& ranges)
+{
+  if(!pruneRootPartitions(lcp, ranges, depth)) { return false; }
+  if(depth <= 1) { return true; }
+  const LCP::rank_type zero = 0;
+  const size_type roots = lcp.kmer_lcp.rank(lcp.total_keys, zero);
+  if(roots == 0) { return true; }
+  const size_type last_root = lcp.kmer_lcp.select(roots, zero);
+  if(last_root == 0 || last_root >= lcp.total_keys) { return true; }
+  for(size_type i = 0; i < ranges.size(); i++)
+  {
+    if(ranges[i].first >= last_root)
+    {
+      ranges[i].second = ranges.back().second;
+      ranges.resize(i + 1);
+      break;
+    }
+  }
+  return (ranges.size() > 1);
+}
+
+/*
+  Groups adjacent spans into at most `count` units of similar record counts.
+  Each cut falls at the span boundary nearest the open unit's share of the
+  records still to be placed, so the units follow the record-count quantiles
+  as closely as the spans allow; a span larger than its share is a unit
+  alone. Spans without records join a neighbouring unit.
+*/
+std::vector<std::pair<size_type, size_type>>
+groupPruneSpans(const std::vector<PruneSpan>& spans, size_type count)
+{
+  std::vector<std::pair<size_type, size_type>> result;
+  size_type total = 0;
+  for(const PruneSpan& span : spans) { total += span.records; }
+  count = std::max(static_cast<size_type>(1), count);
+  size_type begin = 0, records = 0, placed = 0;
+  for(size_type i = 0; i < spans.size(); i++)
+  {
+    // The open unit is below its share here, or it would have been closed.
+    if(records > 0 && count - result.size() > 1)
+    {
+      const size_type share = (total - placed) / (count - result.size());
+      if(records + spans[i].records > share &&
+         records + spans[i].records - share > share - records)
+      {
+        result.push_back(std::make_pair(begin, i));
+        placed += records; begin = i; records = 0;
+      }
+    }
+    records += spans[i].records;
+    if(records > 0 && count - result.size() > 1 &&
+       records >= (total - placed) / (count - result.size()))
+    {
+      result.push_back(std::make_pair(begin, i + 1));
+      placed += records; begin = i + 1; records = 0;
+    }
+  }
+  if(begin < spans.size())
+  {
+    if(records == 0 && !result.empty()) { result.back().second = spans.size(); }
+    else { result.push_back(std::make_pair(begin, spans.size())); }
+  }
+  return result;
 }
 
 /*
@@ -4080,20 +4282,33 @@ declineParallel(const char** reason_out, const char* reason)
   return false;
 }
 
+/*
+  The partitioned prune. Spans are cut where adjacent keys share fewer than
+  the split depth's leading characters (with the last root whole in the
+  balanced prune); units group adjacent spans by record-count quantiles, about
+  pruneUnitsPerWorker() per worker, so the step does not wait on one large
+  partition. Every split between units is a split between spans, so any
+  grouping is exact if pruning the spans separately is, which is what the
+  crossing test and the stitching below establish; the grouping only decides
+  which output shard holds a span's records.
+*/
 bool
 buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   size_type size_limit, size_type group_buffer_bytes,
   PathGraphMergeStats* stats, size_type max_open_files,
   size_type input_cache_bytes, size_type requested_workers,
   const PruneOutputLayout& layout, const char** fallback_reason,
-  size_type concurrent_open_files)
+  size_type concurrent_open_files, size_type parallel_cache_bytes)
 {
   std::vector<std::pair<PathNode::rank_type, PathNode::rank_type>> ranges;
   if(requested_workers < 2 || source.size() == 0 || layout.logical.empty()) { return false; }
-  const size_type split_depth = pruneSplitDepth();
-  if(!pruneRootPartitions(lcp, ranges, split_depth))
+  const bool balanced = !pruneRootPartitionsRequested();
+  const size_type split_depth = (balanced ? pruneCandidateDepth() : pruneSplitDepth());
+  if(!(balanced ? pruneCandidateRanges(lcp, split_depth, ranges) :
+       pruneRootPartitions(lcp, ranges, split_depth)))
   {
-    return declineParallel(fallback_reason, "no zero-LCP root partitions");
+    return declineParallel(fallback_reason,
+      (split_depth == 1 ? "no zero-LCP root partitions" : "no prefix partitions"));
   }
 
   const size_type minimum_group = std::max(
@@ -4132,17 +4347,27 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
     return declineParallel(fallback_reason, "input window size overflows");
   }
   const size_type resident_per_worker = resident_pair * source.files();
-  const size_type cache_budget = (input_cache_bytes == 0 ?
+  // Each framed worker holds a decoded block pair of every shard, about 67 MB
+  // per shard on chr18, so the input cache sets the worker count: a quarter of
+  // the memory goal admitted 6-7 workers on the joint chr2+chr18 steps, whose
+  // prunes peaked at 12.6-14.5 GiB of a 96 GiB goal. The balanced prune
+  // divides the caller's larger prune share instead (parallel_cache_bytes).
+  size_type cache_budget = (input_cache_bytes == 0 ?
     group_buffer_bytes : input_cache_bytes);
+  if(balanced) { cache_budget = std::max(cache_budget, parallel_cache_bytes); }
   if(resident_per_worker > 0)
   {
     workers = std::min(workers, cache_budget / resident_per_worker);
   }
   // Raw readers hold their descriptors for the whole pass, so the workers'
   // descriptors are real and come from the separate concurrent budget. Framed
-  // readers open theirs transiently and stay under the merge ceiling, which
-  // also sizes each framed worker's input share below.
-  const size_type admission_files = (all_framed ? max_open_files :
+  // readers open theirs transiently, but each worker still keeps its output
+  // pairs and spill files open; the earlier prune admitted framed workers
+  // against the merge ceiling, at most 21 at 128 descriptors with one
+  // descriptor pair of output each, which also cycles a multi-input build's
+  // outputs through one pair. The balanced prune admits them against the
+  // concurrent budget as well.
+  const size_type admission_files = (all_framed && !balanced ? max_open_files :
     std::max(max_open_files, concurrent_open_files));
   workers = std::min(workers, admission_files / 6);
   if(!all_framed)
@@ -4163,7 +4388,7 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   // rounded share cannot retain the full raw/mixed input set, reduce
   // concurrency rather than admit a known cache-thrashing execution.
   size_type worker_open_files = 0, output_pairs = 0, input_pairs = 0;
-  while(workers >= 2)
+  auto descriptor_shares = [&]() -> bool
   {
     worker_open_files = admission_files / workers;
     output_pairs = pathMergeOutputPairs(worker_open_files, layout.logical.size());
@@ -4171,18 +4396,14 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
       layout.logical.size()) : source.files());
     size_type required_fds = 2 + 2 * output_pairs +
       2 * (all_framed ? static_cast<size_type>(1) : input_pairs);
-    if(required_fds <= worker_open_files) { break; }
-    workers--;
-  }
+    return (required_fds <= worker_open_files);
+  };
+  while(workers >= 2 && !descriptor_shares()) { workers--; }
   if(workers < 2)
   {
     return declineParallel(fallback_reason, "open-file share cannot hold each worker's shards");
   }
-
-  const size_type worker_group = group_buffer_bytes / workers;
-  const size_type worker_cache = (input_cache_bytes == 0 ? worker_group :
-    input_cache_bytes / workers);
-  if(resident_per_worker > worker_cache)
+  if(resident_per_worker > cache_budget / workers)
   {
     return declineParallel(fallback_reason, "input cache cannot hold each worker's windows");
   }
@@ -4194,64 +4415,149 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
     shardPassThreads(source, pair_bytes, cache_budget)));
   validatePruneShardTails(source, lcp, pass_pair, pass_threads);
 
-  std::vector<PrunePartition> partitions(ranges.size());
+  std::vector<PruneSpan> spans(ranges.size());
   for(size_type i = 0; i < ranges.size(); i++)
   {
-    partitions[i].lower_rank = ranges[i].first;
-    partitions[i].upper_rank = ranges[i].second;
+    spans[i].lower_rank = ranges[i].first;
+    spans[i].upper_rank = ranges[i].second;
   }
   const auto locate_start = std::chrono::steady_clock::now();
-  locatePartitionBounds(source, partitions, pass_pair, pass_threads);
+  locatePartitionBounds(source, spans, pass_pair, pass_threads);
   if(Verbosity::level >= Verbosity::EXTENDED)
   {
-    std::cerr << "PathGraph::prune(): located " << partitions.size() << " partition bounds in "
+    std::cerr << "PathGraph::prune(): located " << spans.size() << " partition bounds in "
               << source.files() << " shard(s) in "
               << std::chrono::duration<double>(std::chrono::steady_clock::now() - locate_start).count()
               << " seconds" << std::endl;
   }
+  size_type total_records = 0, nonempty_spans = 0;
+  for(PruneSpan& span : spans)
+  {
+    for(size_type file = 0; file < source.files(); file++)
+    {
+      span.records += span.stop_offsets[file] - span.start_offsets[file];
+    }
+    total_records += span.records;
+    if(span.records > 0) { nonempty_spans++; }
+  }
+  if(total_records != source.size())
+  {
+    return declineParallel(fallback_reason, "the key ranges do not cover the input");
+  }
 
-  std::atomic<size_type> output_bytes(0), next_partition(0);
+  std::vector<PruneUnit> units;
+  {
+    std::vector<std::pair<size_type, size_type>> groups;
+    if(balanced)
+    {
+      workers = std::min(workers, nonempty_spans);
+      if(workers < 2)
+      {
+        return declineParallel(fallback_reason, "fewer than two key ranges hold input");
+      }
+      groups = groupPruneSpans(spans, std::min(nonempty_spans, pruneUnitsPerWorker() * workers));
+    }
+    else
+    {
+      for(size_type i = 0; i < spans.size(); i++) { groups.push_back(std::make_pair(i, i + 1)); }
+    }
+    units.resize(groups.size());
+    for(size_type u = 0; u < groups.size(); u++)
+    {
+      units[u].first_span = groups[u].first; units[u].last_span = groups[u].second;
+      for(size_type s = groups[u].first; s < groups[u].second; s++) { units[u].records += spans[s].records; }
+    }
+  }
+  if(balanced)
+  {
+    workers = std::min(workers, static_cast<size_type>(units.size()));
+    if(workers < 2)
+    {
+      return declineParallel(fallback_reason, "fewer than two key ranges hold input");
+    }
+    // Fewer workers only widen each one's descriptor share: the requirement
+    // grows by at most half of any growth of the share.
+    descriptor_shares();
+  }
+  const size_type worker_group = group_buffer_bytes / workers;
+  const size_type worker_cache = cache_budget / workers;
+  if(Verbosity::level >= Verbosity::EXTENDED)
+  {
+    // The largest unit bounds the speedup: no worker finishes before the one
+    // pruning it.
+    size_type largest = 0;
+    for(const PruneUnit& unit : units) { largest = std::max(largest, unit.records); }
+    std::cerr << "PathGraph::prune(): " << units.size() << " unit(s) over " << spans.size()
+              << " span(s) at prefix depth " << split_depth << " ("
+              << (balanced ? "balanced" : "one unit per span") << "), " << nonempty_spans
+              << " holding input; largest unit " << largest << " of " << total_records
+              << " records (" << (total_records == 0 ? 0.0 :
+                 100.0 * static_cast<double>(largest) / static_cast<double>(total_records))
+              << "%); " << workers << " worker(s) dividing " << formatBytes(cache_budget)
+              << " of input cache over " << source.files() << " shard(s), "
+              << worker_open_files << " descriptors each" << std::endl;
+  }
+
+  std::atomic<size_type> output_bytes(0);
   std::atomic<bool> cancelled(false);
-  std::vector<std::exception_ptr> errors(partitions.size());
-  // Workers take runs of adjacent partitions and keep one input cache across
-  // them. Adjacent partitions start in the same compressed blocks, and each
-  // shard's offsets only ascend within a worker, so a block one partition
-  // decoded serves the next instead of being decoded again. Four runs per
-  // worker keep the tail balanced.
-  const size_type run_length = std::max(static_cast<size_type>(1),
-    partitions.size() / (4 * workers));
+  std::vector<std::exception_ptr> errors(units.size());
+  // Each worker starts at an evenly spaced unit and then takes the unit after
+  // the one it finished, while that one is unclaimed, else the largest
+  // unclaimed unit. A unit starts in the blocks its left neighbour read last,
+  // so a worker that continues into the next unit decodes them once instead
+  // of every unit start decoding a block pair of every shard again.
+  const size_type no_unit = units.size();
+  std::mutex claim_mutex;
+  std::vector<bool> claimed(units.size(), false);
+  size_type starts = 0;
+  auto claim = [&](size_type previous) -> size_type
+  {
+    std::lock_guard<std::mutex> lock(claim_mutex);
+    size_type wanted = no_unit;
+    if(previous == no_unit)
+    {
+      if(starts < workers) { wanted = starts * units.size() / workers; }
+      starts++;
+    }
+    else if(previous + 1 < units.size()) { wanted = previous + 1; }
+    if(wanted == no_unit || claimed[wanted])
+    {
+      wanted = no_unit;
+      for(size_type u = 0; u < units.size(); u++)
+      {
+        if(!claimed[u] && (wanted == no_unit || units[u].records > units[wanted].records)) { wanted = u; }
+      }
+    }
+    if(wanted != no_unit) { claimed[wanted] = true; }
+    return wanted;
+  };
   auto run = [&]()
   {
     std::unique_ptr<PathGraphInputCache> shared_input;
-    for(size_type start = next_partition.fetch_add(run_length, std::memory_order_relaxed);
-        start < partitions.size();
-        start = next_partition.fetch_add(run_length, std::memory_order_relaxed))
+    for(size_type u = claim(no_unit); u != no_unit; u = claim(u))
     {
-      const size_type stop = std::min(start + run_length, partitions.size());
-      for(size_type i = start; i < stop; i++)
+      if(cancelled.load(std::memory_order_relaxed)) { return; }
+      try
       {
-        if(cancelled.load(std::memory_order_relaxed)) { return; }
-        try
+        if(!shared_input)
         {
-          if(!shared_input)
-          {
-            shared_input.reset(new PathGraphInputCache(source, nullptr, input_pairs,
-              worker_cache, 0));
-          }
-          buildPrunePartition(partitions[i], source, lcp, size_limit,
-            worker_group, worker_cache, input_pairs, output_pairs, layout,
-            output_bytes, cancelled, shared_input.get());
+          shared_input.reset(new PathGraphInputCache(source, nullptr, input_pairs,
+            worker_cache, 0));
         }
-        catch(...)
-        {
-          errors[i] = std::current_exception();
-          cancelled.store(true, std::memory_order_relaxed);
-        }
+        buildPruneUnit(units[u], spans, source, lcp, size_limit, worker_group,
+          worker_cache, input_pairs, output_pairs, layout, output_bytes, cancelled,
+          shared_input.get());
+      }
+      catch(...)
+      {
+        errors[u] = std::current_exception();
+        cancelled.store(true, std::memory_order_relaxed);
       }
     }
     if(shared_input) { shared_input->close(); }
   };
 
+  const auto prune_start = std::chrono::steady_clock::now();
   std::vector<std::thread> threads;
   threads.reserve(workers - 1);
   std::exception_ptr startup_error;
@@ -4273,6 +4579,8 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   if(!startup_error) { run(); }
   for(std::thread& thread : threads) { thread.join(); }
   if(startup_error) { std::rethrow_exception(startup_error); }
+  const double prune_seconds =
+    std::chrono::duration<double>(std::chrono::steady_clock::now() - prune_start).count();
 
   std::exception_ptr first_error;
   bool size_limit_exceeded = false;
@@ -4294,49 +4602,57 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   // Validate the actual emitted neighbors. A malformed or unusual label range
   // that spans a planned root split cannot be published as independent shards;
   // discard the attempt and let the exact serial route decide the groups.
+  const auto stitch_start = std::chrono::steady_clock::now();
+  size_type stitches = 0, stitched_spans = 0;
   if(split_depth > 1)
   {
-    // Every comparison inside a partition shares at least split_depth leading
-    // characters, so only a partition whose first range merged all of it can
-    // reach a split. The serial merger carries that range across only if
-    // (a) the LCP across the right split exceeds the LCP across the left one,
-    // which is the range's left_lcp; and (b) every partition below that right
-    // LCP is also one merged range from the same start node and logical file,
-    // because extendRange() stops at the first group that fails either test.
-    // Such a span is one group in the serial pass, so prune it again as one
-    // partition (stitch it) and repeat until no merged range crosses a split.
-    // The keys below '#A', '#C', '#G' and '#T' all start at the end node's
-    // last offset, so a split inside one of those subtrees is always stitched.
+    // Every comparison inside a span cut at split_depth shares at least
+    // split_depth leading characters, so only a span whose first range merged
+    // all of it can reach a split. The serial merger carries that range across
+    // only if (a) the LCP across the right split exceeds the LCP across the
+    // left one, which is the range's left_lcp; and (b) every span below that
+    // right LCP is also one merged range from the same start node and logical
+    // file, because extendRange() stops at the first group that fails either
+    // test. Such a run of spans is one group in the serial pass, so prune it
+    // again as one span (stitch it) and repeat until no merged range crosses a
+    // split. The keys below '#A', '#C', '#G' and '#T' all start at the end
+    // node's last offset, so a split inside one of those subtrees is always
+    // stitched; the balanced prune keeps the '#' subtree whole for that
+    // reason, and its zero-LCP left split makes any group crossing it fail
+    // (a). Nothing here depends on which spans share a unit: a stitch prunes
+    // the units holding its spans again as one unit.
     auto split_lcp = [&](size_type left, size_type right) -> range_type
     {
-      return lcp.max_lcp(partitions[left].last_output.node, partitions[right].first_output.node,
-        partitions[left].last_output.label, partitions[right].first_output.label);
+      return lcp.max_lcp(spans[left].last_output.node, spans[right].first_output.node,
+        spans[left].last_output.label, spans[right].first_output.label);
     };
     auto same_start = [&](size_type a, size_type b) -> bool
     {
-      return partitions[a].first_output.node.from == partitions[b].first_output.node.from &&
-        source.logicalFile(partitions[a].first_output.file) ==
-        source.logicalFile(partitions[b].first_output.file);
+      return spans[a].first_output.node.from == spans[b].first_output.node.from &&
+        source.logicalFile(spans[a].first_output.file) ==
+        source.logicalFile(spans[b].first_output.file);
     };
-    size_type stitches = 0, stitched_partitions = 0, logged = 0;
+    size_type logged = 0;
     while(true)
     {
       // A node merged in an earlier step carries a label interval. If one
-      // reaches past its partition's split, its neighbors' LCPs depend on keys
-      // in later partitions: stitch through the partition holding its end.
+      // reaches past its span's split, its neighbors' LCPs depend on keys in
+      // later spans: stitch through the span holding its end. The input
+      // records' last ranks cover every interval the span's outputs carry.
       size_type stitch_first = 0, stitch_last = 0;
       bool found = false;
       std::vector<size_type> nonempty;
-      for(size_type i = 0; !found && i < partitions.size(); i++)
+      for(size_type i = 0; !found && i < spans.size(); i++)
       {
-        const PrunePartition& part = partitions[i];
-        if(!part.has_output) { continue; }
-        const PathNode::rank_type last = part.last_output.node.lastLabel(0, part.last_output.label);
-        if(last >= part.upper_rank)
+        const PruneSpan& span = spans[i];
+        if(!span.has_output) { continue; }
+        const PathNode::rank_type last = std::max(span.max_last_rank,
+          span.last_output.node.lastLabel(0, span.last_output.label));
+        if(last >= span.upper_rank)
         {
           size_type j = i + 1;
-          while(j < partitions.size() && partitions[j].upper_rank <= last) { j++; }
-          if(j >= partitions.size())
+          while(j < spans.size() && spans[j].upper_rank <= last) { j++; }
+          if(j >= spans.size())
           {
             std::cerr << "PathGraph::prune(): warning: a label range reaches past the last partition; "
                       << "pruning this step serially" << std::endl;
@@ -4346,8 +4662,8 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
           if(Verbosity::level >= Verbosity::EXTENDED && logged < 32)
           {
             logged++;
-            std::cerr << "PathGraph::prune(): partition " << i << " of " << partitions.size()
-                      << " (keys " << part.lower_rank << " to " << part.upper_rank
+            std::cerr << "PathGraph::prune(): span " << i << " of " << spans.size()
+                      << " (keys " << span.lower_rank << " to " << span.upper_rank
                       << "): a label interval reaches key " << last << std::endl;
           }
           break;
@@ -4358,7 +4674,7 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
       for(size_type n = 0; !found && n + 1 < nonempty.size(); n++)
       {
         const size_type i = nonempty[n];
-        if(!(partitions[i].first_range_open)) { continue; }
+        if(!(spans[i].first_range_open)) { continue; }
         const range_type left = (n == 0 ? range_type(0, 0) : split_lcp(nonempty[n - 1], i));
         const range_type right = split_lcp(i, nonempty[n + 1]);
         bool crosses = (right > left);
@@ -4369,19 +4685,19 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
           {
             const size_type j = nonempty[checked];
             if(split_lcp(nonempty[checked - 1], j) < right) { break; }
-            if(!(partitions[j].first_range_open) || !same_start(i, j)) { crosses = false; break; }
+            if(!(spans[j].first_range_open) || !same_start(i, j)) { crosses = false; break; }
           }
         }
         if(Verbosity::level >= Verbosity::EXTENDED && logged < 32)
         {
           logged++;
-          std::cerr << "PathGraph::prune(): merged partition " << i << " of " << partitions.size()
-                    << " (keys " << partitions[i].lower_rank << " to " << partitions[i].upper_rank
+          std::cerr << "PathGraph::prune(): merged span " << i << " of " << spans.size()
+                    << " (keys " << spans[i].lower_rank << " to " << spans[i].upper_rank
                     << "): left split LCP (" << left.first << ", " << left.second
                     << "), right split LCP (" << right.first << ", " << right.second << "), "
                     << (crosses ? "continues past the split" :
                         (right <= left ? "closed: right split is not deeper" :
-                         "closed: a later partition differs")) << std::endl;
+                         "closed: a later span differs")) << std::endl;
         }
         if(crosses)
         {
@@ -4390,75 +4706,107 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
       }
       if(!found) { break; }
 
-      // Release the replaced partitions' output reservations, then prune the
-      // span on this thread; the other workers have finished.
-      PrunePartition stitched;
-      stitched.lower_rank = partitions[stitch_first].lower_rank;
-      stitched.upper_rank = partitions[stitch_last].upper_rank;
-      stitched.start_offsets = partitions[stitch_first].start_offsets;
-      stitched.stop_offsets = partitions[stitch_last].stop_offsets;
-      for(size_type i = stitch_first; i <= stitch_last; i++)
+      // The spans become one, and the units holding them one unit. Release
+      // the replaced units' output reservations, then prune the new unit on
+      // this thread; the other workers have finished.
+      size_type unit_first = 0, unit_last = 0;
+      for(size_type u = 0; u < units.size(); u++)
       {
-        if(!(partitions[i].graph)) { continue; }
-        size_type released = partitions[i].graph->bytes();
+        if(units[u].first_span <= stitch_first && stitch_first < units[u].last_span) { unit_first = u; }
+        if(units[u].first_span <= stitch_last && stitch_last < units[u].last_span) { unit_last = u; }
+      }
+      PruneSpan stitched;
+      stitched.lower_rank = spans[stitch_first].lower_rank;
+      stitched.upper_rank = spans[stitch_last].upper_rank;
+      stitched.start_offsets = spans[stitch_first].start_offsets;
+      stitched.stop_offsets = spans[stitch_last].stop_offsets;
+      for(size_type i = stitch_first; i <= stitch_last; i++) { stitched.records += spans[i].records; }
+      PruneUnit combined;
+      const size_type removed = stitch_last - stitch_first;
+      combined.first_span = units[unit_first].first_span;
+      combined.last_span = units[unit_last].last_span - removed;
+      for(size_type u = unit_first; u <= unit_last; u++)
+      {
+        combined.records += units[u].records;
+        if(!(units[u].graph)) { continue; }
+        size_type released = units[u].graph->bytes();
         output_bytes.fetch_sub(std::min(released, output_bytes.load(std::memory_order_relaxed)),
           std::memory_order_relaxed);
       }
+      for(size_type u = unit_last + 1; u < units.size(); u++)
+      {
+        units[u].first_span -= removed; units[u].last_span -= removed;
+      }
+      spans[stitch_first] = std::move(stitched);
+      spans.erase(spans.begin() + stitch_first + 1, spans.begin() + stitch_last + 1);
+      units[unit_first] = std::move(combined);
+      units.erase(units.begin() + unit_first + 1, units.begin() + unit_last + 1);
       try
       {
-        buildPrunePartition(stitched, source, lcp, size_limit, worker_group, worker_cache,
-          input_pairs, output_pairs, layout, output_bytes, cancelled);
+        PathGraphInputCache input(source, nullptr, input_pairs, worker_cache, 0);
+        buildPruneUnit(units[unit_first], spans, source, lcp, size_limit, worker_group,
+          worker_cache, input_pairs, output_pairs, layout, output_bytes, cancelled, &input);
+        input.close();
       }
       catch(const PruneSizeLimit&)
       {
         std::cerr << "PathGraphBuilder::write(): Size limit exceeded, construction aborted" << std::endl;
         std::exit(EXIT_SIZE_LIMIT_EXCEEDED);
       }
-      stitches++; stitched_partitions += stitch_last + 1 - stitch_first;
+      stitches++; stitched_spans += removed + 1;
       if(Verbosity::level >= Verbosity::EXTENDED)
       {
-        std::cerr << "PathGraph::prune(): stitched partitions " << stitch_first << " to " << stitch_last
-                  << " (keys " << stitched.lower_rank << " to " << stitched.upper_rank << ")" << std::endl;
+        std::cerr << "PathGraph::prune(): stitched spans " << stitch_first << " to " << stitch_last
+                  << " (keys " << spans[stitch_first].lower_rank << " to "
+                  << spans[stitch_first].upper_rank << ") and pruned units " << unit_first
+                  << " to " << unit_last << " again as one" << std::endl;
       }
-      partitions[stitch_first] = std::move(stitched);
-      partitions.erase(partitions.begin() + stitch_first + 1, partitions.begin() + stitch_last + 1);
     }
     if(stitches > 0)
     {
       std::cerr << "PathGraph::prune(): " << stitches << " stitch(es) re-pruned "
-                << stitched_partitions << " partition(s) into wider spans; " << partitions.size()
-                << " partition(s) remain" << std::endl;
+                << stitched_spans << " span(s) into wider spans; " << spans.size()
+                << " span(s) in " << units.size() << " unit(s) remain" << std::endl;
     }
   }
   const PriorityNode* previous = nullptr;
-  for(size_type i = 0; split_depth == 1 && i < partitions.size(); i++)
+  for(size_type i = 0; split_depth == 1 && i < spans.size(); i++)
   {
-    const PrunePartition& part = partitions[i];
-    if(!part.has_output) { continue; }
+    const PruneSpan& span = spans[i];
+    if(!span.has_output) { continue; }
     if(previous != nullptr &&
-       lcp.max_lcp(previous->node, part.first_output.node,
-         previous->label, part.first_output.label) != range_type(0, 0))
+       lcp.max_lcp(previous->node, span.first_output.node,
+         previous->label, span.first_output.label) != range_type(0, 0))
     {
       std::cerr << "PathGraph::prune(): warning: root partitions share a nonzero LCP; "
                 << "pruning this step serially" << std::endl;
       return declineParallel(fallback_reason, "root partitions share a nonzero LCP");
     }
-    previous = &(part.last_output);
+    previous = &(span.last_output);
+  }
+  size_type tie_sensitive = 0;
+  for(const PruneSpan& span : spans) { tie_sensitive += span.tie_sensitive_ranges; }
+  if(Verbosity::level >= Verbosity::EXTENDED)
+  {
+    std::cerr << "PathGraph::prune(): units pruned in " << prune_seconds << " seconds on "
+              << actual_workers << " worker(s); " << stitches << " stitch(es) in "
+              << std::chrono::duration<double>(std::chrono::steady_clock::now() - stitch_start).count()
+              << " seconds; " << tie_sensitive << " tie-sensitive equal-label range(s)" << std::endl;
   }
 
   PathGraph combined(0, source.k(), source.step());
-  combined.delete_files = false; // It borrows partition files until commit.
-  std::vector<std::vector<bool>> retain(partitions.size(),
+  combined.delete_files = false; // It borrows unit files until commit.
+  std::vector<std::vector<bool>> retain(units.size(),
     std::vector<bool>(layout.logical.size(), false));
   std::vector<bool> logical_retained(layout.logical.size(), false);
-  for(size_type part = 0; part < partitions.size(); part++)
+  for(size_type unit = 0; unit < units.size(); unit++)
   {
-    if(!(partitions[part].graph)) { continue; }
+    if(!(units[unit].graph)) { continue; }
     for(size_type logical = 0; logical < layout.logical.size(); logical++)
     {
-      if(partitions[part].graph->path_counts[logical] > 0)
+      if(units[unit].graph->path_counts[logical] > 0)
       {
-        retain[part][logical] = true; logical_retained[logical] = true;
+        retain[unit][logical] = true; logical_retained[logical] = true;
       }
     }
   }
@@ -4469,16 +4817,16 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   }
 
   size_type next_physical = 0;
-  for(size_type part = 0; part < partitions.size(); part++)
+  for(size_type unit = 0; unit < units.size(); unit++)
   {
-    PathGraph& graph = *(partitions[part].graph);
+    PathGraph& graph = *(units[unit].graph);
     combined.range_count += graph.range_count;
     combined.unique += graph.unique; combined.redundant += graph.redundant;
     combined.unsorted += graph.unsorted;
     combined.nondeterministic += graph.nondeterministic;
     for(size_type logical = 0; logical < layout.logical.size(); logical++)
     {
-      if(!retain[part][logical]) { continue; }
+      if(!retain[unit][logical]) { continue; }
       combined.path_names.push_back(graph.path_names[logical]);
       combined.rank_names.push_back(graph.rank_names[logical]);
       combined.path_counts.push_back(graph.path_counts[logical]);
@@ -4496,41 +4844,45 @@ buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
   if(stats != nullptr)
   {
     *stats = PathGraphMergeStats();
-    std::vector<PathGraphMergeStats> part_stats;
-    part_stats.reserve(partitions.size());
-    for(const PrunePartition& part : partitions)
+    std::vector<PathGraphMergeStats> unit_stats;
+    unit_stats.reserve(units.size());
+    for(const PruneUnit& unit : units)
     {
-      addPruneStats(*stats, part.stats); part_stats.push_back(part.stats);
+      addPruneStats(*stats, unit.stats); unit_stats.push_back(unit.stats);
     }
-    stats->max_open_input_pairs = pruneConcurrentPeak(part_stats, actual_workers,
+    stats->max_open_input_pairs = pruneConcurrentPeak(unit_stats, actual_workers,
       [](const PathGraphMergeStats& value) { return value.max_open_input_pairs; });
-    stats->max_open_output_pairs = pruneConcurrentPeak(part_stats, actual_workers,
+    stats->max_open_output_pairs = pruneConcurrentPeak(unit_stats, actual_workers,
       [](const PathGraphMergeStats& value) { return value.max_open_output_pairs; });
-    stats->max_input_buffer_bytes = pruneConcurrentPeak(part_stats, actual_workers,
+    stats->max_input_buffer_bytes = pruneConcurrentPeak(unit_stats, actual_workers,
       [](const PathGraphMergeStats& value) { return value.max_input_buffer_bytes; });
-    stats->prefetch_workers = pruneConcurrentPeak(part_stats, actual_workers,
+    stats->prefetch_workers = pruneConcurrentPeak(unit_stats, actual_workers,
       [](const PathGraphMergeStats& value) { return value.prefetch_workers; });
-    stats->max_prefetch_bytes = pruneConcurrentPeak(part_stats, actual_workers,
+    stats->max_prefetch_bytes = pruneConcurrentPeak(unit_stats, actual_workers,
       [](const PathGraphMergeStats& value) { return value.max_prefetch_bytes; });
-    stats->oversized_input_pair_bytes = pruneConcurrentPeak(part_stats, actual_workers,
+    stats->oversized_input_pair_bytes = pruneConcurrentPeak(unit_stats, actual_workers,
       [](const PathGraphMergeStats& value) { return value.oversized_input_pair_bytes; });
-    stats->max_from_set_nodes = pruneConcurrentPeak(part_stats, actual_workers,
+    stats->max_from_set_nodes = pruneConcurrentPeak(unit_stats, actual_workers,
       [](const PathGraphMergeStats& value) { return value.max_from_set_nodes; });
     stats->prune_requested_workers = requested_workers;
     stats->prune_workers = actual_workers;
-    stats->prune_partitions = partitions.size();
+    stats->prune_partitions = units.size();
+    stats->prune_split_depth = split_depth;
+    stats->prune_spans = spans.size();
+    stats->prune_stitches = stitches;
+    stats->prune_tie_sensitive_ranges = tie_sensitive;
   }
 
   // Remove unretained empty pairs before transferring ownership. No payload is
   // copied or linked, so the writer's closed-file checksum identity remains
   // valid for every retained shard. All potentially allocating work above is
-  // complete while the partition graphs still own their files.
-  for(size_type part = 0; part < partitions.size(); part++)
+  // complete while the unit graphs still own their files.
+  for(size_type unit = 0; unit < units.size(); unit++)
   {
-    PathGraph& graph = *(partitions[part].graph);
+    PathGraph& graph = *(units[unit].graph);
     for(size_type logical = 0; logical < layout.logical.size(); logical++)
     {
-      if(!retain[part][logical])
+      if(!retain[unit][logical])
       {
         TempFile::remove(graph.path_names[logical]);
         TempFile::remove(graph.rank_names[logical]);
@@ -4550,7 +4902,8 @@ void
 PathGraph::prune(const LCP& lcp, size_type size_limit,
   size_type group_buffer_bytes, PathGraphMergeStats* stats,
   size_type max_open_files, size_type input_cache_bytes,
-  size_type prune_workers, size_type concurrent_open_files)
+  size_type prune_workers, size_type concurrent_open_files,
+  size_type parallel_cache_bytes)
 {
   size_type old_path_count = this->size();
 
@@ -4567,7 +4920,7 @@ PathGraph::prune(const LCP& lcp, size_type size_limit,
   const char* fallback_reason = nullptr;
   if(buildPrunedGraphParallel(*this, lcp, size_limit, group_buffer_bytes,
        stats, max_open_files, input_cache_bytes, requested_workers, layout,
-       &fallback_reason, concurrent_open_files))
+       &fallback_reason, concurrent_open_files, parallel_cache_bytes))
   {
     if(Verbosity::level >= Verbosity::EXTENDED)
     {

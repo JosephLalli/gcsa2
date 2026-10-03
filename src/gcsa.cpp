@@ -2221,11 +2221,23 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
       // contract, regardless of the caller's OpenMP thread count.
       const size_type prune_workers = (parameters.externalMemory() ?
         static_cast<size_type>(std::max(1, omp_get_max_threads())) : 1);
+      // The balanced prune's workers each hold a decoded block pair of every
+      // shard (about 2.2 GB over chr18's 33 step-2 shards), so the input cache
+      // sets how many run. The prune is the only phase running: the generation
+      // it reads is on disk and the next extend has not started, and the joint
+      // chr2+chr18 prunes peaked at 12.6-14.5 GiB of a 96 GiB goal with a
+      // quarter of it. The workers therefore divide 55% of the goal; the
+      // group buffer (a sixteenth) is divided among them, and the rest covers
+      // the LCP support and the output buffers. GCSA_PRUNE_ROOT_PARTITIONS=1
+      // keeps the quarter.
+      const size_type prune_input_cache = pathMergeInputCacheBudget(parameters, path_graph);
+      const size_type prune_worker_cache = std::max(prune_input_cache,
+        parameters.getMemoryLimitBytes() / 20 * 11);
       const double prune_start = readTimer();
       path_graph.prune(lcp, path_graph.remainingLimit(parameters.getLimitBytes()),
         prune_buffer, &merge_stats, parameters.getMaxOpenFiles(),
-        pathMergeInputCacheBudget(parameters, path_graph),
-        prune_workers, parameters.getConcurrentOpenFiles());
+        prune_input_cache, prune_workers, parameters.getConcurrentOpenFiles(),
+        prune_worker_cache);
       const double prune_stop = readTimer();
       if(Verbosity::level >= Verbosity::BASIC)
       {
