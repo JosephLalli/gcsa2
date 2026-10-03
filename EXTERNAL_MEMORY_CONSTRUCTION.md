@@ -1286,6 +1286,80 @@ result and the joint timing build are recorded in
 `hprc_v2_vg_rna/gcsa2_distribution_concurrency_20260928/serial_phase_fixes_20261002/` and
 `joint_chr2_chr18_60a0abd_20261002/`. vg integration test 58 was not run (vg was not relinked).
 
+### Parallel-phase candidate and joint acceptance (2026-10-02/03)
+
+This checkpoint describes the isolated `parallel-phases` candidate at `0da9176`,
+which includes the five serial-phase fixes above and proposals 2, 3, 5, 6, 7,
+and 8. It supersedes older descriptions of these mechanisms for this candidate
+only. The vg submodule pointer and production binary have not been promoted.
+The decision record and complete retained evidence are at
+`/mnt/ssd/lalli/hprc_v2_vg_rna/gcsa2_distribution_concurrency_20260928/parallel_phase_proposals_20261002/README.md`.
+
+- Final path merging uses bounded prefix ranges, parallel bound/tail scans,
+  group-aware stitching, boundary LCP repair, and prefix-sum rebasing. The copy
+  pass remains. Observable equal-label ties, compressed merge output, or a
+  pre-stitch disk overrun decline to serial; `GCSA_SERIAL_MERGE=1` forces serial.
+  Raw/framed, spill, empty-range, crossing, and tie fixtures compare every
+  output stream and the `next` tables with the serial merge.
+- Final-event construction uses reusable bounded batch slots for loading,
+  preparation, encoding, and ordered writing around one ordered state core.
+  Previous-occurrence and suffix-stack updates remain in path order. The
+  previous-occurrence array resides in RAM when admitted, with a disk-backed
+  fallback. A new scan test compares serial/pipelined event artifacts across
+  sampling, duplicate starts, raw/framed streams, and RAM/disk state.
+- Component serialization counts redundancy events per slot rather than
+  sorting the event stream, with a bounded windowed fallback. Independent
+  encoders can finish out of order into component spools; publication still
+  concatenates them in the required public-file order. Spools consume temporary
+  disk and descriptor admission limits encoder concurrency.
+- Preprocessing removes periodic direct-I/O reduction flushes, reads in
+  slices with read-ahead, fingerprints inputs concurrently, and writes reduced
+  artifact copies/checksums on helper threads. Temporary reduced streams remain
+  because the de Bruijn and LCP builders consume them. The direct-I/O SSD pair
+  reproduced all reference preprocessing markers.
+- Joins use one process-worker pool per doubling step across logical inputs.
+  Logical identities, output plan order, task names, and resume checkpoints are
+  preserved. Launch admission charges committed partition bytes plus running
+  partitions' planned peaks. Distribution/planning remain per input before the
+  shared pool starts. The standalone four-argument `buildAndStore` overlaps
+  LCP construction with the final scan; vg's two-call callers do not yet use
+  this overlap. The LCP helper's roughly 64 MiB and up to five descriptors are
+  additional to scan admission and must be included in process-level limits.
+
+The integrated suite passed 17/17 targets, and integrated chr18 reproduced
+`02b0b8c0b3f55ab875421a22abdb047d` / `c932fdce7d294342ec7a45912632d319`
+in 0:16:05. Proposal 1's larger goal/worker configuration was not approved
+under its fixed noise-floor rule. Proposal 4's balanced prune partitions were
+rejected and are absent from this candidate. The other approvals remain
+provisional, and the shared join pool's speed decision awaits the joint run.
+
+The already-launched joint run is
+`/mnt/ssd/lalli/hprc_v2_vg_rna/gcsa2_distribution_concurrency_20260928/joint_chr2_chr18_parallel_phases_0da9176_20261002/`:
+64 threads, 32 process workers, 96 GiB GCSA goal, 150 GiB cgroup cap, nice 0,
+SSD workspace. Acceptance requires exit 0 and final GCSA/LCP MD5s
+`39441e40a12472d8e005a0c7926b0e90` / `f05d53df0d4d7b8aa5b71cd52f963b09`,
+followed by the pooled timing comparison under the existing rules. Whole-genome
+execution, production promotion, and annotation/paralog decisions remain
+separate. No whole-genome performance or memory claim follows from chr18 or
+joint chr2+chr18 identity.
+
+**Joint gate result (2026-10-03).** That run exited 0 and reproduced `39441e40...` / `f05d53df...`.
+Its blocks sum to 2:11:11 at 10.27 mean threads against 3:00:12 at 8.33 for `60a0abd` at the same
+configuration, at mean host load 41.2 against 78.3. The `60a0abd` pair at 96G and 200G (load 78.3 and
+48.9) moved code-identical blocks by up to 29.9% (preprocessing) and 41.5% (store components), so a
+block counts as confirmed only beyond that. Confirmed: the final-event scan 0:32:48 to 0:05:00
+(proposal 3), store components 0:10:33 to 0:03:12 (proposals 5 and 6), preprocessing 0:12:43 to
+0:07:00 (proposal 7, also -50.7% in the matched SSD preprocessing pair), and the LCP overlap (0:00:14 to
+0:00:02). Not confirmed, and rejected at this gate: the parallel path merge (0:31:40 to 0:29:43; on the
+SSD the bounds pass took 199.9 s and the copy pass 571.6 s around 1,007.3 s of worker merging, and it
+wrote 384.3 against 110.3 GB) and the cross-input join pool (joins 0:34:49 to 0:34:06; steps 1-3 shorter,
+step 4 0:18:54 at 12.77 mean cores against 0:14:40, with more sampled I/O stall at lower load, cause not
+established). The accepted set is `60a0abd` plus proposals 3, 5, 6, 7 and the LCP overlap; this branch
+still contains the merge and the pool (the merge can be disabled with `GCSA_SERIAL_MERGE=1`), and a
+branch of the accepted set alone has not yet been built or gated. The unexplained mapper subphase (67.0 s
+against 15.7-26 s) is untouched by these changes and recorded, not attributed. Records:
+`joint_chr2_chr18_parallel_phases_0da9176_20261002/README.md` and the decision record above.
+
 ## Build, test, and usage
 
 From the containing `vg` checkout, use its local toolchain wrapper. The GCSA2
