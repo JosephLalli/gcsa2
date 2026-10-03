@@ -326,16 +326,21 @@ struct RunReader
   {
     trimReadCache(this->cache.value, this->bytes_read, this->cache_released,
       this->bytes_read == this->total_bytes);
-    read_ahead.advance(static_cast<std::uint64_t>(this->bytes_read));
-    input.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
-    std::streamsize bytes = input.gcount();
-    if(bytes < 0 || static_cast<size_type>(bytes) % record_bytes != 0)
+    // A refill can be a gigabyte (a reduction's one reader gets a whole merge
+    // buffer), and the read-ahead window moves only where a read starts, so
+    // one synchronous read left all but the window's first 64 MiB to the
+    // kernel: 100-200 MB/s on the joint key and start reductions, against
+    // 1.3-2.1 GB/s for readSliced in run formation. Slices move the window
+    // along with the read.
+    const size_type bytes = readSliced(input, buffer.data(), buffer.size(),
+      static_cast<std::uint64_t>(this->bytes_read), read_ahead);
+    if(bytes % record_bytes != 0)
     {
       fail("truncated run");
     }
-    DiskIO::read_volume += static_cast<size_type>(bytes);
-    this->bytes_read += bytes;
-    records = static_cast<size_type>(bytes) / record_bytes;
+    DiskIO::read_volume += bytes;
+    this->bytes_read += static_cast<off_t>(bytes);
+    records = bytes / record_bytes;
     offset = 0; at_end = (records == 0);
   }
 
@@ -727,22 +732,84 @@ installRun(std::string run, const std::string& output_name)
   TempFile::remove(run); // Forget the renamed path from TempFile's registry.
 }
 
+// The reducer's output stream. Bytes stage in a budget-accounted buffer and
+// go to the file, then to the caller's tap, whenever the buffer fills or is
+// drained, so the tap sees exactly the file's bytes in order without reading
+// the file back. An error from either propagates out of the reducer's write:
+// the stream that wraps this buffer rethrows on badbit.
+class StagedOutput : public std::streambuf
+{
+public:
+  StagedOutput(OutputStream& file, std::vector<char>& staging,
+    const ExternalFixedRecordSorter::OutputTap& tap, const std::string& name) :
+    file(file), tap(tap), name(name), written(0)
+  {
+    this->setp(staging.data(), staging.data() + staging.size());
+  }
+
+  // Hands every staged byte to the file and the tap.
+  void drain()
+  {
+    const size_type bytes = static_cast<size_type>(this->pptr() - this->pbase());
+    if(bytes == 0) { return; }
+    writeBytes(this->file, reinterpret_cast<const std::uint8_t*>(this->pbase()),
+      bytes, this->name);
+    if(this->tap) { this->tap(this->pbase(), bytes); }
+    this->written += static_cast<off_t>(bytes);
+    this->setp(this->pbase(), this->epptr());
+  }
+
+  // Bytes handed to the file so far.
+  off_t bytes() const { return this->written; }
+
+protected:
+  int_type overflow(int_type ch) override
+  {
+    this->drain();
+    if(traits_type::eq_int_type(ch, traits_type::eof())) { return traits_type::not_eof(ch); }
+    *this->pptr() = traits_type::to_char_type(ch); this->pbump(1);
+    return ch;
+  }
+
+  int sync() override { this->drain(); return 0; }
+
+private:
+  OutputStream& file;
+  const ExternalFixedRecordSorter::OutputTap& tap;
+  const std::string& name;
+  off_t written;
+};
+
+// The reducer's output stages through this many bytes at most. A merge-sized
+// buffer (about 1 GB at the joint chr2+chr18 settings) would only hold the
+// output longer: a buffered stream is drained every CACHE_CHECK_RECORDS input
+// records (512 KiB of eight-byte results at most), and a direct stream copies
+// the staged bytes into its own 4 MiB blocks, which a smaller buffer feeds
+// from cache.
+constexpr size_type STAGING_BYTES = 16 * MEGABYTE;
+
 void
 consumeRun(const std::string& run, const SortPlan& plan,
   const ExternalFixedRecordSorter::Comparator& compare,
   const ExternalFixedRecordSorter::Reducer& reducer,
-  const std::string& output_name, ExternalFixedRecordSortStats* stats)
+  const std::string& output_name, ExternalFixedRecordSortStats* stats,
+  const ExternalFixedRecordSorter::OutputTap& tap)
 {
   // Reducers often emit one compact result per group. Supply an explicit,
   // budget-accounted output buffer so key/start deduplication does not turn
   // into one syscall per result while still avoiding a hidden stream buffer.
-  std::vector<char> output_buffer(plan.merge_records * plan.record_bytes);
+  // It replaces the file stream's buffer, so the file itself is unbuffered.
+  std::vector<char> output_buffer(std::min(plan.merge_records * plan.record_bytes,
+    std::max(plan.record_bytes, STAGING_BYTES - STAGING_BYTES % plan.record_bytes)));
   OutputStream output;
-  output.setFileBuffer(output_buffer.data(), output_buffer.size());
+  output.setFileBuffer(nullptr, 0);
   output.open(output_name.c_str(), std::ios_base::binary | std::ios_base::trunc);
   if(!output) { fail("cannot create reduced output " + output_name); }
   CacheDescriptor output_cache(output_name, O_RDWR);
   off_t output_cache_released = 0;
+  StagedOutput staged(output, output_buffer, tap, output_name);
+  std::ostream reduced(&staged);
+  reduced.exceptions(std::ios_base::badbit);
   RunReader reader(run, plan.record_bytes, plan.merge_records);
   if(reader.at_end)
   {
@@ -760,27 +827,30 @@ consumeRun(const std::string& run, const SortPlan& plan,
   while(!reader.at_end)
   {
     bool last = (compare(previous.data(), reader.current()) != 0);
-    reducer(previous.data(), first, last, output);
+    reducer(previous.data(), first, last, reduced);
     first = last;
     std::memcpy(previous.data(), reader.current(), plan.record_bytes);
     reader.advance();
     processed++;
-    if(processed % CACHE_CHECK_RECORDS == 0)
+    // Only a buffered stream needs the periodic check: its flushed prefix has
+    // to be synced before the page cache can drop it. A direct stream leaves
+    // nothing in the cache, and its flush is not free: it waits for every
+    // block in flight, pads the partial 4 MiB tail block, writes it and
+    // truncates, and the next records rewrite that block. Flushing every
+    // 65,536 records wrote 27.9-29.5 GB per joint chr2+chr18 reduction for
+    // 3.2-4.3 GB of output. Full blocks are written as they fill, and the
+    // final trim below still flushes the tail once.
+    if(!output.direct() && processed % CACHE_CHECK_RECORDS == 0)
     {
-      output.flush();
-      std::streamoff position = output.tellp();
-      if(position < 0) { fail("cannot inspect reduced output " + output_name); }
-      trimWrittenCache(output, output_cache.value, static_cast<off_t>(position),
+      staged.drain();
+      trimWrittenCache(output, output_cache.value, staged.bytes(),
         output_cache_released, false, output_name);
     }
   }
-  reducer(previous.data(), first, true, output);
-  output.flush();
-  std::streamoff position = output.tellp();
-  if(position < 0) { fail("cannot inspect reduced output " + output_name); }
-  trimWrittenCache(output, output_cache.value, static_cast<off_t>(position),
+  reducer(previous.data(), first, true, reduced);
+  staged.drain();
+  trimWrittenCache(output, output_cache.value, staged.bytes(),
     output_cache_released, true, output_name);
-  DiskIO::write_volume += static_cast<size_type>(position);
   output.close();
   if(!output) { fail("cannot write reduced output " + output_name); }
 }
@@ -819,7 +889,8 @@ void
 ExternalFixedRecordSorter::sortAndReduce(const std::string& input_name,
   const std::string& output_name, size_type record_bytes, size_type byte_budget,
   size_type requested_fan_in, const Comparator& compare, const Reducer& reducer,
-  ExternalFixedRecordSortStats* stats, bool total_order, RecordOrder order)
+  ExternalFixedRecordSortStats* stats, bool total_order, RecordOrder order,
+  const OutputTap& tap)
 {
   if(!compare || !reducer) { fail("missing comparator or reducer"); }
   if(stats != nullptr) { *stats = ExternalFixedRecordSortStats(); }
@@ -829,7 +900,7 @@ ExternalFixedRecordSorter::sortAndReduce(const std::string& input_name,
   if(run.empty()) { writeEmpty(output_name); return; }
   try
   {
-    consumeRun(run, plan, compare, reducer, output_name, stats);
+    consumeRun(run, plan, compare, reducer, output_name, stats, tap);
   }
   catch(...)
   {

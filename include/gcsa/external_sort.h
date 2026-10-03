@@ -73,6 +73,16 @@ public:
   typedef std::function<void(const void* record, bool first_in_group,
     bool last_in_group, std::ostream& output)> Reducer;
 
+  /*
+    An optional observer of sortAndReduce()'s output. Each call carries the
+    next bytes written to output_name, in order, and together the calls carry
+    exactly the file's bytes; a range is valid only during the call. A caller
+    can then copy the reduced stream elsewhere while it is written, instead of
+    reading the file back afterwards. An empty input writes an empty file
+    without calling it. An exception from the tap aborts the reduction.
+  */
+  typedef std::function<void(const void* data, size_type bytes)> OutputTap;
+
   static size_type minimumBudget(size_type record_bytes);
 
   /*
@@ -109,7 +119,8 @@ public:
     size_type byte_budget, size_type requested_fan_in,
     const Comparator& compare, const Reducer& reducer,
     ExternalFixedRecordSortStats* stats = nullptr, bool total_order = false,
-    RecordOrder order = RecordOrder::COMPARATOR);
+    RecordOrder order = RecordOrder::COMPARATOR,
+    const OutputTap& tap = OutputTap());
 };
 
 } // namespace gcsa
