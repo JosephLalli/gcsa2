@@ -103,16 +103,18 @@ struct FinalEventFiles
 
 /*
   Incremental checksums for streams written directly by FinalEventWriter.
-  Redundancy is omitted because its order changes in the subsequent external
-  sort, and metadata is small enough that avoiding its checksum scan is not
-  material. These digests allow same-filesystem workspace adoption without a
-  second full read of the immutable event payloads.
+  Redundancy is included because its stream is committed in emission order:
+  component construction counts it per slot instead of sorting it first.
+  Metadata is small enough that avoiding its checksum scan is not material.
+  These digests allow same-filesystem workspace adoption without a second full
+  read of the immutable event payloads.
 */
 struct FinalEventChecksums
 {
   std::uint64_t bwt_masks;
   std::vector<std::uint64_t> edge_destinations;
   std::uint64_t sample_positions, sample_ids, sample_ends, occurrences;
+  std::uint64_t redundant;
 
   explicit FinalEventChecksums(size_type sigma = 0);
 };
@@ -154,13 +156,6 @@ private:
   FinalEventWriter(const FinalEventWriter&) = delete;
   FinalEventWriter& operator=(const FinalEventWriter&) = delete;
 };
-
-// Sort the (potentially nonmonotone) redundancy positions externally.
-// stats is optional and diagnostic: run count, merge passes and peak resident
-// bytes are what decide whether this sort is worth replacing.
-void sortFinalRedundancy(FinalEventFiles& files,
-  const ConstructionParameters& parameters,
-  ExternalFixedRecordSortStats* stats = nullptr);
 
 // Write/read and validate the small versioned metadata record.
 void writeFinalEventMetadata(const FinalEventFiles& files,
@@ -212,23 +207,46 @@ void serializeOccurrencePointers(std::ostream& out,
   size_type occurrence_items, size_type occurrence_extra,
   const ConstructionParameters& parameters);
 
+/*
+  How serializeRedundantPointers() counted the redundancy stream. window_slots
+  is the number of suffix-tree slots one stream pass counts; a goal too small
+  for one byte per slot gives several windows and one pass per window for each
+  of the two serialized members. wraps sums, over all passes, the counts that
+  wrapped a slot's byte.
+*/
+struct RedundancyCountStats
+{
+  size_type slots = 0, window_slots = 0, stream_passes = 0, wraps = 0;
+};
+
 // Stream SadaCount's ordinary bit_vector and select_support_mcl payload from
-// sorted redundancy events without materializing the dense unary vector.
-// Public only for exact-format regression tests.
+// redundancy events in any order, without sorting them or materializing the
+// dense unary vector. The count array is reserved from parameters' memory
+// goal. Public only for exact-format regression tests.
 void serializeRedundantPointers(std::ostream& out,
   const std::string& redundancy_file, size_type paths, size_type redundant,
-  const ConstructionParameters& parameters);
+  const ConstructionParameters& parameters,
+  RedundancyCountStats* stats = nullptr);
 
 /*
   Serialize final components directly from immutable event streams. Members
   are encoded concurrently when the thread, memory, and descriptor budgets
-  permit. Bounded pipes preserve GCSA::load() order without retaining the
-  completed index or writing component temporary files. The result has the
+  permit, longest first, and may finish in any order: each is spooled in a
+  bounded buffer, continuing in a temporary file when larger, and the spools
+  are appended in GCSA::load() order. Temporary disk is at most about the
+  index size, and the completed index is never retained. The result has the
   normal public .gcsa format and is published with a synced atomic rename.
+
+  max_concurrent is the most encoders that ran at once, out_of_order the
+  components that finished while a component before them had not, and
+  spilled/spilled_bytes the components that outgrew their buffers.
 */
 struct FinalComponentStats
 {
   size_type tasks = 0, workers = 1, buffer_limit_bytes = 0;
+  size_type max_concurrent = 0, out_of_order = 0;
+  size_type spilled = 0, spilled_bytes = 0;
+  RedundancyCountStats redundancy;
 };
 
 void storeFinalComponents(const GCSAHeader& header,

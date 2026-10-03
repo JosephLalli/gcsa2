@@ -475,8 +475,8 @@ int main()
     writer.path(1U << 0); writer.edge(0, 2);
     writer.sampledPath(3); writer.sample(100); writer.sampleEnd();
 
-    // Deliberately unsorted with a duplicate; external sorting must produce
-    // counts [1, 0, 2] for the three suffix-tree slots.
+    // Deliberately unsorted with a duplicate; counting must produce counts
+    // [1, 0, 2] for the three suffix-tree slots without a sort.
     writer.redundancy(2); writer.redundancy(0); writer.redundancy(2);
     metadata = writer.finish();
     event_checksums = writer.checksums();
@@ -491,8 +491,8 @@ int main()
   require(event_checksums.sample_ids == checksumFile(files.sample_ids));
   require(event_checksums.sample_ends == checksumFile(files.sample_ends));
   require(event_checksums.occurrences == checksumFile(files.occurrences));
+  require(event_checksums.redundant == checksumFile(files.redundant));
   metadata.fast_chars = alphabet.fast_chars;
-  sortFinalRedundancy(files, parameters);
   writeFinalEventMetadata(files, metadata);
 
   BuildWorkspace::Settings semantic;
@@ -584,8 +584,9 @@ int main()
     compressed_metadata = writer.finish(); compressed_checksums = writer.checksums();
   }
   require(CompressedBlockReader::isFramed(compressed_files.bwt_masks));
+  require(!CompressedBlockReader::isFramed(compressed_files.redundant));
+  require(compressed_checksums.redundant == checksumFile(compressed_files.redundant));
   compressed_metadata.fast_chars = alphabet.fast_chars;
-  sortFinalRedundancy(compressed_files, compressed_parameters);
   writeFinalEventMetadata(compressed_files, compressed_metadata);
   const std::string compressed_root = std::string(root) + "/compressed-workspace";
   BuildWorkspace compressed_workspace(compressed_root, semantic,
@@ -633,35 +634,58 @@ int main()
   compressed_restored.clear(); compressed_files.clear();
 
   // The direct redundancy writer covers duplicate positions, a zero run, and
-  // the final suffix-tree slot in the same native SadaCount byte layout.
+  // the final suffix-tree slot in the same native SadaCount byte layout. The
+  // restored stream is in emission order, not sorted.
   std::ostringstream streamed_redundancy, expected_redundancy;
+  RedundancyCountStats small_redundancy_stats;
   serializeRedundantPointers(streamed_redundancy, restored.redundant, 4, 3,
-    parameters);
+    parameters, &small_redundancy_stats);
   expected.redundant_pointers.serialize(expected_redundancy);
   require(streamed_redundancy.str() == expected_redundancy.str());
+  require(small_redundancy_stats.slots == 3 &&
+    small_redundancy_stats.window_slots == 3 &&
+    small_redundancy_stats.stream_passes == 1);
 
   // Cross select_support_mcl's 4096-one superblock boundary and its final
-  // partial-block path. This is a direct byte comparison against SDSL.
+  // partial-block path. Events are shuffled, as the final scan emits them, and
+  // four slots straddle the one-byte counter: 255 stays in the byte, 256 wraps
+  // it exactly to zero, and 600 and 513 (the last slot) wrap it twice. This is
+  // a direct byte comparison against SDSL.
   const size_type large_slots = 5 * 4096 + 17;
-  const std::string large_redundancy = std::string(root) + "/large-redundancy";
   std::vector<size_type> large_counts(large_slots, 0);
-  size_type large_events = 0;
+  std::vector<std::uint64_t> large_events;
+  for(size_type slot = 0; slot < large_slots; slot++)
   {
-    std::ofstream output(large_redundancy.c_str(), std::ios_base::binary);
-    require(static_cast<bool>(output));
-    for(size_type slot = 0; slot < large_slots; slot++)
-    {
-      large_counts[slot] = (slot % 5 == 0 ? 2 : (slot % 11 == 0 ? 1 : 0));
-      for(size_type i = 0; i < large_counts[slot]; i++)
-      {
-        std::uint64_t value = slot;
-        output.write(reinterpret_cast<const char*>(&value), sizeof(value));
-        large_events++;
-      }
-    }
-    require(static_cast<bool>(output));
+    large_counts[slot] = (slot % 5 == 0 ? 2 : (slot % 11 == 0 ? 1 : 0));
   }
-  GCSA::bit_vector large_data(large_slots + large_events, 0);
+  large_counts[3] = 600; large_counts[4100] = 256; large_counts[9001] = 255;
+  large_counts[large_slots - 1] = 513;
+  for(size_type slot = 0; slot < large_slots; slot++)
+  {
+    large_events.insert(large_events.end(), large_counts[slot], slot);
+  }
+  const auto write_redundancy = [](const std::string& filename,
+    const std::vector<std::uint64_t>& values)
+  {
+    std::ofstream output(filename.c_str(), std::ios_base::binary);
+    require(static_cast<bool>(output));
+    for(std::uint64_t value : values) { appendInteger(output, value); }
+    require(static_cast<bool>(output));
+  };
+  const std::string sorted_redundancy = std::string(root) + "/sorted-redundancy";
+  write_redundancy(sorted_redundancy, large_events);
+  // A fixed multiplicative permutation keeps the fixture deterministic.
+  std::vector<std::uint64_t> shuffled_events(large_events.size());
+  require(large_events.size() % 7919 != 0);
+  for(size_type i = 0; i < large_events.size(); i++)
+  {
+    shuffled_events[(i * 7919) % large_events.size()] = large_events[i];
+  }
+  require(shuffled_events != large_events);
+  const std::string large_redundancy = std::string(root) + "/large-redundancy";
+  write_redundancy(large_redundancy, shuffled_events);
+
+  GCSA::bit_vector large_data(large_slots + large_events.size(), 0);
   size_type large_tail = 0;
   for(size_type slot = 0; slot < large_slots; slot++)
   {
@@ -671,12 +695,69 @@ int main()
   SadaCount large_native;
   large_native.data = large_data;
   sdsl::util::init_support(large_native.select, &(large_native.data));
-  std::ostringstream streamed_large_redundancy, expected_large_redundancy;
-  serializeRedundantPointers(streamed_large_redundancy, large_redundancy,
-    large_slots + 1, large_events, parameters);
+  std::ostringstream expected_large_redundancy;
   large_native.serialize(expected_large_redundancy);
+
+  RedundancyCountStats large_stats;
+  std::ostringstream streamed_large_redundancy;
+  serializeRedundantPointers(streamed_large_redundancy, large_redundancy,
+    large_slots + 1, large_events.size(), parameters, &large_stats);
   require(streamed_large_redundancy.str() == expected_large_redundancy.str());
+  // One window: one stream pass serves both members. 600 and 513 wrap twice,
+  // 256 once, 255 never.
+  require(large_stats.window_slots == large_slots && large_stats.stream_passes == 1);
+  require(large_stats.wraps == 5);
+
+  // Workspaces written before the sort was removed hold the sorted stream;
+  // counting is order-free, so they resume to the same bytes.
+  std::ostringstream sorted_large_redundancy;
+  serializeRedundantPointers(sorted_large_redundancy, sorted_redundancy,
+    large_slots + 1, large_events.size(), parameters);
+  require(sorted_large_redundancy.str() == expected_large_redundancy.str());
+
+  // A goal that cannot hold a byte per slot counts windows of slots, one
+  // stream pass per window and member, without changing a byte.
+  ConstructionParameters windowed_parameters = parameters;
+  windowed_parameters.setMemoryLimitBytes(8 * KILOBYTE);
+  RedundancyCountStats windowed_stats;
+  std::ostringstream windowed_large_redundancy;
+  serializeRedundantPointers(windowed_large_redundancy, large_redundancy,
+    large_slots + 1, large_events.size(), windowed_parameters, &windowed_stats);
+  require(windowed_large_redundancy.str() == expected_large_redundancy.str());
+  const size_type windows = (large_slots + windowed_stats.window_slots - 1) /
+    windowed_stats.window_slots;
+  require(windowed_stats.window_slots < large_slots && windows > 2);
+  require(windowed_stats.stream_passes == 2 * windows);
+  require(windowed_stats.wraps == 2 * 5);
+
+  // A goal that cannot hold the reader and the wrap list fails closed instead
+  // of waiting on its own reservation.
+  ConstructionParameters starved_parameters = parameters;
+  starved_parameters.setMemoryLimitBytes(128);
+  bool rejected_starved_counts = false;
+  try
+  {
+    std::ostringstream ignored;
+    serializeRedundantPointers(ignored, large_redundancy, large_slots + 1,
+      large_events.size(), starved_parameters);
+  }
+  catch(const std::runtime_error&) { rejected_starved_counts = true; }
+  require(rejected_starved_counts);
+
+  // An event outside the slot universe is rejected, whatever its position in
+  // the stream.
+  writeInteger(large_redundancy, 8 * (large_events.size() / 2), large_slots);
+  bool rejected_large_redundancy = false;
+  try
+  {
+    std::ostringstream ignored;
+    serializeRedundantPointers(ignored, large_redundancy, large_slots + 1,
+      large_events.size(), parameters);
+  }
+  catch(const std::runtime_error&) { rejected_large_redundancy = true; }
+  require(rejected_large_redundancy);
   require(std::filesystem::remove(large_redundancy));
+  require(std::filesystem::remove(sorted_redundancy));
 
   // Both Elias--Fano vectors cross the select_support_mcl fast-construction
   // threshold. Exact equality proves the direct writer preserves SadaSparse's
@@ -849,37 +930,68 @@ int main()
   require(packed.sampleCount() == 3 && packed.sample(2) == 100);
 
   // Parallel encoders must preserve the native byte stream, including empty
-  // rank supports. Memory and descriptor allowances bound worker admission.
+  // rank supports. Memory, threads and the concurrent descriptor budget bound
+  // worker admission; pin the budget so it does not follow the shell's limit.
   const int saved_threads = omp_get_max_threads();
   omp_set_num_threads(4);
   ConstructionParameters parallel_parameters = parameters;
   parallel_parameters.setMemoryLimitBytes(4 * MEGABYTE);
   parallel_parameters.setMaxOpenFiles(128);
+  parallel_parameters.setConcurrentOpenFiles(128);
   const auto read_bytes = [](const std::string& filename)
   {
     std::ifstream input(filename, std::ios_base::binary);
     require(static_cast<bool>(input));
     std::ostringstream bytes; bytes << input.rdbuf(); return bytes.str();
   };
+  // Spools must never outlive the store that created them.
+  const auto component_spools = [&]()
+  {
+    size_type found = 0;
+    for(const auto& entry : std::filesystem::directory_iterator(std::string(root)))
+    {
+      if(entry.path().filename().string().rfind("gcsa_final_component", 0) == 0)
+      {
+        found++;
+      }
+    }
+    return found;
+  };
   FinalComponentStats component_stats;
   storeFinalComponents(observed.header, alphabet, restored, restored_metadata,
     parallel_parameters, packed_name, &component_stats);
   require(component_stats.workers == 3 && component_stats.buffer_limit_bytes > 0);
+  require(component_stats.max_concurrent >= 1 && component_stats.max_concurrent <= 3);
+  // Every member of this four-path index fits in its in-memory spool.
+  require(component_stats.spilled == 0 && component_spools() == 0);
+  require(component_stats.redundancy.stream_passes == 1);
   require(read_bytes(packed_name) == expected_bytes.str());
   storeFinalComponents(observed.header, alphabet, restored, restored_metadata,
     parameters, packed_name, &component_stats);
   require(component_stats.workers == 1);
+  // At the 64-descriptor floor, (64 - 4) / (2 sigma + 5) encoders fit even
+  // with eight threads.
   ConstructionParameters descriptor_limited = parallel_parameters;
   descriptor_limited.setMaxOpenFiles(64);
+  descriptor_limited.setConcurrentOpenFiles(64);
   omp_set_num_threads(8);
   storeFinalComponents(observed.header, alphabet, restored, restored_metadata,
     descriptor_limited, packed_name, &component_stats);
   require(component_stats.workers == 3);
-  omp_set_num_threads(4);
   require(read_bytes(packed_name) == expected_bytes.str());
+  // A concurrent budget above the 128-file ceiling admits an encoder for
+  // every component; the ceiling alone admitted six.
+  ConstructionParameters descriptor_wide = parallel_parameters;
+  descriptor_wide.setConcurrentOpenFiles(1024);
+  omp_set_num_threads(32);
+  storeFinalComponents(observed.header, alphabet, restored, restored_metadata,
+    descriptor_wide, packed_name, &component_stats);
+  require(component_stats.workers == component_stats.tasks);
+  require(read_bytes(packed_name) == expected_bytes.str());
+  omp_set_num_threads(4);
 
-  // A late encoder failure must wake blocked producers, join every worker,
-  // remove the partial file, and preserve an already published index.
+  // A late encoder failure must stop dispatch, join every worker, remove the
+  // partial file and every spool, and preserve an already published index.
   writeInteger(restored.occurrences, 0, restored_metadata.paths);
   bool parallel_failure_rejected = false;
   try
@@ -892,10 +1004,12 @@ int main()
   require(read_bytes(packed_name) == expected_bytes.str());
   require(!std::filesystem::exists(packed_name + "." +
     std::to_string(static_cast<unsigned long long>(::getpid())) + ".partial"));
+  require(component_spools() == 0);
   writeInteger(restored.occurrences, 0, 0);
 
-  // Force queue backpressure with components larger than each bounded pipe.
-  // Raw and framed inputs must produce the same serial and parallel bytes.
+  // Components larger than each spool buffer continue in temporary files, and
+  // encoders finish out of output order. Raw and framed inputs must produce
+  // the same serial and parallel bytes.
   std::string previous_large_bytes;
   for(bool framed : { false, true })
   {
@@ -927,7 +1041,6 @@ int main()
     GCSAHeader large_header = observed.header;
     large_header.path_nodes = paths; large_header.edges = paths;
     const std::string large_name = std::string(root) + "/large-packed.gcsa";
-    // A small queue limit relative to output size exercises blocked encoders.
     omp_set_num_threads(1);
     storeFinalComponents(large_header, alphabet, large_files, large_metadata,
       large_parameters, large_name, &component_stats);
@@ -938,10 +1051,17 @@ int main()
       large_parameters, large_name, &component_stats);
     require(component_stats.workers >= 2);
     require(read_bytes(large_name) == serial_bytes);
+    // Longest-first dispatch hands out twelve nonempty components before
+    // component 0, so with at most three encoders at least ten finish before
+    // it does.
+    require(component_stats.out_of_order >= 10);
+    require(component_spools() == 0);
     if(!framed)
     {
-      // Component 1 fails after producing more bytes than its pipe holds;
-      // later component producers can be blocked when cancellation arrives.
+      // Small spool buffers relative to this output force temporary files.
+      require(component_stats.spilled > 0 && component_stats.spilled_bytes > 0);
+      // Component 1 fails after spilling past its buffer; dispatch stops,
+      // every encoder is joined and every spool is removed.
       writeByte(large_files.bwt_masks, 1, 0);
       bool rejected_parallel_mask = false;
       try
@@ -952,6 +1072,7 @@ int main()
       catch(const std::runtime_error&) { rejected_parallel_mask = true; }
       require(rejected_parallel_mask && component_stats.workers >= 2);
       require(read_bytes(large_name) == serial_bytes);
+      require(component_spools() == 0);
       writeByte(large_files.bwt_masks, 1, 1U << 1);
     }
     if(framed) { require(serial_bytes == previous_large_bytes); }

@@ -1123,24 +1123,66 @@ componentBufferBytes(const ConstructionParameters& parameters, size_type readers
     std::min(parameters.getIOBufferSize(), share));
 }
 
-class RedundancyPositionReader
+/*
+  SadaCount marks slot + (events at slots <= slot) for each suffix-tree slot,
+  which depends only on the number of redundancy events per slot. The event
+  stream is therefore counted in emission order instead of being sorted. Each
+  slot gets one byte; an increment that wraps a byte to zero appends the slot
+  to a wrap list, so a slot's count is its byte plus 256 per listed wrap. The
+  list can never hold more than redundant / 256 entries, so it is reserved up
+  front whatever the distribution. A goal too small for one byte per slot
+  counts consecutive windows of slots, reading the stream once per window;
+  the positions, and so the serialized bytes, are the same.
+*/
+class RedundancyCounts
 {
 public:
-  RedundancyPositionReader(const std::string& filename, size_type paths,
+  RedundancyCounts(const std::string& filename, size_type paths,
     size_type redundant, const ConstructionParameters& parameters) :
-    slots_(paths > 0 ? paths - 1 : 0), redundant_(redundant), slot_(0),
-    cumulative_(0), budget_(parameters.getMemoryLimitBytes(),
-      parameters.getMemoryLimitBytes() / 8), input_(new BufferedEventReader(filename, 8, redundant,
-      componentBufferBytes(parameters, 1), budget_, "final-redundancy-reader")),
-    current_(0), available_(input_->nextInteger(current_)), finished_(false)
+    filename_(filename), slots_(paths > 0 ? paths - 1 : 0),
+    redundant_(redundant), reader_bytes_(componentBufferBytes(parameters, 1)),
+    window_(0), first_(0), last_(0), slot_(0), cumulative_(0),
+    wrap_capacity_(redundant / 256), wrap_count_(0), wrap_cursor_(0),
+    budget_(parameters.getMemoryLimitBytes(),
+      parameters.getMemoryLimitBytes() / 8),
+    reservation_(), counts_(), wraps_(), stats_()
   {
+    requireFileSize(filename_, redundant_, 8);
+    if(slots_ == 0 && redundant_ != 0)
+    {
+      throw eventError("redundancy rank exceeds suffix-tree slot universe", filename_);
+    }
+    // Leave room for the reader each pass constructs, sized as
+    // BufferedEventReader sizes itself, before the counts take the rest.
+    size_type reader = std::max(static_cast<size_type>(8),
+      reader_bytes_ - reader_bytes_ % 8);
+    if(CompressedBlockReader::isFramed(filename_))
+    {
+      reader += CompressedBlockReader::workingMemoryEstimate(
+        static_cast<size_type>(CompressedBlockReader::declaredBlockSize(filename_)));
+    }
+    const size_type wrap_bytes = checkedBytes(wrap_capacity_,
+      sizeof(size_type), filename_);
+    const size_type available = budget_.available();
+    if(slots_ > 0 && (available <= reader || available - reader <= wrap_bytes))
+    {
+      throw eventError("memory limit cannot hold redundancy counts", filename_);
+    }
+    window_ = (slots_ > 0 ? std::min(slots_, available - reader - wrap_bytes) : 0);
+    reservation_ = budget_.reserve(window_ + wrap_bytes, "final-redundancy-counts");
+    counts_.reset(new std::uint8_t[std::max(static_cast<size_type>(1), window_)]);
+    wraps_.reset(new size_type[std::max(static_cast<size_type>(1), wrap_capacity_)]);
+    stats_.slots = slots_; stats_.window_slots = window_;
   }
 
-  ~RedundancyPositionReader()
+  // Restart the slot sequence. One window covering every slot is reused;
+  // windowed counts are recounted on demand.
+  void rewind()
   {
-    if(!finished_)
+    slot_ = cumulative_ = wrap_cursor_ = 0;
+    if(stats_.stream_passes == 0 || first_ != 0 || last_ != slots_)
     {
-      try { finish(); } catch(...) { }
+      first_ = last_ = 0;
     }
   }
 
@@ -1148,35 +1190,63 @@ public:
   {
     if(slot_ == slots_)
     {
-      finish(); return false;
+      if(cumulative_ != redundant_)
+      {
+        throw eventError("redundancy counts do not match metadata", filename_);
+      }
+      return false;
     }
-    if(available_ && current_ < slot_)
+    if(slot_ == last_) { count(slot_); }
+    size_type events = counts_[slot_ - first_];
+    while(wrap_cursor_ < wrap_count_ && wraps_[wrap_cursor_] == slot_)
     {
-      throw eventError("redundancy stream is not nondecreasing");
+      events += 256; wrap_cursor_++;
     }
-    while(available_ && current_ == slot_)
-    {
-      cumulative_++; available_ = input_->nextInteger(current_);
-    }
+    cumulative_ += events;
     position = slot_ + cumulative_;
     slot_++; return true;
   }
 
-private:
-  size_type slots_, redundant_, slot_, cumulative_;
-  MemoryBudget budget_;
-  std::unique_ptr<BufferedEventReader> input_;
-  std::uint64_t current_;
-  bool available_, finished_;
+  const RedundancyCountStats& stats() const { return stats_; }
 
-  void finish()
+private:
+  std::string filename_;
+  size_type slots_, redundant_, reader_bytes_;
+  size_type window_, first_, last_, slot_, cumulative_;
+  size_type wrap_capacity_, wrap_count_, wrap_cursor_;
+  MemoryBudget budget_;
+  MemoryBudget::Reservation reservation_;
+  std::unique_ptr<std::uint8_t[]> counts_;
+  std::unique_ptr<size_type[]> wraps_;
+  RedundancyCountStats stats_;
+
+  void count(size_type first)
   {
-    if(finished_) { return; }
-    if(slot_ != slots_ || available_ || cumulative_ != redundant_)
+    first_ = first; last_ = first + std::min(window_, slots_ - first);
+    std::memset(counts_.get(), 0, last_ - first_);
+    wrap_count_ = wrap_cursor_ = 0;
+    BufferedEventReader input(filename_, 8, redundant_, reader_bytes_, budget_,
+      "final-redundancy-reader");
+    std::uint64_t value = 0;
+    while(input.nextInteger(value))
     {
-      throw eventError("redundancy rank exceeds suffix-tree slot universe");
+      if(value >= slots_)
+      {
+        throw eventError("redundancy rank exceeds suffix-tree slot universe", filename_);
+      }
+      if(value < first_ || value >= last_) { continue; }
+      if(++counts_[value - first_] == 0)
+      {
+        if(wrap_count_ == wrap_capacity_)
+        {
+          throw eventError("redundancy wrap list exceeds its bound", filename_);
+        }
+        wraps_[wrap_count_++] = static_cast<size_type>(value);
+      }
     }
-    input_->finish(); finished_ = true;
+    input.finish();
+    std::sort(wraps_.get(), wraps_.get() + wrap_count_);
+    stats_.stream_passes++; stats_.wraps += wrap_count_;
   }
 };
 
@@ -1197,14 +1267,6 @@ residentMemoryUsage()
   }
 #endif
   return 0;
-}
-
-int
-compareEncoded64(const void* left, const void* right)
-{
-  std::uint64_t a = get64(static_cast<const std::uint8_t*>(left));
-  std::uint64_t b = get64(static_cast<const std::uint8_t*>(right));
-  return (a < b ? -1 : (a > b ? 1 : 0));
 }
 
 } // namespace
@@ -1477,7 +1539,8 @@ FinalEventChecksums::FinalEventChecksums(size_type sigma) :
   sample_positions(1469598103934665603ULL),
   sample_ids(1469598103934665603ULL),
   sample_ends(1469598103934665603ULL),
-  occurrences(1469598103934665603ULL)
+  occurrences(1469598103934665603ULL),
+  redundant(1469598103934665603ULL)
 {
 }
 
@@ -1695,7 +1758,8 @@ serializeOccurrencePointers(std::ostream& out,
 
 void
 serializeRedundantPointers(std::ostream& out, const std::string& redundancy_file,
-  size_type paths, size_type redundant, const ConstructionParameters& parameters)
+  size_type paths, size_type redundant, const ConstructionParameters& parameters,
+  RedundancyCountStats* stats)
 {
   if(paths == 0 && redundant != 0)
   {
@@ -1707,20 +1771,19 @@ serializeRedundantPointers(std::ostream& out, const std::string& redundancy_file
     throw eventError("redundancy bitvector length overflows");
   }
   const size_type bits = slots + redundant;
+  // Both members walk the same counts, so the stream is read once unless the
+  // goal forced windows.
+  RedundancyCounts counts(redundancy_file, paths, redundant, parameters);
+  serializePlainBitVector(out, bits, [&](size_type& position)
   {
-    RedundancyPositionReader input(redundancy_file, paths, redundant, parameters);
-    serializePlainBitVector(out, bits, [&](size_type& position)
-    {
-      return input.next(position);
-    });
-  }
+    return counts.next(position);
+  });
+  counts.rewind();
+  serializeSelectMCL(out, bits, slots, [&](size_type& position)
   {
-    RedundancyPositionReader input(redundancy_file, paths, redundant, parameters);
-    serializeSelectMCL(out, bits, slots, [&](size_type& position)
-    {
-      return input.next(position);
-    });
-  }
+    return counts.next(position);
+  });
+  if(stats != nullptr) { *stats = counts.stats(); }
 }
 
 FinalEventFiles::FinalEventFiles(size_type sigma) :
@@ -1865,8 +1928,9 @@ struct FinalEventWriter::Impl
     occurrences.reset(new BufferedEventWriter(files.occurrences,
       codec.enabled() ? codec.block_size : buffer_bytes, budget,
       "final-event-occurrence", codec));
-    // The external sorter consumes this stream before publication. Keep it raw
-    // so the sorted output remains compatible with its fixed-record interface.
+    // Kept raw: the writer's incremental checksum then adopts it without the
+    // full reread a framed stream needs, and component construction reads it
+    // once to count events per slot.
     const TempFileCodecParameters raw_codec;
     redundant.reset(new BufferedEventWriter(files.redundant,
       buffer_bytes, budget, "final-event-redundancy", raw_codec));
@@ -1987,38 +2051,8 @@ FinalEventWriter::checksums() const
   result.sample_ids = this->impl_->sample_ids->checksum();
   result.sample_ends = this->impl_->sample_ends->checksum();
   result.occurrences = this->impl_->occurrences->checksum();
+  result.redundant = this->impl_->redundant->checksum();
   return result;
-}
-
-void
-sortFinalRedundancy(FinalEventFiles& files,
-  const ConstructionParameters& parameters,
-  ExternalFixedRecordSortStats* stats)
-{
-  std::string sorted = TempFile::getName("gcsa_final_redundant_sorted");
-  try
-  {
-    size_type usable_memory = parameters.getMemoryLimitBytes() -
-      parameters.getMemoryLimitBytes() / 8;
-    size_type budget = std::min(usable_memory, parameters.getSortRunSize());
-    const size_type sorter_descriptors = 4;
-    if(parameters.getMaxOpenFiles() < sorter_descriptors + 2 * 2)
-    {
-      throw eventError("max-open-files cannot hold redundancy sort streams");
-    }
-    size_type fan_in = std::min(parameters.getMergeFanIn(),
-      (parameters.getMaxOpenFiles() - sorter_descriptors) / 2);
-    // compareEncoded64 decodes the whole eight-byte record, so equal implies
-    // byte-identical and the run may be sorted in place.
-    ExternalFixedRecordSorter::sort(files.redundant, sorted, 8, budget,
-      fan_in, compareEncoded64, stats, true,
-      ExternalFixedRecordSorter::RecordOrder::ASCENDING_U64);
-    TempFile::remove(files.redundant); files.redundant = sorted;
-  }
-  catch(...)
-  {
-    TempFile::remove(sorted); throw;
-  }
 }
 
 void
@@ -2143,7 +2177,8 @@ checkpointFinalEvents(BuildWorkspace& workspace,
     (checksums == nullptr || CompressedBlockReader::isFramed(files.occurrences)) ? nullptr : &(checksums->occurrences)));
   artifacts.push_back(checkpointFile(workspace,
     streamArtifact("redundancy", "path-rank-u64le-v1"), physical_shard_id_t(6),
-    files.redundant, metadata.redundant, buffer_bytes, "path-rank"));
+    files.redundant, metadata.redundant, buffer_bytes, "emission-order",
+    (checksums == nullptr || CompressedBlockReader::isFramed(files.redundant)) ? nullptr : &(checksums->redundant)));
   workspace.commit_task(FINAL_TASK, FINAL_PHASE, artifacts);
 }
 
@@ -2193,48 +2228,80 @@ restoreFinalEvents(const BuildWorkspace& workspace,
 namespace
 {
 
-// Each encoder writes to a bounded pipe. The foreground drains pipes in the
-// public serialization order, so workers never seek/write the shared output.
-// No component-sized allocation or temporary component file is required.
-class FinalComponentPipe : public std::streambuf
+/*
+  One component's bytes while its encoder runs out of order. A component that
+  fits in the buffer never touches the disk (most rank supports are empty); a
+  larger one continues in a temporary file opened at the first overflow and
+  closed by finish(), so its descriptor lives only while it is encoded. The
+  coordinator appends finished spools in GCSA::load() order, so no encoder
+  waits for an earlier component to reach the output.
+*/
+class FinalComponentSpool : public std::streambuf
 {
 public:
-  explicit FinalComponentPipe(size_type capacity) :
-    capacity_(capacity), buffered_(0), done_(false), error_(),
-    pending_(std::min<size_type>(MEGABYTE, capacity))
+  FinalComponentSpool(size_type buffer_bytes, const std::atomic<bool>& cancelled) :
+    buffer_(buffer_bytes), filename_(), descriptor_(-1), file_bytes_(0),
+    cancelled_(cancelled)
   {
-    this->setp(pending_.data(), pending_.data() + pending_.size());
+    this->setp(buffer_.data(), buffer_.data() + buffer_.size());
   }
 
+  ~FinalComponentSpool()
+  {
+    if(descriptor_ >= 0) { ::close(descriptor_); }
+    TempFile::remove(filename_);
+  }
+
+  // Encoder side, after the last write.
   void finish()
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    done_ = true; ready_.notify_all();
-  }
-
-  void cancel(std::exception_ptr error)
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if(!error_) { error_ = error; }
-    done_ = true; ready_.notify_all(); space_.notify_all();
-  }
-
-  void drain(std::ostream& out)
-  {
-    while(true)
+    if(descriptor_ < 0) { return; }
+    flushBuffer();
+    const int descriptor = descriptor_;
+    descriptor_ = -1;
+    if(::close(descriptor) != 0)
     {
-      std::vector<char> block;
-      {
-        std::unique_lock<std::mutex> lock(mutex_);
-        ready_.wait(lock, [&]() { return error_ || done_ || !blocks_.empty(); });
-        if(error_) { std::rethrow_exception(error_); }
-        if(blocks_.empty()) { return; }
-        block = std::move(blocks_.front()); blocks_.pop_front();
-        buffered_ -= block.size(); space_.notify_one();
-      }
-      out.write(block.data(), block.size());
-      if(!out) { throw eventError("cannot write ordered final component"); }
+      throw eventError("cannot close final component spool", filename_);
     }
+    std::vector<char>().swap(buffer_); this->setp(nullptr, nullptr);
+  }
+
+  bool spilled() const { return !filename_.empty(); }
+  size_type spilledBytes() const { return file_bytes_; }
+
+  // Coordinator side: append the component, then release its buffer and
+  // temporary file. scratch is the coordinator's copy buffer.
+  void appendTo(std::ostream& out, std::vector<char>& scratch)
+  {
+    if(filename_.empty())
+    {
+      out.write(this->pbase(), this->pptr() - this->pbase());
+    }
+    else
+    {
+      const int descriptor = ::open(filename_.c_str(), O_RDONLY);
+      if(descriptor < 0)
+      {
+        throw eventError("cannot open final component spool", filename_);
+      }
+      try
+      {
+        adviseSequential(descriptor);
+        for(size_type done = 0; done < file_bytes_ && out;)
+        {
+          const size_type bytes = std::min<size_type>(scratch.size(), file_bytes_ - done);
+          readAll(descriptor, scratch.data(), bytes, filename_);
+          out.write(scratch.data(), bytes);
+          done += bytes;
+        }
+        discardCache(descriptor, 0, static_cast<off_t>(file_bytes_));
+      }
+      catch(...) { ::close(descriptor); throw; }
+      ::close(descriptor);
+      TempFile::remove(filename_);
+    }
+    if(!out) { throw eventError("cannot write ordered final component"); }
+    std::vector<char>().swap(buffer_); this->setp(nullptr, nullptr);
   }
 
 protected:
@@ -2243,7 +2310,7 @@ protected:
     std::streamsize written = 0;
     while(written < count)
     {
-      if(this->pptr() == this->epptr()) { flushBlock(); }
+      if(this->pptr() == this->epptr()) { flushBuffer(); }
       auto amount = std::min<std::streamsize>(count - written,
         this->epptr() - this->pptr());
       std::memcpy(this->pptr(), data + written, amount);
@@ -2254,7 +2321,7 @@ protected:
 
   int_type overflow(int_type value) override
   {
-    flushBlock();
+    flushBuffer();
     if(!traits_type::eq_int_type(value, traits_type::eof()))
     {
       *this->pptr() = traits_type::to_char_type(value); this->pbump(1);
@@ -2262,43 +2329,80 @@ protected:
     return traits_type::not_eof(value);
   }
 
-  int sync() override { flushBlock(); return 0; }
+  // A flush must not create a file: a component that fits stays in memory.
+  int sync() override { return 0; }
 
 private:
-  size_type capacity_, buffered_;
-  bool done_;
-  std::exception_ptr error_;
-  std::vector<char> pending_;
-  std::deque<std::vector<char>> blocks_;
-  std::mutex mutex_;
-  std::condition_variable ready_, space_;
+  std::vector<char> buffer_;
+  std::string filename_;
+  int descriptor_;
+  size_type file_bytes_;
+  const std::atomic<bool>& cancelled_;
 
-  void flushBlock()
+  void flushBuffer()
   {
+    // Encoders no longer block on the output, so a failure elsewhere stops a
+    // long component here instead of letting it run to completion.
+    if(cancelled_.load())
+    {
+      throw eventError("final component encoding cancelled", filename_);
+    }
     const size_type bytes = this->pptr() - this->pbase();
     if(bytes == 0) { return; }
-    std::unique_lock<std::mutex> lock(mutex_);
-    space_.wait(lock, [&]() { return error_ || bytes <= capacity_ - buffered_; });
-    if(error_) { std::rethrow_exception(error_); }
-    blocks_.emplace_back(this->pbase(), this->pptr());
-    buffered_ += bytes; this->pbump(-static_cast<int>(bytes));
-    ready_.notify_one();
+    if(descriptor_ < 0)
+    {
+      filename_ = TempFile::getName("gcsa_final_component");
+      descriptor_ = ::open(filename_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      if(descriptor_ < 0)
+      {
+        throw eventError("cannot create final component spool", filename_);
+      }
+      adviseSequential(descriptor_);
+    }
+    writeAll(descriptor_, this->pbase(), bytes, filename_);
+    file_bytes_ += bytes; this->pbump(-static_cast<int>(bytes));
   }
 };
+
+// What the scheduler knows about one component: the bytes its encoder reads,
+// which only orders dispatch, and a memory goal it needs beyond an ordinary
+// encoder share (the redundancy counts), granted when the goal affords it.
+struct FinalComponentTask
+{
+  size_type cost = 0, memory = 0;
+};
+
+// The goal a redundancy encoder needs to count every slot in one window: the
+// counts, the wrap list and its reader, over the 7/8 its MemoryBudget leaves.
+size_type
+redundancyCountLimit(size_type paths, size_type redundant,
+  const ConstructionParameters& parameters)
+{
+  const size_type slots = (paths > 0 ? paths - 1 : 0);
+  const size_type need = slots + 8 * (redundant / 256) +
+    parameters.getIOBufferSize() + 64;
+  return need + need / 7 + 8;
+}
 
 template<class Encoder>
 void
 writeFinalComponents(std::ostream& out, const FinalEventFiles& files,
   const FinalEventMetadata& metadata, const ConstructionParameters& parameters,
-  size_type tasks, const Encoder& encode, FinalComponentStats* stats)
+  const std::vector<FinalComponentTask>& plan, const Encoder& encode,
+  FinalComponentStats* stats)
 {
-  // A worker may open all sigma edge streams; a framed stream may transiently
-  // need a second descriptor. Leave four descriptors for the output/coordinator.
-  const size_type per_worker_fds = 2 * metadata.sigma + 4;
+  const size_type tasks = plan.size();
+  // A worker may open all sigma edge streams, a framed stream may transiently
+  // need a second descriptor, and the worker's spool needs one. Encoders run
+  // together, so they are admitted against the concurrent descriptor budget,
+  // as compaction batches are; four descriptors stay with the coordinator for
+  // the output and the spool it is appending.
+  const size_type per_worker_fds = 2 * metadata.sigma + 5;
   const size_type threads = std::max(1, omp_get_max_threads());
+  const size_type descriptors = parameters.getConcurrentOpenFiles();
   size_type workers = std::min(tasks, threads > 1 ? threads - 1 : 0);
-  workers = std::min(workers, parameters.getMaxOpenFiles() > 4 ?
-    (parameters.getMaxOpenFiles() - 4) / per_worker_fds : 0);
+  workers = std::min(workers, descriptors > 4 ?
+    (descriptors - 4) / per_worker_fds : 0);
 
   // Admission uses actual framed blocks, which may have been created before a
   // resume with a different compression setting. Reader buffers also receive
@@ -2320,9 +2424,22 @@ writeFinalComponents(std::ostream& out, const FinalEventFiles& files,
     }
   }
   const size_type goal = parameters.getMemoryLimitBytes();
-  const size_type pipe_bytes = std::min<size_type>(64 * MEGABYTE, goal / (16 * tasks));
-  const size_type pipe_reservation = 3 * pipe_bytes * tasks;
-  const size_type worker_budget = goal - pipe_reservation;
+  // Components up to spool_bytes stay in memory until appended. The
+  // reservation covers every spool buffer and the coordinator's copy buffer.
+  const size_type spool_bytes = std::min<size_type>(MEGABYTE,
+    goal / (16 * (tasks + 1)));
+  const size_type spool_reservation = spool_bytes * (tasks + 1);
+  size_type worker_budget = goal - spool_reservation;
+  std::vector<size_type> granted(tasks, 0);
+  for(size_type task = 0; task < tasks; task++)
+  {
+    // Half the remaining budget at most, so a grant cannot starve the
+    // ordinary shares; a task without one works within its share.
+    if(plan[task].memory > 0 && plan[task].memory <= worker_budget / 2)
+    {
+      granted[task] = plan[task].memory; worker_budget -= plan[task].memory;
+    }
+  }
   size_type minimum_worker = 64 * KILOBYTE;
   if(codec_bytes > (std::numeric_limits<size_type>::max() / (4 * metadata.sigma)) - 16)
   {
@@ -2330,16 +2447,20 @@ writeFinalComponents(std::ostream& out, const FinalEventFiles& files,
   }
   else { minimum_worker = std::max(minimum_worker, 4 * metadata.sigma * (codec_bytes + 16)); }
   workers = std::min(workers, worker_budget / minimum_worker);
-  if(pipe_bytes < 16 || workers < 2) { workers = 1; }
+  if(spool_bytes < 16 || workers < 2) { workers = 1; }
   if(stats != nullptr)
   {
     stats->tasks = tasks; stats->workers = workers;
-    stats->buffer_limit_bytes = workers > 1 ? pipe_reservation : 0;
+    stats->buffer_limit_bytes = workers > 1 ? spool_reservation : 0;
+    stats->max_concurrent = stats->out_of_order = 0;
+    stats->spilled = stats->spilled_bytes = 0;
   }
   if(Verbosity::level >= Verbosity::EXTENDED)
   {
     std::cerr << "GCSA::storeFinalComponents(): " << tasks << " components, "
-              << workers << " encoder(s), ordered streaming output" << std::endl;
+              << workers << " encoder(s), "
+              << (workers > 1 ? "out-of-order spooled output" : "serial output")
+              << std::endl;
   }
   if(workers == 1)
   {
@@ -2347,26 +2468,41 @@ writeFinalComponents(std::ostream& out, const FinalEventFiles& files,
     return;
   }
 
-  ConstructionParameters local = parameters;
-  local.setMemoryLimitBytes(worker_budget / workers);
-  std::vector<std::unique_ptr<FinalComponentPipe>> pipes;
+  std::vector<ConstructionParameters> local(tasks, parameters);
   for(size_type task = 0; task < tasks; task++)
   {
-    pipes.emplace_back(new FinalComponentPipe(pipe_bytes));
+    local[task].setMemoryLimitBytes(worker_budget / workers + granted[task]);
   }
-  std::atomic<size_type> next(0);
+  // Longest first: with fewer encoders than components, the one that bounds
+  // the phase must not be the last to start.
+  std::vector<size_type> order(tasks);
+  for(size_type task = 0; task < tasks; task++) { order[task] = task; }
+  std::stable_sort(order.begin(), order.end(), [&](size_type a, size_type b)
+  {
+    return plan[a].cost > plan[b].cost;
+  });
   std::atomic<bool> failed(false);
+  std::vector<std::unique_ptr<FinalComponentSpool>> spools;
+  for(size_type task = 0; task < tasks; task++)
+  {
+    spools.emplace_back(new FinalComponentSpool(spool_bytes, failed));
+  }
+  std::vector<char> scratch(spool_bytes);
+  std::vector<bool> done(tasks, false);
+  size_type lowest_pending = 0, running = 0, max_running = 0, out_of_order = 0;
+  std::mutex state_mutex;
+  std::condition_variable state_changed;
+  std::atomic<size_type> next(0);
   std::exception_ptr first_error;
-  std::mutex error_mutex;
   std::vector<std::thread> pool;
   const auto cancel = [&](std::exception_ptr error)
   {
     {
-      std::lock_guard<std::mutex> lock(error_mutex);
+      std::lock_guard<std::mutex> lock(state_mutex);
       if(!first_error) { first_error = error; }
+      failed.store(true);
     }
-    failed.store(true);
-    for(auto& pipe : pipes) { pipe->cancel(error); }
+    state_changed.notify_all();
   };
   const auto join = [&]() { for(auto& thread : pool) { if(thread.joinable()) { thread.join(); } } };
   try
@@ -2379,20 +2515,60 @@ writeFinalComponents(std::ostream& out, const FinalEventFiles& files,
         {
           while(!failed.load())
           {
-            size_type task = next.fetch_add(1);
-            if(task >= tasks) { break; }
-            std::ostream stream(pipes[task].get());
+            const size_type position = next.fetch_add(1);
+            if(position >= tasks) { break; }
+            const size_type task = order[position];
+            {
+              std::lock_guard<std::mutex> lock(state_mutex);
+              running++; max_running = std::max(max_running, running);
+            }
+            std::ostream stream(spools[task].get());
             stream.exceptions(std::ios::badbit | std::ios::failbit);
-            encode(task, stream, local);
-            stream.flush(); pipes[task]->finish();
+            encode(task, stream, local[task]);
+            stream.flush(); spools[task]->finish();
+            {
+              std::lock_guard<std::mutex> lock(state_mutex);
+              running--;
+              if(task != lowest_pending) { out_of_order++; }
+              done[task] = true;
+              while(lowest_pending < tasks && done[lowest_pending]) { lowest_pending++; }
+            }
+            state_changed.notify_all();
           }
         }
         catch(...) { cancel(std::current_exception()); }
       });
     }
-    for(auto& pipe : pipes) { pipe->drain(out); }
+    size_type spilled = 0, spilled_bytes = 0;
+    for(size_type task = 0; task < tasks; task++)
+    {
+      {
+        std::unique_lock<std::mutex> lock(state_mutex);
+        state_changed.wait(lock, [&]() { return failed.load() || done[task]; });
+        if(failed.load()) { break; }
+      }
+      if(spools[task]->spilled())
+      {
+        spilled++; spilled_bytes += spools[task]->spilledBytes();
+      }
+      spools[task]->appendTo(out, scratch);
+      spools[task].reset();
+    }
     join();
     if(first_error) { std::rethrow_exception(first_error); }
+    if(stats != nullptr)
+    {
+      stats->max_concurrent = max_running; stats->out_of_order = out_of_order;
+      stats->spilled = spilled; stats->spilled_bytes = spilled_bytes;
+    }
+    if(Verbosity::level >= Verbosity::EXTENDED)
+    {
+      std::cerr << "GCSA::storeFinalComponents(): at most " << max_running
+                << " encoder(s) at once, " << out_of_order << " of " << tasks
+                << " components finished out of output order, " << spilled
+                << " spooled to temporary files ("
+                << inGigabytes(spilled_bytes) << " GB)" << std::endl;
+    }
   }
   catch(...)
   {
@@ -2439,6 +2615,7 @@ storeFinalComponents(const GCSAHeader& header,
     write(alphabet);
 
     const size_type component_tasks = 2 * metadata.sigma + 6;
+    RedundancyCountStats redundancy_stats;
     const auto encode = [&](size_type task, std::ostream& out,
       const ConstructionParameters& parameters)
     {
@@ -2615,12 +2792,38 @@ storeFinalComponents(const GCSAHeader& header,
           throw eventError("redundancy bitvector length overflows");
         }
         serializeRedundantPointers(out, files.redundant, metadata.paths,
-          metadata.redundant, parameters);
+          metadata.redundant, parameters, &redundancy_stats);
         if(!out) { throw eventError("cannot write partial final index", partial); }
       }
       if(!out) { throw eventError("cannot encode final component", partial); }
     };
-    writeFinalComponents(out, files, metadata, parameters, component_tasks, encode, stats);
+    // Costs are the bytes each encoder reads and only order dispatch: a
+    // sparse BWT member replays the mask stream four times and the
+    // occurrence pointers replay their pairs eight times.
+    std::vector<FinalComponentTask> plan(component_tasks);
+    for(size_type comp = 0; comp < metadata.sigma; comp++)
+    {
+      const bool fast = (comp > 0 && comp <= metadata.fast_chars);
+      plan[comp].cost = (fast ? metadata.paths : 0);
+      plan[metadata.sigma + 1 + comp].cost = (fast ? 0 : 4 * metadata.paths);
+    }
+    plan[2 * metadata.sigma + 2].cost = 8 * metadata.total_edges;
+    plan[2 * metadata.sigma + 3].cost =
+      8 * (3 * metadata.sampled_paths + metadata.sample_ids);
+    plan[2 * metadata.sigma + 4].cost = 128 * metadata.occurrence_items;
+    plan[2 * metadata.sigma + 5].cost = 8 * metadata.redundant + metadata.paths;
+    plan[2 * metadata.sigma + 5].memory = redundancyCountLimit(metadata.paths,
+      metadata.redundant, parameters);
+    writeFinalComponents(out, files, metadata, parameters, plan, encode, stats);
+    if(stats != nullptr) { stats->redundancy = redundancy_stats; }
+    if(Verbosity::level >= Verbosity::EXTENDED)
+    {
+      std::cerr << "GCSA::storeFinalComponents(): redundancy counts for "
+                << redundancy_stats.slots << " slots in windows of "
+                << redundancy_stats.window_slots << ", "
+                << redundancy_stats.stream_passes << " stream pass(es), "
+                << redundancy_stats.wraps << " byte wrap(s)" << std::endl;
+    }
 
     out.flush();
     out.close();
