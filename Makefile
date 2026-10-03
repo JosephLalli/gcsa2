@@ -70,7 +70,7 @@ LIBRARY=$(BUILD_LIB)/libgcsa2.a
 PROGRAMS=$(addprefix $(BUILD_BIN)/,build_gcsa convert_graph gcsa_format try_extend)
 OBSOLETE=build_gcsa convert_graph gcsa_format try_extend
 
-.PHONY: all clean directories test compressed-block-test workspace-test external-path-sort-test path-sort-run-test external-join-test external-sort-test external-preprocessing-test external-verification-test final-events-test lcp-streaming-test disk-array-test internal-buffer-test parameter-test construction-resume-test path-graph-prune-test checkpoint-checksums-test
+.PHONY: all clean directories test compressed-block-test workspace-test external-path-sort-test path-sort-run-test external-join-test external-sort-test external-preprocessing-test external-verification-test final-events-test lcp-streaming-test disk-array-test internal-buffer-test parameter-test construction-resume-test path-graph-prune-test checkpoint-checksums-test final-scan-test
 all: directories $(LIBRARY) $(PROGRAMS)
 
 directories: $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)
@@ -195,6 +195,13 @@ construction-resume-test: directories $(BUILD_OBJ)/test_construction_resume.o $(
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_construction_resume $(BUILD_OBJ)/test_construction_resume.o $(LIBRARY) $(LIBS)
 	$(BUILD_BIN)/test_construction_resume
 
+$(BUILD_OBJ)/test_final_scan.o:tests/test_final_scan.cpp include/gcsa/final_events.h include/gcsa/gcsa.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+final-scan-test: directories $(BUILD_OBJ)/test_final_scan.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_final_scan $(BUILD_OBJ)/test_final_scan.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_final_scan
+
 $(BUILD_OBJ)/test_checkpoint_checksums.o:tests/test_checkpoint_checksums.cpp include/gcsa/checkpoint.h include/gcsa/compressed_block.h include/gcsa/workspace.h
 	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
 
@@ -209,7 +216,7 @@ path-graph-prune-test: directories $(BUILD_OBJ)/test_path_graph_prune.o $(LIBRAR
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_path_graph_prune $(BUILD_OBJ)/test_path_graph_prune.o $(LIBRARY) $(LIBS)
 	$(BUILD_BIN)/test_path_graph_prune
 
-test: compressed-block-test workspace-test external-path-sort-test path-sort-run-test external-join-test external-sort-test external-preprocessing-test external-verification-test final-events-test lcp-streaming-test disk-array-test internal-buffer-test parameter-test construction-resume-test path-graph-prune-test checkpoint-checksums-test
+test: compressed-block-test workspace-test external-path-sort-test path-sort-run-test external-join-test external-sort-test external-preprocessing-test external-verification-test final-events-test lcp-streaming-test disk-array-test internal-buffer-test parameter-test construction-resume-test path-graph-prune-test checkpoint-checksums-test final-scan-test
 
 clean:
 	rm -rf $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)

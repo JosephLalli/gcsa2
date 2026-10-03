@@ -11,8 +11,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <deque>
 #include <exception>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <fstream>
 #include <filesystem>
 #include <fcntl.h>
@@ -828,13 +834,31 @@ struct ExternalFinalScanStats
   bool predecessor_parallel_fallback;
   bool restored;
 
+  // The pipelined scan (see producePipelinedFinalEvents). Busy seconds are
+  // the time each stage spent working rather than waiting for its input;
+  // walk is the slowest component's. core_wait is the time the ordered core
+  // waited for walked batches, which is what the parallel stages cost it.
+  bool pipelined;
+  std::string pipeline_declined;
+  size_type pipeline_workers, pipeline_walkers, pipeline_slots;
+  size_type pipeline_batch_paths, pipeline_slot_bytes, pipeline_batches;
+  size_type pipeline_serial_paths, previous_ram_bytes;
+  double load_seconds, label_seconds, prepare_seconds, walk_seconds;
+  double encode_seconds, core_seconds, core_wait_seconds, write_seconds;
+
   ExternalFinalScanStats() : previous_occurrences(), suffix_tree_stack(),
     from_node_spills(0), maximum_from_nodes(0), predecessor_workers(1),
     predecessor_batches(0), maximum_predecessor_batch(0),
     predecessor_buffer_bytes(0), prepared_from_paths(0),
     prepared_from_ranks(0), prepared_from_spill_fallbacks(0),
     from_preparation_buffer_bytes(0), predecessor_parallel_fallback(false),
-    restored(false) { }
+    restored(false), pipelined(false), pipeline_declined(),
+    pipeline_workers(0), pipeline_walkers(0), pipeline_slots(0),
+    pipeline_batch_paths(0), pipeline_slot_bytes(0), pipeline_batches(0),
+    pipeline_serial_paths(0), previous_ram_bytes(0), load_seconds(0.0),
+    label_seconds(0.0), prepare_seconds(0.0), walk_seconds(0.0),
+    encode_seconds(0.0), core_seconds(0.0), core_wait_seconds(0.0),
+    write_seconds(0.0) { }
 };
 
 /*
@@ -957,6 +981,1337 @@ finalScanBuffer(size_type target, size_type minimum, size_type available,
   return std::max(minimum, std::min(target, share));
 }
 
+//------------------------------------------------------------------------------
+
+/*
+  FORK: the pipelined final-event scan.
+
+  produceExternalFinalEvents() below runs its scan on one coordinator thread.
+  In a gperftools profile of a complete chr18 build that thread was busy for
+  about 318 of the scan's 328 s: about 108 s of ordered state, 89 s of it the
+  per-access call, division and tag check of DiskBackedArray64; 70 s copying
+  each batch out of the merged-graph readers one path at a time; 45 s of
+  per-record event writes and checksums; and 32 s reading predecessors' start
+  nodes for the sampling test. The seven-thread region between batches added
+  33 s more, 21 s of it the coordinator spinning at its barrier.
+
+  Only two pieces of state depend on the order of paths: the previous
+  occurrence of every start-node rank and the suffix-tree stack over the LCP
+  array, which together decide the redundancy events. Everything else about
+  path i is a function of path i, the immutable merged graph and the
+  start-node index -- except the destination walks, and each component's walk
+  depends only on the paths with a predecessor in that component, in order.
+  So the scan is a pipeline of stages, each working through batches of paths
+  in order, with a batch moving through FINAL_SCAN_SLOTS reusable slots:
+
+    load     one thread copies a batch's paths, LCP bytes and raw start nodes
+             into the slot's flat arrays, and another its labels;
+    prepare  pool tasks map, sort and deduplicate each path's start nodes,
+             resolve their ranks, and compute every predecessor label range;
+    walk     one thread per component runs the serial destination walk and
+             the sampling continuation test of paths whose only predecessor is
+             in that component;
+    encode   pool tasks decide sampling and encode every stream but redundancy;
+    core     the calling thread updates the LCP stack and previous occurrences
+             in path order and emits redundancy, with previous occurrences in
+             RAM and prefetched when the memory goal admits them;
+    write    pool tasks append the batch to the streams, one task per stream.
+
+  Every stream is still written in path order from batches appended in order,
+  and every record is computed by the serial scan's function: the walks are
+  the serial walks (one advance() at most per source path), with the labels of
+  the destination under the cursor read once instead of once per source; the
+  continuation test compares the same two sets, by membership with a covering
+  count instead of a sorted merge; and the core applies the serial update in
+  path order and, within a path, in sorted node order, which is rank order.
+
+  A path whose start nodes outgrow a slot's arena keeps them in the spillable
+  set, as the serial scan does, alone in its batch; only one such path is in
+  flight at a time, so the descriptor accounting is the serial scan's.
+  GCSA_SERIAL_FINAL_SCAN=1 forces the serial scan, for comparisons and as a
+  fallback, and one thread or a budget too small for the slots selects it.
+*/
+
+// One slot per stage (paths, labels, prepare, walk, encode and core, write)
+// plus one, so the loader fills a slot while the writer drains another.
+constexpr size_type FINAL_SCAN_SLOTS = 7;
+
+// Start-node and edge arenas per batch path. A batch ends early when either
+// fills; chr18 averages 1.86 start nodes and 1.03 edges per path.
+constexpr size_type FINAL_SCAN_NODES_PER_PATH = 4;
+
+// Per-path flags: a start node falls on the sample period; the walker found
+// the path continues its predecessor; the encoder decided to sample it.
+constexpr std::uint8_t FINAL_SCAN_PERIOD = 1, FINAL_SCAN_CONTINUES = 2,
+  FINAL_SCAN_SAMPLED = 4;
+
+// Previous-occurrence updates are random accesses into an array of all
+// start-node ranks; the core prefetches this many ranks ahead.
+constexpr size_type FINAL_SCAN_PREFETCH = 16;
+
+/*
+  A fixed set of worker threads for the data-parallel steps of the pipelined
+  scan. Several stage threads may submit jobs at once; a submitter works on its
+  own job as well and returns when every task of it has finished, rethrowing
+  the first failure. Tasks are coarse (thousands of paths, or a whole stream),
+  so one mutex suffices.
+*/
+class FinalScanPool
+{
+public:
+  explicit FinalScanPool(size_type workers) : stopping(false)
+  {
+    for(size_type i = 0; i < workers; i++)
+    {
+      this->threads.emplace_back(&FinalScanPool::work, this);
+    }
+  }
+
+  ~FinalScanPool()
+  {
+    {
+      std::lock_guard<std::mutex> lock(this->mutex);
+      this->stopping = true;
+    }
+    this->wake.notify_all();
+    for(std::thread& thread : this->threads) { thread.join(); }
+  }
+
+  size_type workers() const { return this->threads.size(); }
+
+  void run(size_type tasks, const std::function<void(size_type)>& task)
+  {
+    if(tasks == 0) { return; }
+    Job job; job.task = &task; job.tasks = tasks;
+    std::unique_lock<std::mutex> lock(this->mutex);
+    this->jobs.push_back(&job);
+    this->wake.notify_all();
+    while(job.next < job.tasks) { this->runOne(job, lock); }
+    this->finished.wait(lock, [&job]() { return job.done == job.tasks; });
+    if(job.error) { std::rethrow_exception(job.error); }
+  }
+
+  FinalScanPool(const FinalScanPool&) = delete;
+  FinalScanPool& operator=(const FinalScanPool&) = delete;
+
+private:
+  struct Job
+  {
+    const std::function<void(size_type)>* task = nullptr;
+    size_type tasks = 0, next = 0, done = 0;
+    std::exception_ptr error;
+  };
+
+  // Runs the next task of job. Called and returns with the lock held.
+  void runOne(Job& job, std::unique_lock<std::mutex>& lock)
+  {
+    const size_type index = job.next++;
+    if(job.next == job.tasks)
+    {
+      this->jobs.erase(std::find(this->jobs.begin(), this->jobs.end(), &job));
+    }
+    const bool skip = static_cast<bool>(job.error);
+    lock.unlock();
+    std::exception_ptr error;
+    if(!skip)
+    {
+      try { (*(job.task))(index); }
+      catch(...) { error = std::current_exception(); }
+    }
+    lock.lock();
+    if(error && !(job.error)) { job.error = error; }
+    if(++job.done == job.tasks) { this->finished.notify_all(); }
+  }
+
+  void work()
+  {
+    std::unique_lock<std::mutex> lock(this->mutex);
+    while(true)
+    {
+      this->wake.wait(lock, [this]() { return this->stopping || !(this->jobs.empty()); });
+      if(this->jobs.empty()) { return; }
+      this->runOne(*(this->jobs.front()), lock);
+    }
+  }
+
+  std::mutex mutex;
+  std::condition_variable wake, finished;
+  std::deque<Job*> jobs;
+  bool stopping;
+  std::vector<std::thread> threads;
+};
+
+/*
+  One batch of paths [first, first + count) in flat arrays. Path k's labels are
+  labels[label_start[k] ...], its edges are edge slots [edge_start[k],
+  edge_start[k + 1]) in component order, and its start nodes are
+  from_nodes[from_start[k] ...]: raw as loaded, then mapped, sorted and
+  deduplicated in place, from_count[k] of them, with their ranks alongside.
+  A serial batch is one path whose start nodes are in the spillable set.
+*/
+struct FinalScanSlot
+{
+  // Flat arrays left uninitialized when allocated: every element a stage
+  // reads was written for the current batch first, and value-initializing
+  // about a gigabyte of slots took most of a second on the setup thread.
+  template<class Element>
+  struct Array
+  {
+    std::unique_ptr<Element[]> values;
+
+    void allocate(size_type size) { this->values.reset(new Element[size]); }
+    Element* data() { return this->values.get(); }
+    const Element* data() const { return this->values.get(); }
+    Element& operator[](size_type i) { return this->values[i]; }
+    const Element& operator[](size_type i) const { return this->values[i]; }
+  };
+
+  size_type first, count;
+  bool serial;
+  Array<PathNode> paths;
+  Array<byte_type> masks;
+  Array<std::uint8_t> lcp, flags;
+  Array<size_type> label_start, edge_start, from_start, from_count;
+  Array<PathNode::rank_type> labels;
+  Array<node_type> from_nodes;
+  Array<size_type> from_ranks;
+  Array<PathLabel> first_label, last_label;
+  FinalEventBatch events;
+
+  FinalScanSlot() : first(0), count(0), serial(false) { }
+
+  void allocate(size_type batch_paths, size_type nodes, size_type edges,
+    size_type sigma)
+  {
+    this->paths.allocate(batch_paths); this->masks.allocate(batch_paths);
+    this->lcp.allocate(batch_paths); this->flags.allocate(batch_paths);
+    this->label_start.allocate(batch_paths);
+    this->edge_start.allocate(batch_paths + 1);
+    this->from_start.allocate(batch_paths + 1);
+    this->from_count.allocate(batch_paths);
+    this->labels.allocate(batch_paths * (PathLabel::LABEL_LENGTH + 1));
+    this->from_nodes.allocate(nodes); this->from_ranks.allocate(nodes);
+    this->first_label.allocate(edges); this->last_label.allocate(edges);
+    this->events.masks.reserve(batch_paths);
+    for(size_type comp = 0; comp < sigma; comp++)
+    {
+      this->events.edges[comp].reserve(edges);
+    }
+    this->events.occurrences.reserve(2 * batch_paths);
+    this->events.sampled_paths.reserve(batch_paths);
+    this->events.sample_counts.reserve(batch_paths);
+    this->events.samples.reserve(nodes);
+    this->events.redundant.reserve(nodes);
+  }
+};
+
+// Bytes one batch path costs in a slot, for admission. Labels are counted at
+// their fixed bound, and every component's edge vector at every edge, since
+// each keeps the capacity of its largest batch.
+size_type
+finalScanBytesPerPath(size_type sigma)
+{
+  // Node, mask, LCP byte and flags; label, edge and node offsets and the node
+  // count; labels; and the encoded mask, occurrence pair and sample entry.
+  const size_type per_path = sizeof(PathNode) + 3 * sizeof(byte_type) +
+    4 * sizeof(size_type) +
+    (PathLabel::LABEL_LENGTH + 1) * sizeof(PathNode::rank_type) +
+    sizeof(byte_type) + 4 * sizeof(size_type);
+  // Node, rank, sample id and redundancy event, and a covering mark of each
+  // walker's continuation test.
+  const size_type per_node = sizeof(node_type) + 3 * sizeof(size_type) + sigma;
+  // Both predecessor label bounds and the destination.
+  const size_type per_edge = 2 * sizeof(PathLabel) + sigma * sizeof(size_type);
+  return per_path + FINAL_SCAN_NODES_PER_PATH * per_node + (3 * per_edge + 1) / 2;
+}
+
+/*
+  Copies elements [first, first + count) of a ReadBuffer into flat storage
+  with one segmented copy instead of an operator[] call per element; the
+  per-path accesses were most of the serial scan's batch preparation. The
+  window must not have moved past first: the scan's readers only move forward
+  and seek() once per batch, after copying.
+*/
+template<class Element, class Output>
+void
+copyBufferedRange(ReadBuffer<Element>& buffer, size_type first, size_type count,
+  Output* output)
+{
+  if(count == 0) { return; }
+  if(first + count > buffer.size())
+  {
+    throw std::runtime_error("GCSA::GCSA(): final scan read past a merged-graph stream");
+  }
+  buffer[first + count - 1];
+  if(!(buffer.buffer.buffered(first)))
+  {
+    throw std::runtime_error("GCSA::GCSA(): final scan reader moved past its batch");
+  }
+  auto begin = buffer.buffer.data.begin() + (first - buffer.buffer.offset);
+  std::copy(begin, begin + count, output);
+}
+
+// Previous occurrences held in RAM. get() keeps the disk array's range check.
+struct FinalScanRamPrevious
+{
+  std::uint64_t* values;
+  size_type size;
+
+  std::uint64_t get(size_type index) const
+  {
+    if(index >= this->size) { throw std::out_of_range("final scan previous occurrences"); }
+    return this->values[index];
+  }
+  void set(size_type index, std::uint64_t value) { this->values[index] = value; }
+  void prefetch(size_type index) const
+  {
+    if(index < this->size) { __builtin_prefetch(this->values + index, 1, 1); }
+  }
+};
+
+// The disk-backed array, when the memory goal cannot hold the RAM array.
+struct FinalScanDiskPrevious
+{
+  DiskBackedArray64& array;
+
+  std::uint64_t get(size_type index) { return this->array.get(index); }
+  void set(size_type index, std::uint64_t value) { this->array.set(index, value); }
+  void prefetch(size_type) const { }
+};
+
+typedef std::chrono::steady_clock FinalScanClock;
+
+double
+finalScanSeconds(FinalScanClock::time_point start)
+{
+  return std::chrono::duration<double>(FinalScanClock::now() - start).count();
+}
+
+void
+reportFinalScanPipeline(const ExternalFinalScanStats& stats)
+{
+  if(Verbosity::level < Verbosity::EXTENDED) { return; }
+  std::cerr << "GCSA::GCSA(): final scan pipeline: "
+            << stats.pipeline_workers << " pool worker(s), "
+            << stats.pipeline_walkers << " walker(s), "
+            << stats.pipeline_batches << " batch(es) of at most "
+            << stats.pipeline_batch_paths << " paths in "
+            << stats.pipeline_slots << " slots ("
+            << formatBytes(stats.pipeline_slot_bytes) << " admitted), "
+            << stats.prepared_from_paths << " paths / "
+            << stats.prepared_from_ranks << " from-ranks prepared, "
+            << stats.pipeline_serial_paths << " serial path(s); previous occurrences ";
+  if(stats.previous_ram_bytes > 0)
+  {
+    std::cerr << "in RAM (" << formatBytes(stats.previous_ram_bytes) << ")";
+  }
+  else { std::cerr << "on disk"; }
+  std::cerr << std::endl;
+  std::cerr << "GCSA::GCSA(): final scan stage busy seconds: load "
+            << stats.load_seconds << ", labels "
+            << stats.label_seconds << ", prepare "
+            << stats.prepare_seconds << ", walk (slowest component) "
+            << stats.walk_seconds << ", encode "
+            << stats.encode_seconds << ", core "
+            << stats.core_seconds << " (waited "
+            << stats.core_wait_seconds << "), write "
+            << stats.write_seconds << std::endl;
+}
+
+/*
+  The pipelined scan described above. Returns false without writing anything,
+  and with the reason in `declined`, when the serial scan must run instead.
+  Otherwise it writes, checkpoints and returns the same events.
+*/
+bool
+producePipelinedFinalEvents(const MergedGraph& merged_graph,
+  const DeBruijnGraph& mapper, const sdsl::int_vector<0>& last_char,
+  const sdsl::sd_vector<>& from_nodes, size_type unique_from_nodes,
+  const InputGraph& graph, const ConstructionParameters& parameters,
+  BuildWorkspace& workspace, FinalEventFiles& files, size_type checkpoint_buffer,
+  ExternalFinalScanStats* stats, FinalEventMetadata& metadata,
+  std::string& declined)
+{
+  const size_type sigma = graph.alpha.sigma;
+  const size_type path_count = merged_graph.size();
+  const size_type threads = static_cast<size_type>(std::max(1, omp_get_max_threads()));
+  const size_type memory_limit = parameters.getMemoryLimitBytes();
+  MemoryBudget memory(memory_limit, memory_limit / 8);
+
+  // The same streams, descriptors and minimum workspace as the serial scan:
+  // the loader reads paths, labels, start nodes and LCP bytes, and each
+  // walker its destinations' paths and labels and their start nodes.
+  const size_type reader_streams = 3 * (sigma + 1) + 1;
+  const size_type minimum_reader = std::max(sizeof(PathNode),
+    std::max(sizeof(PathNode::rank_type), sizeof(range_type)));
+  const size_type writer_streams = sigma + 6;
+  const size_type reader_minimum = checkedProduct(2 * reader_streams,
+    minimum_reader, "minimum final reader reservation");
+  const size_type writer_minimum = checkedProduct(writer_streams,
+    static_cast<size_type>(16), "minimum final writer reservation");
+  const size_type minimum_node_set = SpillableNodeSet::minimumBudget();
+  const size_type non_set_minimum = reader_minimum + writer_minimum;
+  if(memory.available() < non_set_minimum + 2 * minimum_node_set)
+  {
+    declined = "memory limit below the final-scan minimum"; return false;
+  }
+  const size_type fixed_descriptors = reader_streams + writer_streams + 2;
+  const size_type sorter_fixed_descriptors = 5;
+  if(parameters.getMaxOpenFiles() < fixed_descriptors +
+     sorter_fixed_descriptors + 2 * 2)
+  {
+    declined = "descriptor limit below the final-scan streams"; return false;
+  }
+  // The batch target is the serial scan's bounded batch, so a configuration
+  // that falls back there falls back here too.
+  const size_type batch_target = parameters.getIOBufferSize() /
+    sizeof(FinalPredecessorWork);
+  if(batch_target < MIN_FINAL_PREDECESSOR_BATCH)
+  {
+    declined = "batch admission too small"; return false;
+  }
+
+  size_type desired_node_set = std::max(minimum_node_set,
+    std::min(parameters.getIOBufferSize(), parameters.getSortRunSize()));
+  size_type node_set_cap = (memory.available() - non_set_minimum) / 2;
+  size_type node_set_budget = std::min(node_set_cap,
+    finalScanBuffer(desired_node_set, minimum_node_set, memory.available(), 16));
+  size_type node_set_fan_in = std::min(parameters.getMergeFanIn(),
+    (parameters.getMaxOpenFiles() - fixed_descriptors -
+      sorter_fixed_descriptors) / 2);
+  node_set_fan_in = std::max(static_cast<size_type>(2), node_set_fan_in);
+
+  // Admission of the slots, before anything is opened. The event writer takes
+  // at most half of what the readers leave, and the slots at most half of the
+  // rest, which keeps the remainder for the previous-occurrence array.
+  const size_type node_set_bytes = 2 * node_set_budget;
+  if(memory.available() < node_set_bytes)
+  {
+    declined = "memory limit below the start-node sets"; return false;
+  }
+  const size_type after_sets = memory.available() - node_set_bytes;
+  const size_type reader_buffer = finalScanBuffer(parameters.getIOBufferSize(),
+    minimum_reader, after_sets, 4 * reader_streams);
+  const size_type reader_reservation_bytes = checkedProduct(2 * reader_streams,
+    reader_buffer, "final reader reservation");
+  if(after_sets < reader_reservation_bytes)
+  {
+    declined = "memory limit below the final-scan readers"; return false;
+  }
+  const size_type bytes_per_path = finalScanBytesPerPath(sigma);
+  const size_type slot_share = (after_sets - reader_reservation_bytes) / 4;
+  const size_type batch_paths = std::min(batch_target,
+    slot_share / (FINAL_SCAN_SLOTS * bytes_per_path));
+  if(batch_paths < MIN_FINAL_PREDECESSOR_BATCH)
+  {
+    declined = "batch admission too small"; return false;
+  }
+  const size_type node_capacity = FINAL_SCAN_NODES_PER_PATH * batch_paths;
+  const size_type edge_capacity = batch_paths + batch_paths / 2;
+  const size_type slot_bytes = checkedProduct(batch_paths, bytes_per_path,
+    "final scan slot");
+
+  // Threads: the path and label loaders, the prepare, encode and write
+  // stages, one walker per component and the caller as the core; the pool
+  // gets the rest.
+  const size_type stage_threads = 6 + sigma;
+  const size_type pool_workers = (threads > stage_threads + 1 ?
+    threads - stage_threads : 1);
+
+  std::string previous_name = TempFile::getName("gcsa_final_prev_occ");
+  try
+  {
+    {
+      SpillableNodeSet curr_from(node_set_budget, node_set_fan_in, memory);
+      SpillableNodeSet pred_from(node_set_budget, node_set_fan_in, memory);
+      MemoryBudget::Reservation reader_reservation = memory.reserve(
+        reader_reservation_bytes, "final-merged-graph-readers");
+      size_type writer_buffer = finalScanBuffer(parameters.getIOBufferSize(),
+        static_cast<size_type>(16), memory.available(), 2 * writer_streams);
+      if(checkedProduct(writer_streams, writer_buffer,
+          "final writer reservation") > memory.available())
+      {
+        throw std::runtime_error("GCSA::GCSA(): memory limit cannot hold final event buffers");
+      }
+      FinalEventWriter output(files, sigma, writer_buffer, memory,
+        parameters.getTempFileCodecParameters());
+
+      const size_type all_slot_bytes = checkedProduct(FINAL_SCAN_SLOTS,
+        slot_bytes, "final scan slots");
+      if(all_slot_bytes > memory.available())
+      {
+        throw std::runtime_error("GCSA::GCSA(): memory limit cannot hold the final scan slots");
+      }
+      MemoryBudget::Reservation slot_reservation = memory.reserve(all_slot_bytes,
+        "final-scan-slots");
+      std::vector<FinalScanSlot> slots(FINAL_SCAN_SLOTS);
+      for(FinalScanSlot& slot : slots)
+      {
+        slot.allocate(batch_paths, node_capacity, edge_capacity, sigma);
+      }
+
+      // Previous occurrences in RAM when the goal admits them (4.25 GB for
+      // the joint chr2+chr18 graph, about 44 GB for the whole genome), or
+      // the serial scan's disk-backed array. calloc leaves untouched pages
+      // to the kernel's zero pages, so the array is not written up front.
+      // GCSA_FINAL_SCAN_PREVIOUS_ON_DISK=1 keeps the disk array, so tests
+      // reach that branch without a budget tuned to just miss the RAM array.
+      MemoryBudget::Reservation previous_reservation;
+      std::unique_ptr<std::uint64_t, decltype(&std::free)> previous_values(nullptr, &std::free);
+      std::unique_ptr<DiskBackedArray64> previous_disk;
+      const size_type previous_ram_bytes = checkedProduct(unique_from_nodes,
+        sizeof(std::uint64_t), "previous occurrences");
+      const char* previous_on_disk = std::getenv("GCSA_FINAL_SCAN_PREVIOUS_ON_DISK");
+      const bool force_disk = (previous_on_disk != nullptr &&
+        std::string(previous_on_disk) == "1");
+      if(!force_disk && unique_from_nodes > 0 &&
+         previous_ram_bytes <= memory.available())
+      {
+        previous_reservation = memory.reserve(previous_ram_bytes,
+          "final-previous-occurrences");
+        previous_values.reset(static_cast<std::uint64_t*>(
+          std::calloc(unique_from_nodes, sizeof(std::uint64_t))));
+        if(!previous_values) { throw std::bad_alloc(); }
+      }
+      else
+      {
+        size_type previous_cache = memory.available() / 2;
+        if(unique_from_nodes > 0 && previous_cache < DiskBackedArray64::minimumCacheBytes())
+        {
+          throw std::runtime_error("GCSA::GCSA(): memory limit cannot hold previous-occurrence cache");
+        }
+        previous_disk.reset(new DiskBackedArray64(previous_name,
+          unique_from_nodes, previous_cache, memory, true, 64 * KILOBYTE));
+      }
+      FinalScanRamPrevious ram_previous = { previous_values.get(), unique_from_nodes };
+
+      // The suffix-tree stack holds one frame of (LCP, first, last) per
+      // distinct LCP value (see the serial scan), so it is a small array.
+      typedef std::uint8_t merged_lcp_type;
+      constexpr size_type distinct_lcp_values =
+        static_cast<size_type>(std::numeric_limits<merged_lcp_type>::max()) + 2;
+      const size_type stack_capacity = 3 * distinct_lcp_values;
+      std::vector<size_type> stack(stack_capacity, 0);
+      size_type stack_size = 0;
+
+      // Each stage opens its own readers on its thread: a reader starting deep
+      // in a stream reads its first window synchronously, which took most of
+      // a second over the walkers' fourteen readers when done here in turn.
+      const size_type scan_read_start = DiskIO::read_volume;
+      MergedGraphLabelReader source;
+      MergedGraphReader start_reader;
+      ReadBuffer<merged_lcp_type> lcp_array;
+      std::vector<MergedGraphReader> destination(sigma), sampling(sigma);
+
+      FinalScanPool pool(pool_workers);
+      const FinalEventTaskRunner runner = [&pool](size_type tasks,
+        const std::function<void(size_type)>& task) { pool.run(tasks, task); };
+      const size_type chunk_paths = std::max(static_cast<size_type>(256),
+        batch_paths / (4 * (pool_workers + 1)) + 1);
+      const byte_type alphabet_mask = static_cast<byte_type>(
+        (static_cast<size_type>(1) << sigma) - 1);
+      const size_type sample_period = parameters.getSamplePeriod();
+      ProgressReporter scan_progress("final event scan", path_count, "paths");
+
+      // Pipeline state, under one mutex: a slot holds batch `batch` (NO_BATCH
+      // when free) at a stage; walked counts finished walkers.
+      constexpr size_type NO_BATCH = std::numeric_limits<size_type>::max();
+      enum { SLOT_PATHS = 1, SLOT_LOADED = 2, SLOT_PREPARED = 3, SLOT_WALKED = 4 };
+      struct SlotState
+      {
+        size_type batch = NO_BATCH, walked = 0;
+        int stage = 0;
+        bool encoded = false, cored = false;
+      };
+      std::array<SlotState, FINAL_SCAN_SLOTS> state;
+      std::mutex mutex;
+      std::condition_variable changed;
+      bool failed = false, load_done = false, serial_in_flight = false;
+      size_type total_batches = 0, written_batches = 0;
+      std::exception_ptr failure;
+
+      const auto fail = [&](std::exception_ptr error)
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        if(!failed) { failed = true; failure = error; }
+        changed.notify_all();
+      };
+      // Waits until batch b is in its slot and ready, or the batches ended
+      // before b, or the scan failed. True when b is ready.
+      const auto awaitBatch = [&](size_type b,
+        const std::function<bool(const SlotState&)>& ready) -> bool
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        const SlotState& current = state[b % FINAL_SCAN_SLOTS];
+        changed.wait(lock, [&]() {
+          return failed || (load_done && b >= total_batches) ||
+            (current.batch == b && ready(current));
+        });
+        return !failed && current.batch == b && ready(current);
+      };
+      const auto advanceSlot = [&](size_type b, const std::function<void(SlotState&)>& update)
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        update(state[b % FINAL_SCAN_SLOTS]);
+        changed.notify_all();
+      };
+
+      double load_seconds = 0.0, label_seconds = 0.0, prepare_seconds = 0.0;
+      double encode_seconds = 0.0;
+      double core_seconds = 0.0, core_wait_seconds = 0.0, write_seconds = 0.0;
+      std::vector<double> walk_seconds(sigma, 0.0);
+      std::vector<size_type> walker_spills(sigma, 0), walker_maximum(sigma, 0);
+      size_type serial_paths = 0, maximum_from_nodes = 0, prepared_paths = 0;
+      size_type prepared_ranks = 0, batches = 0;
+
+      //------------------------------------------------------------------------
+
+      // Load: paths are inspected one at a time to close the batch when the
+      // path, edge or start-node capacity is reached; LCP bytes are copied in
+      // one run.
+      size_type next_path = 0;
+      ReadBuffer<range_type>& entries = start_reader.from_nodes;
+      const auto loadBatch = [&](FinalScanSlot& slot) -> bool
+      {
+        if(next_path >= path_count) { return false; }
+        slot.first = next_path; slot.count = 0; slot.serial = false;
+        size_type nodes_used = 0, edges_used = 0;
+        size_type entry = start_reader.from;
+        while(next_path < path_count && slot.count < batch_paths)
+        {
+          const size_type p = next_path;
+          const PathNode node = source.paths[p];
+          if(node.ranks() > PathLabel::LABEL_LENGTH + 1)
+          {
+            throw std::runtime_error(
+              "GCSA::GCSA(): final predecessor label exceeds the fixed bound");
+          }
+          const byte_type mask = static_cast<byte_type>(node.predecessors() & alphabet_mask);
+          const size_type edges = static_cast<size_type>(__builtin_popcount(mask));
+          if(edges_used + edges > edge_capacity) { break; }
+          if(entry < entries.size() && entries[entry].first < p)
+          {
+            throw std::runtime_error(
+              "GCSA::GCSA(): current from-node reader lost batch alignment");
+          }
+
+          // The primary start node, then the stream's entries for p.
+          const size_type node_begin = nodes_used;
+          size_type next_entry = entry;
+          bool fits = (nodes_used < node_capacity);
+          if(fits) { slot.from_nodes[nodes_used++] = node.from; }
+          while(fits && next_entry < entries.size() && entries[next_entry].first == p)
+          {
+            if(nodes_used == node_capacity) { fits = false; break; }
+            slot.from_nodes[nodes_used++] = entries[next_entry].second;
+            next_entry++;
+          }
+          const size_type k = slot.count;
+          if(!fits)
+          {
+            // The path starts the next batch, unless it is alone and still
+            // too large: then it becomes a serial batch, its set in curr_from.
+            if(k > 0) { nodes_used = node_begin; break; }
+            {
+              std::unique_lock<std::mutex> lock(mutex);
+              changed.wait(lock, [&]() { return failed || !serial_in_flight; });
+              if(failed) { return false; }
+              serial_in_flight = true;
+            }
+            curr_from.clear();
+            bool period = false;
+            const auto push = [&](node_type raw) {
+              node_type mapped = mappedFinalNode(raw, graph.mapping);
+              curr_from.push_back(mapped);
+              if(mapped % sample_period == 0) { period = true; }
+            };
+            push(node.from);
+            next_entry = entry;
+            while(next_entry < entries.size() && entries[next_entry].first == p)
+            {
+              push(entries[next_entry].second); next_entry++;
+              // Keep the window bounded however many start nodes p has.
+              if((next_entry - entry) % MEGABYTE == 0) { entries.seek(next_entry); }
+            }
+            curr_from.finish();
+            slot.serial = true;
+            slot.from_count[0] = curr_from.size();
+            slot.flags[0] = (period ? FINAL_SCAN_PERIOD : 0);
+            nodes_used = 0;
+          }
+          else { slot.flags[k] = 0; }
+          slot.paths[k] = node; slot.masks[k] = mask;
+          slot.edge_start[k] = edges_used; slot.from_start[k] = node_begin;
+          edges_used += edges; entry = next_entry;
+          slot.count++; next_path++;
+          if(slot.serial) { break; }
+        }
+        slot.edge_start[slot.count] = edges_used;
+        slot.from_start[slot.count] = nodes_used;
+        source.paths.seek(next_path);
+        if(next_path < path_count) { source.path = next_path; }
+        start_reader.from = entry;
+        entries.seek(entry);
+        copyBufferedRange(lcp_array, slot.first, slot.count, slot.lcp.data());
+        lcp_array.seek(slot.first + slot.count);
+        return true;
+      };
+
+      // Load labels: one copy per contiguous run of the batch's label ranges,
+      // on a thread of its own because labels are the largest stream the
+      // loader reads (about ten ranks per path on chr18).
+      const auto loadLabels = [&](FinalScanSlot& slot)
+      {
+        size_type run_begin = 0, run_end = 0, run_slot = 0, slot_offset = 0;
+        bool in_run = false;
+        const auto flushRun = [&]() {
+          if(!in_run) { return; }
+          copyBufferedRange(source.labels, run_begin, run_end - run_begin,
+            slot.labels.data() + run_slot);
+          source.labels.seek(run_end);
+        };
+        for(size_type k = 0; k < slot.count; k++)
+        {
+          const size_type position = slot.paths[k].pointer();
+          const size_type ranks = slot.paths[k].ranks();
+          if(in_run && position == run_end) { run_end += ranks; }
+          else
+          {
+            flushRun();
+            run_begin = position; run_end = position + ranks;
+            run_slot = slot_offset; in_run = true;
+          }
+          slot.label_start[k] = slot_offset; slot_offset += ranks;
+        }
+        flushRun();
+      };
+
+      // Prepare: per path, the sorted deduplicated mapped start nodes with
+      // their ranks and the sample-period flag, as the serial scan's
+      // preparation workers compute them, and every predecessor range.
+      const auto preparePaths = [&](FinalScanSlot& slot, size_type begin, size_type end)
+      {
+        for(size_type k = begin; k < end; k++)
+        {
+          if(!(slot.serial))
+          {
+            node_type* nodes = slot.from_nodes.data() + slot.from_start[k];
+            const size_type raw = slot.from_start[k + 1] - slot.from_start[k];
+            for(size_type j = 0; j < raw; j++)
+            {
+              nodes[j] = mappedFinalNode(nodes[j], graph.mapping);
+            }
+            std::sort(nodes, nodes + raw);
+            const size_type unique = static_cast<size_type>(
+              std::unique(nodes, nodes + raw) - nodes);
+            slot.from_count[k] = unique;
+            size_type* ranks = slot.from_ranks.data() + slot.from_start[k];
+            bool period = false;
+            for(size_type j = 0; j < unique; j++)
+            {
+              ranks[j] = finalFromRank(nodes[j], from_nodes);
+              if(nodes[j] % sample_period == 0) { period = true; }
+            }
+            slot.flags[k] = (period ? FINAL_SCAN_PERIOD : 0);
+          }
+          const PathNode& path = slot.paths[k];
+          const PathNode::rank_type* labels = slot.labels.data() + slot.label_start[k];
+          size_type edge = slot.edge_start[k];
+          for(size_type comp = 0; comp < sigma; comp++)
+          {
+            if((slot.masks[k] & (1U << comp)) == 0) { continue; }
+            predecessorRange(path, comp, mapper, last_char,
+              [labels](size_type rank) { return labels[rank]; },
+              slot.first_label[edge], slot.last_label[edge]);
+            edge++;
+          }
+        }
+      };
+
+      // Walk: component comp's serial destination walk over the batch. The
+      // labels of the destination under the cursor are read once per
+      // destination rather than once per source path, which is the serial
+      // intersect() evaluated on the same path.
+      const auto walkComponent = [&](FinalScanSlot& slot, size_type comp,
+        size_type& cached_path, PathLabel& cached_first, PathLabel& cached_last,
+        std::vector<PathNode::rank_type>& destination_ranks,
+        std::vector<std::uint8_t>& marks)
+      {
+        MergedGraphReader& reader = destination[comp];
+        MergedGraphReader& sample_reader = sampling[comp];
+        std::vector<size_type>& edges = slot.events.edges[comp];
+        edges.clear();
+        const byte_type bit = static_cast<byte_type>(1U << comp);
+        for(size_type k = 0; k < slot.count; k++)
+        {
+          const byte_type mask = slot.masks[k];
+          if((mask & bit) == 0) { continue; }
+          const size_type edge = slot.edge_start[k] +
+            static_cast<size_type>(__builtin_popcount(mask & (bit - 1)));
+          if(reader.path >= path_count)
+          {
+            throw std::runtime_error("GCSA::GCSA(): final edge destination is outside the merged graph");
+          }
+          if(cached_path != reader.path)
+          {
+            // firstLabel() and lastLabel() of the destination, from its ranks
+            // copied out of the reader in one piece.
+            const PathNode current = reader.paths[reader.path];
+            const size_type ranks = current.ranks();
+            if(destination_ranks.size() < ranks) { destination_ranks.resize(ranks); }
+            copyBufferedRange(reader.labels, current.pointer(), ranks,
+              destination_ranks.data());
+            const size_type limit = std::min(current.order(), PathLabel::LABEL_LENGTH);
+            cached_first.first = true; cached_last.first = false;
+            for(size_type i = 0; i < limit; i++)
+            {
+              cached_first.label[i] = destination_ranks[i];
+              cached_last.label[i] = destination_ranks[i < current.lcp() ? i : current.order()];
+            }
+            for(size_type i = limit; i < PathLabel::LABEL_LENGTH; i++)
+            {
+              cached_first.label[i] = 0; cached_last.label[i] = PathLabel::NO_RANK;
+            }
+            cached_path = reader.path;
+          }
+          const PathLabel& first = slot.first_label[edge];
+          const PathLabel& last = slot.last_label[edge];
+          const bool intersects = (cached_first <= first ? first <= cached_last :
+            cached_first <= last);
+          if(!intersects) { reader.advance(); }
+          if(reader.path >= path_count)
+          {
+            throw std::runtime_error("GCSA::GCSA(): final edge destination is outside the merged graph");
+          }
+          const size_type destination_path = reader.path;
+          edges.push_back(destination_path);
+
+          // The sampling test runs only for a path with exactly this one
+          // predecessor, not the sink, and no start node on the period.
+          if(mask != bit || comp == Alphabet::SINK_COMP ||
+             (slot.flags[k] & FINAL_SCAN_PERIOD) != 0)
+          {
+            continue;
+          }
+          if(destination_path < sample_reader.path)
+          {
+            throw std::runtime_error("GCSA::GCSA(): sampling destination moved backwards");
+          }
+          const node_type primary = reader.paths[destination_path].from;
+          sample_reader.path = destination_path;
+          sample_reader.seek(false);
+          bool continues = true;
+          if(slot.serial)
+          {
+            // The serial scan's comparison of two spillable sets.
+            sample_reader.fromNodes(pred_from, graph.mapping, primary);
+            walker_spills[comp] += pred_from.spilled();
+            walker_maximum[comp] = std::max(walker_maximum[comp], pred_from.size());
+            if(pred_from.size() != slot.from_count[k]) { continues = false; }
+            else
+            {
+              pred_from.rewind(); curr_from.rewind();
+              node_type curr_node, pred_node;
+              while(curr_from.next(curr_node))
+              {
+                if(!pred_from.next(pred_node) || curr_node != pred_node + 1)
+                {
+                  continues = false; break;
+                }
+              }
+            }
+            pred_from.clear();
+          }
+          else
+          {
+            // The predecessor's mapped start nodes, each plus one, must
+            // cover this path's sorted set exactly. Distinct nodes give
+            // distinct targets, so covering every element means the two
+            // sets are equal, which is what the serial size check and
+            // elementwise comparison test. A node of all ones wraps to zero;
+            // the serial comparison accepts that only for a set of one.
+            const node_type* curr = slot.from_nodes.data() + slot.from_start[k];
+            const size_type curr_size = slot.from_count[k];
+            marks.assign(curr_size, 0);
+            size_type covered = 0;
+            const auto cover = [&](node_type raw) -> bool {
+              const node_type mapped = mappedFinalNode(raw, graph.mapping);
+              if(mapped == std::numeric_limits<node_type>::max() && curr_size != 1)
+              {
+                return false;
+              }
+              const node_type target = mapped + 1;
+              const node_type* found = std::lower_bound(curr, curr + curr_size, target);
+              if(found == curr + curr_size || *found != target) { return false; }
+              std::uint8_t& mark = marks[found - curr];
+              if(mark == 0) { mark = 1; covered++; }
+              return true;
+            };
+            continues = cover(primary);
+            for(size_type at = sample_reader.from; continues &&
+                at < sample_reader.from_nodes.size() &&
+                sample_reader.from_nodes[at].first == destination_path; at++)
+            {
+              continues = cover(sample_reader.from_nodes[at].second);
+            }
+            continues = continues && (covered == curr_size);
+          }
+          if(continues) { slot.flags[k] |= FINAL_SCAN_CONTINUES; }
+        }
+      };
+
+      // Encode: the serial scan's sampling decision, then every stream but
+      // redundancy. Counts per chunk give each chunk its output offsets.
+      std::vector<std::array<size_type, 4>> chunk_totals;
+      const auto encodeBatch = [&](FinalScanSlot& slot)
+      {
+        FinalEventBatch& events = slot.events;
+        events.masks.assign(slot.masks.data(), slot.masks.data() + slot.count);
+        const auto decide = [&](size_type k) -> bool {
+          const byte_type mask = slot.masks[k];
+          const size_type indegree = static_cast<size_type>(__builtin_popcount(mask));
+          const bool period = (slot.flags[k] & FINAL_SCAN_PERIOD) != 0;
+          if(slot.from_count[k] == 0)
+          {
+            throw std::runtime_error("GCSA::GCSA(): merged path has no start node");
+          }
+          if(indegree > 1 || (mask & (1U << Alphabet::SINK_COMP)) != 0 || period)
+          {
+            return true;
+          }
+          if(indegree == 0)
+          {
+            throw std::runtime_error("GCSA::GCSA(): unsampled path has no predecessor");
+          }
+          return (slot.flags[k] & FINAL_SCAN_CONTINUES) == 0;
+        };
+        events.occurrences.clear(); events.sampled_paths.clear();
+        events.sample_counts.clear(); events.samples.clear();
+        if(slot.serial)
+        {
+          // The serial path's samples stream from curr_from in the writer.
+          if(decide(0)) { slot.flags[0] |= FINAL_SCAN_SAMPLED; }
+          if(slot.from_count[0] > 1)
+          {
+            events.occurrences.push_back(slot.first);
+            events.occurrences.push_back(slot.from_count[0] - 1);
+          }
+          return;
+        }
+        const size_type chunks = (slot.count + chunk_paths - 1) / chunk_paths;
+        chunk_totals.assign(chunks, std::array<size_type, 4>());
+        pool.run(chunks, [&](size_type chunk) {
+          std::array<size_type, 4>& totals = chunk_totals[chunk];
+          totals.fill(0);
+          const size_type end = std::min(slot.count, (chunk + 1) * chunk_paths);
+          for(size_type k = chunk * chunk_paths; k < end; k++)
+          {
+            const size_type count = slot.from_count[k];
+            if(decide(k))
+            {
+              slot.flags[k] |= FINAL_SCAN_SAMPLED;
+              totals[0]++; totals[1] += count;
+            }
+            if(count > 1) { totals[2]++; }
+            totals[3] = std::max(totals[3], count);
+          }
+        });
+        std::array<size_type, 3> sum = { 0, 0, 0 };
+        for(std::array<size_type, 4>& totals : chunk_totals)
+        {
+          maximum_from_nodes = std::max(maximum_from_nodes, totals[3]);
+          for(size_type i = 0; i < 3; i++)
+          {
+            const size_type count = totals[i]; totals[i] = sum[i]; sum[i] += count;
+          }
+        }
+        events.sampled_paths.resize(sum[0]); events.sample_counts.resize(sum[0]);
+        events.samples.resize(sum[1]); events.occurrences.resize(2 * sum[2]);
+        pool.run(chunks, [&](size_type chunk) {
+          size_type sampled = chunk_totals[chunk][0], sample = chunk_totals[chunk][1];
+          size_type occurrence = 2 * chunk_totals[chunk][2];
+          const size_type end = std::min(slot.count, (chunk + 1) * chunk_paths);
+          for(size_type k = chunk * chunk_paths; k < end; k++)
+          {
+            const size_type count = slot.from_count[k];
+            const size_type path = slot.first + k;
+            if((slot.flags[k] & FINAL_SCAN_SAMPLED) != 0)
+            {
+              events.sampled_paths[sampled] = path;
+              events.sample_counts[sampled] = count; sampled++;
+              const node_type* nodes = slot.from_nodes.data() + slot.from_start[k];
+              std::copy(nodes, nodes + count, events.samples.begin() + sample);
+              sample += count;
+            }
+            if(count > 1)
+            {
+              events.occurrences[occurrence] = path;
+              events.occurrences[occurrence + 1] = count - 1;
+              occurrence += 2;
+            }
+          }
+        });
+        prepared_paths += slot.count;
+        for(size_type k = 0; k < slot.count; k++) { prepared_ranks += slot.from_count[k]; }
+      };
+
+      // Core: the serial scan's LCP stack and previous-occurrence update, in
+      // path order and, within a path, in rank order.
+      const auto coreBatch = [&](FinalScanSlot& slot, auto& previous, auto& emit)
+      {
+        const auto update = [&](size_type rank, size_type i) {
+          const size_type prior = previous.get(rank);
+          if(prior > 0)
+          {
+            size_type low = 0, high = stack_size;
+            while(low < high)
+            {
+              size_type middle = low + (high - low) / 2;
+              if(stack[3 * middle + 2] < prior) { low = middle + 1; }
+              else { high = middle; }
+            }
+            if(low >= stack_size)
+            {
+              throw std::runtime_error("GCSA::GCSA(): invalid previous-occurrence suffix-tree state");
+            }
+            size_type first_time = stack[3 * low + 1];
+            if(first_time == 0)
+            {
+              throw std::runtime_error("GCSA::GCSA(): redundancy position underflows");
+            }
+            emit(first_time - 1);
+          }
+          previous.set(rank, i + 1);
+        };
+        size_type ahead_path = 0, ahead_node = 0;
+        const auto prefetchNext = [&]() {
+          while(ahead_path < slot.count && ahead_node >= slot.from_count[ahead_path])
+          {
+            ahead_path++; ahead_node = 0;
+          }
+          if(ahead_path < slot.count)
+          {
+            previous.prefetch(slot.from_ranks[slot.from_start[ahead_path] + ahead_node]);
+            ahead_node++;
+          }
+        };
+        if(!(slot.serial))
+        {
+          for(size_type j = 0; j < FINAL_SCAN_PREFETCH; j++) { prefetchNext(); }
+        }
+        for(size_type k = 0; k < slot.count; k++)
+        {
+          const size_type i = slot.first + k;
+          size_type curr_lcp = slot.lcp[k] + (i > 0 ? 1 : 0);
+          while(stack_size > 0 && stack[3 * (stack_size - 1)] > curr_lcp)
+          {
+            stack_size--;
+          }
+          if(stack_size > 0 && stack[3 * (stack_size - 1)] == curr_lcp)
+          {
+            stack[3 * (stack_size - 1) + 2] = i;
+          }
+          else
+          {
+            if(3 * stack_size + 2 >= stack_capacity)
+            {
+              throw std::runtime_error(
+                "GCSA::GCSA(): suffix-tree stack exceeded its bounded capacity");
+            }
+            stack[3 * stack_size] = curr_lcp;
+            stack[3 * stack_size + 1] = i;
+            stack[3 * stack_size + 2] = i;
+            stack_size++;
+          }
+          if(slot.serial)
+          {
+            curr_from.rewind();
+            node_type node;
+            while(curr_from.next(node)) { update(finalFromRank(node, from_nodes), i); }
+          }
+          else
+          {
+            const size_type* ranks = slot.from_ranks.data() + slot.from_start[k];
+            for(size_type j = 0; j < slot.from_count[k]; j++)
+            {
+              prefetchNext();
+              update(ranks[j], i);
+            }
+          }
+        }
+        scan_progress.advance(slot.count);
+      };
+
+      // Write: append the batch; a serial path's samples stream from
+      // curr_from, after which the set may be reused.
+      const auto writeBatch = [&](FinalScanSlot& slot)
+      {
+        output.append(slot.events, runner);
+        if(slot.serial)
+        {
+          if((slot.flags[0] & FINAL_SCAN_SAMPLED) != 0)
+          {
+            output.sampledPath(slot.first);
+            curr_from.rewind();
+            node_type node;
+            while(curr_from.next(node)) { output.sample(node); }
+            output.sampleEnd();
+          }
+          curr_from.clear();
+        }
+      };
+
+      //------------------------------------------------------------------------
+
+      std::vector<std::thread> stage_threads_list;
+      const auto launch = [&](std::function<void()> body)
+      {
+        stage_threads_list.emplace_back([&fail, body]() {
+          try { body(); }
+          catch(...) { fail(std::current_exception()); }
+        });
+      };
+      const auto joinStages = [&]()
+      {
+        for(std::thread& thread : stage_threads_list)
+        {
+          if(thread.joinable()) { thread.join(); }
+        }
+      };
+
+      try
+      {
+        launch([&]() {
+          source.init(merged_graph, reader_buffer);
+          start_reader.initFromOnly(merged_graph, reader_buffer, true);
+          lcp_array.open(merged_graph.lcp_name, reader_buffer, true);
+          for(size_type b = 0; ; b++)
+          {
+            FinalScanSlot& slot = slots[b % FINAL_SCAN_SLOTS];
+            {
+              std::unique_lock<std::mutex> lock(mutex);
+              changed.wait(lock, [&]() {
+                return failed || state[b % FINAL_SCAN_SLOTS].batch == NO_BATCH;
+              });
+              if(failed) { return; }
+            }
+            FinalScanClock::time_point start = FinalScanClock::now();
+            const bool loaded = loadBatch(slot);
+            load_seconds += finalScanSeconds(start);
+            std::lock_guard<std::mutex> lock(mutex);
+            if(!loaded)
+            {
+              load_done = true; total_batches = b; changed.notify_all(); return;
+            }
+            SlotState& current = state[b % FINAL_SCAN_SLOTS];
+            current.batch = b; current.stage = SLOT_PATHS; current.walked = 0;
+            current.encoded = current.cored = false;
+            changed.notify_all();
+          }
+        });
+        launch([&]() {
+          for(size_type b = 0; ; b++)
+          {
+            if(!awaitBatch(b, [](const SlotState& s) { return s.stage == SLOT_PATHS; }))
+            {
+              return;
+            }
+            FinalScanClock::time_point start = FinalScanClock::now();
+            loadLabels(slots[b % FINAL_SCAN_SLOTS]);
+            label_seconds += finalScanSeconds(start);
+            advanceSlot(b, [](SlotState& s) { s.stage = SLOT_LOADED; });
+          }
+        });
+        launch([&]() {
+          for(size_type b = 0; ; b++)
+          {
+            if(!awaitBatch(b, [](const SlotState& s) { return s.stage == SLOT_LOADED; }))
+            {
+              return;
+            }
+            FinalScanSlot& slot = slots[b % FINAL_SCAN_SLOTS];
+            FinalScanClock::time_point start = FinalScanClock::now();
+            const size_type chunks = (slot.count + chunk_paths - 1) / chunk_paths;
+            pool.run(chunks, [&](size_type chunk) {
+              preparePaths(slot, chunk * chunk_paths,
+                std::min(slot.count, (chunk + 1) * chunk_paths));
+            });
+            prepare_seconds += finalScanSeconds(start);
+            advanceSlot(b, [](SlotState& s) { s.stage = SLOT_PREPARED; });
+          }
+        });
+        for(size_type comp = 0; comp < sigma; comp++)
+        {
+          launch([&, comp]() {
+            destination[comp].init(merged_graph, comp, reader_buffer, true, false);
+            sampling[comp].initFromOnly(merged_graph, reader_buffer, true, comp);
+            size_type cached_path = NO_BATCH;
+            PathLabel cached_first = PathLabel(), cached_last = PathLabel();
+            std::vector<PathNode::rank_type> destination_ranks;
+            std::vector<std::uint8_t> marks;
+            for(size_type b = 0; ; b++)
+            {
+              if(!awaitBatch(b, [](const SlotState& s) { return s.stage >= SLOT_PREPARED; }))
+              {
+                return;
+              }
+              FinalScanClock::time_point start = FinalScanClock::now();
+              walkComponent(slots[b % FINAL_SCAN_SLOTS], comp, cached_path,
+                cached_first, cached_last, destination_ranks, marks);
+              walk_seconds[comp] += finalScanSeconds(start);
+              advanceSlot(b, [&](SlotState& s) {
+                if(++s.walked == sigma) { s.stage = SLOT_WALKED; }
+              });
+            }
+          });
+        }
+        launch([&]() {
+          for(size_type b = 0; ; b++)
+          {
+            if(!awaitBatch(b, [](const SlotState& s) { return s.stage == SLOT_WALKED; }))
+            {
+              return;
+            }
+            FinalScanClock::time_point start = FinalScanClock::now();
+            encodeBatch(slots[b % FINAL_SCAN_SLOTS]);
+            encode_seconds += finalScanSeconds(start);
+            advanceSlot(b, [](SlotState& s) { s.encoded = true; });
+          }
+        });
+        launch([&]() {
+          for(size_type b = 0; ; b++)
+          {
+            if(!awaitBatch(b, [](const SlotState& s) { return s.encoded && s.cored; }))
+            {
+              return;
+            }
+            FinalScanSlot& slot = slots[b % FINAL_SCAN_SLOTS];
+            FinalScanClock::time_point start = FinalScanClock::now();
+            writeBatch(slot);
+            write_seconds += finalScanSeconds(start);
+            const bool serial = slot.serial;
+            advanceSlot(b, [&](SlotState& s) {
+              s = SlotState();
+              written_batches = b + 1;
+              if(serial) { serial_in_flight = false; }
+            });
+          }
+        });
+
+        // The core runs here. A serial path's redundancy goes straight to the
+        // writer, which is idle once every earlier batch is written, so its
+        // events need no buffer however many start nodes it has.
+        for(size_type b = 0; ; b++)
+        {
+          FinalScanClock::time_point wait_start = FinalScanClock::now();
+          if(!awaitBatch(b, [](const SlotState& s) { return s.stage == SLOT_WALKED; }))
+          {
+            break;
+          }
+          FinalScanSlot& slot = slots[b % FINAL_SCAN_SLOTS];
+          if(slot.serial)
+          {
+            std::unique_lock<std::mutex> lock(mutex);
+            changed.wait(lock, [&]() { return failed || written_batches == b; });
+            if(failed) { break; }
+          }
+          core_wait_seconds += finalScanSeconds(wait_start);
+          FinalScanClock::time_point start = FinalScanClock::now();
+          std::vector<size_type>& redundant = slot.events.redundant;
+          redundant.clear();
+          const auto buffered = [&redundant](size_type position) {
+            redundant.push_back(position);
+          };
+          const auto direct = [&output](size_type position) {
+            output.redundancy(position);
+          };
+          if(previous_values)
+          {
+            if(slot.serial) { coreBatch(slot, ram_previous, direct); }
+            else { coreBatch(slot, ram_previous, buffered); }
+          }
+          else
+          {
+            FinalScanDiskPrevious disk_previous = { *previous_disk };
+            if(slot.serial) { coreBatch(slot, disk_previous, direct); }
+            else { coreBatch(slot, disk_previous, buffered); }
+          }
+          if(slot.serial) { serial_paths++; }
+          batches++;
+          core_seconds += finalScanSeconds(start);
+          advanceSlot(b, [](SlotState& s) { s.cored = true; });
+        }
+      }
+      catch(...)
+      {
+        fail(std::current_exception());
+      }
+      joinStages();
+      if(failure) { std::rethrow_exception(failure); }
+
+      source.close(); start_reader.close(); lcp_array.close();
+      for(MergedGraphReader& current : destination) { current.close(); }
+      for(MergedGraphReader& current : sampling) { current.close(); }
+      scan_progress.finish();
+      if(Verbosity::level >= Verbosity::EXTENDED)
+      {
+        std::cerr << "GCSA::GCSA(): final scan read bytes: "
+                  << (DiskIO::read_volume - scan_read_start) << std::endl;
+      }
+      if(previous_disk) { previous_disk->flush(false); }
+      ExternalFinalScanStats local_stats;
+      if(stats == nullptr) { stats = &local_stats; }
+      {
+        stats->pipelined = true;
+        if(previous_disk) { stats->previous_occurrences = previous_disk->stats(); }
+        stats->pipeline_workers = pool.workers();
+        stats->pipeline_walkers = sigma;
+        stats->pipeline_slots = FINAL_SCAN_SLOTS;
+        stats->pipeline_batch_paths = batch_paths;
+        stats->pipeline_slot_bytes = all_slot_bytes;
+        stats->pipeline_batches = batches;
+        stats->pipeline_serial_paths = serial_paths;
+        stats->previous_ram_bytes = (previous_values ? previous_ram_bytes : 0);
+        stats->prepared_from_paths = prepared_paths;
+        stats->prepared_from_ranks = prepared_ranks;
+        stats->prepared_from_spill_fallbacks = serial_paths;
+        stats->from_node_spills = serial_paths;
+        stats->maximum_from_nodes = maximum_from_nodes;
+        for(size_type comp = 0; comp < sigma; comp++)
+        {
+          stats->from_node_spills += walker_spills[comp];
+          stats->maximum_from_nodes = std::max(stats->maximum_from_nodes,
+            walker_maximum[comp]);
+          stats->walk_seconds = std::max(stats->walk_seconds, walk_seconds[comp]);
+        }
+        stats->load_seconds = load_seconds; stats->label_seconds = label_seconds;
+        stats->prepare_seconds = prepare_seconds;
+        stats->encode_seconds = encode_seconds; stats->core_seconds = core_seconds;
+        stats->core_wait_seconds = core_wait_seconds; stats->write_seconds = write_seconds;
+      }
+      reportFinalScanPipeline(*stats);
+      metadata = output.finish();
+      FinalEventChecksums event_checksums = output.checksums();
+
+      previous_disk.reset();
+      TempFile::remove(previous_name);
+      metadata.fast_chars = graph.alpha.fast_chars;
+      if(metadata.paths != path_count)
+      {
+        throw std::runtime_error("GCSA::GCSA(): final event path count mismatch");
+      }
+      writeFinalEventMetadata(files, metadata);
+      checkpointFinalEvents(workspace, files, metadata, checkpoint_buffer,
+        &event_checksums);
+    }
+  }
+  catch(...)
+  {
+    TempFile::remove(previous_name); throw;
+  }
+  return true;
+}
+
 /*
   Scan the final MergedGraph once and publish compact immutable events. This is
   intentionally one atomic task: prev_occ and the suffix-tree traversal stack
@@ -986,6 +2341,27 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
   if(graph.alpha.sigma == 0 || graph.alpha.sigma > FinalEventMetadata::MAX_SIGMA)
   {
     throw std::runtime_error("GCSA::GCSA(): external final events require an alphabet of at most 8 components");
+  }
+  // The pipelined scan writes the same events. This serial scan runs when one
+  // thread was requested, when GCSA_SERIAL_FINAL_SCAN=1 forces it, or when
+  // the pipeline declines, whose reason is reported.
+  const char* serial_scan = std::getenv("GCSA_SERIAL_FINAL_SCAN");
+  if(omp_get_max_threads() > 1 &&
+     !(serial_scan != nullptr && std::string(serial_scan) == "1"))
+  {
+    std::string declined;
+    if(producePipelinedFinalEvents(merged_graph, mapper, last_char, from_nodes,
+      unique_from_nodes, graph, parameters, workspace, files, checkpoint_buffer,
+      stats, metadata, declined))
+    {
+      return metadata;
+    }
+    if(stats != nullptr) { stats->pipeline_declined = declined; }
+    if(Verbosity::level >= Verbosity::EXTENDED)
+    {
+      std::cerr << "GCSA::GCSA(): final scan pipeline declined: " << declined
+                << "; running the serial scan" << std::endl;
+    }
   }
   const size_type memory_limit = parameters.getMemoryLimitBytes();
   const size_type safety_margin = memory_limit / 8;
@@ -1932,6 +3308,9 @@ reportFinalEventStats(const FinalEventMetadata& event_metadata,
       std::cerr << "GCSA::GCSA(): final start-node sets: "
                 << event_stats.from_node_spills << " spills, maximum "
                 << event_stats.maximum_from_nodes << " unique nodes" << std::endl;
+      // The pipelined scan reports its own lines when it finishes, so that
+      // they appear even when construction stops after the events.
+      if(event_stats.pipelined) { return; }
       std::cerr << "GCSA::GCSA(): final predecessor lookup: "
                 << event_stats.predecessor_workers << " worker(s), "
                 << event_stats.predecessor_batches << " bounded batch(es), maximum "
