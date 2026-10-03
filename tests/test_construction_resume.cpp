@@ -373,7 +373,8 @@ main()
     require(!hasWorkspaceArtifact(workspace_root, "initial--paths--"));
   }
 
-  // Rebuild the same event frontier with component-wise predecessor workers.
+  // Rebuild the same event frontier with the pipelined scan, whose walkers
+  // follow each component's destinations on their own threads.
   // A 16 KiB event buffer forces framed event payloads, while 64 descriptors
   // is the supported minimum and the small sort/join caps retain forced
   // spilling.
@@ -411,22 +412,23 @@ main()
       parallel_prefix + LCPArray::EXTENSION));
     require(verifyIndex(index, &lcp, graph));
   }
-  const std::string predecessor_prefix =
-    "final predecessor lookup: 4 worker(s), ";
-  size_type predecessor_line = parallel_log.str().find(predecessor_prefix);
-  require(predecessor_line != std::string::npos);
-  size_type predecessor_batches = std::stoull(parallel_log.str().substr(
-    predecessor_line + predecessor_prefix.size()));
-  require(predecessor_batches > 1);
-  const std::string preparation_prefix =
-    "final ordered-state preparation: 4 worker(s), ";
-  size_type preparation_line = parallel_log.str().find(preparation_prefix);
-  require(preparation_line != std::string::npos);
-  size_type prepared_paths = std::stoull(parallel_log.str().substr(
-    preparation_line + preparation_prefix.size()));
-  require(prepared_paths >= 4096);
-  require(parallel_log.str().find("1 spill fallback(s)", preparation_line) !=
-    std::string::npos);
+  // With four threads the pipelined scan runs. Its 66-path batches cross
+  // many boundaries, and the N component's path, whose 2,051 start nodes
+  // outgrow a slot's arena, is the one serial path carried in the spillable
+  // set.
+  const std::string pipeline_prefix = "final scan pipeline: ";
+  size_type pipeline_line = parallel_log.str().find(pipeline_prefix);
+  require(pipeline_line != std::string::npos);
+  const std::string pipeline_log = parallel_log.str().substr(pipeline_line,
+    parallel_log.str().find('\n', pipeline_line) - pipeline_line);
+  const auto pipelineCount = [&pipeline_log](const std::string& suffix) -> size_type {
+    size_type at = pipeline_log.find(suffix); require(at != std::string::npos);
+    size_type start = pipeline_log.rfind(' ', at - 1) + 1;
+    return std::stoull(pipeline_log.substr(start, at - start));
+  };
+  require(pipelineCount(" batch(es)") > 1);
+  require(pipelineCount(" paths / ") >= 4096);
+  require(pipelineCount(" serial path(s)") == 1);
   const auto scanReadBytes = [](const std::string& log) -> size_type {
     const std::string prefix = "final scan read bytes: ";
     size_type at = log.find(prefix); require(at != std::string::npos);

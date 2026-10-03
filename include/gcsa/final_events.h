@@ -14,6 +14,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <iosfwd>
 #include <memory>
 #include <string>
@@ -120,6 +121,36 @@ struct FinalEventChecksums
 };
 
 /*
+  The events of a contiguous run of merged paths, already encoded, in path
+  order within every stream. A parallel final scan computes most events for
+  many paths at once; only the stream order has to be serial. Appending a
+  batch writes each stream exactly the records the equivalent sequence of
+  per-event calls would, so payloads, checksums and metadata are unchanged.
+
+  occurrences holds flattened (path, extra) pairs and only pairs with a
+  nonzero extra, as occurrence() keeps. sample_counts holds the number of
+  sample ids of each sampled path; samples concatenates those ids.
+*/
+struct FinalEventBatch
+{
+  std::vector<byte_type> masks;
+  std::array<std::vector<size_type>, FinalEventMetadata::MAX_SIGMA> edges;
+  std::vector<size_type> occurrences;
+  std::vector<size_type> sampled_paths, sample_counts;
+  std::vector<node_type> samples;
+  std::vector<size_type> redundant;
+
+  void clear();
+};
+
+/*
+  Runs task(0) ... task(tasks - 1), possibly concurrently, and returns once
+  every task has finished. An empty runner runs them in order on the caller.
+*/
+typedef std::function<void(size_type tasks,
+  const std::function<void(size_type)>& task)> FinalEventTaskRunner;
+
+/*
   A byte-budgeted writer set. buffer_bytes is the budget for each individual
   stream, and every buffer reserves from the shared MemoryBudget. The caller
   chooses buffer_bytes after accounting for the number of streams.
@@ -139,6 +170,14 @@ public:
   void sampleEnd();
   void occurrence(size_type path, size_type extra);
   void redundancy(size_type path);
+
+  // Appends a batch as described at FinalEventBatch. Streams share no state,
+  // so the runner may write them concurrently: one task per BWT mask, edge,
+  // occurrence and redundancy stream, and one for the three sample streams,
+  // whose records interleave. A framed stream still receives one record per
+  // event, because its block boundaries and headers depend on the records.
+  void append(const FinalEventBatch& batch,
+    const FinalEventTaskRunner& runner = FinalEventTaskRunner());
 
   // Closes and fdatasyncs every stream. The returned counts describe the
   // closed payloads; semantic fields such as paths/fast_chars are completed
