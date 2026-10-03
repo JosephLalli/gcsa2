@@ -187,9 +187,10 @@ constructionOperationalSettings(const ConstructionParameters& parameters)
 //
 // The construction path has four timers, and each spans several distinct
 // operations: "Merging" covers the mapper build and the merged-graph merge,
-// "Construction" covers the final-event scan and the component build. A phase total therefore cannot say which operation costs
-// what, which is exactly the question an optimization pass has to answer.
-// These probes print under EXTENDED verbosity only and serialize nothing.
+// "Construction" covers the final-event scan and the component build. A
+// phase total therefore cannot say which operation costs what, which is
+// exactly the question an optimization pass has to answer. These probes
+// print under EXTENDED verbosity only and serialize nothing.
 struct SubPhaseProbe
 {
   std::string name;
