@@ -354,9 +354,9 @@ main(int argc, char** argv)
     {
       if(parameters.externalMemory())
       {
-        GCSA::buildAndStore(graph, parameters, index_file);
+        // The LCP array is built during the final-event scan.
+        GCSA::buildAndStore(graph, parameters, index_file, lcp_file);
         stored_directly = true;
-        LCPArray::buildAndStore(graph, parameters, lcp_file);
         lcp_stored_directly = true;
       }
       else

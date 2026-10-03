@@ -58,6 +58,19 @@ public:
   static void buildAndStore(InputGraph& graph,
     const ConstructionParameters& parameters, const std::string& filename);
 
+  /*
+    As above, and also writes the LCP array to lcp_filename, byte for byte what
+    LCPArray::buildAndStore(graph, parameters, lcp_filename) writes when called
+    afterwards. The LCP array needs only the merged graph's LCP leaf file, so it
+    is built on another thread while the final events are scanned and the
+    components stored, instead of after them; it is published after the index.
+    Do not call LCPArray::buildAndStore() for the same workspace afterwards: its
+    LCP workspace already exists.
+  */
+  static void buildAndStore(InputGraph& graph,
+    const ConstructionParameters& parameters, const std::string& filename,
+    const std::string& lcp_filename);
+
 //------------------------------------------------------------------------------
 
   /*
@@ -232,7 +245,7 @@ public:
 
 private:
   GCSA(InputGraph& graph, const ConstructionParameters& parameters,
-    const std::string* direct_output);
+    const std::string* direct_output, const std::string* lcp_output = nullptr);
   void copy(const GCSA& source);
   void setVectors();
   void initSupport();

@@ -4,6 +4,7 @@
 #include <gcsa/compressed_block.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +15,8 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <fcntl.h>
+#include <map>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -214,6 +217,46 @@ requireSameGraph(const PathGraph& expected_graph, const PathGraph& actual_graph,
   }
 }
 
+// Every workspace entry whose name starts with `prefix`: task completion
+// records by name, artifacts by name and bytes.
+std::map<std::string, std::vector<std::uint8_t>>
+workspaceEntries(const std::string& root, const std::string& prefix)
+{
+  std::map<std::string, std::vector<std::uint8_t>> result;
+  for(const auto& entry : std::filesystem::directory_iterator(root))
+  {
+    const std::string name = entry.path().filename().string();
+    if(name.compare(0, prefix.size(), prefix) != 0) { continue; }
+    result[name] = (entry.path().extension() == ".bin" ?
+      readBytes(entry.path().string()) : std::vector<std::uint8_t>());
+  }
+  return result;
+}
+
+// Test-only fault injection for the re-executed worker: when
+// GCSA_TEST_JOIN_WORKER_FAIL_DIR names a directory, each worker claims the next
+// ordinal by creating a file there, and the one whose ordinal equals
+// GCSA_TEST_JOIN_WORKER_FAIL_AT exits before joining, as a crashed worker would.
+bool
+injectedWorkerFailure()
+{
+  const char* directory = std::getenv("GCSA_TEST_JOIN_WORKER_FAIL_DIR");
+  const char* at = std::getenv("GCSA_TEST_JOIN_WORKER_FAIL_AT");
+  if(directory == nullptr || at == nullptr) { return false; }
+  for(size_type ordinal = 0; ; ordinal++)
+  {
+    const std::string claim = std::string(directory) + "/" + std::to_string(ordinal);
+    int descriptor = ::open(claim.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if(descriptor < 0)
+    {
+      if(errno == EEXIST) { continue; }
+      return false;
+    }
+    ::close(descriptor);
+    return ordinal == std::strtoull(at, nullptr, 10);
+  }
+}
+
 bool
 labelSorted(const PathGraph& graph)
 {
@@ -261,6 +304,7 @@ int main(int argc, char** argv)
 {
   if(argc == 3 && std::string(argv[1]) == "gcsa-worker-task")
   {
+    if(injectedWorkerFailure()) { return EXIT_FAILURE; }
     return externalPathJoinWorker(argv[2]);
   }
   omp_set_num_threads(1);
@@ -1028,6 +1072,255 @@ int main(int argc, char** argv)
 
     std::remove(chain_path.c_str()); std::remove(chain_rank.c_str());
     std::filesystem::remove_all(range_root);
+  }
+
+  // One worker pool across logical inputs. Inputs 7 and 9 each plan several
+  // partitions. Joined in one step, their partitions share a single pool,
+  // launched largest first across both inputs, yet each input's output shards,
+  // their numbering, and their partition task names and artifacts must be
+  // exactly those of the input joined by itself (which is what a per-input pool
+  // produced), and a step whose pool fails midway must resume to the same bytes.
+  {
+    std::vector<TestRecord> second_left, second_right;
+    for(size_type i = 0; i < 30; i++)
+    {
+      second_left.push_back({ 5000 + i, 200, static_cast<byte_type>(1 << (i % 4)),
+        static_cast<PathNode::rank_type>(20000 + i), false });
+    }
+    for(size_type i = 0; i < 900; i++)
+    {
+      second_right.push_back({ 200, 6000 + i, static_cast<byte_type>(1),
+        static_cast<PathNode::rank_type>(21000 + i), false });
+    }
+    const std::string second_left_path = base + ".pool-left.path";
+    const std::string second_left_rank = base + ".pool-left.rank";
+    const std::string second_right_path = base + ".pool-right.path";
+    const std::string second_right_rank = base + ".pool-right.rank";
+    writePathPair(second_left_path, second_left_rank, second_left);
+    writePathPair(second_right_path, second_right_rank, second_right);
+    auto first_input = [&](PathGraph& graph)
+    {
+      graph.logical_file_ids[0] = logical_file_id_t(7);
+      graph.physical_shard_ids[0] = physical_shard_id_t(101);
+      appendShard(graph, right_path, right_rank, logical_file_id_t(7), physical_shard_id_t(202));
+    };
+    auto second_shards = [&](PathGraph& graph)
+    {
+      appendShard(graph, second_right_path, second_right_rank,
+        logical_file_id_t(9), physical_shard_id_t(302));
+    };
+    BuildWorkspace::Settings pool_semantic;
+    pool_semantic["fixture"] = "external-join-pool";
+    // Few enough partitions per input that the step does not compact them, so
+    // its output graph is the workers' shards themselves.
+    ConstructionParameters pool_parameters = process_parameters;
+    pool_parameters.setCheckpointBytes(320 * KILOBYTE);
+    auto pool_step = [&](PathGraph& graph, const std::string& root,
+      BuildWorkspace::OpenMode mode, ExternalPathJoinStats& pool_stats)
+    {
+      BuildWorkspace pool_workspace(root, pool_semantic, BuildWorkspace::Settings(), mode);
+      graph.order = 1;
+      omp_set_num_threads(4);
+      try
+      {
+        externalPathGraphExtend(graph, GIGABYTE, pool_parameters, &pool_stats,
+          &pool_workspace, "step-pool");
+      }
+      catch(...) { omp_set_num_threads(1); throw; }
+      omp_set_num_threads(1);
+    };
+    auto make_root = [](const char* stem)
+    {
+      std::string pattern = std::string("/tmp/") + stem + "-XXXXXX";
+      std::vector<char> name(pattern.begin(), pattern.end()); name.push_back(0);
+      require(mkdtemp(name.data()) != nullptr);
+      return std::string(name.data());
+    };
+    const std::string alone_first_root = make_root("gcsa-pool-first");
+    const std::string alone_second_root = make_root("gcsa-pool-second");
+    const std::string pooled_root = make_root("gcsa-pool-both");
+    const std::string interrupted_root = make_root("gcsa-pool-interrupted");
+    const std::string claims_root = make_root("gcsa-pool-claims");
+    // The interrupted step below kills a running worker, whose partially
+    // written output shard (<name>.partial and its index spool) the
+    // coordinator does not name; keep the step's temporaries in a directory
+    // this block removes.
+    const std::string pool_temp_root = make_root("gcsa-pool-temp");
+    TempFile::setDirectory(pool_temp_root);
+
+    PathGraph alone_first(left_path, left_rank);
+    first_input(alone_first);
+    ExternalPathJoinStats alone_first_stats;
+    pool_step(alone_first, alone_first_root, BuildWorkspace::NEW_WORKSPACE, alone_first_stats);
+    PathGraph alone_second(second_left_path, second_left_rank);
+    alone_second.logical_file_ids[0] = logical_file_id_t(9);
+    alone_second.physical_shard_ids[0] = physical_shard_id_t(301);
+    second_shards(alone_second);
+    ExternalPathJoinStats alone_second_stats;
+    pool_step(alone_second, alone_second_root, BuildWorkspace::NEW_WORKSPACE, alone_second_stats);
+    const size_type first_partitions = alone_first_stats.join_partitions;
+    const size_type second_partitions = alone_second_stats.join_partitions;
+    // Two workers run in every step below, so each worker's reservation, and
+    // with it the framed bytes it writes, is the same alone and pooled. Three
+    // partitions per input keep one committed for each input when the pool
+    // fails on its last launch below.
+    require(first_partitions >= 3 && second_partitions >= 3);
+    require(alone_first_stats.join_pool_inputs == 1);
+    require(alone_first_stats.join_pool_concurrent_inputs == 0);
+    // Too few shards to compact: the step's output is the workers' shards.
+    require(alone_first.files() == first_partitions);
+    require(alone_second.files() == second_partitions);
+
+    auto both_inputs = [&](PathGraph& graph)
+    {
+      first_input(graph);
+      appendShard(graph, second_left_path, second_left_rank,
+        logical_file_id_t(9), physical_shard_id_t(301));
+      second_shards(graph);
+    };
+    PathGraph pooled(left_path, left_rank);
+    both_inputs(pooled);
+    ExternalPathJoinStats pooled_stats;
+    pool_step(pooled, pooled_root, BuildWorkspace::NEW_WORKSPACE, pooled_stats);
+    std::cerr << "test_external_join: one pool for " << pooled_stats.join_partitions
+              << " partitions of " << pooled_stats.join_pool_inputs
+              << " logical inputs (" << first_partitions << " + " << second_partitions
+              << "), at most " << pooled_stats.join_pool_concurrent_inputs
+              << " inputs with a worker running at once" << std::endl;
+    require(pooled_stats.join_pool_inputs == 2);
+    require(pooled_stats.join_pool_concurrent_inputs == 2);
+    require(pooled_stats.join_partitions == first_partitions + second_partitions);
+    require(pooled_stats.worker_processes == pooled_stats.join_partitions);
+    require(pooled_stats.generated_records ==
+      alone_first_stats.generated_records + alone_second_stats.generated_records);
+    // Input 7's shards come first, numbered 0..n-1, then input 9's, each
+    // byte-identical to the same input's shard when joined alone.
+    require(pooled.files() == first_partitions + second_partitions);
+    for(size_type file = 0; file < pooled.files(); file++)
+    {
+      const bool first = (file < first_partitions);
+      const PathGraph& alone = (first ? alone_first : alone_second);
+      const size_type alone_file = (first ? file : file - first_partitions);
+      require(pooled.physicalShard(file) == physical_shard_id_t(file));
+      require(pooled.logicalFile(file) == alone.logicalFile(alone_file));
+      require(pooled.path_counts[file] == alone.path_counts[alone_file]);
+      require(pooled.rank_counts[file] == alone.rank_counts[alone_file]);
+      require(readBytes(pooled.path_names[file]) == readBytes(alone.path_names[alone_file]));
+      require(readBytes(pooled.rank_names[file]) == readBytes(alone.rank_names[alone_file]));
+    }
+    // The same partition tasks, plans and artifacts as the two inputs alone.
+    std::map<std::string, std::vector<std::uint8_t>> expected_tasks =
+      workspaceEntries(alone_first_root, "step-pool-");
+    const std::map<std::string, std::vector<std::uint8_t>> second_tasks =
+      workspaceEntries(alone_second_root, "step-pool-");
+    expected_tasks.insert(second_tasks.begin(), second_tasks.end());
+    require(expected_tasks.size() > first_partitions + second_partitions);
+    require(workspaceEntries(pooled_root, "step-pool-") == expected_tasks);
+
+    // Disk admission. Each input's plan must fit the limit by itself, as it had
+    // to in its own pool, and the pool needs no more: at the larger input's
+    // planned peaks, eight workers' running peaks exceed the limit, so launches
+    // wait for running workers, whose stored pairs are far below their peaks.
+    // One byte less, and that input's own plan is refused before any launch.
+    {
+      ConstructionParameters wide_parameters = pool_parameters;
+      wide_parameters.setMemoryLimitBytes(32 * MEGABYTE);
+      wide_parameters.setProcessWorkers(8);
+      auto wide_step = [&](PathGraph& graph, size_type limit, ExternalPathJoinStats& wide_stats)
+      {
+        both_inputs(graph);
+        graph.order = 1;
+        omp_set_num_threads(4);
+        try { externalPathGraphExtend(graph, limit, wide_parameters, &wide_stats); }
+        catch(...) { omp_set_num_threads(1); throw; }
+        omp_set_num_threads(1);
+      };
+      PathGraph wide(left_path, left_rank);
+      ExternalPathJoinStats wide_stats;
+      wide_step(wide, GIGABYTE, wide_stats);
+      const size_type input_limit = wide_stats.join_largest_input_plan_bytes;
+      require(wide_stats.join_pool_disk_waits == 0);
+      PathGraph limited(left_path, left_rank);
+      ExternalPathJoinStats limited_stats;
+      wide_step(limited, input_limit, limited_stats);
+      std::cerr << "test_external_join: at the larger input's planned "
+                << input_limit << " bytes, the pool waited for "
+                << limited_stats.join_pool_disk_waits << " workers to free disk" << std::endl;
+      require(limited_stats.join_pool_disk_waits > 0);
+      require(limited.storedBytes() <= input_limit);
+      requireByteIdenticalGraph(wide, limited);
+      PathGraph refused(left_path, left_rank);
+      ExternalPathJoinStats refused_stats;
+      bool refused_plan = false;
+      try { wide_step(refused, input_limit - 1, refused_stats); }
+      catch(const std::runtime_error& error)
+      {
+        refused_plan = (std::string(error.what()).find(
+          "exceeded by deterministic partition plan: logical input ") != std::string::npos);
+      }
+      require(refused_plan);
+      require(refused_stats.worker_processes == 0);
+    }
+
+    // The same step again on its workspace restores every partition.
+    PathGraph restored_pool(left_path, left_rank);
+    both_inputs(restored_pool);
+    ExternalPathJoinStats restored_pool_stats;
+    pool_step(restored_pool, pooled_root, BuildWorkspace::RESUME, restored_pool_stats);
+    require(restored_pool_stats.restored_partitions == pooled_stats.join_partitions);
+    require(restored_pool_stats.worker_processes == 0);
+    requireByteIdenticalGraph(pooled, restored_pool);
+
+    // A worker fails on the pool's last launch. The coordinator stops its
+    // sibling and the step throws with the partitions collected so far
+    // committed, from both inputs. Resuming launches only the rest.
+    PathGraph failing(left_path, left_rank);
+    both_inputs(failing);
+    ExternalPathJoinStats failing_stats;
+    const size_type last_launch = first_partitions + second_partitions - 1;
+    ::setenv("GCSA_TEST_JOIN_WORKER_FAIL_DIR", claims_root.c_str(), 1);
+    ::setenv("GCSA_TEST_JOIN_WORKER_FAIL_AT", std::to_string(last_launch).c_str(), 1);
+    bool interrupted = false;
+    try
+    {
+      pool_step(failing, interrupted_root, BuildWorkspace::NEW_WORKSPACE, failing_stats);
+    }
+    catch(const std::runtime_error& error)
+    {
+      interrupted = (std::string(error.what()).find("external join worker failed") != std::string::npos);
+    }
+    ::unsetenv("GCSA_TEST_JOIN_WORKER_FAIL_DIR");
+    ::unsetenv("GCSA_TEST_JOIN_WORKER_FAIL_AT");
+    require(interrupted);
+    size_type committed_first = 0, committed_second = 0;
+    for(const auto& entry : workspaceEntries(interrupted_root, "step-pool-join-l"))
+    {
+      if(entry.first.find("--join-partition.complete") == std::string::npos) { continue; }
+      if(entry.first.compare(0, 18, "step-pool-join-l7-") == 0) { committed_first++; }
+      if(entry.first.compare(0, 18, "step-pool-join-l9-") == 0) { committed_second++; }
+    }
+    std::cerr << "test_external_join: interrupted pool committed " << committed_first
+              << " + " << committed_second << " partitions" << std::endl;
+    require(committed_first >= 1 && committed_second >= 1);
+    require(committed_first + committed_second < pooled_stats.join_partitions);
+    PathGraph resumed_pool(left_path, left_rank);
+    both_inputs(resumed_pool);
+    ExternalPathJoinStats resumed_pool_stats;
+    pool_step(resumed_pool, interrupted_root, BuildWorkspace::RESUME, resumed_pool_stats);
+    require(resumed_pool_stats.restored_partitions == committed_first + committed_second);
+    require(resumed_pool_stats.worker_processes ==
+      pooled_stats.join_partitions - resumed_pool_stats.restored_partitions);
+    requireByteIdenticalGraph(pooled, resumed_pool);
+    require(workspaceEntries(interrupted_root, "step-pool-") == expected_tasks);
+
+    std::remove(second_left_path.c_str()); std::remove(second_left_rank.c_str());
+    std::remove(second_right_path.c_str()); std::remove(second_right_rank.c_str());
+    TempFile::setDirectory(std::string());
+    for(const std::string& root : { alone_first_root, alone_second_root, pooled_root,
+      interrupted_root, claims_root, pool_temp_root })
+    {
+      std::filesystem::remove_all(root);
+    }
   }
 
   std::remove(combined_path.c_str()); std::remove(combined_rank.c_str());
