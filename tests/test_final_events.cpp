@@ -6,11 +6,14 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <iterator>
 #include <limits>
 #include <omp.h>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -1123,6 +1126,121 @@ int main()
   try { buildViaStore(alphabet, restored, restored_metadata, parameters, 4, 6, 8); }
   catch(const std::runtime_error&) { rejected = true; }
   require(rejected);
+
+  // Batch appends must give every stream exactly the records per-event calls
+  // give it: raw and framed payload bytes, checksums and metadata. Batches end
+  // at irregular paths (one is empty), a 24-byte raw buffer makes 8- and
+  // 16-byte records straddle its flushes, 64-byte frames put block boundaries
+  // between records, and a concurrent runner writes the streams at once.
+  for(bool framed : { false, true })
+  {
+    const size_type sigma = alphabet.sigma;
+    const TempFileCodecParameters codec = (framed ?
+      TempFileCodecParameters(TempCompression::ZSTD, 64, 1, 1) :
+      TempFileCodecParameters());
+    FinalEventFiles serial_files(sigma), batch_files(sigma);
+    FinalEventMetadata serial_meta, batch_meta;
+    FinalEventChecksums serial_sums(sigma), batch_sums(sigma);
+    {
+      MemoryBudget serial_memory(64 * MEGABYTE), batch_memory(64 * MEGABYTE);
+      FinalEventWriter serial_writer(serial_files, sigma, 24, serial_memory, codec);
+      FinalEventWriter batch_writer(batch_files, sigma, 24, batch_memory, codec);
+      const FinalEventTaskRunner concurrent = [](size_type tasks,
+        const std::function<void(size_type)>& task)
+      {
+        std::vector<std::thread> threads;
+        for(size_type t = 0; t < tasks; t++) { threads.emplace_back(task, t); }
+        for(std::thread& thread : threads) { thread.join(); }
+      };
+      std::uint64_t state = 0x9e3779b97f4a7c15ULL;
+      const auto next = [&state]() -> std::uint64_t
+      {
+        state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+        return state;
+      };
+      FinalEventBatch batch;
+      const size_type paths = 20000;
+      size_type batch_end = 0, batches = 0;
+      for(size_type path = 0; path < paths; path++)
+      {
+        if(path == batch_end)
+        {
+          batch_writer.append(batch,
+            (batches++ % 2 == 0 ? concurrent : FinalEventTaskRunner()));
+          batch.clear(); batch_end = path + 1 + next() % 700;
+        }
+        const byte_type mask = static_cast<byte_type>(next() &
+          ((static_cast<size_type>(1) << sigma) - 1));
+        serial_writer.path(mask); batch.masks.push_back(mask);
+        for(size_type comp = 0; comp < sigma; comp++)
+        {
+          if((mask & (1U << comp)) == 0) { continue; }
+          const size_type destination = next() % paths;
+          serial_writer.edge(comp, destination);
+          batch.edges[comp].push_back(destination);
+        }
+        if(next() % 3 == 0)
+        {
+          const size_type count = 1 + next() % 4;
+          serial_writer.sampledPath(path);
+          batch.sampled_paths.push_back(path); batch.sample_counts.push_back(count);
+          for(size_type j = 0; j < count; j++)
+          {
+            const node_type node = next() >> (next() % 60);
+            serial_writer.sample(node); batch.samples.push_back(node);
+          }
+          serial_writer.sampleEnd();
+        }
+        const size_type extra = next() % 4;
+        serial_writer.occurrence(path, extra);
+        if(extra > 0) { batch.occurrences.push_back(path); batch.occurrences.push_back(extra); }
+        for(size_type j = next() % 3; j > 0; j--)
+        {
+          const size_type slot = next() % paths;
+          serial_writer.redundancy(slot); batch.redundant.push_back(slot);
+        }
+      }
+      batch_writer.append(batch, concurrent);
+      serial_meta = serial_writer.finish(); serial_sums = serial_writer.checksums();
+      batch_meta = batch_writer.finish(); batch_sums = batch_writer.checksums();
+    }
+    const auto file_bytes = [](const std::string& name)
+    {
+      std::ifstream input(name.c_str(), std::ios_base::binary);
+      require(static_cast<bool>(input));
+      return std::string((std::istreambuf_iterator<char>(input)),
+        std::istreambuf_iterator<char>());
+    };
+    require(CompressedBlockReader::isFramed(batch_files.bwt_masks) == framed);
+    require(file_bytes(serial_files.bwt_masks) == file_bytes(batch_files.bwt_masks));
+    for(size_type comp = 0; comp < sigma; comp++)
+    {
+      require(file_bytes(serial_files.edge_destinations[comp]) ==
+        file_bytes(batch_files.edge_destinations[comp]));
+      require(serial_sums.edge_destinations[comp] == batch_sums.edge_destinations[comp]);
+      require(serial_meta.bwt_counts[comp] == batch_meta.bwt_counts[comp]);
+    }
+    require(file_bytes(serial_files.sample_positions) ==
+      file_bytes(batch_files.sample_positions));
+    require(file_bytes(serial_files.sample_ids) == file_bytes(batch_files.sample_ids));
+    require(file_bytes(serial_files.sample_ends) == file_bytes(batch_files.sample_ends));
+    require(file_bytes(serial_files.occurrences) == file_bytes(batch_files.occurrences));
+    require(file_bytes(serial_files.redundant) == file_bytes(batch_files.redundant));
+    require(serial_sums.bwt_masks == batch_sums.bwt_masks);
+    require(serial_sums.sample_positions == batch_sums.sample_positions);
+    require(serial_sums.sample_ids == batch_sums.sample_ids);
+    require(serial_sums.sample_ends == batch_sums.sample_ends);
+    require(serial_sums.occurrences == batch_sums.occurrences);
+    require(serial_sums.redundant == batch_sums.redundant);
+    require(serial_meta.paths == batch_meta.paths);
+    require(serial_meta.total_edges == batch_meta.total_edges);
+    require(serial_meta.sampled_paths == batch_meta.sampled_paths);
+    require(serial_meta.sample_ids == batch_meta.sample_ids);
+    require(serial_meta.sample_bits == batch_meta.sample_bits);
+    require(serial_meta.occurrence_items == batch_meta.occurrence_items);
+    require(serial_meta.occurrence_extra == batch_meta.occurrence_extra);
+    require(serial_meta.redundant == batch_meta.redundant);
+  }
 
   restored.clear(); files.clear();
   std::filesystem::remove_all(root);

@@ -238,6 +238,35 @@ public:
     append(record, sizeof(record));
   }
 
+  /*
+    Runs of records, for batch appends. A framed stream still gets one
+    writeRecord() per record: its block boundaries and per-block record counts
+    depend on them. A raw stream is a byte sequence, so records are encoded
+    straight into the buffer and checksummed per run; the FNV fold over the
+    same bytes in the same order gives the same digest. A record that would
+    straddle a flush goes through append(), exactly as before.
+  */
+  void bytes(const std::uint8_t* values, size_type count)
+  {
+    if(framed_)
+    {
+      for(size_type i = 0; i < count; i++) { append(values + i, 1); }
+      return;
+    }
+    append(values, count);
+  }
+
+  void integers(const std::uint64_t* values, size_type count)
+  {
+    records(values, count, 1);
+  }
+
+  // count pairs from 2 * count flattened values.
+  void pairs(const std::uint64_t* values, size_type count)
+  {
+    records(values, count, 2);
+  }
+
   std::uint64_t checksum() const
   {
     if(!closed_) { throw eventError("checksum requested before event stream close", path_); }
@@ -294,6 +323,38 @@ private:
       std::memcpy(buffer_.data() + used_, data, count);
       checksum_ = BuildWorkspace::checksum(data, count, checksum_);
       used_ += count; data += count; bytes -= count;
+      if(used_ == buffer_.size()) { flush(); }
+    }
+  }
+
+  void records(const std::uint64_t* values, size_type count, size_type words)
+  {
+    const size_type width = 8 * words;
+    std::uint8_t record[16];
+    if(framed_)
+    {
+      for(size_type i = 0; i < count; i++, values += words)
+      {
+        for(size_type w = 0; w < words; w++) { put64(record + 8 * w, values[w]); }
+        append(record, width);
+      }
+      return;
+    }
+    if(closed_) { throw eventError("write after close", path_); }
+    while(count > 0)
+    {
+      size_type room = (buffer_.size() - used_) / width;
+      if(room == 0)
+      {
+        for(size_type w = 0; w < words; w++) { put64(record + 8 * w, values[w]); }
+        append(record, width); values += words; count--;
+        continue;
+      }
+      size_type take = std::min(room, count);
+      std::uint8_t* target = buffer_.data() + used_;
+      for(size_type i = 0; i < take * words; i++) { put64(target + 8 * i, values[i]); }
+      checksum_ = BuildWorkspace::checksum(target, take * width, checksum_);
+      used_ += take * width; values += take * words; count -= take;
       if(used_ == buffer_.size()) { flush(); }
     }
   }
@@ -2024,6 +2085,128 @@ void
 FinalEventWriter::redundancy(size_type path)
 {
   this->impl_->redundant->integer(path); this->impl_->metadata.redundant++;
+}
+
+void
+FinalEventBatch::clear()
+{
+  this->masks.clear();
+  for(std::vector<size_type>& comp_edges : this->edges) { comp_edges.clear(); }
+  this->occurrences.clear();
+  this->sampled_paths.clear(); this->sample_counts.clear();
+  this->samples.clear(); this->redundant.clear();
+}
+
+void
+FinalEventWriter::append(const FinalEventBatch& batch,
+  const FinalEventTaskRunner& runner)
+{
+  Impl& impl = *(this->impl_);
+  if(impl.finished) { throw eventError("batch append after finish"); }
+  const size_type sigma = impl.sigma;
+  for(size_type comp = sigma; comp < FinalEventMetadata::MAX_SIGMA; comp++)
+  {
+    if(!(batch.edges[comp].empty())) { throw eventError("invalid edge event"); }
+  }
+  if(batch.occurrences.size() % 2 != 0 ||
+     batch.sample_counts.size() != batch.sampled_paths.size())
+  {
+    throw eventError("malformed event batch");
+  }
+
+  // Each task owns its streams and the metadata fields only those streams
+  // touch, so tasks may run concurrently. total_edges is the one field shared
+  // by several streams; it is added after every task has finished.
+  const size_type mask_task = 0, first_edge_task = 1;
+  const size_type sample_task = first_edge_task + sigma;
+  const size_type occurrence_task = sample_task + 1;
+  const size_type redundancy_task = occurrence_task + 1;
+  const size_type tasks = redundancy_task + 1;
+  const auto task = [&](size_type which)
+  {
+    if(which == mask_task)
+    {
+      if(sigma < 8)
+      {
+        for(byte_type mask : batch.masks)
+        {
+          if((mask >> sigma) != 0)
+          {
+            throw eventError("BWT mask has a component outside the alphabet");
+          }
+        }
+      }
+      impl.masks->bytes(batch.masks.data(), batch.masks.size());
+      impl.metadata.paths += batch.masks.size();
+    }
+    else if(which < sample_task)
+    {
+      const size_type comp = which - first_edge_task;
+      impl.edges[comp]->integers(batch.edges[comp].data(),
+        batch.edges[comp].size());
+      impl.metadata.bwt_counts[comp] += batch.edges[comp].size();
+    }
+    else if(which == sample_task)
+    {
+      FinalEventMetadata& metadata = impl.metadata;
+      size_type next_sample = 0;
+      for(size_type i = 0; i < batch.sampled_paths.size(); i++)
+      {
+        const size_type count = batch.sample_counts[i];
+        if(count > batch.samples.size() - next_sample)
+        {
+          throw eventError("malformed event batch");
+        }
+        impl.sample_positions->integer(batch.sampled_paths[i]);
+        metadata.sampled_paths++;
+        impl.sample_ids->integers(batch.samples.data() + next_sample, count);
+        for(size_type j = 0; j < count; j++)
+        {
+          metadata.sample_bits = std::max(metadata.sample_bits,
+            bit_length(batch.samples[next_sample + j]));
+        }
+        metadata.sample_ids += count; next_sample += count;
+        if(metadata.sample_ids == 0)
+        {
+          throw eventError("sample end without a sample ID");
+        }
+        impl.sample_ends->integer(metadata.sample_ids - 1);
+      }
+      if(next_sample != batch.samples.size())
+      {
+        throw eventError("malformed event batch");
+      }
+    }
+    else if(which == occurrence_task)
+    {
+      FinalEventMetadata& metadata = impl.metadata;
+      for(size_type i = 1; i < batch.occurrences.size(); i += 2)
+      {
+        const size_type extra = batch.occurrences[i];
+        if(extra == 0) { throw eventError("malformed event batch"); }
+        if(metadata.occurrence_extra >
+           std::numeric_limits<size_type>::max() - extra)
+        {
+          throw eventError("occurrence total overflows");
+        }
+        metadata.occurrence_extra += extra;
+      }
+      impl.occurrences->pairs(batch.occurrences.data(),
+        batch.occurrences.size() / 2);
+      metadata.occurrence_items += batch.occurrences.size() / 2;
+    }
+    else
+    {
+      impl.redundant->integers(batch.redundant.data(), batch.redundant.size());
+      impl.metadata.redundant += batch.redundant.size();
+    }
+  };
+  if(runner) { runner(tasks, task); }
+  else { for(size_type which = 0; which < tasks; which++) { task(which); } }
+  for(size_type comp = 0; comp < sigma; comp++)
+  {
+    impl.metadata.total_edges += batch.edges[comp].size();
+  }
 }
 
 FinalEventMetadata
