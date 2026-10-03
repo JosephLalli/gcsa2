@@ -22,6 +22,7 @@
 #include <random>
 #include <sstream>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 #include <unordered_set>
 
@@ -271,6 +272,85 @@ storeEmptyIndexAtomically(const GCSA& index, const std::string& filename)
     throw;
   }
 }
+
+/*
+  The LCP array of the four-argument GCSA::buildAndStore(), built on its own
+  thread from the merged graph's LCP leaf file while the main thread scans the
+  final events and stores the components. It used to run after them, alone:
+  about 60 s at 0.22 threads on the joint chr2+chr18 input, although the leaf
+  file is complete when the merge ends.
+
+  The thread runs the caller's LCPArray::buildAndStore(graph, ...) unchanged,
+  with its own resumable workspace, so the bytes and resume behavior are those
+  of the call it replaces. It writes to a staged name beside the target, and
+  finish() renames that into place after the index is published, so a failed
+  index build never leaves a new .lcp beside an old or missing .gcsa. The
+  thread is not admitted against the scan's budgets: it holds about one stream
+  budget, min(--memory-limit, --io-buffer-size), well inside the eighth of
+  the memory goal the scan keeps as allocator margin, and at most five
+  descriptors, above the --max-open-files ceiling the scan is sized to. The
+  destructor joins the thread (a joinable std::thread would terminate the
+  process) and discards the staged file, so an exception on the main thread
+  neither strands the thread nor publishes a partial result.
+*/
+class ConcurrentLCPBuild
+{
+public:
+  ConcurrentLCPBuild() = default;
+  ConcurrentLCPBuild(const ConcurrentLCPBuild&) = delete;
+  ConcurrentLCPBuild& operator=(const ConcurrentLCPBuild&) = delete;
+
+  ~ConcurrentLCPBuild()
+  {
+    if(this->worker.joinable()) { this->worker.join(); }
+    if(!this->staged.empty()) { ::unlink(this->staged.c_str()); }
+  }
+
+  // graph.lcp_name must already name the merged LCP leaf file, and neither it
+  // nor graph.size() may change until finish().
+  void start(const InputGraph& graph, const ConstructionParameters& parameters,
+    const std::string& target)
+  {
+    this->target = target;
+    this->staged = target + "." + std::to_string(static_cast<unsigned long long>(::getpid())) +
+      ".staged";
+    this->worker = std::thread([this, &graph, &parameters]()
+    {
+      try { LCPArray::buildAndStore(graph, parameters, this->staged); }
+      catch(...) { this->failure = std::current_exception(); }
+    });
+  }
+
+  bool started() const { return !(this->target.empty()); }
+
+  void finish()
+  {
+    this->worker.join();
+    if(this->failure) { std::rethrow_exception(this->failure); }
+    if(::rename(this->staged.c_str(), this->target.c_str()) != 0)
+    {
+      throw std::runtime_error("cannot publish LCP array " + this->target);
+    }
+    this->staged.clear();
+    std::filesystem::path parent = std::filesystem::path(this->target).parent_path();
+    if(parent.empty()) { parent = "."; }
+    int descriptor = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY);
+    if(descriptor < 0 || ::fsync(descriptor) != 0)
+    {
+      if(descriptor >= 0) { ::close(descriptor); }
+      throw std::runtime_error("cannot sync LCP output directory " + this->target);
+    }
+    if(::close(descriptor) != 0)
+    {
+      throw std::runtime_error("cannot close LCP output directory " + this->target);
+    }
+  }
+
+private:
+  std::string target, staged;
+  std::thread worker;
+  std::exception_ptr failure;
+};
 
 } // namespace
 
@@ -1989,8 +2069,26 @@ GCSA::buildAndStore(InputGraph& graph, const ConstructionParameters& parameters,
   GCSA builder(graph, parameters, &filename);
 }
 
+void
+GCSA::buildAndStore(InputGraph& graph, const ConstructionParameters& parameters,
+  const std::string& filename, const std::string& lcp_filename)
+{
+  if(!parameters.externalMemory())
+  {
+    throw std::invalid_argument("GCSA::buildAndStore() requires a durable external-memory workspace");
+  }
+  if(graph.size() == 0)
+  {
+    GCSA empty;
+    storeEmptyIndexAtomically(empty, filename);
+    LCPArray::buildAndStore(graph, parameters, lcp_filename);
+    return;
+  }
+  GCSA builder(graph, parameters, &filename, &lcp_filename);
+}
+
 GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
-  const std::string* direct_output) :
+  const std::string* direct_output, const std::string* lcp_output) :
   GCSA()
 {
   double start = readTimer();
@@ -2364,6 +2462,25 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     start = stop;
   }
 
+  // The merged LCP leaf file is complete: build the LCP array beside the final
+  // scan when the caller asked for it here. Declared after merged_graph, the
+  // builder is destroyed, and its thread joined, before the leaf file the
+  // merged graph owns is removed. A configured stop always precedes the end
+  // of construction, where the LCP array would be published, so a stopping
+  // build starts no thread.
+  ConcurrentLCPBuild concurrent_lcp;
+  if(lcp_output != nullptr && parameters.getStopAfter().empty())
+  {
+    TempFile::remove(graph.lcp_name);
+    graph.lcp_name = merged_graph.lcp_name;
+    concurrent_lcp.start(graph, parameters, *lcp_output);
+    if(Verbosity::level >= Verbosity::EXTENDED)
+    {
+      std::cerr << "GCSA::GCSA(): Building the LCP array during the final-event scan"
+                << std::endl;
+    }
+  }
+
   // Structures used for building GCSA.
   if(Verbosity::level >= Verbosity::BASIC)
   {
@@ -2597,10 +2714,23 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   final_sampled_positions = this->sampledPositions();
   }
 
-  // Transfer the LCP array from MergedGraph to InputGraph.
-  TempFile::remove(graph.lcp_name);
-  graph.lcp_name = merged_graph.lcp_name;
-  merged_graph.lcp_name.clear();
+  // Transfer the LCP array from MergedGraph to InputGraph. The concurrent
+  // builder already shares the name; the merged graph gives up ownership only
+  // after the builder has finished reading the file.
+  if(concurrent_lcp.started())
+  {
+    SubPhaseProbe lcp_probe("construct/lcp-join");
+    concurrent_lcp.finish();
+    lcp_probe.report();
+    merged_graph.lcp_name.clear();
+  }
+  else
+  {
+    TempFile::remove(graph.lcp_name);
+    graph.lcp_name = merged_graph.lcp_name;
+    merged_graph.lcp_name.clear();
+    if(lcp_output != nullptr) { LCPArray::buildAndStore(graph, parameters, *lcp_output); }
+  }
 
   if(Verbosity::level >= Verbosity::EXTENDED)
   {

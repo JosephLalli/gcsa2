@@ -524,6 +524,97 @@ main()
   require(readFile(legacy_prefix + LCPArray::EXTENSION) ==
     readFile(tiny_prefix + LCPArray::EXTENSION));
 
+  // The four-argument buildAndStore() builds the LCP array on its own thread
+  // during the final-event scan instead of after the index. A fresh build must
+  // match the legacy route byte for byte and leave no staged LCP file. A build
+  // stopped after the final events publishes neither output and starts no LCP
+  // workspace; resuming it (the LCP array is then built while the components
+  // are stored) gives the same bytes.
+  const auto stagedLCPFiles = [](const std::string& root) -> size_type {
+    size_type staged = 0;
+    for(const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(root))
+    {
+      if(entry.path().extension() == ".staged") { staged++; }
+    }
+    return staged;
+  };
+  const std::string overlap_root = makeTempRoot("gcsa-resume-lcp-overlap");
+  const std::string overlap_prefix = overlap_root + "/index";
+  TempFile::setDirectory(overlap_root);
+  {
+    ConstructionParameters parameters = externalParameters(overlap_root,
+      external_minimum + 64 * MEGABYTE);
+    enableSmallFramedStreams(parameters);
+    InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
+    std::ostringstream overlap_log;
+    std::streambuf* old_stderr = std::cerr.rdbuf(overlap_log.rdbuf());
+    Verbosity::set(Verbosity::EXTENDED);
+    try
+    {
+      GCSA::buildAndStore(graph, parameters, overlap_prefix + GCSA::EXTENSION,
+        overlap_prefix + LCPArray::EXTENSION);
+    }
+    catch(...)
+    {
+      std::cerr.rdbuf(old_stderr); Verbosity::set(Verbosity::SILENT); throw;
+    }
+    std::cerr.rdbuf(old_stderr); Verbosity::set(Verbosity::SILENT);
+    const size_type started = overlap_log.str().find(
+      "Building the LCP array during the final-event scan");
+    require(started != std::string::npos);
+    require(started < overlap_log.str().find("subphase construct/final-event-scan"));
+    require(overlap_log.str().find("subphase construct/lcp-join") != std::string::npos);
+    GCSA index; LCPArray lcp;
+    require(sdsl::load_from_file(index, overlap_prefix + GCSA::EXTENSION));
+    require(sdsl::load_from_file(lcp, overlap_prefix + LCPArray::EXTENSION));
+    require(verifyIndex(index, &lcp, graph));
+  }
+  require(stagedLCPFiles(overlap_root) == 0);
+  require(readFile(legacy_prefix + GCSA::EXTENSION) ==
+    readFile(overlap_prefix + GCSA::EXTENSION));
+  require(readFile(legacy_prefix + LCPArray::EXTENSION) ==
+    readFile(overlap_prefix + LCPArray::EXTENSION));
+
+  const std::string stopped_root = makeTempRoot("gcsa-resume-lcp-stopped");
+  const std::string stopped_prefix = stopped_root + "/index";
+  TempFile::setDirectory(stopped_root);
+  {
+    ConstructionParameters parameters = externalParameters(stopped_root,
+      external_minimum + 64 * MEGABYTE);
+    enableSmallFramedStreams(parameters);
+    parameters.setStopAfter("final-events");
+    bool stopped = false;
+    try
+    {
+      InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
+      GCSA::buildAndStore(graph, parameters, stopped_prefix + GCSA::EXTENSION,
+        stopped_prefix + LCPArray::EXTENSION);
+    }
+    catch(const ConstructionStopped& event)
+    {
+      stopped = (event.completed_phase == "final-events");
+    }
+    require(stopped);
+    require(!std::filesystem::exists(stopped_prefix + GCSA::EXTENSION));
+    require(!std::filesystem::exists(stopped_prefix + LCPArray::EXTENSION));
+    require(!std::filesystem::exists(stopped_root + "/lcp-levels"));
+    require(stagedLCPFiles(stopped_root) == 0);
+  }
+  {
+    ConstructionParameters parameters = externalParameters(stopped_root,
+      external_minimum + 64 * MEGABYTE);
+    enableSmallFramedStreams(parameters);
+    parameters.setResume();
+    InputGraph graph({ input_name }, false, parameters, Alphabet(), mapping_name);
+    GCSA::buildAndStore(graph, parameters, stopped_prefix + GCSA::EXTENSION,
+      stopped_prefix + LCPArray::EXTENSION);
+  }
+  require(stagedLCPFiles(stopped_root) == 0);
+  require(readFile(legacy_prefix + GCSA::EXTENSION) ==
+    readFile(stopped_prefix + GCSA::EXTENSION));
+  require(readFile(legacy_prefix + LCPArray::EXTENSION) ==
+    readFile(stopped_prefix + LCPArray::EXTENSION));
+
   omp_set_num_threads(1);
   TempFile::setDirectory(workspace_root);
 
@@ -631,5 +722,7 @@ main()
   std::filesystem::remove_all(fallback_root);
   std::filesystem::remove_all(empty_root);
   std::filesystem::remove_all(tiny_root);
+  std::filesystem::remove_all(overlap_root);
+  std::filesystem::remove_all(stopped_root);
   return 0;
 }
