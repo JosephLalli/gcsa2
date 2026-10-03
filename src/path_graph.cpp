@@ -241,6 +241,46 @@ LCP::LCP(const std::string& key_name, size_type key_count,
 std::atomic<size_type> LCP::range_minimum_queries(0);
 std::atomic<size_type> LCP::range_minimum_span(0);
 
+namespace
+{
+
+/*
+  The diagnostic range-minimum counters are summed per thread and folded into
+  the shared atomics in batches. Parallel prune and merge workers each issue
+  hundreds of millions of queries, and two fetch_adds per query on one shared
+  cache line made the workers queue for the line rather than descend the
+  wavelet tree. A thread folds its remainder in when it exits; a total read
+  while threads run can miss at most one batch per thread.
+*/
+struct RangeMinimumTally
+{
+  constexpr static size_type BATCH = 4096;
+  size_type queries = 0, span = 0;
+
+  ~RangeMinimumTally() { this->flush(); }
+
+  void flush()
+  {
+    if(this->queries == 0) { return; }
+    LCP::range_minimum_queries.fetch_add(this->queries, std::memory_order_relaxed);
+    LCP::range_minimum_span.fetch_add(this->span, std::memory_order_relaxed);
+    this->queries = 0; this->span = 0;
+  }
+};
+
+thread_local RangeMinimumTally range_minimum_tally;
+
+inline void
+tallyRangeMinimum(size_type left, size_type right)
+{
+  RangeMinimumTally& tally = range_minimum_tally;
+  tally.queries++;
+  tally.span += (right >= left ? right - left + 1 : 0);
+  if(tally.queries >= RangeMinimumTally::BATCH) { tally.flush(); }
+}
+
+} // anonymous namespace
+
 range_type
 LCP::min_lcp(const PathNode& a, const PathNode& b, const std::vector<LCP::rank_type>& labels) const
 {
@@ -272,12 +312,7 @@ LCP::min_lcp(const PathNode& a, const PathNode& b,
     // increments. Gate them on the verbosity that prints them, so a production
     // run pays one well-predicted branch and the measurement is still there
     // when it is asked for.
-    if(Verbosity::level >= Verbosity::EXTENDED)
-    {
-      LCP::range_minimum_queries.fetch_add(1, std::memory_order_relaxed);
-      LCP::range_minimum_span.fetch_add(
-        (right >= left ? right - left + 1 : 0), std::memory_order_relaxed);
-    }
+    if(Verbosity::level >= Verbosity::EXTENDED) { tallyRangeMinimum(left, right); }
     lcp.second = sdsl::quantile_freq(this->kmer_lcp, left, right, 0).first;
   }
   return lcp;
@@ -302,12 +337,7 @@ LCP::max_lcp(const PathNode& a, const PathNode& b,
     // increments. Gate them on the verbosity that prints them, so a production
     // run pays one well-predicted branch and the measurement is still there
     // when it is asked for.
-    if(Verbosity::level >= Verbosity::EXTENDED)
-    {
-      LCP::range_minimum_queries.fetch_add(1, std::memory_order_relaxed);
-      LCP::range_minimum_span.fetch_add(
-        (right >= left ? right - left + 1 : 0), std::memory_order_relaxed);
-    }
+    if(Verbosity::level >= Verbosity::EXTENDED) { tallyRangeMinimum(left, right); }
     lcp.second = sdsl::quantile_freq(this->kmer_lcp, left, right, 0).first;
   }
   return lcp;
