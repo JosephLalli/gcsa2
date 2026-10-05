@@ -312,22 +312,14 @@ struct PathGraphMergeStats
   // set came. Its capacity is a share of the merge budget rather than a bound,
   // so the peak is what says whether that share is defensible.
   size_type max_from_set_nodes;
-  // Execution shape for the repeated prune and final-merge passes. Requested
-  // workers is retained even on a safe serial fallback, so a benchmark can
-  // distinguish an unused request from an actual parallel execution.
+  // Execution shape for the repeated prune passes. Requested workers is
+  // retained even on a safe serial fallback, so a benchmark can distinguish
+  // an unused request from an actual parallel execution.
   size_type prune_requested_workers, prune_workers, prune_partitions;
   size_type prune_parallel_fallbacks;
-  size_type merge_workers, merge_partitions;
-  // The partitioned final merge: the prefix depth it split at, the spans it
-  // merged again on one thread because a group crossed a split (stitches),
-  // and the input records of the whole merge and of its largest partition,
-  // which bound the merge's parallel speedup.
-  size_type merge_split_depth, merge_stitches;
-  size_type merge_records, merge_largest_records;
-  // Why a requested parallel prune or merge ran serially (a string literal),
-  // or null when it ran in parallel or was not requested.
+  // Why a requested parallel prune ran serially (a string literal), or null
+  // when it ran in parallel or was not requested.
   const char* prune_fallback_reason = nullptr;
-  const char* merge_fallback_reason = nullptr;
 
   PathGraphMergeStats() :
     priority_spills(0), range_spills(0), from_set_sorts(0),
@@ -343,9 +335,7 @@ struct PathGraphMergeStats
     max_prefetch_bytes(0), oversized_input_pair_bytes(0),
     max_from_set_nodes(0),
     prune_requested_workers(0), prune_workers(0), prune_partitions(0),
-    prune_parallel_fallbacks(0), merge_workers(0), merge_partitions(0),
-    merge_split_depth(0), merge_stitches(0),
-    merge_records(0), merge_largest_records(0) { }
+    prune_parallel_fallbacks(0) { }
 };
 
 //------------------------------------------------------------------------------
@@ -495,13 +485,6 @@ struct MergedGraph
     not taken into account, so you may want to use something like:
 
       MergedGraph merged_graph(source, mapper, kmer_lcp, total_size_limit - source.bytes())
-
-    merge_workers > 1 requests the partitioned merge, which produces the same
-    streams as the serial one or declines and runs it. Its workers share the
-    descriptor budget concurrent_open_files (zero, or anything below
-    max_open_files, means max_open_files) and divide parallel_cache_bytes for
-    their decoded input blocks (zero means input_cache_bytes). A compressed
-    output_codec takes the serial merge, the only one that frames its output.
   */
   MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper,
     const LCP& kmer_lcp, size_type size_limit,
@@ -509,10 +492,7 @@ struct MergedGraph
     PathGraphMergeStats* stats = nullptr,
     size_type max_open_files = 128,
     size_type input_cache_bytes = 0,
-    size_type merge_workers = 1,
-    const TempFileCodecParameters* output_codec = nullptr,
-    size_type concurrent_open_files = 0,
-    size_type parallel_cache_bytes = 0);
+    const TempFileCodecParameters* output_codec = nullptr);
   ~MergedGraph();
 
   void clear();

@@ -901,12 +901,12 @@ receive a clear refusal.
 Label-sort runs group shared left contexts and prefix-compress labels, but a
 deeper reference representation spanning the pre-sort join stream remains an
 optional compaction rather than a feasibility dependency.
-Final component construction, final-path merging, final-event preparation, and
-external-route pruning now have bounded parallel paths; the completed full-suite
-and exact chr21 gate is recorded above. Ordered previous-occurrence and suffix
-state remain serial, and legacy construction retains serial pruning because its
-extend path cannot join across physical shards. Process workers accelerate
-independent join ranges, and
+Final component construction, final-event preparation, and external-route
+pruning have bounded parallel paths; final-path merging remains serial. The
+completed full-suite and exact chr21 gate is recorded above. Ordered
+previous-occurrence and suffix state remain serial, and legacy construction
+retains serial pruning because its extend path cannot join across physical
+shards. Process workers accelerate independent join ranges, and
 post-join compaction runs the batches of a pass on up to `-t` threads when each
 batch fits one output pair and the disk and memory budgets admit them together.
 On the chr21 k32 fixture (2026-09-28, 200 GiB goal, `-t 24`) that took step-4
@@ -1065,16 +1065,13 @@ digests `297f5fe840f7ec48337c97eacdc00c0f` and
 the `.lcp` must match, since a wrong re-base can leave a self-consistent index
 whose pointers are uniformly shifted.
 
-Implemented as the bounded group-aware parallel final-path merge described in
-the implementation checkpoint above. The prefetch observation remains relevant:
-the change targets serial emission rather than adding readers.
-
-GCSA construction runs this merge serially unless
-`GCSA_EXPERIMENTAL_PARALLEL_MERGE=1` is set. Copying every partition into place
-doubles the merge's scratch writes, and on chr21 the parallel merge took 0:07:04
-against 0:07:48 serial while two runs of the same parallel code differed by
-0:00:42. `MergedGraph` still takes an explicit worker count, and its tests
-exercise both routes.
+The historical candidate implemented the bounded group-aware parallel
+final-path merge described in the implementation checkpoint above. Copying
+every partition into place doubled the merge's scratch writes, and on chr21 it
+took 0:07:04 against 0:07:48 serial while two runs of the same parallel code
+differed by 0:00:42. The accepted-only composition below removes that mechanism,
+its worker-selection API, and its mechanism-specific tests; construction uses
+the ordinary serial merge.
 
 ### Descriptor budget and latency-tolerant I/O (2026-09-30 to 2026-10-01)
 
@@ -1354,9 +1351,9 @@ block counts as confirmed only beyond that. Confirmed: the final-event scan 0:32
 SSD the bounds pass took 199.9 s and the copy pass 571.6 s around 1,007.3 s of worker merging, and it
 wrote 384.3 against 110.3 GB) and the cross-input join pool (joins 0:34:49 to 0:34:06; steps 1-3 shorter,
 step 4 0:18:54 at 12.77 mean cores against 0:14:40, with more sampled I/O stall at lower load, cause not
-established). The accepted set is `60a0abd` plus proposals 3, 5, 6, 7 and the LCP overlap; this branch
-still contains the merge and the pool (the merge can be disabled with `GCSA_SERIAL_MERGE=1`), and a
-branch of the accepted set alone has not yet been built or gated. The unexplained mapper subphase (67.0 s
+established). The accepted set is `60a0abd` plus proposals 3, 5, 6, 7 and the LCP overlap. The
+accepted-only composition below removes the rejected merge and pool; its isolated build and fixture
+gate remain pending. The unexplained mapper subphase (67.0 s
 against 15.7-26 s) is untouched by these changes and recorded, not attributed. Records:
 `joint_chr2_chr18_parallel_phases_0da9176_20261002/README.md` and the decision record above.
 
@@ -1364,9 +1361,9 @@ against 15.7-26 s) is untouched by these changes and recorded, not attributed. R
 
 The user authorized a bounded cleanup/mapper improvement after the completed
 parallel-phase gate. Isolated branch `codex/gcsa-cleanup-mapper`, worktree
-`deps/gcsa2/.claude/worktrees/cleanup-mapper`, is based on `242dbb6` (code
-`0da9176`) and still contains the excluded P2 merge and P8 pool. It is not
-an accepted-only integration. Current requests are `-T 32 --process-workers 32`;
+`deps/gcsa2/.claude/worktrees/cleanup-mapper`, was based on `242dbb6` (code
+`0da9176`) and contained the excluded P2 merge and P8 pool. That historical
+branch was not an accepted-only integration. Current requests are `-T 32 --process-workers 32`;
 this introduces no hard 32-worker ceiling.
 
 Family retirement uses one v2 journal instead of a durable transaction per
@@ -1401,6 +1398,19 @@ candidate and remains diagnostic evidence. No chromosome/joint/whole-genome
 rerun or production/annotation change occurred; the earlier fixed joint-run
 budget is unchanged. Implementation is recorded on the isolated branch and
 remains unpromoted.
+
+### Accepted-only composition (2026-10-05, isolated build pending)
+
+Branch `codex/accepted-combined-20261005` starts from `b07e593`. It retains P3,
+P5, P6, P7, the P8 LCP overlap, cleanup-v2 journals, and mapper read-ahead.
+Workspace/task/artifact schemas and both `GCSA::buildAndStore` APIs are unchanged.
+`MergedGraph` now exposes and uses only the serial final merge; the parallel
+implementation, selector, statistics, and exclusive assertions are absent.
+`externalPathGraphExtend` again completes each logical input through its own
+partition-worker invocation; cross-input pool statistics and its exclusive test
+are absent. Existing serial framed-merge and parallel-prune transparency checks
+remain. Build and small-fixture/resume validation are pending in the isolated vg
+tree; this composition authorizes no chromosome or joint run.
 
 ## Build, test, and usage
 
