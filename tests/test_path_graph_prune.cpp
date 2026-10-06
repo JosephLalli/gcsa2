@@ -1,8 +1,14 @@
 #include <gcsa/path_graph.h>
+#include <gcsa/path_graph_external.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstdio>
+#include <dirent.h>
 #include <fstream>
+#include <map>
+#include <stdexcept>
+#include <sys/resource.h>
 #include <limits>
 #include <set>
 #include <string>
@@ -216,6 +222,258 @@ static void compare_merged_graph(const std::string& base)
   std::remove(input_name.c_str());
 }
 
+struct PruneFixtureRecord
+{
+  PathNode::rank_type rank;
+  node_type from;
+  bool sorted;
+};
+
+static std::vector<key_type> parallel_prune_keys(Alphabet& alpha)
+{
+  const std::vector<std::string> labels = {
+    "AAA", "AAC", "CAA", "CAC", "GAA", "GAC", "TAA", "TAC"
+  };
+  std::vector<key_type> result;
+  for(const std::string& label : labels)
+  {
+    comp_type comp = alpha.char2comp[label.front()];
+    byte_type edge = static_cast<byte_type>(1 << comp);
+    result.push_back(Key::encode(alpha, label, edge, edge));
+  }
+  std::sort(result.begin(), result.end());
+  return result;
+}
+
+static std::vector<std::vector<PruneFixtureRecord>> parallel_prune_records()
+{
+  std::vector<std::vector<PruneFixtureRecord>> result(3);
+  auto add = [&](size_type file, PathNode::rank_type rank, size_type count,
+    node_type from, bool sorted = false)
+  {
+    for(size_type i = 0; i < count; i++)
+    {
+      result[file].push_back({ rank, from, sorted && i == 0 });
+    }
+  };
+
+  // Ranks 0/1 share a nonzero-LCP root component, one semantic input, and a
+  // start node, so extendRange() must join their groups across two physical
+  // shards. Rank 2 is duplicated across logical inputs. Rank 3 mixes sorted
+  // and unsorted paths. Ranks 4/5 extend, while rank 6 has the same start and
+  // logical identity but sits beyond an exact zero-LCP boundary and must not.
+  add(0, 0, 5000, Node::encode(100, 0));
+  add(1, 0, 4000, Node::encode(100, 0));
+  add(0, 1, 6, Node::encode(100, 0));
+  add(1, 1, 4, Node::encode(100, 0));
+  add(0, 2, 3, Node::encode(200, 0));
+  add(2, 2, 3, Node::encode(200, 0));
+  add(0, 3, 2, Node::encode(301, 0), true);
+  add(1, 3, 2, Node::encode(302, 0));
+  add(1, 4, 8, Node::encode(500, 0));
+  add(1, 5, 5, Node::encode(500, 0));
+  add(1, 6, 5, Node::encode(500, 0));
+  add(2, 6, 2, Node::encode(600, 0));
+  add(1, 7, 3, Node::encode(500, 0));
+  add(2, 7, 2, Node::encode(601, 0));
+  for(auto& records : result)
+  {
+    std::stable_sort(records.begin(), records.end(),
+      [](const PruneFixtureRecord& left, const PruneFixtureRecord& right)
+      {
+        return left.rank < right.rank;
+      });
+  }
+  return result;
+}
+
+static void write_parallel_prune_pair(const std::string& path_name,
+  const std::string& rank_name, const std::vector<PruneFixtureRecord>& records,
+  bool corrupt = false, bool invalid_tail_rank = false)
+{
+  std::ofstream paths(path_name, std::ios::binary);
+  std::ofstream ranks(rank_name, std::ios::binary);
+  for(size_type i = 0; i < records.size(); i++)
+  {
+    PathNode node;
+    node.from = records[i].from; node.to = Node::encode(10000 + i, 0);
+    node.fields = 0; node.setPredecessors(1);
+    node.setOrder(1); node.setLCP(1); node.setPointer(2 * i);
+    if(records[i].sorted) { node.makeSorted(); }
+    if(corrupt && i == 0) { node.setPointer(2 * records.size() + 17); }
+    PathNode::rank_type label[] = {
+      (invalid_tail_rank && i + 1 == records.size() ? 12345 : records[i].rank), 0
+    };
+    paths.write(reinterpret_cast<const char*>(&node), sizeof(node));
+    ranks.write(reinterpret_cast<const char*>(label), sizeof(label));
+  }
+  paths.close(); ranks.close();
+  require(static_cast<bool>(paths) && static_cast<bool>(ranks));
+}
+
+static void initialize_parallel_prune_graph(PathGraph& graph,
+  const std::string& base, bool corrupt = false, bool invalid_tail_rank = false)
+{
+  auto records = parallel_prune_records(); records.emplace_back();
+  const logical_file_id_t logical[] = {
+    logical_file_id_t(7), logical_file_id_t(7), logical_file_id_t(8), logical_file_id_t(9)
+  };
+  for(size_type file = 0; file < records.size(); file++)
+  {
+    std::string path = base + "." + std::to_string(file) + ".path";
+    std::string rank = base + "." + std::to_string(file) + ".rank";
+    write_parallel_prune_pair(path, rank, records[file], corrupt && file == 0,
+      invalid_tail_rank && file == 0);
+    graph.path_names.push_back(path); graph.rank_names.push_back(rank);
+    graph.path_counts.push_back(records[file].size());
+    graph.rank_counts.push_back(2 * records[file].size());
+    graph.logical_file_ids.push_back(logical[file]);
+    graph.physical_shard_ids.push_back(physical_shard_id_t(100 + file));
+    graph.path_count += records[file].size(); graph.rank_count += 2 * records[file].size();
+  }
+}
+
+struct LogicalPruneRecord
+{
+  node_type from, to;
+  size_type fields;
+  std::vector<PathNode::rank_type> label;
+
+  bool operator==(const LogicalPruneRecord& another) const
+  {
+    return (this->from == another.from && this->to == another.to &&
+      this->fields == another.fields && this->label == another.label);
+  }
+};
+
+static std::map<logical_file_id_t, std::vector<LogicalPruneRecord>>
+logical_prune_records(const PathGraph& graph)
+{
+  std::map<logical_file_id_t, std::vector<LogicalPruneRecord>> result;
+  for(size_type file = 0; file < graph.files(); file++)
+  {
+    std::vector<PathNode> paths;
+    std::vector<PathNode::rank_type> labels;
+    graph.read(paths, labels, file);
+    for(PathNode node : paths)
+    {
+      size_type pointer = node.pointer();
+      require(pointer <= labels.size());
+      require(node.ranks() <= labels.size() - pointer);
+      LogicalPruneRecord record;
+      record.from = node.from; record.to = node.to;
+      record.label.assign(labels.begin() + pointer,
+        labels.begin() + pointer + node.ranks());
+      node.setPointer(0); record.fields = node.fields;
+      result[graph.logicalFile(file)].push_back(record);
+    }
+  }
+  return result;
+}
+
+static size_type directory_entries(const std::string& directory)
+{
+  DIR* stream = ::opendir(directory.c_str()); require(stream != nullptr);
+  size_type result = 0;
+  while(struct dirent* entry = ::readdir(stream))
+  {
+    std::string name(entry->d_name);
+    if(name != "." && name != "..") { result++; }
+  }
+  require(::closedir(stream) == 0);
+  return result;
+}
+
+static void compare_parallel_prune(const std::string& root)
+{
+  Alphabet alpha;
+  auto keys = parallel_prune_keys(alpha);
+  LCP lcp(keys, 3); DeBruijnGraph mapper(keys, 3, alpha);
+  const size_type budget = 512 * KILOBYTE;
+  PathGraph serial(0, 3, 0);
+  initialize_parallel_prune_graph(serial, root + "/serial");
+  serial.prune(lcp, GIGABYTE, budget);
+  MergedGraph serial_final(serial, mapper, lcp, GIGABYTE, MEGABYTE);
+  for(size_type workers : { 1, 2, 4 })
+  {
+    for(size_type repetition = 0; repetition < 3; repetition++)
+    {
+      PathGraph candidate(0, 3, 0);
+      initialize_parallel_prune_graph(candidate, root + "/candidate");
+      PathGraphMergeStats stats;
+      externalPathGraphPrune(candidate, lcp, GIGABYTE, budget, 128, workers, &stats);
+      require(logical_prune_records(serial) == logical_prune_records(candidate));
+      require(candidate.size() == serial.size()); require(candidate.ranks() == serial.ranks());
+      require(candidate.ranges() == serial.ranges()); require(candidate.unique == serial.unique);
+      require(candidate.redundant == serial.redundant);
+      require(candidate.unsorted == serial.unsorted);
+      require(candidate.nondeterministic == serial.nondeterministic);
+      std::set<logical_file_id_t> logical(candidate.logical_file_ids.begin(), candidate.logical_file_ids.end());
+      require(logical == std::set<logical_file_id_t>{ logical_file_id_t(7), logical_file_id_t(8), logical_file_id_t(9) });
+      if(workers > 1) { require(candidate.files() > serial.files()); require(stats.priority_spills > 0); }
+      else { require(candidate.files() == serial.files()); }
+      MergedGraph merged(candidate, mapper, lcp, GIGABYTE, MEGABYTE);
+      require(contents(serial_final.path_name) == contents(merged.path_name));
+      require(contents(serial_final.rank_name) == contents(merged.rank_name));
+      require(contents(serial_final.from_name) == contents(merged.from_name));
+      require(contents(serial_final.lcp_name) == contents(merged.lcp_name));
+    }
+  }
+  // Both a small buffer allowance and a small descriptor allowance select
+  // the exact serial route before any worker output can be adopted.
+  for(bool small_memory : { false, true })
+  {
+    PathGraph fallback(0, 3, 0); initialize_parallel_prune_graph(fallback, root + "/fallback");
+    externalPathGraphPrune(fallback, lcp, GIGABYTE,
+      (small_memory ? 16 * KILOBYTE : budget), (small_memory ? 128 : 10), 4);
+    require(logical_prune_records(serial) == logical_prune_records(fallback));
+    require(fallback.files() == serial.files());
+  }
+  for(bool invalid_tail : { false, true })
+  {
+    PathGraph broken(0, 3, 0);
+    initialize_parallel_prune_graph(broken, root + "/broken", !invalid_tail, invalid_tail);
+    const auto paths = broken.path_names; const size_type count = broken.size();
+    const size_type before = directory_entries(root);
+    bool failed = false;
+    try { externalPathGraphPrune(broken, lcp, GIGABYTE, budget, 128, 4); }
+    catch(const std::runtime_error&) { failed = true; }
+    require(failed); require(broken.path_names == paths); require(broken.size() == count);
+    require(directory_entries(root) == before);
+    for(const auto& path : paths) { require(::access(path.c_str(), F_OK) == 0); }
+  }
+  PathGraph empty(1, 3, 0); LCP empty_lcp;
+  { std::ofstream paths(empty.path_names[0]), ranks(empty.rank_names[0]); }
+  externalPathGraphPrune(empty, empty_lcp, GIGABYTE, budget, 128, 4);
+  require(empty.size() == 0 && empty.files() == 1);
+}
+
+static void compare_unsafe_prune_boundary(const std::string& root)
+{
+  Alphabet alpha; auto keys = parallel_prune_keys(alpha); LCP lcp(keys, 3);
+  PathGraph serial(1, 3, 0), candidate(1, 3, 0);
+  for(PathGraph* graph : { &serial, &candidate })
+  {
+    std::ofstream paths(graph->path_names[0], std::ios::binary);
+    std::ofstream ranks(graph->rank_names[0], std::ios::binary);
+    for(size_type i = 0; i < 2; i++)
+    {
+      PathNode node; node.from = Node::encode(10 + i, 0); node.to = Node::encode(20 + i, 0);
+      node.fields = 0; node.setOrder(1); node.setLCP(i == 0 ? 0 : 1);
+      node.setPredecessors(1); node.setPointer(2 * i);
+      PathNode::rank_type label[] = { static_cast<PathNode::rank_type>(2 * i), 2 };
+      paths.write(reinterpret_cast<const char*>(&node), sizeof(node));
+      ranks.write(reinterpret_cast<const char*>(label), sizeof(label));
+    }
+    graph->path_count = graph->path_counts[0] = 2;
+    graph->rank_count = graph->rank_counts[0] = 4;
+  }
+  serial.prune(lcp, MEGABYTE, MEGABYTE);
+  externalPathGraphPrune(candidate, lcp, MEGABYTE, MEGABYTE, 128, 4);
+  require(candidate.files() == serial.files());
+  require(logical_prune_records(serial) == logical_prune_records(candidate));
+}
+
 int main()
 {
   const char* configured_tmp = std::getenv("TMPDIR");
@@ -252,6 +510,9 @@ int main()
   // Use the real construction route so mapper ranks and LCP invariants are
   // validated rather than synthesized by the test.
   compare_merged_graph(std::string(root) + "/merged");
-  rmdir(root.c_str());
+  compare_parallel_prune(root);
+  compare_unsafe_prune_boundary(root);
+  require(directory_entries(root) == 0);
+  require(rmdir(root.c_str()) == 0);
   return 0;
 }
