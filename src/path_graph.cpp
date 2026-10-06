@@ -236,9 +236,6 @@ LCP::LCP(const std::string& key_name, size_type key_count,
   directConstruct(this->kmer_lcp, buffer);
 }
 
-std::atomic<size_type> LCP::range_minimum_queries(0);
-std::atomic<size_type> LCP::range_minimum_span(0);
-
 range_type
 LCP::min_lcp(const PathNode& a, const PathNode& b, const std::vector<LCP::rank_type>& labels) const
 {
@@ -265,17 +262,6 @@ LCP::min_lcp(const PathNode& a, const PathNode& b,
   {
     size_type left = a.firstLabel(lcp.first, a_labels) + 1;
     size_type right = std::min((size_type)(b.lastLabel(lcp.first, b_labels)), this->total_keys - 1);
-    // Diagnostic only, and on the library's hottest loop: 753 M descents in a
-    // chr21 merge, where two relaxed fetch_adds measured 3.46 s against plain
-    // increments. Gate them on the verbosity that prints them, so a production
-    // run pays one well-predicted branch and the measurement is still there
-    // when it is asked for.
-    if(Verbosity::level >= Verbosity::EXTENDED)
-    {
-      LCP::range_minimum_queries.fetch_add(1, std::memory_order_relaxed);
-      LCP::range_minimum_span.fetch_add(
-        (right >= left ? right - left + 1 : 0), std::memory_order_relaxed);
-    }
     lcp.second = sdsl::quantile_freq(this->kmer_lcp, left, right, 0).first;
   }
   return lcp;
@@ -295,17 +281,6 @@ LCP::max_lcp(const PathNode& a, const PathNode& b,
   {
     size_type left = a.lastLabel(lcp.first, a_labels) + 1;
     size_type right = b.firstLabel(lcp.first, b_labels);
-    // Diagnostic only, and on the library's hottest loop: 753 M descents in a
-    // chr21 merge, where two relaxed fetch_adds measured 3.46 s against plain
-    // increments. Gate them on the verbosity that prints them, so a production
-    // run pays one well-predicted branch and the measurement is still there
-    // when it is asked for.
-    if(Verbosity::level >= Verbosity::EXTENDED)
-    {
-      LCP::range_minimum_queries.fetch_add(1, std::memory_order_relaxed);
-      LCP::range_minimum_span.fetch_add(
-        (right >= left ? right - left + 1 : 0), std::memory_order_relaxed);
-    }
     lcp.second = sdsl::quantile_freq(this->kmer_lcp, left, right, 0).first;
   }
   return lcp;
