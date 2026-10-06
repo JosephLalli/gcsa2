@@ -1359,15 +1359,18 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   for(size_type i = 0; i < runs.size(); i++) { TempFile::remove(runs[i]); }
 
   std::string final_path = TempFile::getName(PathGraph::PREFIX), final_rank = TempFile::getName(PathGraph::PREFIX);
-  std::string partial_path = final_path + ".partial", partial_rank = final_rank + ".partial";
+  // Register staging names so direct-exit sort errors remove every payload.
+  std::string partial_path = TempFile::getName(PathGraph::PREFIX);
+  std::string partial_rank = TempFile::getName(PathGraph::PREFIX);
   writeSortedPathPair(merged, partial_path, partial_rank, graph.path_counts[file],
     graph.rank_counts[file], merge_records, stats);
   TempFile::remove(merged);
   syncPathSortFile(partial_path); syncPathSortFile(partial_rank);
   if(std::rename(partial_path.c_str(), final_path.c_str()) != 0 || std::rename(partial_rank.c_str(), final_rank.c_str()) != 0)
   {
-    externalSortFailure("cannot atomically install sorted path pair");
+    externalSortFailure("cannot install sorted path pair");
   }
+  TempFile::remove(partial_path); TempFile::remove(partial_rank);
   std::string old_path = graph.path_names[file], old_rank = graph.rank_names[file];
   graph.path_names[file] = final_path; graph.rank_names[file] = final_rank;
   graph.stored_bytes = PathGraph::UNKNOWN;
