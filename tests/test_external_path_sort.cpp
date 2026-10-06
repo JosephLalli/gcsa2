@@ -115,7 +115,7 @@ static void check_descriptor_limited_sort(const std::string& path,
     if(setrlimit(RLIMIT_NOFILE, &limits) != 0) { _exit(2); }
 
     PathGraph graph(path, rank);
-    externalPathGraphSort(graph, 0, 64 * KILOBYTE, 64);
+    externalPathGraphSort(graph, 0, externalPathGraphSortMinimumBudget(), 64);
     check_sorted(graph, expected);
     std::remove(graph.path_names[0].c_str());
     std::remove(graph.rank_names[0].c_str());
@@ -138,7 +138,7 @@ static void expect_descriptor_limit_failure(const std::string& path,
     if(setrlimit(RLIMIT_NOFILE, &limits) != 0) { _exit(2); }
 
     PathGraph graph(path, rank);
-    externalPathGraphSort(graph, 0, 64 * KILOBYTE, 64);
+    externalPathGraphSort(graph, 0, externalPathGraphSortMinimumBudget(), 64);
     _exit(0);
   }
   close(output[1]);

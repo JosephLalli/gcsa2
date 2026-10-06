@@ -799,8 +799,14 @@ struct PathSortRecord
   PathNode::rank_type labels[PathLabel::LABEL_LENGTH + 1];
 };
 
-// Covers stream state, vector control blocks, allocator slack, and the heap.
-constexpr size_type PATH_SORT_FIXED_BYTES = 8192;
+// The source PathGraph uses record-at-a-time decoding because each PathNode
+// points to a variable number of ranks. Explicit stream buffers avoid one
+// syscall per decoded record while remaining part of the declared budget.
+constexpr size_type PATH_SORT_STREAM_BUFFER_BYTES = 64 * KILOBYTE;
+// Covers the two source stream buffers, stream state, vector control blocks,
+// allocator slack, and the heap.
+constexpr size_type PATH_SORT_FIXED_BYTES =
+  8192 + 2 * PATH_SORT_STREAM_BUFFER_BYTES;
 // Linux charges clean filesystem cache to a cgroup's memory ceiling. The
 // sorter therefore retains only a small sequential tail and periodically
 // syncs completed output prefixes before making them reclaimable. These
@@ -1100,8 +1106,16 @@ writePathSortRun(const std::string& name, const std::vector<PathSortRecord>& rec
   if(!output) { externalSortFailure("cannot create run " + name); }
   int cache_descriptor = openPathSortCacheDescriptor(name, O_RDWR);
   off_t written = 0, cache_released = 0;
-  if(!records.empty()) { DiskIO::write(output, records.data(), records.size()); }
-  written = pathSortByteOffset(records.size(), sizeof(PathSortRecord));
+  size_type chunk_records = std::max(static_cast<size_type>(1),
+    static_cast<size_type>(PATH_SORT_CACHE_FLUSH_BYTES) / sizeof(PathSortRecord));
+  for(size_type first = 0; first < records.size(); first += chunk_records)
+  {
+    size_type count = std::min(chunk_records, records.size() - first);
+    DiskIO::write(output, records.data() + first, count);
+    addPathSortBytes(written, count, sizeof(PathSortRecord));
+    trimPathSortWrittenCache(output, cache_descriptor, written,
+      cache_released, false, name);
+  }
   trimPathSortWrittenCache(output, cache_descriptor, written, cache_released, true, name);
   output.close();
   ::close(cache_descriptor);
@@ -1287,11 +1301,17 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   size_type merge_available = available - fan_in * reader_overhead;
   size_type merge_records = merge_available / ((fan_in + 1) * record_bytes);
   if(merge_records == 0) { externalSortFailure("byte budget cannot buffer a merge"); }
-  // Reserve two thirds for sorting records and one third for allocator / I/O slack.
-  size_type run_records = std::max((size_type)1, available / (3 * record_bytes));
+  // Use three quarters for the in-place record sort. The remaining quarter is
+  // larger than the byte-counted stream buffers and allocator metadata while
+  // avoiding a complete merge pass for common one-run inputs.
+  size_type run_bytes = available - available / 4;
+  size_type run_records = std::max((size_type)1, run_bytes / record_bytes);
 
+  std::array<char, PATH_SORT_STREAM_BUFFER_BYTES> path_stream_buffer;
+  std::array<char, PATH_SORT_STREAM_BUFFER_BYTES> rank_stream_buffer;
   std::ifstream paths, ranks;
-  paths.rdbuf()->pubsetbuf(nullptr, 0); ranks.rdbuf()->pubsetbuf(nullptr, 0);
+  paths.rdbuf()->pubsetbuf(path_stream_buffer.data(), path_stream_buffer.size());
+  ranks.rdbuf()->pubsetbuf(rank_stream_buffer.data(), rank_stream_buffer.size());
   graph.open(paths, ranks, file);
   int source_path_cache_descriptor = openPathSortCacheDescriptor(graph.path_names[file], O_RDONLY);
   int source_rank_cache_descriptor = openPathSortCacheDescriptor(graph.rank_names[file], O_RDONLY);
@@ -1380,8 +1400,16 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
     std::string name = TempFile::getName("gcsa_path_sort_run");
     writePathSortRun(name, records); runs.push_back(name);
   }
-  std::string merged = mergePathSortRuns(runs, merge_records, stats);
-  for(size_type i = 0; i < runs.size(); i++) { TempFile::remove(runs[i]); }
+  std::string merged;
+  if(runs.size() == 1)
+  {
+    merged = runs.front();
+  }
+  else
+  {
+    merged = mergePathSortRuns(runs, merge_records, stats);
+    for(size_type i = 0; i < runs.size(); i++) { TempFile::remove(runs[i]); }
+  }
 
   std::string final_path = TempFile::getName(PathGraph::PREFIX), final_rank = TempFile::getName(PathGraph::PREFIX);
   std::string partial_path = final_path + ".partial", partial_rank = final_rank + ".partial";
@@ -3135,7 +3163,7 @@ struct SameFromSet
         },
         [&count](const void* record, bool first, bool, std::ostream& stream) {
           if(first) { stream.write(reinterpret_cast<const char*>(record), sizeof(node_type)); count++; }
-        }, nullptr);
+        }, nullptr, true, ExternalFixedRecordSorter::RecordOrder::ASCENDING_U64);
     }
     catch(...)
     {
