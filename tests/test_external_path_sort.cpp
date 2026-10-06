@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <type_traits>
@@ -60,6 +61,13 @@ static std::vector<PathNode::rank_type> read_ranks(const std::string& name)
   PathNode::rank_type value;
   while(input.read(reinterpret_cast<char*>(&value), sizeof(value))) { result.push_back(value); }
   return result;
+}
+
+static std::vector<char> read_bytes(const std::string& name)
+{
+  std::ifstream input(name.c_str(), std::ios_base::binary);
+  return std::vector<char>(std::istreambuf_iterator<char>(input),
+    std::istreambuf_iterator<char>());
 }
 
 static bool test_record_less(const TestRecord& a, const TestRecord& b)
@@ -234,9 +242,16 @@ int main()
   std::vector<PathNode::rank_type> first_ranks = read_ranks(first.rank_names[0]);
 
   PathGraph second(path_b, rank_b);
-  externalPathGraphSort(second, 0, budget, 2);
+  // The minimum budget takes the raw fallback; the larger budget admits the
+  // private framed run writer and reader. Both must install identical ordinary
+  // PathGraph shards.
+  size_type framed_budget = 8 * MEGABYTE;
+  ExternalPathSortStats second_stats;
+  externalPathGraphSort(second, 0, framed_budget, 2, &second_stats);
   check_sorted(second, records);
+  require(read_bytes(first.path_names[0]) == read_bytes(second.path_names[0]));
   require(first_ranks == read_ranks(second.rank_names[0]));
+  require(second_stats.max_bytes_resident <= framed_budget);
   require(first.files() == 1 && second.files() == 1);
 
   expect_sort_failure(path_c, rank_c, budget - 1, false, false);

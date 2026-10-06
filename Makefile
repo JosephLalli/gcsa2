@@ -11,7 +11,7 @@ SOURCE_DIR=src
 
 # Multithreading with OpenMP.
 PARALLEL_FLAGS=-fopenmp -pthread
-LIBS=-L$(LIB_DIR) -lsdsl -ldivsufsort -ldivsufsort64
+LIBS=-L$(LIB_DIR) -lsdsl -ldivsufsort -ldivsufsort64 -lzstd
 
 # Apple Clang does not support OpenMP directly, so we need special handling.
 ifeq ($(shell uname -s), Darwin)
@@ -47,13 +47,13 @@ endif
 CXX_FLAGS=$(MY_CXX_FLAGS) $(VERIFY_FLAGS) $(PARALLEL_FLAGS) $(MY_CXX_OPT_FLAGS) -Iinclude -I$(SOURCE_DIR) -I$(INC_DIR)
 
 HEADERS=$(wildcard include/gcsa/*.h)
-LIBOBJS=$(addprefix $(BUILD_OBJ)/,algorithms.o dbg.o disk_array.o external_join.o external_preprocessing.o external_sort.o files.o final_events.o gcsa.o internal.o lcp.o path_graph.o support.o utils.o resources.o)
+LIBOBJS=$(addprefix $(BUILD_OBJ)/,algorithms.o compressed_block.o dbg.o disk_array.o external_join.o external_preprocessing.o external_sort.o files.o final_events.o gcsa.o internal.o lcp.o path_graph.o support.o utils.o resources.o)
 LIBRARY=$(BUILD_LIB)/libgcsa2.a
 
 PROGRAMS=$(addprefix $(BUILD_BIN)/,build_gcsa convert_graph gcsa_format try_extend)
 OBSOLETE=build_gcsa convert_graph gcsa_format try_extend
 
-.PHONY: all clean directories test external-path-sort-test external-join-test external-sort-test external-preprocessing-test final-events-test disk-array-test internal-buffer-test parameter-test path-graph-prune-test
+.PHONY: all clean directories test compressed-block-test external-path-sort-test external-join-test external-sort-test external-preprocessing-test final-events-test disk-array-test internal-buffer-test parameter-test path-graph-prune-test
 all: directories $(LIBRARY) $(PROGRAMS)
 
 directories: $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)
@@ -79,6 +79,13 @@ $(patsubst tests/%.cpp,$(BUILD_OBJ)/%.o,$(wildcard tests/test_*.cpp)): $(HEADERS
 
 $(BUILD_BIN)/%:$(BUILD_OBJ)/%.o $(LIBRARY)
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $@ $< $(LIBRARY) $(LIBS)
+
+$(BUILD_OBJ)/test_compressed_block.o:tests/test_compressed_block.cpp $(SOURCE_DIR)/compressed_block.hpp
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+compressed-block-test: directories $(BUILD_OBJ)/test_compressed_block.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_compressed_block $(BUILD_OBJ)/test_compressed_block.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_compressed_block
 
 $(BUILD_OBJ)/test_external_path_sort.o:tests/test_external_path_sort.cpp include/gcsa/path_graph.h include/gcsa/path_graph_external.h
 	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
@@ -143,7 +150,7 @@ path-graph-prune-test: directories $(BUILD_OBJ)/test_path_graph_prune.o $(LIBRAR
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_path_graph_prune $(BUILD_OBJ)/test_path_graph_prune.o $(LIBRARY) $(LIBS)
 	$(BUILD_BIN)/test_path_graph_prune
 
-test: external-path-sort-test external-join-test external-sort-test external-preprocessing-test final-events-test disk-array-test internal-buffer-test parameter-test path-graph-prune-test
+test: compressed-block-test external-path-sort-test external-join-test external-sort-test external-preprocessing-test final-events-test disk-array-test internal-buffer-test parameter-test path-graph-prune-test
 
 clean:
 	rm -rf $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)

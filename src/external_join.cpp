@@ -7,6 +7,7 @@
 
 #include <gcsa/path_graph_external.h>
 #include <external_configuration.hpp>
+#include <compressed_block.hpp>
 
 #include <algorithm>
 #include <array>
@@ -75,6 +76,36 @@ struct JoinRun
   JoinRun(const std::string& path = std::string(), size_type count = 0) :
     name(path), records(count) { }
 };
+
+struct JoinCodec
+{
+  bool enabled;
+  size_type block_bytes, writer_bytes, reader_bytes;
+
+  JoinCodec() : enabled(false), block_bytes(0), writer_bytes(0), reader_bytes(0) { }
+};
+
+JoinCodec
+joinCodec(size_type byte_budget)
+{
+  JoinCodec result;
+  size_type block = std::max(JOIN_RECORD_BYTES,
+    std::min(static_cast<size_type>(MEGABYTE), byte_budget / 128));
+  result.writer_bytes = CompressedBlockWriter::workingMemoryEstimate(block,
+    CompressedBlockWriter::ZSTD, 1);
+  result.reader_bytes = CompressedBlockReader::workingMemoryEstimate(block);
+  size_type minimum = JOIN_FIXED_BYTES + result.writer_bytes +
+    2 * (JOIN_IO_BUFFER_BYTES + result.reader_bytes + sizeof(JoinRecord) + 256);
+  if(minimum <= byte_budget)
+  {
+    result.enabled = true; result.block_bytes = block;
+  }
+  else
+  {
+    result.writer_bytes = 0; result.reader_bytes = 0;
+  }
+  return result;
+}
 
 std::runtime_error
 joinError(const std::string& message, const std::string& path = std::string())
@@ -280,13 +311,22 @@ joinRecordLess(const JoinRecord& left, const JoinRecord& right)
 class JoinFileWriter
 {
 public:
-  JoinFileWriter(const std::string& path, logical_file_id_t logical, JoinKeyKind kind) :
+  JoinFileWriter(const std::string& path, logical_file_id_t logical,
+    JoinKeyKind kind, const JoinCodec& codec) :
     name(path), logical_id(logical), key_kind(kind), descriptor(-1), count(0),
-    cache_released(0), finished(false), buffer()
+    cache_released(0), finished(false), compressed(), buffer()
   {
-    this->descriptor = ::open(this->name.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
-    if(this->descriptor < 0) { throw joinError("cannot create join run", this->name); }
-    adviseSequential(this->descriptor);
+    if(codec.enabled)
+    {
+      this->compressed.reset(new CompressedBlockWriter(this->name,
+        codec.block_bytes, CompressedBlockWriter::ZSTD, 1));
+    }
+    else
+    {
+      this->descriptor = ::open(this->name.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+      if(this->descriptor < 0) { throw joinError("cannot create join run", this->name); }
+      adviseSequential(this->descriptor);
+    }
     std::array<std::uint8_t, JOIN_HEADER_BYTES> header;
     std::uint8_t* out = header.data();
     encodeLittle<std::uint64_t>(out, JOIN_HEADER_MAGIC);
@@ -294,7 +334,11 @@ public:
     encodeLittle<std::uint32_t>(out, static_cast<std::uint32_t>(this->key_kind));
     encodeLittle<std::uint32_t>(out, this->logical_id.value);
     encodeLittle<std::uint64_t>(out, 0);
-    writeAll(this->descriptor, header.data(), header.size(), this->name);
+    if(this->compressed)
+    {
+      this->compressed->writeRecord(header.data(), header.size());
+    }
+    else { writeAll(this->descriptor, header.data(), header.size(), this->name); }
     this->buffer.reserve(JOIN_IO_BUFFER_RECORDS);
   }
 
@@ -317,14 +361,23 @@ public:
   {
     if(this->finished) { throw joinError("join run already finished", this->name); }
     this->flushRecords();
-    std::array<std::uint8_t, 8> encoded_count;
-    std::uint8_t* count_out = encoded_count.data();
-    encodeLittle<std::uint64_t>(count_out, this->count);
-    pwriteAll(this->descriptor, encoded_count.data(), encoded_count.size(), 20, this->name);
+    if(!this->compressed)
+    {
+      std::array<std::uint8_t, 8> encoded_count;
+      std::uint8_t* count_out = encoded_count.data();
+      encodeLittle<std::uint64_t>(count_out, this->count);
+      pwriteAll(this->descriptor, encoded_count.data(), encoded_count.size(), 20, this->name);
+    }
     std::array<std::uint8_t, JOIN_FOOTER_BYTES> footer;
     std::uint8_t* out = footer.data();
     encodeLittle<std::uint64_t>(out, JOIN_FOOTER_MAGIC);
     encodeLittle<std::uint64_t>(out, this->count);
+    if(this->compressed)
+    {
+      this->compressed->writeRecord(footer.data(), footer.size());
+      this->compressed->finish(); this->compressed.reset();
+      this->finished = true; return JoinRun(this->name, this->count);
+    }
     writeAll(this->descriptor, footer.data(), footer.size(), this->name);
     trimWrittenCache(this->descriptor, this->cache_released, true, this->name);
     if(::close(this->descriptor) != 0) { throw joinError("cannot close join run", this->name); }
@@ -336,11 +389,22 @@ private:
   void flushRecords()
   {
     if(this->buffer.empty()) { return; }
-    writeAll(this->descriptor, this->buffer.data(),
-      this->buffer.size() * JOIN_RECORD_BYTES, this->name);
+    if(this->compressed)
+    {
+      for(const auto& record : this->buffer)
+      {
+        this->compressed->writeRecord(record.data(), record.size());
+      }
+    }
+    else
+    {
+      writeAll(this->descriptor, this->buffer.data(),
+        this->buffer.size() * JOIN_RECORD_BYTES, this->name);
+    }
     this->buffer.clear();
     off_t written = JOIN_HEADER_BYTES + this->count * JOIN_RECORD_BYTES;
-    if(written - this->cache_released >= JOIN_CACHE_FLUSH_BYTES)
+    if(!this->compressed &&
+       written - this->cache_released >= JOIN_CACHE_FLUSH_BYTES)
     {
       trimWrittenCache(this->descriptor, this->cache_released, false, this->name);
     }
@@ -356,6 +420,7 @@ private:
   size_type count;
   off_t cache_released;
   bool finished;
+  std::unique_ptr<CompressedBlockWriter> compressed;
   std::vector<std::array<std::uint8_t, JOIN_RECORD_BYTES>> buffer;
 };
 
@@ -363,24 +428,34 @@ class JoinFileReader
 {
 public:
   JoinFileReader(const JoinRun& run, logical_file_id_t logical, JoinKeyKind kind) :
-    name(run.name), descriptor(-1), record_count(0),
+    name(run.name), descriptor(-1), compressed(), record_count(0),
     cache_released(0), buffer(JOIN_IO_BUFFER_RECORDS), buffer_first(0),
     buffer_records(0)
   {
-    this->descriptor = ::open(this->name.c_str(), O_RDONLY);
-    if(this->descriptor < 0) { throw joinError("cannot open join run", this->name); }
-    adviseSequential(this->descriptor);
+    bool framed = CompressedBlockReader::isFramed(this->name);
+    if(framed)
+    {
+      this->compressed.reset(new CompressedBlockReader(this->name));
+    }
+    else
+    {
+      this->descriptor = ::open(this->name.c_str(), O_RDONLY);
+      if(this->descriptor < 0) { throw joinError("cannot open join run", this->name); }
+      adviseSequential(this->descriptor);
+    }
     std::array<std::uint8_t, JOIN_HEADER_BYTES> header;
-    preadAll(this->descriptor, header.data(), header.size(), 0, this->name);
+    this->readAt(header.data(), header.size(), 0);
     const std::uint8_t* in = header.data();
     std::uint64_t magic = decodeLittle<std::uint64_t>(in);
     std::uint32_t version = decodeLittle<std::uint32_t>(in);
     std::uint32_t actual_kind = decodeLittle<std::uint32_t>(in);
     std::uint32_t actual_logical = decodeLittle<std::uint32_t>(in);
-    this->record_count = decodeLittle<std::uint64_t>(in);
+    size_type declared_records = decodeLittle<std::uint64_t>(in);
+    this->record_count = run.records;
     if(magic != JOIN_HEADER_MAGIC || version != JOIN_FORMAT_VERSION ||
        actual_kind != static_cast<std::uint32_t>(kind) || actual_logical != logical.value ||
-       this->record_count != run.records)
+       ((!framed && declared_records != run.records) ||
+        (framed && declared_records != 0)))
     {
       throw joinError("join run header mismatch", this->name);
     }
@@ -389,15 +464,18 @@ public:
     {
       throw joinError("join run is too large for this build", this->name);
     }
+    size_type expected_bytes = JOIN_HEADER_BYTES +
+      this->record_count * JOIN_RECORD_BYTES + JOIN_FOOTER_BYTES;
     struct stat info;
-    if(::fstat(this->descriptor, &info) != 0 || static_cast<size_type>(info.st_size) !=
-       JOIN_HEADER_BYTES + this->record_count * JOIN_RECORD_BYTES + JOIN_FOOTER_BYTES)
+    if((framed && this->compressed->logicalSize() != expected_bytes) ||
+       (!framed && (::fstat(this->descriptor, &info) != 0 ||
+        static_cast<size_type>(info.st_size) != expected_bytes)))
     {
       throw joinError("join run length mismatch", this->name);
     }
     std::array<std::uint8_t, JOIN_FOOTER_BYTES> footer;
-    preadAll(this->descriptor, footer.data(), footer.size(),
-      JOIN_HEADER_BYTES + this->record_count * JOIN_RECORD_BYTES, this->name);
+    this->readAt(footer.data(), footer.size(),
+      JOIN_HEADER_BYTES + this->record_count * JOIN_RECORD_BYTES);
     in = footer.data();
     if(decodeLittle<std::uint64_t>(in) != JOIN_FOOTER_MAGIC ||
        decodeLittle<std::uint64_t>(in) != this->record_count)
@@ -432,12 +510,31 @@ private:
   {
     this->buffer_first = first;
     this->buffer_records = std::min(this->buffer.size(), this->record_count - first);
-    preadAll(this->descriptor, this->buffer.data(),
-      this->buffer_records * JOIN_RECORD_BYTES,
-      JOIN_HEADER_BYTES + first * JOIN_RECORD_BYTES, this->name);
-    trimReadCache(this->descriptor,
-      JOIN_HEADER_BYTES + (first + this->buffer_records) * JOIN_RECORD_BYTES,
-      this->cache_released);
+    size_type bytes = this->buffer_records * JOIN_RECORD_BYTES;
+    this->readAt(this->buffer.data(), bytes,
+      JOIN_HEADER_BYTES + first * JOIN_RECORD_BYTES);
+    if(!this->compressed)
+    {
+      trimReadCache(this->descriptor,
+        JOIN_HEADER_BYTES + (first + this->buffer_records) * JOIN_RECORD_BYTES,
+        this->cache_released);
+    }
+  }
+
+  void readAt(void* target, size_type bytes, size_type offset) const
+  {
+    if(this->compressed)
+    {
+      if(this->compressed->readAt(offset, target, bytes) != bytes)
+      {
+        throw joinError("unexpected end of framed join run", this->name);
+      }
+    }
+    else
+    {
+      preadAll(this->descriptor, target, bytes,
+        static_cast<off_t>(offset), this->name);
+    }
   }
 
   JoinFileReader(const JoinFileReader&);
@@ -445,6 +542,7 @@ private:
 
   std::string name;
   int descriptor;
+  mutable std::unique_ptr<CompressedBlockReader> compressed;
   size_type record_count;
   mutable off_t cache_released;
   mutable std::vector<std::array<std::uint8_t, JOIN_RECORD_BYTES>> buffer;
@@ -467,7 +565,7 @@ struct JoinHeapComparator
 
 JoinRun
 mergeJoinRuns(const std::vector<JoinRun>& inputs, logical_file_id_t logical,
-  JoinKeyKind kind, ExternalPathJoinStats* stats)
+  JoinKeyKind kind, const JoinCodec& codec, ExternalPathJoinStats* stats)
 {
   if(inputs.empty()) { throw joinError("cannot merge an empty run set"); }
   std::vector<std::unique_ptr<JoinFileReader>> readers;
@@ -486,7 +584,7 @@ mergeJoinRuns(const std::vector<JoinRun>& inputs, logical_file_id_t logical,
     if(readers[i]->size() > 0) { queue.push(i); }
   }
   std::string output_name = TempFile::getName("gcsa_join_run");
-  JoinFileWriter output(output_name, logical, kind);
+  JoinFileWriter output(output_name, logical, kind, codec);
   while(!queue.empty())
   {
     size_type best = queue.top(); queue.pop();
@@ -504,7 +602,8 @@ mergeJoinRuns(const std::vector<JoinRun>& inputs, logical_file_id_t logical,
     stats->max_bytes_resident = std::max(stats->max_bytes_resident,
       JOIN_FIXED_BYTES + inputs.size() *
       (JOIN_IO_BUFFER_BYTES + sizeof(JoinRecord) + sizeof(size_type) +
-       sizeof(std::unique_ptr<JoinFileReader>)));
+       sizeof(std::unique_ptr<JoinFileReader>) + codec.reader_bytes) +
+       codec.writer_bytes);
   }
   return output.finish();
 }
@@ -516,20 +615,23 @@ public:
     size_type byte_budget, size_type requested_fan_in,
     ExternalPathJoinStats* stats) :
     logical_id(logical), key_kind(kind), budget(byte_budget), fan_in(0),
-    run_records(0), statistics(stats)
+    run_records(0), statistics(stats), codec(joinCodec(byte_budget))
   {
     if(this->budget < externalPathJoinMinimumBudget())
     {
       throw joinError("memory budget is too small for an external join");
     }
     size_type per_input = sizeof(JoinRecord) + sizeof(size_type) +
-      sizeof(std::unique_ptr<JoinFileReader>) + JOIN_IO_BUFFER_BYTES + 128;
-    size_type maximum_fan_in = (this->budget - JOIN_FIXED_BYTES) / per_input;
+      sizeof(std::unique_ptr<JoinFileReader>) + JOIN_IO_BUFFER_BYTES +
+      this->codec.reader_bytes + 128;
+    size_type maximum_fan_in = (this->budget - JOIN_FIXED_BYTES -
+      this->codec.writer_bytes) / per_input;
     this->fan_in = std::min(std::max(static_cast<size_type>(2), requested_fan_in),
       maximum_fan_in);
     if(this->fan_in < 2) { throw joinError("memory budget cannot support a two-way join merge"); }
     this->run_records = std::max(static_cast<size_type>(1),
-      (this->budget - JOIN_FIXED_BYTES) / (2 * sizeof(JoinRecord)));
+      (this->budget - JOIN_FIXED_BYTES - this->codec.writer_bytes) /
+      (2 * sizeof(JoinRecord)));
     this->buffer.reserve(this->run_records);
     if(this->statistics != nullptr)
     {
@@ -537,7 +639,8 @@ public:
         this->statistics->max_records_resident, this->run_records);
       this->statistics->max_bytes_resident = std::max(
         this->statistics->max_bytes_resident,
-        JOIN_FIXED_BYTES + this->run_records * sizeof(JoinRecord));
+        JOIN_FIXED_BYTES + this->run_records * sizeof(JoinRecord) +
+        this->codec.writer_bytes);
     }
   }
 
@@ -560,7 +663,8 @@ public:
     if(remaining.empty())
     {
       std::string empty_name = TempFile::getName("gcsa_join_run");
-      JoinFileWriter empty(empty_name, this->logical_id, this->key_kind);
+      JoinFileWriter empty(empty_name, this->logical_id, this->key_kind,
+        this->codec);
       return empty.finish();
     }
     while(remaining.size() > 1)
@@ -572,7 +676,7 @@ public:
         if(last - first == 1) { next.push_back(remaining[first]); continue; }
         std::vector<JoinRun> group(remaining.begin() + first, remaining.begin() + last);
         JoinRun merged = mergeJoinRuns(group, this->logical_id, this->key_kind,
-          this->statistics);
+          this->codec, this->statistics);
         for(size_type i = 0; i < group.size(); i++) { TempFile::remove(group[i].name); }
         next.push_back(merged);
       }
@@ -587,7 +691,7 @@ private:
     if(this->buffer.empty()) { return; }
     std::sort(this->buffer.begin(), this->buffer.end(), joinRecordLess);
     std::string name = TempFile::getName("gcsa_join_run");
-    JoinFileWriter writer(name, this->logical_id, this->key_kind);
+    JoinFileWriter writer(name, this->logical_id, this->key_kind, this->codec);
     for(size_type i = 0; i < this->buffer.size(); i++) { writer.writeRecord(this->buffer[i]); }
     JoinRun run = writer.finish();
     // Release the sort allocation before a leveled merge reserves its reader
@@ -605,7 +709,7 @@ private:
     if(this->levels[level].size() < this->fan_in) { return; }
     std::vector<JoinRun> inputs; inputs.swap(this->levels[level]);
     JoinRun merged = mergeJoinRuns(inputs, this->logical_id, this->key_kind,
-      this->statistics);
+      this->codec, this->statistics);
     for(size_type i = 0; i < inputs.size(); i++) { TempFile::remove(inputs[i].name); }
     this->addRun(merged, level + 1);
   }
@@ -614,6 +718,7 @@ private:
   JoinKeyKind key_kind;
   size_type budget, fan_in, run_records;
   ExternalPathJoinStats* statistics;
+  JoinCodec codec;
   std::vector<JoinRecord> buffer;
   std::vector<std::vector<JoinRun>> levels;
 };

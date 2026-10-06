@@ -10,7 +10,6 @@
 #include <gcsa/external_sort.h>
 #include <gcsa/gcsa.h>
 #include <gcsa/resources.h>
-#include <external_configuration.hpp>
 
 #include <array>
 #include <cstdint>
