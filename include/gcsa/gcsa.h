@@ -229,7 +229,7 @@ private:
     const ConstructionParameters& parameters, const std::string& filename);
 
   GCSA(InputGraph& graph, const ConstructionParameters& parameters,
-    const std::string* direct_output);
+    const std::string* direct_output, size_type requested_threads);
   void copy(const GCSA& source);
   void setVectors();
   void initSupport();
