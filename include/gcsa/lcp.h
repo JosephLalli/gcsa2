@@ -1,6 +1,8 @@
 #ifndef GCSA_LCP_H
 #define GCSA_LCP_H
 
+#include <string>
+
 #include <gcsa/files.h>
 
 namespace gcsa
@@ -165,6 +167,11 @@ public:
   sdsl::int_vector<64> offsets;
 
 private:
+  friend class GCSA;
+
+  static void buildAndStore(const InputGraph& graph,
+    const ConstructionParameters& parameters, const std::string& filename);
+
   void copy(const LCPArray& source);
 };  // class LCPArray
 

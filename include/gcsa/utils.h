@@ -211,6 +211,12 @@ size_type memoryUsage();  // Peak memory usage in bytes.
 size_type readVolume();   // Only for GCSA construction.
 size_type writeVolume();  // Only for GCSA construction.
 
+// Parse a non-negative byte count with an optional binary suffix (K, M, G, T,
+// P, optionally followed by B or iB). Throws std::invalid_argument or
+// std::out_of_range rather than silently wrapping.
+size_type parseBytes(const std::string& value);
+std::string formatBytes(size_type bytes);
+
 //------------------------------------------------------------------------------
 
 /*
@@ -224,7 +230,9 @@ size_type writeVolume();  // Only for GCSA construction.
   remaining temporary files are deleted when the program exits (normally or
   with std::exit()).
 
-  TempFile is not thread-safe!
+  getName(), remove(), forget() and setDirectory() hold one mutex, so threads
+  may name and remove temporaries concurrently. temp_dir may be read while no
+  thread is setting it.
 */
 
 namespace TempFile
@@ -417,6 +425,46 @@ LF(const BWTType& bwt, const AlphabetType& alpha, range_type range, comp_type co
 {
   return range_type(LF(bwt, alpha, range.first, comp), LF(bwt, alpha, range.second + 1, comp) - 1);
 }
+
+//------------------------------------------------------------------------------
+
+/*
+  Progress for a phase whose total work is known in advance.
+
+  A chromosome-scale doubling step can run for hours while printing nothing, so
+  the only way to tell a working build from a stuck one has been to watch the
+  workspace grow and guess. This reports a completed fraction, a rate and a
+  remaining estimate, throttled so that the cost is one clock read per update
+  call and one line of output per interval.
+
+  advance() is safe to call in the innermost loop: it compares a counter
+  against a threshold and returns, and only consults the clock when that
+  threshold is crossed. It reports nothing below BASIC verbosity, and the
+  totals it prints are the phase's own units (paths, records, partitions), not
+  bytes, so a reader can check them against the counts the phase reports when
+  it finishes.
+*/
+class ProgressReporter
+{
+public:
+  // interval_seconds <= 0 disables reporting entirely.
+  ProgressReporter(const std::string& phase_name, size_type total_units,
+    const std::string& unit_name = "records", double interval_seconds = 60.0);
+
+  // Advance by `units` and report if the interval has elapsed.
+  void advance(size_type units = 1);
+
+  // Report the final state regardless of the interval, once.
+  void finish();
+
+private:
+  void report(bool final_report);
+
+  std::string name, unit;
+  size_type total, processed, next_check;
+  double start_time, last_report, interval;
+  bool done;
+};
 
 //------------------------------------------------------------------------------
 

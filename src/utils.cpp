@@ -27,8 +27,14 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
+#include <cmath>
+#include <iomanip>
+#include <limits>
+#include <mutex>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 
 #include <sys/resource.h>
 #include <unistd.h>
@@ -158,6 +164,65 @@ writeVolume()
   return DiskIO::write_volume;
 }
 
+size_type
+parseBytes(const std::string& value)
+{
+  if(value.empty() || value[0] == '-')
+  {
+    throw std::invalid_argument("empty or negative byte count: " + value);
+  }
+
+  size_t parsed = 0;
+  long double number = std::stold(value, &parsed);
+  if(!std::isfinite(number) || number < 0.0L)
+  {
+    throw std::invalid_argument("non-finite or negative byte count: " + value);
+  }
+
+  std::string suffix = value.substr(parsed);
+  std::transform(suffix.begin(), suffix.end(), suffix.begin(),
+    [](unsigned char c) { return std::toupper(c); });
+  if(suffix.length() >= 2 && suffix.substr(suffix.length() - 2) == "IB")
+  {
+    suffix.resize(suffix.length() - 2);
+  }
+  else if(!(suffix.empty()) && suffix.back() == 'B')
+  {
+    suffix.pop_back();
+  }
+
+  size_type multiplier = 1;
+  if(suffix == "K") { multiplier = KILOBYTE; }
+  else if(suffix == "M") { multiplier = MEGABYTE; }
+  else if(suffix == "G") { multiplier = GIGABYTE; }
+  else if(suffix == "T") { multiplier = GIGABYTE * KILOBYTE; }
+  else if(suffix == "P") { multiplier = GIGABYTE * MEGABYTE; }
+  else if(!suffix.empty()) { throw std::invalid_argument("invalid byte suffix: " + value); }
+
+  long double result = number * static_cast<long double>(multiplier);
+  if(result > static_cast<long double>(std::numeric_limits<size_type>::max()))
+  {
+    throw std::out_of_range("byte count is too large: " + value);
+  }
+  return static_cast<size_type>(result);
+}
+
+std::string
+formatBytes(size_type bytes)
+{
+  const char* suffixes[] = { "B", "KiB", "MiB", "GiB", "TiB", "PiB" };
+  long double value = bytes;
+  size_type suffix = 0;
+  while(value >= 1024.0L && suffix + 1 < sizeof(suffixes) / sizeof(suffixes[0]))
+  {
+    value /= 1024.0L; suffix++;
+  }
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(value < 10.0L && suffix > 0 ? 2 : 1)
+      << static_cast<double>(value) << ' ' << suffixes[suffix];
+  return out.str();
+}
+
 //------------------------------------------------------------------------------
 
 namespace TempFile
@@ -167,6 +232,11 @@ namespace TempFile
   const std::string DEFAULT_TEMP_DIR = ".";
   std::string temp_dir = DEFAULT_TEMP_DIR;
 
+  // Guards counter, temp_dir and the handler's set: the external join names
+  // temporaries from several threads at once. Defined before the handler so
+  // it is still alive when the handler's destructor runs at exit.
+  std::mutex mutex;
+
   // By storing the filenames in a static object, we can delete the remaining
   // temporary files when std::exit() is called.
   struct Handler
@@ -174,6 +244,7 @@ namespace TempFile
     std::set<std::string> filenames;
     ~Handler()
     {
+      std::lock_guard<std::mutex> lock(mutex);
       for(auto& filename : this->filenames)
       {
         std::remove(filename.c_str());
@@ -184,6 +255,7 @@ namespace TempFile
   void
   setDirectory(const std::string& directory)
   {
+    std::lock_guard<std::mutex> lock(mutex);
     if(directory.empty()) { temp_dir = DEFAULT_TEMP_DIR; }
     else if(directory[directory.length() - 1] != '/') { temp_dir = directory; }
     else { temp_dir = directory.substr(0, directory.length() - 1); }
@@ -195,6 +267,7 @@ namespace TempFile
     char hostname[32];
     gethostname(hostname, 32); hostname[31] = 0;
 
+    std::lock_guard<std::mutex> lock(mutex);
     std::string filename = temp_dir + '/' + name_part + '_'
       + std::string(hostname) + '_'
       + sdsl::util::to_string(sdsl::util::pid()) + '_'
@@ -211,6 +284,7 @@ namespace TempFile
     if(!(filename.empty()))
     {
       std::remove(filename.c_str());
+      std::lock_guard<std::mutex> lock(mutex);
       handler.filenames.erase(filename);
       filename.clear();
     }
@@ -218,6 +292,7 @@ namespace TempFile
 
   void
   forget() {
+    std::lock_guard<std::mutex> lock(mutex);
     handler.filenames.clear();
     counter = 0;
   }
@@ -284,6 +359,95 @@ getChunkSize(size_type n, size_type min_size)
   size_type chunks = std::max(threads, (size_type)8) * threads;
   size_type chunk_size = n / chunks;
   return std::max(chunk_size, min_size);
+}
+
+//------------------------------------------------------------------------------
+
+namespace
+{
+
+// How many advance() calls to take before consulting the clock again. Small
+// enough that a slow phase still reports on time, large enough that a fast one
+// does not call readTimer() per record.
+constexpr size_type PROGRESS_CHECK_STRIDE = 4096;
+
+std::string
+formatDuration(double seconds)
+{
+  if(seconds < 0.0 || !(seconds < 1.0e9)) { return "unknown"; }
+  size_type total = static_cast<size_type>(seconds + 0.5);
+  size_type hours = total / 3600, minutes = (total % 3600) / 60, secs = total % 60;
+  std::ostringstream result;
+  if(hours > 0) { result << hours << "h"; }
+  if(hours > 0 || minutes > 0)
+  {
+    if(hours > 0 && minutes < 10) { result << "0"; }
+    result << minutes << "m";
+    if(secs < 10) { result << "0"; }
+  }
+  result << secs << "s";
+  return result.str();
+}
+
+} // anonymous namespace
+
+ProgressReporter::ProgressReporter(const std::string& phase_name,
+  size_type total_units, const std::string& unit_name, double interval_seconds) :
+  name(phase_name), unit(unit_name), total(total_units), processed(0),
+  next_check(PROGRESS_CHECK_STRIDE), start_time(readTimer()),
+  last_report(start_time), interval(interval_seconds), done(false)
+{
+}
+
+void
+ProgressReporter::advance(size_type units)
+{
+  this->processed += units;
+  if(this->processed < this->next_check) { return; }
+  this->next_check = this->processed + PROGRESS_CHECK_STRIDE;
+  if(this->interval <= 0.0 || Verbosity::level < Verbosity::BASIC) { return; }
+  if(readTimer() - this->last_report < this->interval) { return; }
+  this->report(false);
+}
+
+void
+ProgressReporter::finish()
+{
+  if(this->done) { return; }
+  this->done = true;
+  if(this->interval <= 0.0 || Verbosity::level < Verbosity::BASIC) { return; }
+  this->report(true);
+}
+
+void
+ProgressReporter::report(bool final_report)
+{
+  double now = readTimer(), elapsed = now - this->start_time;
+  this->last_report = now;
+  double rate = (elapsed > 0.0 ? this->processed / elapsed : 0.0);
+
+  std::cerr << "  " << this->name << ": " << this->processed;
+  if(this->total > 0)
+  {
+    std::cerr << " / " << this->total << " " << this->unit << " ("
+              << std::fixed << std::setprecision(1)
+              << (100.0 * this->processed / this->total) << "%)";
+  }
+  else { std::cerr << " " << this->unit; }
+  std::cerr << ", " << formatDuration(elapsed) << " elapsed";
+  if(rate > 0.0)
+  {
+    std::cerr << ", " << static_cast<size_type>(rate) << " " << this->unit << "/s";
+    // An estimate from the mean rate so far. A phase whose cost per unit is
+    // not uniform will drift, so this is a progress indication and not a
+    // schedule.
+    if(!final_report && this->total > this->processed)
+    {
+      std::cerr << ", ~" << formatDuration((this->total - this->processed) / rate)
+                << " left";
+    }
+  }
+  std::cerr << std::endl;
 }
 
 //------------------------------------------------------------------------------

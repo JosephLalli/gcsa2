@@ -2,6 +2,8 @@
 #include <gcsa/internal.h>
 #include <gcsa/utils.h>
 
+#include <stdexcept>
+
 namespace gcsa
 {
 
@@ -318,8 +320,12 @@ InputGraph::build(const ConstructionParameters& parameters, const std::string& m
     input.close();
   }
   
-  if (this->size() * sizeof(KMer) > parameters.getMemoryLimitBytes()) {
-    std::cerr << "InputGraph::InputGraph(): Memory use of input kmers (" << inGigabytes(this->size() * sizeof(KMer)) << " GB) exceeds memory limit (" << inGigabytes(parameters.getMemoryLimitBytes()) << " GB)" << std::endl;
+  if (!parameters.externalMemory() &&
+      this->size() > parameters.getMemoryLimitBytes() / sizeof(KMer)) {
+    std::cerr << "InputGraph::InputGraph(): Memory use of input kmers ("
+              << (static_cast<double>(this->size()) * sizeof(KMer) / GIGABYTE_DOUBLE)
+              << " GB) exceeds memory limit ("
+              << inGigabytes(parameters.getMemoryLimitBytes()) << " GB)" << std::endl;
     std::exit(EXIT_SIZE_LIMIT_EXCEEDED);
   }
 
@@ -416,6 +422,97 @@ InputGraph::read(std::vector<KMer>& kmers, size_type file, bool append) const
   }
 
   if(!append) { markSourceSinkNodes(kmers); }
+}
+
+void
+InputGraph::scanKMerBlocks(size_type file, size_type byte_budget,
+  const KMerBlockConsumer& consumer) const
+{
+  if(file >= this->files())
+  {
+    throw std::out_of_range("InputGraph::scanKMerBlocks(): invalid file number");
+  }
+  if(!consumer)
+  {
+    throw std::invalid_argument("InputGraph::scanKMerBlocks(): missing consumer");
+  }
+
+  // The block is the only KMer resident set in this method. Text input can
+  // contain a single line with many successors, so emit it incrementally as
+  // each generated KMer fills this bounded vector.
+  const size_type records_per_block = std::max(static_cast<size_type>(1),
+    byte_budget / sizeof(KMer));
+  std::vector<KMer> block;
+  block.reserve(records_per_block);
+  size_type records_seen = 0;
+  const auto emit = [&]()
+  {
+    if(block.empty()) { return; }
+    markSourceSinkNodes(block);
+    consumer(file, block);
+    records_seen += block.size(); block.clear();
+  };
+
+  std::ifstream input; this->open(input, file);
+  if(this->binary)
+  {
+    size_type section = 0;
+    while(true)
+    {
+      GraphFileHeader header(input);
+      if(!input) { break; }
+      if(header.flags != 0)
+      {
+        std::cerr << "InputGraph::scanKMerBlocks(): Invalid flags in section "
+                  << section << ": " << header.flags << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      this->checkK(header.kmer_length, file);
+      for(size_type remaining = header.kmer_count; remaining > 0; )
+      {
+        size_type count = std::min(remaining, records_per_block);
+        block.resize(count);
+        // Credit the read, as InputGraph::read() does for the same bytes.
+        // scanKMerBlocks replaced a readBinary path that used DiskIO::read, so
+        // the external route's reported read total silently excluded the entire
+        // k-mer input scan.
+        if(!DiskIO::read(input, block.data(), count))
+        {
+          std::cerr << "InputGraph::scanKMerBlocks(): Unexpected EOF" << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+        emit(); remaining -= count;
+      }
+      section++;
+    }
+  }
+  else
+  {
+    while(true)
+    {
+      std::string line;
+      std::getline(input, line);
+      if(!input) { break; }
+      std::vector<std::string> tokens;
+      if(!tokenize(line, tokens)) { continue; }
+      this->checkK(tokens[0].length(), file);
+      for(size_type successor = 4; successor < tokens.size(); successor++)
+      {
+        block.push_back(KMer(tokens, this->alpha, successor));
+        if(block.size() == records_per_block) { emit(); }
+      }
+    }
+  }
+  emit(); input.close();
+
+  // InputGraph::build() records this count while validating the same input.
+  // A mismatch therefore catches a changed/truncated source before an external
+  // stage publishes artifacts derived from it.
+  if(records_seen != this->sizes[file])
+  {
+    throw std::runtime_error("InputGraph::scanKMerBlocks(): input record count changed for " +
+      this->filenames[file]);
+  }
 }
 
 void

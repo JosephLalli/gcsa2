@@ -1,7 +1,53 @@
 #include <gcsa/dbg.h>
+#include <gcsa/internal.h>
+
+#include <fstream>
+#include <stdexcept>
+#include <vector>
 
 namespace gcsa
 {
+
+namespace
+{
+
+template<class Callback>
+void
+scanKeys(const std::string& name, size_type expected_records,
+  size_type buffer_bytes, const Callback& callback)
+{
+  if(buffer_bytes < sizeof(key_type)) { buffer_bytes = sizeof(key_type); }
+  // Clamp to the records that exist. expected_records is already in hand and is
+  // validated against below, so a 64 MiB buffer_bytes was value-initialising
+  // 64 MiB twice per DeBruijnGraph for a stream that may hold far less.
+  size_type records_per_block = std::max(static_cast<size_type>(1),
+    std::min(buffer_bytes / sizeof(key_type),
+      std::max(static_cast<size_type>(1), expected_records)));
+  std::ifstream input;
+  input.rdbuf()->pubsetbuf(nullptr, 0);
+  input.open(name.c_str(), std::ios_base::binary);
+  if(!input) { throw std::runtime_error("DeBruijnGraph: cannot open key stream " + name); }
+  std::vector<key_type> buffer(records_per_block);
+  size_type seen = 0;
+  while(seen < expected_records)
+  {
+    size_type count = std::min(records_per_block, expected_records - seen);
+    if(!DiskIO::read(input, buffer.data(), count))
+    {
+      throw std::runtime_error("DeBruijnGraph: truncated key stream " + name);
+    }
+    for(size_type i = 0; i < count; i++) { callback(buffer[i], seen + i); }
+    seen += count;
+  }
+  key_type extra;
+  input.read(reinterpret_cast<char*>(&extra), sizeof(extra));
+  if(input.gcount() != 0)
+  {
+    throw std::runtime_error("DeBruijnGraph: key stream has trailing records " + name);
+  }
+}
+
+} // namespace
 
 //------------------------------------------------------------------------------
 
@@ -168,6 +214,54 @@ DeBruijnGraph::DeBruijnGraph(const std::vector<key_type>& keys, size_type kmer_l
   this->bwt = bwt_buffer; sdsl::util::clear(bwt_buffer);
   this->nodes = node_buffer; sdsl::util::clear(node_buffer);
 
+  this->initSupport();
+}
+
+DeBruijnGraph::DeBruijnGraph(const std::string& key_name, size_type key_count,
+  size_type kmer_length, const Alphabet& alphabet, size_type buffer_bytes)
+{
+  this->node_count = key_count;
+  this->graph_order = kmer_length;
+
+  size_type total_edges = 0;
+  sdsl::int_vector<64> counts(alphabet.sigma, 0);
+  scanKeys(key_name, key_count, buffer_bytes, [&total_edges, &counts](key_type key, size_type)
+  {
+    total_edges += sdsl::bits::lt_cnt[Key::predecessors(key)];
+    for(size_type comp = 0; comp < counts.size(); comp++)
+    {
+      if(Key::predecessors(key) & (static_cast<size_type>(1) << comp)) { counts[comp]++; }
+    }
+  });
+
+  bit_vector bwt_buffer(alphabet.sigma * this->size(), 0);
+  bit_vector node_buffer(total_edges, 0);
+  size_type edge_pos = 0;
+  scanKeys(key_name, key_count, buffer_bytes,
+    [&bwt_buffer, &node_buffer, &edge_pos, this, &alphabet](key_type key, size_type rank)
+  {
+    size_type predecessors = Key::predecessors(key);
+    for(size_type comp = 0; comp < alphabet.sigma; comp++)
+    {
+      if(predecessors & (static_cast<size_type>(1) << comp))
+      {
+        bwt_buffer[comp * this->size() + rank] = 1;
+      }
+    }
+    size_type outdegree = sdsl::bits::lt_cnt[Key::successors(key)];
+    if(outdegree == 0)
+    {
+      throw std::runtime_error("DeBruijnGraph: key stream contains a node without successors");
+    }
+    edge_pos += outdegree; node_buffer[edge_pos - 1] = 1;
+  });
+  if(edge_pos != total_edges)
+  {
+    throw std::runtime_error("DeBruijnGraph: inconsistent key stream edge count");
+  }
+  this->alpha = Alphabet(counts, alphabet.char2comp, alphabet.comp2char);
+  this->bwt = bwt_buffer; sdsl::util::clear(bwt_buffer);
+  this->nodes = node_buffer; sdsl::util::clear(node_buffer);
   this->initSupport();
 }
 
