@@ -73,6 +73,12 @@ struct ExternalPathJoinStats
     max_records_resident(0), max_bytes_resident(0) { }
 };
 
+// Prune independent zero-LCP roots using a privately admitted thread limit.
+// Falls back to the serial route when complete worker caches do not fit.
+void externalPathGraphPrune(PathGraph& graph, const LCP& lcp, size_type size_limit,
+  size_type group_buffer_bytes, size_type max_open_files,
+  size_type requested_workers, PathGraphMergeStats* stats = nullptr);
+
 // Prefix doubling with a bounded external sort-merge join. Input shards with
 // the same logical ID are joined together, regardless of physical layout.
 size_type externalPathJoinMinimumBudget();

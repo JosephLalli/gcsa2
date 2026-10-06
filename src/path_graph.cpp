@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -17,6 +18,7 @@
 #include <memory>
 #include <queue>
 #include <stdexcept>
+#include <thread>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -813,9 +815,8 @@ constexpr size_type PATH_SORT_MERGE_OUTPUT_DESCRIPTORS = 2;
 constexpr size_type PATH_SORT_MERGE_READER_DESCRIPTORS = 2;
 
 size_type
-pathSortDescriptorFanIn()
+availablePathGraphDescriptors(size_type descriptor_limit)
 {
-  size_type descriptor_limit = externalMaxOpenFiles();
   struct rlimit limit;
   if(::getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY &&
      limit.rlim_cur < static_cast<rlim_t>(descriptor_limit))
@@ -828,10 +829,16 @@ pathSortDescriptorFanIn()
     int result = ::fcntl(static_cast<int>(descriptor), F_GETFD);
     if(result >= 0 || errno != EBADF) { open_descriptors++; }
   }
+  return descriptor_limit - open_descriptors;
+}
+
+size_type
+pathSortDescriptorFanIn()
+{
+  size_type available = availablePathGraphDescriptors(externalMaxOpenFiles());
   const size_type fixed_descriptors = PATH_SORT_SOURCE_DESCRIPTORS +
     PATH_SORT_MERGE_OUTPUT_DESCRIPTORS;
-  if(open_descriptors >= descriptor_limit ||
-     descriptor_limit - open_descriptors < fixed_descriptors)
+  if(available < fixed_descriptors)
   {
     return 0;
   }
@@ -841,7 +848,7 @@ pathSortDescriptorFanIn()
   // A reader owns an ifstream and its cache descriptor. The merged output
   // owns the same pair, and a level merge may start before the source stream
   // and cache pairs close. The remaining descriptors belong to callers.
-  return (descriptor_limit - open_descriptors - fixed_descriptors) /
+  return (available - fixed_descriptors) /
     PATH_SORT_MERGE_READER_DESCRIPTORS;
 }
 
@@ -2449,14 +2456,16 @@ struct PathGraphMerger
 
   // Input cache and priority queue.
   PathGraphInputCache                           input_files;
-  std::vector<size_type>                        offsets;
+  std::vector<size_type>                        offsets, end_offsets;
   size_type                                     path_count;
   PriorityQueue<PriorityNode>                   inputs;
 
   PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lcp,
     size_type group_buffer_bytes = MEGABYTE,
     PathGraphMergeStats* stats = nullptr,
-    size_type max_input_pairs = 32);
+    size_type max_input_pairs = 32,
+    PathNode::rank_type lower_rank = 0,
+    PathNode::rank_type upper_rank = PathLabel::NO_RANK);
   void close();
 
   inline size_type size() const { return this->path_count; }
@@ -2506,26 +2515,47 @@ struct PathGraphMerger
 
 PathGraphMerger::PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lcp,
   size_type group_buffer_bytes, PathGraphMergeStats* stats,
-  size_type max_input_pairs) :
+  size_type max_input_pairs,
+  PathNode::rank_type lower_rank, PathNode::rank_type upper_rank) :
   graph(path_graph), lcp(kmer_lcp),
   ranges(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->range_spills))),
   buffer(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->priority_spills))),
   input_files(path_graph, stats, max_input_pairs, group_buffer_bytes),
-  offsets(path_graph.files()), path_count(0),
+  offsets(path_graph.files()), end_offsets(path_graph.files()), path_count(0),
   inputs(path_graph.files())
 {
   if(stats != nullptr)
   {
     *stats = PathGraphMergeStats();
   }
+  auto lower_bound = [&](size_type file, PathNode::rank_type key) -> size_type
+  {
+    size_type low = 0, high = path_graph.path_counts[file];
+    PriorityNode probe; probe.file = file;
+    while(low < high)
+    {
+      size_type mid = low + (high - low) / 2;
+      this->input_files.read(file, mid, probe.node, probe.label);
+      if(probe.firstLabel(0) < key) { low = mid + 1; }
+      else { high = mid; }
+    }
+    return low;
+  };
   for(size_type file = 0; file < path_graph.files(); file++)
   {
-    if(path_graph.path_counts[file] >
+    this->offsets[file] = (lower_rank == 0 ? 0 : lower_bound(file, lower_rank));
+    this->end_offsets[file] = (upper_rank == PathLabel::NO_RANK ?
+      path_graph.path_counts[file] : lower_bound(file, upper_rank));
+    if(this->end_offsets[file] < this->offsets[file])
+    {
+      throw std::runtime_error("PathGraphMerger: invalid label-rank partition");
+    }
+    if(this->end_offsets[file] - this->offsets[file] >
        std::numeric_limits<size_type>::max() - this->path_count)
     {
-      throw std::overflow_error("PathGraphMerger: path count overflow");
+      throw std::overflow_error("PathGraphMerger: partition path count overflow");
     }
-    this->path_count += path_graph.path_counts[file];
+    this->path_count += this->end_offsets[file] - this->offsets[file];
     this->inputs[file].file = file; this->read(this->inputs[file]);
   }
   this->inputs.heapify();
@@ -2537,7 +2567,7 @@ PathGraphMerger::close()
   this->ranges.clear();
   this->buffer.clear();
   this->input_files.close();
-  this->offsets.clear();
+  this->offsets.clear(); this->end_offsets.clear();
   this->path_count = 0;
   this->inputs.clear();
 }
@@ -2665,7 +2695,7 @@ PathGraphMerger::bufferNext()
 void
 PathGraphMerger::read(PriorityNode& path)
 {
-  if(this->offsets[path.file] >= this->graph.path_counts[path.file])
+  if(this->offsets[path.file] >= this->end_offsets[path.file])
   {
     path.node.setOrder(1);
     path.node.setLCP(1);
@@ -2954,6 +2984,90 @@ pruneOutputLayout(const PathGraph& source)
   return result;
 }
 
+
+struct PruneSizeLimit { };
+struct PruneCancelled { };
+
+struct PruneSharedState
+{
+  std::atomic<size_type> output_bytes;
+  std::atomic<bool> cancelled;
+  size_type size_limit;
+
+  explicit PruneSharedState(size_type limit) :
+    output_bytes(0), cancelled(false), size_limit(limit) { }
+};
+
+struct PrunePartition
+{
+  PathNode::rank_type lower_rank, upper_rank;
+  std::unique_ptr<PathGraph> graph;
+  PathGraphMergeStats stats;
+  PriorityNode first_output, last_output;
+  bool has_output;
+
+  PrunePartition() : lower_rank(0), upper_rank(0), graph(), stats(),
+    first_output(), last_output(), has_output(false) { }
+};
+
+bool
+reservePruneOutput(std::atomic<size_type>& used, size_type bytes,
+  size_type limit)
+{
+  size_type current = used.load(std::memory_order_relaxed);
+  while(true)
+  {
+    if(current > limit || bytes > limit - current) { return false; }
+    if(used.compare_exchange_weak(current, current + bytes,
+      std::memory_order_relaxed, std::memory_order_relaxed))
+    {
+      return true;
+    }
+  }
+}
+
+bool
+pruneRootPartitions(const LCP& lcp,
+  std::vector<std::pair<PathNode::rank_type, PathNode::rank_type>>& ranges)
+{
+  ranges.clear();
+  if(lcp.total_keys < 2 || lcp.total_keys >= PathLabel::NO_RANK ||
+     lcp.kmer_lcp.size() != lcp.total_keys)
+  {
+    return false;
+  }
+
+  const LCP::rank_type zero = 0;
+  size_type zero_count = lcp.kmer_lcp.rank(lcp.total_keys, zero);
+  std::vector<size_type> boundaries;
+  boundaries.reserve(zero_count + 1); boundaries.push_back(0);
+  for(size_type occurrence = 1; occurrence <= zero_count; occurrence++)
+  {
+    size_type boundary = lcp.kmer_lcp.select(occurrence, zero);
+    if(boundary > 0 && boundary < lcp.total_keys)
+    {
+      boundaries.push_back(boundary);
+    }
+  }
+  boundaries.push_back(lcp.total_keys);
+  boundaries.erase(std::unique(boundaries.begin(), boundaries.end()),
+    boundaries.end());
+  if(boundaries.size() < 3) { return false; }
+
+  for(size_type i = 1; i < boundaries.size(); i++)
+  {
+    if(boundaries[i] <= boundaries[i - 1] ||
+       (i + 1 < boundaries.size() && lcp.kmer_lcp[boundaries[i]] != 0))
+    {
+      ranges.clear(); return false;
+    }
+    ranges.push_back(std::make_pair(
+      static_cast<PathNode::rank_type>(boundaries[i - 1]),
+      static_cast<PathNode::rank_type>(boundaries[i])));
+  }
+  return (ranges.size() > 1);
+}
+
 void
 validatePruneShardTails(const PathGraph& source, const LCP& lcp)
 {
@@ -2981,12 +3095,30 @@ prunePathRange(const PathGraph& source, const LCP& lcp,
   size_type group_buffer_bytes, size_type input_pairs,
   const PruneOutputLayout& layout,
   PathGraphBuilder& builder, PathGraphMergeStats* stats,
-  ProgressReporter& progress)
+  ProgressReporter* progress, PruneSharedState* shared = nullptr,
+  PrunePartition* partition = nullptr)
 {
-  PathGraphMerger merger(source, lcp, group_buffer_bytes, stats, input_pairs);
+  PathGraphMerger merger(source, lcp, group_buffer_bytes, stats, input_pairs,
+    (partition == nullptr ? 0 : partition->lower_rank),
+    (partition == nullptr ? PathLabel::NO_RANK : partition->upper_rank));
 
   auto write_output = [&](PriorityNode node)
   {
+    if(shared != nullptr && shared->cancelled.load(std::memory_order_relaxed))
+    {
+      throw PruneCancelled();
+    }
+    if(shared != nullptr && !reservePruneOutput(shared->output_bytes,
+        node.bytes(), shared->size_limit))
+    {
+      shared->cancelled.store(true, std::memory_order_relaxed);
+      throw PruneSizeLimit();
+    }
+    if(partition != nullptr)
+    {
+      if(!partition->has_output) { partition->first_output = node; }
+      partition->last_output = node; partition->has_output = true;
+    }
     if(node.file >= layout.source_to_output.size() ||
        layout.source_to_output[node.file] == PathGraph::UNKNOWN)
     {
@@ -2999,6 +3131,10 @@ prunePathRange(const PathGraph& source, const LCP& lcp,
   for(range_type range = merger.first(); !(merger.atEnd(range));
       range = merger.next())
   {
+    if(shared != nullptr && shared->cancelled.load(std::memory_order_relaxed))
+    {
+      throw PruneCancelled();
+    }
     SameFromLogicalFile same_from(merger, range);
     if(same_from.same_from)
     {
@@ -3030,12 +3166,314 @@ prunePathRange(const PathGraph& source, const LCP& lcp,
       }
     }
     builder.graph.range_count++;
-    progress.advance(range.second - range.first + 1);
+    if(progress != nullptr) { progress->advance(range.second - range.first + 1); }
   }
   merger.close();
 }
 
+void
+addPruneStats(PathGraphMergeStats& total, const PathGraphMergeStats& part)
+{
+  total.priority_spills += part.priority_spills;
+  total.range_spills += part.range_spills;
+  total.from_set_sorts += part.from_set_sorts;
+  total.path_input_reads += part.path_input_reads;
+  total.rank_input_reads += part.rank_input_reads;
+  total.path_input_refills += part.path_input_refills;
+  total.rank_input_refills += part.rank_input_refills;
+  total.direct_input_reads += part.direct_input_reads;
+
+}
+
+template<class Getter>
+size_type
+pruneConcurrentPeak(const std::vector<PathGraphMergeStats>& parts,
+  size_type workers, Getter get)
+{
+  std::vector<size_type> peaks;
+  peaks.reserve(parts.size());
+  for(const PathGraphMergeStats& part : parts) { peaks.push_back(get(part)); }
+  std::sort(peaks.begin(), peaks.end(), std::greater<size_type>());
+  size_type result = 0;
+  for(size_type i = 0; i < std::min(workers, static_cast<size_type>(peaks.size())); i++)
+  {
+    if(peaks[i] > std::numeric_limits<size_type>::max() - result)
+    {
+      return std::numeric_limits<size_type>::max();
+    }
+    result += peaks[i];
+  }
+  return result;
+}
+
+void
+buildPrunePartition(PrunePartition& result, const PathGraph& source,
+  const LCP& lcp, size_type size_limit, size_type group_buffer_bytes,
+  size_type input_pairs, size_type output_pairs,
+  const PruneOutputLayout& layout, PruneSharedState& shared)
+{
+  PathGraphBuilder builder(layout.logical.size(), source.k(), source.step(),
+    size_limit, group_buffer_bytes, output_pairs, &(result.stats));
+  builder.graph.logical_file_ids = layout.logical;
+  builder.graph.physical_shard_ids = layout.physical;
+  prunePathRange(source, lcp, group_buffer_bytes, input_pairs, layout,
+    builder, &(result.stats), nullptr, &shared, &result);
+  builder.close();
+
+  // Retain only the lightweight graph metadata between tasks. In particular,
+  // do not retain every completed builder's output-cache vector capacity; that
+  // would turn a worker bound into a partition-count bound.
+  result.graph.reset(new PathGraph(0, source.k(), source.step()));
+  result.graph->swap(builder.graph);
+}
+
+bool
+buildPrunedGraphParallel(PathGraph& source, const LCP& lcp,
+  size_type size_limit, size_type group_buffer_bytes,
+  PathGraphMergeStats* stats, size_type max_open_files,
+  size_type requested_workers,
+  const PruneOutputLayout& layout)
+{
+  std::vector<std::pair<PathNode::rank_type, PathNode::rank_type>> ranges;
+  if(requested_workers < 2 || source.size() == 0 || layout.logical.empty() ||
+     !pruneRootPartitions(lcp, ranges))
+  {
+    return false;
+  }
+
+  const size_type minimum_group = std::max(
+    2 * static_cast<size_type>(sizeof(PriorityNode)),
+    static_cast<size_type>(sizeof(PathNode)) +
+      (PathLabel::LABEL_LENGTH + 1) * sizeof(PathNode::rank_type));
+  // The caller supplies the original construction thread limit. Nested
+  // OpenMP remains serial; each raw worker owns its readers and spill files.
+  size_type workers = requested_workers;
+  workers = std::min(workers, static_cast<size_type>(ranges.size()));
+  workers = std::min(workers, max_open_files / 6);
+  workers = std::min(workers, group_buffer_bytes / minimum_group);
+
+  // Keep every source pair resident in each worker's private raw cache.
+  // Otherwise partitioning merely multiplies descriptor-cache thrashing.
+  const size_type raw_pair_budget = 8 * static_cast<size_type>(4 * KILOBYTE);
+  if(source.files() > (std::numeric_limits<size_type>::max() - 4) / 2 ||
+     source.files() > std::numeric_limits<size_type>::max() / raw_pair_budget)
+  {
+    return false;
+  }
+  const size_type resident_per_worker = raw_pair_budget * source.files();
+  workers = std::min(workers, group_buffer_bytes / resident_per_worker);
+  workers = std::min(workers, max_open_files / (4 + 2 * source.files()));
+  if(workers < 2) { return false; }
+
+  // The exact output-pair allocation depends on the per-worker FD share. If a
+  // rounded share cannot retain the full raw/mixed input set, reduce
+  // concurrency rather than admit a known cache-thrashing execution.
+  size_type worker_open_files = 0, output_pairs = 0, input_pairs = 0;
+  while(workers >= 2)
+  {
+    worker_open_files = max_open_files / workers;
+    output_pairs = pathMergeOutputPairs(worker_open_files, layout.logical.size());
+    input_pairs = source.files();
+    size_type required_fds = 2 + 2 * output_pairs + 2 * input_pairs;
+    if(required_fds <= worker_open_files) { break; }
+    workers--;
+  }
+  if(workers < 2) { return false; }
+
+  const size_type worker_group = group_buffer_bytes / workers;
+  if(resident_per_worker > worker_group) { return false; }
+  validatePruneShardTails(source, lcp);
+
+  std::vector<PrunePartition> partitions(ranges.size());
+  for(size_type i = 0; i < ranges.size(); i++)
+  {
+    partitions[i].lower_rank = ranges[i].first;
+    partitions[i].upper_rank = ranges[i].second;
+  }
+
+  PruneSharedState shared(size_limit);
+  std::atomic<size_type> next_partition(0);
+  std::vector<std::exception_ptr> errors(partitions.size());
+  auto run = [&]()
+  {
+    for(size_type i = next_partition.fetch_add(1, std::memory_order_relaxed);
+        i < partitions.size();
+        i = next_partition.fetch_add(1, std::memory_order_relaxed))
+    {
+      if(shared.cancelled.load(std::memory_order_relaxed)) { return; }
+      try
+      {
+        buildPrunePartition(partitions[i], source, lcp, size_limit,
+          worker_group, input_pairs, output_pairs, layout, shared);
+      }
+      catch(...)
+      {
+        errors[i] = std::current_exception();
+        shared.cancelled.store(true, std::memory_order_relaxed);
+      }
+    }
+  };
+
+  std::vector<std::thread> threads;
+  threads.reserve(workers - 1);
+  std::exception_ptr startup_error;
+  try
+  {
+    for(size_type i = 1; i < workers; i++) { threads.emplace_back(run); }
+  }
+  catch(const std::system_error&)
+  {
+    // The shared queue lets the threads that did start, plus this thread,
+    // finish safely under the smaller actual concurrency.
+  }
+  catch(...)
+  {
+    startup_error = std::current_exception();
+    shared.cancelled.store(true, std::memory_order_relaxed);
+  }
+  const size_type actual_workers = threads.size() + 1;
+  if(!startup_error) { run(); }
+  for(std::thread& thread : threads) { thread.join(); }
+  if(startup_error) { std::rethrow_exception(startup_error); }
+
+  std::exception_ptr first_error;
+  bool size_limit_exceeded = false;
+  for(const std::exception_ptr& error : errors)
+  {
+    if(!error) { continue; }
+    try { std::rethrow_exception(error); }
+    catch(const PruneCancelled&) { }
+    catch(const PruneSizeLimit&) { size_limit_exceeded = true; }
+    catch(...) { if(!first_error) { first_error = error; } }
+  }
+  if(first_error) { std::rethrow_exception(first_error); }
+  if(size_limit_exceeded)
+  {
+    std::cerr << "PathGraphBuilder::write(): Size limit exceeded, construction aborted" << std::endl;
+    std::exit(EXIT_SIZE_LIMIT_EXCEEDED);
+  }
+
+  // Validate the actual emitted neighbors. A malformed or unusual label range
+  // that spans a planned root split cannot be published as independent shards;
+  // discard the attempt and let the exact serial route decide the groups.
+  const PriorityNode* previous = nullptr;
+  for(const PrunePartition& part : partitions)
+  {
+    if(!part.has_output) { continue; }
+    if(previous != nullptr &&
+       lcp.max_lcp(previous->node, part.first_output.node,
+         previous->label, part.first_output.label) != range_type(0, 0))
+    {
+      return false;
+    }
+    previous = &(part.last_output);
+  }
+
+  PathGraph combined(0, source.k(), source.step());
+  combined.delete_files = false; // It borrows partition files until commit.
+  std::vector<std::vector<bool>> retain(partitions.size(),
+    std::vector<bool>(layout.logical.size(), false));
+  std::vector<bool> logical_retained(layout.logical.size(), false);
+  for(size_type part = 0; part < partitions.size(); part++)
+  {
+    if(!(partitions[part].graph)) { continue; }
+    for(size_type logical = 0; logical < layout.logical.size(); logical++)
+    {
+      if(partitions[part].graph->path_counts[logical] > 0)
+      {
+        retain[part][logical] = true; logical_retained[logical] = true;
+      }
+    }
+  }
+  // Preserve every semantic input even if pruning emitted no records for it.
+  for(size_type logical = 0; logical < layout.logical.size(); logical++)
+  {
+    if(!logical_retained[logical]) { retain[0][logical] = true; }
+  }
+
+  size_type next_physical = 0;
+  for(size_type part = 0; part < partitions.size(); part++)
+  {
+    PathGraph& graph = *(partitions[part].graph);
+    combined.range_count += graph.range_count;
+    combined.unique += graph.unique; combined.redundant += graph.redundant;
+    combined.unsorted += graph.unsorted;
+    combined.nondeterministic += graph.nondeterministic;
+    for(size_type logical = 0; logical < layout.logical.size(); logical++)
+    {
+      if(!retain[part][logical]) { continue; }
+      combined.path_names.push_back(graph.path_names[logical]);
+      combined.rank_names.push_back(graph.rank_names[logical]);
+      combined.path_counts.push_back(graph.path_counts[logical]);
+      combined.rank_counts.push_back(graph.rank_counts[logical]);
+      combined.logical_file_ids.push_back(layout.logical[logical]);
+      combined.physical_shard_ids.push_back(
+        physical_shard_id_t(next_physical++));
+      combined.path_count += graph.path_counts[logical];
+      combined.rank_count += graph.rank_counts[logical];
+    }
+  }
+
+  if(stats != nullptr)
+  {
+    *stats = PathGraphMergeStats();
+    std::vector<PathGraphMergeStats> part_stats;
+    part_stats.reserve(partitions.size());
+    for(const PrunePartition& part : partitions)
+    {
+      addPruneStats(*stats, part.stats); part_stats.push_back(part.stats);
+    }
+    stats->max_open_input_pairs = pruneConcurrentPeak(part_stats, actual_workers,
+      [](const PathGraphMergeStats& value) { return value.max_open_input_pairs; });
+    stats->max_open_output_pairs = pruneConcurrentPeak(part_stats, actual_workers,
+      [](const PathGraphMergeStats& value) { return value.max_open_output_pairs; });
+    stats->max_input_buffer_bytes = pruneConcurrentPeak(part_stats, actual_workers,
+      [](const PathGraphMergeStats& value) { return value.max_input_buffer_bytes; });
+  }
+
+  // Finish every allocating operation while partitions still own their
+  // outputs. Adopt retained shards in rank order without copying payloads.
+  for(size_type part = 0; part < partitions.size(); part++)
+  {
+    PathGraph& graph = *(partitions[part].graph);
+    for(size_type logical = 0; logical < layout.logical.size(); logical++)
+    {
+      if(!retain[part][logical])
+      {
+        TempFile::remove(graph.path_names[logical]);
+        TempFile::remove(graph.rank_names[logical]);
+      }
+    }
+    graph.delete_files = false;
+  }
+
+  combined.delete_files = true;
+  source.clear(); source.swap(combined);
+  return true;
+}
+
 } // anonymous namespace
+
+void
+externalPathGraphPrune(PathGraph& graph, const LCP& lcp, size_type size_limit,
+  size_type group_buffer_bytes, size_type max_open_files,
+  size_type requested_workers, PathGraphMergeStats* stats)
+{
+  // Admit the complete phase, including a serial fallback, against currently
+  // available low-numbered descriptor slots. Later open failures still join
+  // workers and retain source ownership.
+  max_open_files = availablePathGraphDescriptors(max_open_files);
+  if(max_open_files < 6)
+  {
+    throw std::runtime_error("externalPathGraphPrune: insufficient descriptors");
+  }
+  PruneOutputLayout layout = pruneOutputLayout(graph);
+  if(!buildPrunedGraphParallel(graph, lcp, size_limit, group_buffer_bytes,
+       stats, max_open_files, requested_workers, layout))
+  {
+    graph.prune(lcp, size_limit, group_buffer_bytes, stats, max_open_files);
+  }
+}
 
 void
 PathGraph::prune(const LCP& lcp, size_type size_limit,
@@ -3072,7 +3510,7 @@ PathGraph::prune(const LCP& lcp, size_type size_limit,
   builder.graph.physical_shard_ids = layout.physical;
   ProgressReporter progress("PathGraph::prune()", this->size(), "paths");
   prunePathRange(*this, lcp, group_buffer_bytes, input_pairs,
-    layout, builder, stats, progress);
+    layout, builder, stats, &progress);
   progress.finish();
   builder.close();
   this->clear(); this->swap(builder.graph);
