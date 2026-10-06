@@ -1,5 +1,6 @@
 #include <gcsa/path_graph.h>
 #include <gcsa/path_graph_external.h>
+#include "path_graph_sort_internal.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -225,13 +226,17 @@ int main()
     }
   }
   write_input(path_e, rank_e, descriptor_records);
+  const std::string path_f = base + ".f.path", rank_f = base + ".f.rank";
+  write_input(path_f, rank_f, descriptor_records);
 
   PathGraph first(path_a, rank_a);
   first.logical_file_ids[0] = logical_file_id_t(17);
   first.physical_shard_ids[0] = physical_shard_id_t(9001);
   ExternalPathSortStats first_stats;
   size_type budget = externalPathGraphSortMinimumBudget();
-  externalPathGraphSort(first, 0, budget, 2, &first_stats);
+  // The thread allowance alone must not create a worker when the raw fallback
+  // is selected by the existing byte budget.
+  externalPathGraphSortWithThreads(first, 0, budget, 2, &first_stats, 2);
   check_sorted(first, records);
   require(first_stats.runs > 2);
   require(first_stats.merge_passes >= 2);
@@ -247,7 +252,8 @@ int main()
   // PathGraph shards.
   size_type framed_budget = 8 * MEGABYTE;
   ExternalPathSortStats second_stats;
-  externalPathGraphSort(second, 0, framed_budget, 2, &second_stats);
+  externalPathGraphSortWithThreads(second, 0, framed_budget, 2,
+    &second_stats, 2);
   check_sorted(second, records);
   require(read_bytes(first.path_names[0]) == read_bytes(second.path_names[0]));
   require(first_ranks == read_ranks(second.rank_names[0]));
@@ -261,12 +267,24 @@ int main()
   check_descriptor_limited_sort(path_e, rank_e, descriptor_records, 64);
   expect_descriptor_limit_failure(path_e, rank_e, 8);
 
+  // Several framed runs exercise repeated submission, handoff and teardown of
+  // the single admitted prefetch worker against the ordinary installed files.
+  PathGraph prefetched(path_f, rank_f);
+  ExternalPathSortStats prefetched_stats;
+  externalPathGraphSortWithThreads(prefetched, 0, 2 * MEGABYTE, 4,
+    &prefetched_stats, 2);
+  check_sorted(prefetched, descriptor_records);
+  require(prefetched_stats.runs > 1);
+  require(prefetched_stats.max_bytes_resident <= 2 * MEGABYTE);
+
   std::remove(first.path_names[0].c_str()); std::remove(first.rank_names[0].c_str());
   std::remove(second.path_names[0].c_str()); std::remove(second.rank_names[0].c_str());
+  std::remove(prefetched.path_names[0].c_str()); std::remove(prefetched.rank_names[0].c_str());
   std::remove(path_a.c_str()); std::remove(rank_a.c_str());
   std::remove(path_b.c_str()); std::remove(rank_b.c_str());
   std::remove(path_c.c_str()); std::remove(rank_c.c_str());
   std::remove(path_d.c_str()); std::remove(rank_d.c_str());
   std::remove(path_e.c_str()); std::remove(rank_e.c_str());
+  std::remove(path_f.c_str()); std::remove(rank_f.c_str());
   return 0;
 }
