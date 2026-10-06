@@ -1433,6 +1433,7 @@ struct ExternalPathSortSink::Impl
     {
       externalSortFailure("cannot install streaming sorted path pair");
     }
+    TempFile::remove(partial_path); TempFile::remove(partial_rank);
 
     this->graph.path_counts[this->file] = this->path_count;
     this->graph.rank_counts[this->file] = this->rank_count;
