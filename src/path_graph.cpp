@@ -1421,9 +1421,9 @@ struct ExternalPathSortSink::Impl
     std::string merged = this->finishRuns();
     const std::string& final_path = this->graph.path_names[this->file];
     const std::string& final_rank = this->graph.rank_names[this->file];
-    std::string partial_path = final_path + ".partial";
-    std::string partial_rank = final_rank + ".partial";
-    std::remove(partial_path.c_str()); std::remove(partial_rank.c_str());
+    // Sort errors may exit directly, so staged files need registry ownership.
+    std::string partial_path = TempFile::getName(PathGraph::PREFIX);
+    std::string partial_rank = TempFile::getName(PathGraph::PREFIX);
     writeSortedPathPair(merged, partial_path, partial_rank,
       this->path_count, this->rank_count, this->merge_records, this->stats);
     TempFile::remove(merged);
@@ -1431,7 +1431,7 @@ struct ExternalPathSortSink::Impl
     if(std::rename(partial_path.c_str(), final_path.c_str()) != 0 ||
        std::rename(partial_rank.c_str(), final_rank.c_str()) != 0)
     {
-      externalSortFailure("cannot atomically install streaming sorted path pair");
+      externalSortFailure("cannot install streaming sorted path pair");
     }
 
     this->graph.path_counts[this->file] = this->path_count;
