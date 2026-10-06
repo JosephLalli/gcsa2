@@ -1079,8 +1079,17 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     std::string task = doublingTask(step);
     size_type prune_buffer = pathMergeInputBudget(parameters);
     const double prune_start = readTimer();
-    path_graph.prune(lcp, path_graph.remainingLimit(parameters.getLimitBytes()),
-      prune_buffer, nullptr, externalMaxOpenFiles());
+    if(parameters.externalMemory())
+    {
+      externalPathGraphPrune(path_graph, lcp,
+        path_graph.remainingLimit(parameters.getLimitBytes()), prune_buffer,
+        externalMaxOpenFiles(), requested_threads);
+    }
+    else
+    {
+      path_graph.prune(lcp, path_graph.remainingLimit(parameters.getLimitBytes()),
+        prune_buffer, nullptr, externalMaxOpenFiles());
+    }
     const double prune_stop = readTimer();
     if(Verbosity::level >= Verbosity::BASIC)
     {
