@@ -1451,6 +1451,10 @@ template<class Element>
 struct SpillableGroup
 {
   std::vector<Element> memory;
+  // Retain the dead prefix until compaction is needed, avoiding repeated
+  // movement of the live elements. Flushing resets head to zero, so only
+  // resident accesses add it to the absolute merger offset.
+  size_type head;
   std::string          filename;
   int                  file;
   size_type            elements, disk_elements, offset, file_begin;
@@ -1459,7 +1463,7 @@ struct SpillableGroup
   mutable std::vector<Element> read_cache;
   size_type*           spill_counter;
 
-  SpillableGroup(size_type limit, size_type* counter = nullptr) : file(-1), elements(0), disk_elements(0), offset(0), file_begin(0),
+  SpillableGroup(size_type limit, size_type* counter = nullptr) : head(0), file(-1), elements(0), disk_elements(0), offset(0), file_begin(0),
     byte_limit(std::max(2 * static_cast<size_type>(sizeof(Element)), limit)),
     write_bytes(this->byte_limit / 2), read_bytes(this->byte_limit - this->write_bytes), advised_write(0), cache_offset(0),
     spill_counter(counter)
@@ -1477,7 +1481,78 @@ struct SpillableGroup
 
   void push_back(const Element& value)
   {
-    if(!this->spilled() && (this->memory.size() + 1) * sizeof(Element) > this->byte_limit)
+    if(!this->spilled() &&
+       (this->memory.size() + 1) * sizeof(Element) > this->byte_limit)
+    {
+      this->makeRoom();
+    }
+    this->memory.push_back(value);
+    this->elements++;
+    if(this->spilled() && this->liveSize() * sizeof(Element) >= this->write_bytes) { this->flush(); }
+  }
+
+  Element get(size_type i) const
+  {
+    if(i < this->offset || i >= this->elements) { throw std::out_of_range("PathGraph::prune(): spill index"); }
+    if(!this->spilled()) { return this->memory[this->head + i - this->offset]; }
+    if(i >= this->disk_elements) { return this->memory[i - this->disk_elements]; }
+    if(i < this->cache_offset || i >= this->cache_offset + this->read_cache.size())
+    {
+      this->discard(this->cache_offset, this->read_cache.size());
+      this->cache_offset = i;
+      size_type count = std::min(this->read_bytes / sizeof(Element), this->disk_elements - i);
+      this->read_cache.resize(count); this->read(this->read_cache.data(), count, i);
+    }
+    return this->read_cache[i - this->cache_offset];
+  }
+
+  void set(size_type i, const Element& value)
+  {
+    if(i < this->offset || i >= this->elements) { throw std::out_of_range("PathGraph::prune(): spill index"); }
+    if(!this->spilled()) { this->memory[this->head + i - this->offset] = value; return; }
+    if(i >= this->disk_elements) { this->memory[i - this->disk_elements] = value; return; }
+    this->flush(); this->write(&value, 1, i);
+    if(::fdatasync(this->file) != 0) { throw std::runtime_error("PathGraph::prune(): spill sync failed"); }
+    this->discard(i, 1); sdsl::util::clear(this->read_cache);
+  }
+
+  size_type liveSize() const { return this->memory.size() - this->head; }
+
+  void seek(size_type i)
+  {
+    if(i > this->elements) { throw std::out_of_range("PathGraph::prune(): spill seek"); }
+    if(!this->spilled())
+    {
+      this->head += (i - this->offset);
+      if(this->head > this->memory.size() / 2)
+      {
+        this->memory.erase(this->memory.begin(),
+          this->memory.begin() + this->head);
+        this->head = 0;
+      }
+    }
+    this->offset = i;
+  }
+
+  void clear()
+  {
+    if(this->file >= 0) { ::close(this->file); this->file = -1; }
+    if(!this->filename.empty()) { TempFile::remove(this->filename); this->filename.clear(); }
+    sdsl::util::clear(this->memory); this->head = 0;
+    sdsl::util::clear(this->read_cache);
+    this->elements = 0; this->disk_elements = 0; this->offset = 0; this->file_begin = 0;
+    this->advised_write = 0; this->cache_offset = 0;
+  }
+
+private:
+  void makeRoom()
+  {
+    if((this->liveSize() + 1) * sizeof(Element) <= this->byte_limit)
+    {
+      this->memory.erase(this->memory.begin(), this->memory.begin() + this->head);
+      this->head = 0;
+    }
+    else
     {
       this->filename = TempFile::getName("gcsa_prune_group");
       this->file = ::open(this->filename.c_str(), O_CREAT | O_TRUNC | O_RDWR, 0600);
@@ -1498,61 +1573,18 @@ struct SpillableGroup
       this->cache_offset = this->offset;
       this->flush();
     }
-    this->memory.push_back(value);
-    this->elements++;
-    if(this->spilled() && this->memory.size() * sizeof(Element) >= this->write_bytes) { this->flush(); }
   }
 
-  Element get(size_type i) const
-  {
-    if(i < this->offset || i >= this->elements) { throw std::out_of_range("PathGraph::prune(): spill index"); }
-    if(!this->spilled()) { return this->memory[i - this->offset]; }
-    if(i >= this->disk_elements) { return this->memory[i - this->disk_elements]; }
-    if(i < this->cache_offset || i >= this->cache_offset + this->read_cache.size())
-    {
-      this->discard(this->cache_offset, this->read_cache.size());
-      this->cache_offset = i;
-      size_type count = std::min(this->read_bytes / sizeof(Element), this->disk_elements - i);
-      this->read_cache.resize(count); this->read(this->read_cache.data(), count, i);
-    }
-    return this->read_cache[i - this->cache_offset];
-  }
-
-  void set(size_type i, const Element& value)
-  {
-    if(i < this->offset || i >= this->elements) { throw std::out_of_range("PathGraph::prune(): spill index"); }
-    if(!this->spilled()) { this->memory[i - this->offset] = value; return; }
-    if(i >= this->disk_elements) { this->memory[i - this->disk_elements] = value; return; }
-    this->flush(); this->write(&value, 1, i);
-    if(::fdatasync(this->file) != 0) { throw std::runtime_error("PathGraph::prune(): spill sync failed"); }
-    this->discard(i, 1); sdsl::util::clear(this->read_cache);
-  }
-
-  void seek(size_type i)
-  {
-    if(i > this->elements) { throw std::out_of_range("PathGraph::prune(): spill seek"); }
-    if(!this->spilled())
-    {
-      this->memory.erase(this->memory.begin(), this->memory.begin() + (i - this->offset));
-    }
-    this->offset = i;
-  }
-
-  void clear()
-  {
-    if(this->file >= 0) { ::close(this->file); this->file = -1; }
-    if(!this->filename.empty()) { TempFile::remove(this->filename); this->filename.clear(); }
-    sdsl::util::clear(this->memory); sdsl::util::clear(this->read_cache);
-    this->elements = 0; this->disk_elements = 0; this->offset = 0; this->file_begin = 0;
-    this->advised_write = 0; this->cache_offset = 0;
-  }
-
-private:
   void flush()
   {
-    if(this->memory.empty()) { return; }
-    this->write(this->memory.data(), this->memory.size(), this->disk_elements);
-    this->disk_elements += this->memory.size(); sdsl::util::clear(this->memory);
+    if(this->liveSize() == 0)
+    {
+      sdsl::util::clear(this->memory); this->head = 0; return;
+    }
+    this->write(this->memory.data() + this->head, this->liveSize(),
+      this->disk_elements);
+    this->disk_elements += this->liveSize();
+    sdsl::util::clear(this->memory); this->head = 0;
     this->memory.reserve(std::max(static_cast<size_type>(1), this->write_bytes / sizeof(Element)));
     if(::fdatasync(this->file) != 0) { throw std::runtime_error("PathGraph::prune(): spill sync failed"); }
     this->discard(this->advised_write, this->disk_elements - this->advised_write);
@@ -1916,14 +1948,41 @@ private:
 */
 struct PathGraphInputCache
 {
+  struct Window
+  {
+    std::vector<char> data;
+    off_t start;
+    size_type valid;
+
+    explicit Window(size_type bytes = 0) : data(bytes), start(0), valid(0) { }
+
+    void reset() { this->start = 0; this->valid = 0; }
+
+    bool contains(off_t offset, size_type bytes) const
+    {
+      if(offset < this->start) { return false; }
+      size_type relative = static_cast<size_type>(offset - this->start);
+      return (relative <= this->valid && bytes <= this->valid - relative);
+    }
+  };
+
   struct Entry
   {
     size_type file, stamp;
     int path, rank;
     off_t path_high, rank_high, path_released, rank_released;
+    Window path_window, rank_window;
 
-    Entry() : file(PathGraph::UNKNOWN), stamp(0), path(-1), rank(-1),
-      path_high(0), rank_high(0), path_released(0), rank_released(0) { }
+    explicit Entry(size_type window_bytes = 0) :
+      file(PathGraph::UNKNOWN), stamp(0), path(-1), rank(-1),
+      path_high(0), rank_high(0), path_released(0), rank_released(0),
+      path_window(window_bytes), rank_window(window_bytes) { }
+
+    Entry(Entry&&) = default;
+    Entry& operator=(Entry&&) = default;
+
+    Entry(const Entry&) = delete;
+    Entry& operator=(const Entry&) = delete;
 
     void reset(size_type new_file, size_type new_stamp)
     {
@@ -1931,23 +1990,41 @@ struct PathGraphInputCache
       this->path = -1; this->rank = -1;
       this->path_high = 0; this->rank_high = 0;
       this->path_released = 0; this->rank_released = 0;
+      this->path_window.reset(); this->rank_window.reset();
     }
   };
 
   const PathGraph& graph;
   std::vector<Entry> entries;
-  size_type clock, max_pairs;
+  // Logical shard -> index into `entries`, or NO_ENTRY. Indices rather than
+  // pointers because emplace_back may reallocate `entries`.
+  std::vector<size_type> file_to_entry;
+  size_type clock, max_pairs, window_bytes;
   PathGraphMergeStats* stats;
 
+  constexpr static size_type NO_ENTRY = ~static_cast<size_type>(0);
+
   constexpr static off_t CACHE_TAIL = 64 * KILOBYTE;
+  constexpr static size_type MIN_WINDOW = 4 * KILOBYTE;
+  constexpr static size_type MAX_WINDOW = 64 * KILOBYTE;
 
   PathGraphInputCache(const PathGraph& source, PathGraphMergeStats* merge_stats,
-    size_type requested_pairs) :
-    graph(source), entries(), clock(0),
+    size_type requested_pairs, size_type byte_budget = 0) :
+    graph(source), entries(), file_to_entry(source.files(), NO_ENTRY), clock(0),
     max_pairs(std::max(static_cast<size_type>(1),
       std::min(requested_pairs, std::max(static_cast<size_type>(1), source.files())))),
+    window_bytes(0),
     stats(merge_stats)
   {
+    // At most 2 * max_pairs windows can coexist. Their combined capacity is
+    // at most one quarter of this per-structure allowance. Other merger
+    // buffers and metadata have separate allocations.
+    size_type candidate = byte_budget / this->max_pairs / 8;
+    if(candidate >= MIN_WINDOW)
+    {
+      this->window_bytes = std::min(MAX_WINDOW,
+        candidate - (candidate % MIN_WINDOW));
+    }
     this->entries.reserve(this->max_pairs);
   }
 
@@ -1962,7 +2039,10 @@ struct PathGraphInputCache
     }
     Entry& entry = this->get(file);
     off_t path_offset = this->checkedOffset(offset, sizeof(PathNode));
-    this->preadAll(entry.path, &node, sizeof(node), path_offset);
+    off_t path_limit = this->checkedOffset(this->graph.path_counts[file],
+      sizeof(PathNode));
+    this->readWindow(entry.path, entry.path_window, &node, sizeof(node),
+      path_offset, path_limit);
     if(this->stats != nullptr) { this->stats->path_input_reads++; }
     entry.path_high = std::max(entry.path_high,
       path_offset + static_cast<off_t>(sizeof(node)));
@@ -1979,7 +2059,10 @@ struct PathGraphInputCache
     }
     size_type rank_bytes = node.ranks() * sizeof(PathNode::rank_type);
     off_t rank_offset = this->checkedOffset(node.pointer(), sizeof(PathNode::rank_type));
-    this->preadAll(entry.rank, labels, rank_bytes, rank_offset);
+    off_t rank_limit = this->checkedOffset(this->graph.rank_counts[file],
+      sizeof(PathNode::rank_type));
+    this->readWindow(entry.rank, entry.rank_window, labels, rank_bytes,
+      rank_offset, rank_limit);
     if(this->stats != nullptr) { this->stats->rank_input_reads++; }
     entry.rank_high = std::max(entry.rank_high,
       rank_offset + static_cast<off_t>(rank_bytes));
@@ -1990,21 +2073,27 @@ struct PathGraphInputCache
   {
     for(Entry& entry : this->entries) { this->close(entry); }
     this->entries.clear();
+    std::fill(this->file_to_entry.begin(), this->file_to_entry.end(), NO_ENTRY);
   }
 
 private:
   Entry& get(size_type file)
   {
     this->clock++;
-    for(Entry& entry : this->entries)
+    if(file < this->file_to_entry.size() &&
+       this->file_to_entry[file] != NO_ENTRY)
     {
-      if(entry.file == file) { entry.stamp = this->clock; return entry; }
+      Entry& entry = this->entries[this->file_to_entry[file]];
+      entry.stamp = this->clock;
+      return entry;
     }
 
     Entry* target = nullptr;
+    size_type target_index = 0;
     if(this->entries.size() < this->max_pairs)
     {
-      this->entries.emplace_back(); target = &(this->entries.back());
+      target_index = this->entries.size();
+      this->entries.emplace_back(this->window_bytes); target = &(this->entries.back());
       if(this->stats != nullptr)
       {
         this->stats->max_open_input_pairs = std::max(
@@ -2014,12 +2103,20 @@ private:
     }
     else
     {
-      target = &(*std::min_element(this->entries.begin(), this->entries.end(),
-        [](const Entry& left, const Entry& right) { return left.stamp < right.stamp; }));
+      auto victim = std::min_element(this->entries.begin(), this->entries.end(),
+        [](const Entry& left, const Entry& right) { return left.stamp < right.stamp; });
+      target_index = static_cast<size_type>(victim - this->entries.begin());
+      target = &(*victim);
+      if(target->file != PathGraph::UNKNOWN &&
+         target->file < this->file_to_entry.size())
+      {
+        this->file_to_entry[target->file] = NO_ENTRY;
+      }
       this->close(*target);
     }
 
     target->reset(file, this->clock);
+    if(file < this->file_to_entry.size()) { this->file_to_entry[file] = target_index; }
     target->path = ::open(this->graph.path_names[file].c_str(), O_RDONLY);
     if(target->path < 0) { throw std::runtime_error("PathGraphMerger: cannot open path input"); }
     target->rank = ::open(this->graph.rank_names[file].c_str(), O_RDONLY);
@@ -2072,6 +2169,32 @@ private:
     }
   }
 
+  void readWindow(int descriptor, Window& window, void* target, size_type bytes,
+    off_t offset, off_t limit)
+  {
+    if(offset < 0 || limit < offset ||
+       bytes > static_cast<size_type>(limit - offset))
+    {
+      throw std::runtime_error("PathGraphMerger: input range is outside its file");
+    }
+    if(bytes == 0) { return; }
+
+    if(window.data.empty() || bytes > window.data.size())
+    {
+      this->preadAll(descriptor, target, bytes, offset);
+      return;
+    }
+    if(!(window.contains(offset, bytes)))
+    {
+      size_type available = static_cast<size_type>(limit - offset);
+      size_type refill = std::min(static_cast<size_type>(window.data.size()), available);
+      this->preadAll(descriptor, window.data.data(), refill, offset);
+      window.start = offset; window.valid = refill;
+    }
+    size_type relative = static_cast<size_type>(offset - window.start);
+    std::memcpy(target, window.data.data() + relative, bytes);
+  }
+
   static void trim(int descriptor, off_t high, off_t& released)
   {
     if(high <= released + 2 * CACHE_TAIL) { return; }
@@ -2094,6 +2217,8 @@ private:
 };
 
 constexpr off_t PathGraphInputCache::CACHE_TAIL;
+constexpr size_type PathGraphInputCache::MIN_WINDOW;
+constexpr size_type PathGraphInputCache::MAX_WINDOW;
 
 /*
   This structure reads a buffered stream of PriorityNodes in sorted order and outputs a
@@ -2172,7 +2297,7 @@ PathGraphMerger::PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lc
   graph(path_graph), lcp(kmer_lcp),
   ranges(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->range_spills))),
   buffer(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->priority_spills))),
-  input_files(path_graph, stats, max_input_pairs),
+  input_files(path_graph, stats, max_input_pairs, group_buffer_bytes),
   offsets(path_graph.files()), path_count(0),
   inputs(path_graph.files())
 {
@@ -3094,10 +3219,28 @@ private:
 
 struct SameFromSet
 {
+  struct Result
+  {
+    std::string name;
+    size_type nodes;
+    bool in_memory;
+
+    Result() : name(), nodes(0), in_memory(false) { }
+    Result(const std::string& file_name, size_type count) :
+      name(file_name), nodes(count), in_memory(false) { }
+    explicit Result(size_type count) : name(), nodes(count), in_memory(true) { }
+  };
+
   const PathGraphMerger& merger;
   std::string            selected;
   size_type              selected_nodes, budget, stream_buffer;
   PathGraphMergeStats*   stats;
+  // The two retained vector capacities share the group-buffer allowance.
+  // An external fallback may coexist with them and uses a separate sorter
+  // allowance. Small sets avoid per-group I/O and allocation.
+  std::vector<node_type> selected_memory, scratch;
+  size_type              memory_records;
+  bool                   selected_in_memory;
 
   SameFromSet(const PathGraphMerger& source, size_type group_buffer_bytes,
     PathGraphMergeStats* merge_stats) :
@@ -3106,14 +3249,38 @@ struct SameFromSet
       group_buffer_bytes)),
     stream_buffer(std::max(static_cast<size_type>(sizeof(node_type)),
       std::min(static_cast<size_type>(64 * KILOBYTE), this->budget / 4))),
-    stats(merge_stats)
+    stats(merge_stats), selected_memory(), scratch(),
+    memory_records(group_buffer_bytes / (2 * sizeof(node_type))),
+    selected_in_memory(false)
   {
+    this->selected_memory.reserve(this->memory_records);
+    this->scratch.reserve(this->memory_records);
   }
 
   ~SameFromSet() { if(!this->selected.empty()) { TempFile::remove(this->selected); } }
 
-  std::pair<std::string, size_type> fromNodes(range_type range) const
+  Result fromNodes(range_type range)
   {
+    size_type records = Range::length(range);
+    if(records <= this->memory_records)
+    {
+      // Collapse adjacent duplicates before sorting the remaining nodes.
+      this->scratch.clear();
+      node_type prev = ~static_cast<node_type>(0);
+      for(size_type i = range.first; i <= range.second; i++)
+      {
+        node_type curr = this->merger.buffer.get(i).node.from;
+        if(curr != prev) { this->scratch.push_back(curr); prev = curr; }
+      }
+      if(this->scratch.size() > 1)
+      {
+        std::sort(this->scratch.begin(), this->scratch.end());
+        this->scratch.erase(std::unique(this->scratch.begin(), this->scratch.end()),
+          this->scratch.end());
+      }
+      return Result(this->scratch.size());
+    }
+
     std::string raw = TempFile::getName("gcsa_same_from_raw");
     std::string reduced = TempFile::getName("gcsa_same_from_set");
     size_type count = 0;
@@ -3141,49 +3308,97 @@ struct SameFromSet
     {
       TempFile::remove(raw); TempFile::remove(reduced); throw;
     }
-    TempFile::remove(raw); return std::make_pair(reduced, count);
+    TempFile::remove(raw); return Result(reduced, count);
   }
 
   bool operator() (range_type range)
   {
-    std::pair<std::string, size_type> next_set = this->fromNodes(range);
-    bool equal = (next_set.second == this->selected_nodes);
+    Result next_set = this->fromNodes(range);
+    bool equal = (next_set.nodes == this->selected_nodes);
     try
     {
       if(equal)
       {
-        SequentialRecordReader<node_type> left(this->selected, this->stream_buffer);
-        SequentialRecordReader<node_type> right(next_set.first, this->stream_buffer);
-        node_type a, b;
-        for(size_type i = 0; equal && i < this->selected_nodes; i++)
+        if(this->selected_in_memory && next_set.in_memory)
         {
-          equal = (left.next(a) && right.next(b) && a == b);
+          equal = (this->selected_memory == this->scratch);
         }
-        if(equal) { equal = (!left.next(a) && !right.next(b)); }
+        else if(this->selected_in_memory)
+        {
+          SequentialRecordReader<node_type> right(next_set.name, this->stream_buffer);
+          node_type value;
+          for(size_type i = 0; equal && i < this->selected_nodes; i++)
+          {
+            equal = (right.next(value) && value == this->selected_memory[i]);
+          }
+          if(equal) { equal = !right.next(value); }
+        }
+        else if(next_set.in_memory)
+        {
+          SequentialRecordReader<node_type> left(this->selected, this->stream_buffer);
+          node_type value;
+          for(size_type i = 0; equal && i < this->selected_nodes; i++)
+          {
+            equal = (left.next(value) && value == this->scratch[i]);
+          }
+          if(equal) { equal = !left.next(value); }
+        }
+        else
+        {
+          SequentialRecordReader<node_type> left(this->selected, this->stream_buffer);
+          SequentialRecordReader<node_type> right(next_set.name, this->stream_buffer);
+          node_type a, b;
+          for(size_type i = 0; equal && i < this->selected_nodes; i++)
+          {
+            equal = (left.next(a) && right.next(b) && a == b);
+          }
+          if(equal) { equal = (!left.next(a) && !right.next(b)); }
+        }
       }
     }
     catch(...)
     {
-      TempFile::remove(next_set.first); throw;
+      if(!next_set.in_memory) { TempFile::remove(next_set.name); }
+      throw;
     }
-    TempFile::remove(next_set.first); return equal;
+    if(!next_set.in_memory) { TempFile::remove(next_set.name); }
+    return equal;
   }
 
   void select(range_type range)
   {
-    std::pair<std::string, size_type> result = this->fromNodes(range);
-    if(result.second == 0)
+    Result result = this->fromNodes(range);
+    if(result.nodes == 0)
     {
-      TempFile::remove(result.first);
+      if(!result.in_memory) { TempFile::remove(result.name); }
       throw std::runtime_error("SameFromSet: empty selected set");
     }
     if(!this->selected.empty()) { TempFile::remove(this->selected); }
-    this->selected = result.first; this->selected_nodes = result.second;
+    this->selected.clear(); this->selected_nodes = result.nodes;
+    this->selected_in_memory = result.in_memory;
+    if(result.in_memory)
+    {
+      this->selected_memory.swap(this->scratch); this->scratch.clear();
+    }
+    else
+    {
+      this->selected_memory.clear(); this->selected = result.name;
+    }
   }
 
   template<class Callback>
   node_type streamAfterFirst(Callback callback) const
   {
+    if(this->selected_in_memory)
+    {
+      if(this->selected_memory.empty()) { throw std::runtime_error("SameFromSet: empty selected set"); }
+      for(size_type i = 1; i < this->selected_memory.size(); i++) { callback(this->selected_memory[i]); }
+      if(this->selected_memory.size() != this->selected_nodes)
+      {
+        throw std::runtime_error("SameFromSet: selected set size changed");
+      }
+      return this->selected_memory.front();
+    }
     SequentialRecordReader<node_type> input(this->selected, this->stream_buffer);
     node_type first_value;
     if(!input.next(first_value)) { throw std::runtime_error("SameFromSet: empty selected set"); }

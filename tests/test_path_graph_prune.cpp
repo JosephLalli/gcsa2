@@ -193,7 +193,7 @@ static void compare_merged_graph(const std::string& base)
     require(reference.size() == 1); require(reference.extra() == 15);
     require(reference_stats.priority_spills == 0);
     require(reference_stats.range_spills == 0);
-    require(reference_stats.from_set_sorts >= 4);
+    require(reference_stats.from_set_sorts == 0);
     require(spilled_stats.priority_spills > 0);
     require(spilled_stats.range_spills > 0);
     require(spilled_stats.from_set_sorts >= 4);
