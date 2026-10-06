@@ -3,8 +3,12 @@
 
 #include <gcsa/files.h>
 
+#include <functional>
+
 namespace gcsa
 {
+
+class LCPArray;
 
 /*
   gcsa.h: The main public interface.
@@ -225,6 +229,14 @@ public:
 //------------------------------------------------------------------------------
 
 private:
+  typedef std::function<void(node_type)> OccurrenceCallback;
+
+  // Stream raw occurrences for the byte-bounded verifier, which sorts and
+  // deduplicates them externally before comparison.
+  void locateRaw(range_type range, const OccurrenceCallback& report) const;
+  friend bool verifyIndex(const GCSA& index, const LCPArray* lcp,
+    const InputGraph& graph, size_type byte_budget);
+
   static void buildAndStore(InputGraph& graph,
     const ConstructionParameters& parameters, const std::string& filename);
 

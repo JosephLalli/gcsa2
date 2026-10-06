@@ -23,6 +23,7 @@
   SOFTWARE.
 */
 
+#include <algorithm>
 #include <exception>
 #include <getopt.h>
 #include <string>
@@ -240,7 +241,16 @@ main(int argc, char** argv)
               << std::endl << std::endl;
   }
 
-  if(verify) { verifyIndex(index, &lcp, graph); }
+  if(verify)
+  {
+    if(parameters.externalMemory())
+    {
+      const size_type verification_budget = std::min(
+        parameters.getMemoryLimitBytes(), static_cast<size_type>(64 * MEGABYTE));
+      verifyIndex(index, &lcp, graph, verification_budget);
+    }
+    else { verifyIndex(index, &lcp, graph); }
+  }
 
   std::cout << "Final memory usage: " << inGigabytes(memoryUsage()) << " GB" << std::endl;
   std::cout << std::endl;
