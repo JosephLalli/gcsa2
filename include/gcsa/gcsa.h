@@ -225,11 +225,9 @@ public:
 //------------------------------------------------------------------------------
 
 private:
-  static void buildAndStore(InputGraph& graph,
-    const ConstructionParameters& parameters, const std::string& filename);
-
   GCSA(InputGraph& graph, const ConstructionParameters& parameters,
-    const std::string* direct_output);
+    const std::string* direct_output, const std::string* lcp_output = nullptr,
+    size_type construction_threads = 1);
   void copy(const GCSA& source);
   void setVectors();
   void initSupport();

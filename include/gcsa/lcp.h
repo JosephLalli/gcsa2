@@ -171,6 +171,8 @@ private:
 
   static void buildAndStore(const InputGraph& graph,
     const ConstructionParameters& parameters, const std::string& filename);
+  static void buildAndStore(const std::string& leaf_filename,
+    const ConstructionParameters& parameters, const std::string& filename);
 
   void copy(const LCPArray& source);
 };  // class LCPArray
