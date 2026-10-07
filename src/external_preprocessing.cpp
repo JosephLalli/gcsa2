@@ -309,7 +309,8 @@ ExternalInputPreprocessor::prepare()
       [](const void* value, bool first, bool, std::ostream& output)
       {
         if(first) { output.write(reinterpret_cast<const char*>(value), sizeof(node_type)); }
-      });
+      }, nullptr, true,
+      ExternalFixedRecordSorter::RecordOrder::ASCENDING_U64);
     TempFile::remove(key_source);
     TempFile::remove(start_source);
   }
@@ -449,7 +450,7 @@ ExternalInputPreprocessor::buildInitialPathGraph(PathGraph& result)
       }
       ExternalFixedRecordSorter::sort(raw_name, sorted_name,
         sizeof(InitialKMerRecord), sort_budget, externalMergeFanIn(),
-        compareInitialKMer);
+        compareInitialKMer, nullptr, true);
 
       // Mapping uses two bounded readers and two bounded path/rank writers.
       // ioBufferBytes() is at most sortBudget()/8, so their four explicit
