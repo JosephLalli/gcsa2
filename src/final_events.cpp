@@ -6,11 +6,13 @@
 
 #include <gcsa/final_events.h>
 #include <external_configuration.hpp>
+#include "final_events_internal.hpp"
 
 #include <gcsa/external_sort.h>
 #include <gcsa/internal.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -19,8 +21,11 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <queue>
 #include <stdexcept>
+#include <thread>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -1704,11 +1709,302 @@ sortFinalRedundancy(FinalEventFiles& files,
   }
 }
 
+namespace
+{
+
+/*
+  One component's bytes while its encoder runs independently. Small components
+  remain in memory. Larger components continue in a temporary file, which is
+  closed before the coordinator appends it in the public serialization order.
+*/
+class FinalComponentSpool : public std::streambuf
+{
+public:
+  FinalComponentSpool(size_type buffer_bytes,
+    const std::atomic<bool>& cancelled) :
+    buffer_(buffer_bytes), filename_(), descriptor_(-1), file_bytes_(0),
+    cancelled_(cancelled)
+  {
+    this->setp(buffer_.data(), buffer_.data() + buffer_.size());
+  }
+
+  ~FinalComponentSpool()
+  {
+    if(descriptor_ >= 0) { ::close(descriptor_); }
+    TempFile::remove(filename_);
+  }
+
+  void finish()
+  {
+    if(descriptor_ < 0) { return; }
+    this->flushBuffer();
+    int descriptor = descriptor_; descriptor_ = -1;
+    if(::close(descriptor) != 0)
+    {
+      throw eventError("cannot close final component spool", filename_);
+    }
+    std::vector<char>().swap(buffer_); this->setp(nullptr, nullptr);
+  }
+
+  void appendTo(std::ostream& out, std::vector<char>& scratch)
+  {
+    if(filename_.empty())
+    {
+      out.write(this->pbase(), this->pptr() - this->pbase());
+    }
+    else
+    {
+      int descriptor = ::open(filename_.c_str(), O_RDONLY);
+      if(descriptor < 0)
+      {
+        throw eventError("cannot open final component spool", filename_);
+      }
+      try
+      {
+        adviseSequential(descriptor);
+        for(size_type done = 0; done < file_bytes_ && out;)
+        {
+          size_type bytes = std::min(scratch.size(), file_bytes_ - done);
+          readAll(descriptor, scratch.data(), bytes, filename_);
+          out.write(scratch.data(), bytes); done += bytes;
+        }
+      }
+      catch(...)
+      {
+        ::close(descriptor); throw;
+      }
+      if(::close(descriptor) != 0)
+      {
+        throw eventError("cannot close final component spool", filename_);
+      }
+      TempFile::remove(filename_);
+    }
+    if(!out) { throw eventError("cannot write ordered final component"); }
+    std::vector<char>().swap(buffer_); this->setp(nullptr, nullptr);
+  }
+
+protected:
+  std::streamsize xsputn(const char* data, std::streamsize count) override
+  {
+    std::streamsize written = 0;
+    while(written < count)
+    {
+      if(this->pptr() == this->epptr()) { this->flushBuffer(); }
+      std::streamsize bytes = std::min(count - written,
+        this->epptr() - this->pptr());
+      std::memcpy(this->pptr(), data + written, bytes);
+      this->pbump(static_cast<int>(bytes)); written += bytes;
+    }
+    return written;
+  }
+
+  int_type overflow(int_type value) override
+  {
+    this->flushBuffer();
+    if(!traits_type::eq_int_type(value, traits_type::eof()))
+    {
+      *this->pptr() = traits_type::to_char_type(value); this->pbump(1);
+    }
+    return traits_type::not_eof(value);
+  }
+
+  // flush() must not force an otherwise in-memory component onto disk.
+  int sync() override { return 0; }
+
+private:
+  std::vector<char> buffer_;
+  std::string filename_;
+  int descriptor_;
+  size_type file_bytes_;
+  const std::atomic<bool>& cancelled_;
+
+  void flushBuffer()
+  {
+    if(cancelled_.load())
+    {
+      throw eventError("final component encoding cancelled", filename_);
+    }
+    size_type bytes = this->pptr() - this->pbase();
+    if(bytes == 0) { return; }
+    if(file_bytes_ > std::numeric_limits<size_type>::max() - bytes)
+    {
+      throw eventError("final component spool size overflows", filename_);
+    }
+    if(descriptor_ < 0)
+    {
+      filename_ = TempFile::getName("gcsa_final_component");
+      descriptor_ = ::open(filename_.c_str(),
+        O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      if(descriptor_ < 0)
+      {
+        throw eventError("cannot create final component spool", filename_);
+      }
+      adviseSequential(descriptor_);
+    }
+    writeAll(descriptor_, this->pbase(), bytes, filename_);
+    file_bytes_ += bytes; this->pbump(-static_cast<int>(bytes));
+  }
+};
+
+size_type
+finalComponentDescriptorWorkers(size_type descriptors_per_worker)
+{
+  size_type limit = externalMaxOpenFiles();
+  struct rlimit process_limit;
+  if(::getrlimit(RLIMIT_NOFILE, &process_limit) == 0 &&
+     process_limit.rlim_cur != RLIM_INFINITY)
+  {
+    limit = std::min(limit, static_cast<size_type>(process_limit.rlim_cur));
+  }
+  size_type open = 0;
+  for(size_type descriptor = 0; descriptor < limit; descriptor++)
+  {
+    errno = 0;
+    if(::fcntl(static_cast<int>(descriptor), F_GETFD) >= 0 || errno != EBADF)
+    {
+      open++;
+    }
+  }
+  // The coordinator appends spools only after all encoder descriptors close.
+  if(descriptors_per_worker == 0 || open >= limit)
+  {
+    return 0;
+  }
+  return (limit - open) / descriptors_per_worker;
+}
+
+template<class Encoder>
 void
-storeFinalComponents(const GCSAHeader& header,
+writeFinalComponents(std::ostream& out, const FinalEventMetadata& metadata,
+  const ConstructionParameters& parameters, const std::vector<size_type>& costs,
+  size_type available_threads, const Encoder& encode)
+{
+  const size_type tasks = costs.size();
+  size_type workers = std::min(tasks,
+    available_threads > 1 ? available_threads - 1 : 0);
+  // The edge component may open all sigma event streams; a spilling encoder
+  // owns one more descriptor.
+  workers = std::min(workers,
+    finalComponentDescriptorWorkers(metadata.sigma + 1));
+
+  const size_type goal = parameters.getMemoryLimitBytes();
+  const size_type spool_bytes = std::min<size_type>(MEGABYTE,
+    goal / (16 * (tasks + 1)));
+  const size_type spool_reservation = spool_bytes * (tasks + 1);
+  const size_type worker_budget = goal - spool_reservation;
+  workers = std::min(workers, worker_budget / (64 * KILOBYTE));
+  if(spool_bytes < 16 || workers < 2)
+  {
+    for(size_type task = 0; task < tasks; task++)
+    {
+      encode(task, out, parameters);
+    }
+    return;
+  }
+
+  ConstructionParameters local = parameters;
+  local.setMemoryLimitBytes(worker_budget / workers);
+  std::vector<size_type> order(tasks);
+  for(size_type task = 0; task < tasks; task++) { order[task] = task; }
+  std::stable_sort(order.begin(), order.end(), [&](size_type left, size_type right)
+  {
+    return costs[left] > costs[right];
+  });
+
+  std::atomic<bool> failed(false);
+  std::vector<std::unique_ptr<FinalComponentSpool>> spools;
+  spools.reserve(tasks);
+  for(size_type task = 0; task < tasks; task++)
+  {
+    spools.emplace_back(new FinalComponentSpool(spool_bytes, failed));
+  }
+  std::vector<char> scratch(spool_bytes);
+  std::atomic<size_type> next(0);
+  std::exception_ptr first_error;
+  std::mutex error_mutex;
+  std::vector<std::thread> pool;
+  pool.reserve(workers);
+  const auto cancel = [&](std::exception_ptr error)
+  {
+    std::lock_guard<std::mutex> lock(error_mutex);
+    if(!first_error) { first_error = error; }
+    failed.store(true);
+  };
+  const auto join = [&]()
+  {
+    for(std::thread& worker : pool)
+    {
+      if(worker.joinable()) { worker.join(); }
+    }
+  };
+
+  try
+  {
+    for(size_type worker = 0; worker < workers; worker++)
+    {
+      pool.emplace_back([&]()
+      {
+        try
+        {
+          while(!failed.load())
+          {
+            size_type position = next.fetch_add(1);
+            if(position >= tasks) { break; }
+            size_type task = order[position];
+            std::ostream stream(spools[task].get());
+            stream.exceptions(std::ios::badbit | std::ios::failbit);
+            encode(task, stream, local);
+            stream.flush(); spools[task]->finish();
+          }
+        }
+        catch(...) { cancel(std::current_exception()); }
+      });
+    }
+    // Spools remove output-order backpressure, so every encoder can finish
+    // before the coordinator appends the completed components in wire order.
+    join();
+    if(first_error) { std::rethrow_exception(first_error); }
+    for(size_type task = 0; task < tasks; task++)
+    {
+      spools[task]->appendTo(out, scratch); spools[task].reset();
+    }
+  }
+  catch(...)
+  {
+    cancel(std::current_exception()); join();
+    std::rethrow_exception(first_error);
+  }
+}
+
+size_type
+saturatedProduct(size_type left, size_type right)
+{
+  if(right != 0 && left > std::numeric_limits<size_type>::max() / right)
+  {
+    return std::numeric_limits<size_type>::max();
+  }
+  return left * right;
+}
+
+size_type
+saturatedSum(size_type left, size_type right)
+{
+  if(left > std::numeric_limits<size_type>::max() - right)
+  {
+    return std::numeric_limits<size_type>::max();
+  }
+  return left + right;
+}
+
+} // namespace
+
+void
+storeFinalComponentsConcurrent(const GCSAHeader& header,
+
   const Alphabet& source_alphabet, const FinalEventFiles& files,
   const FinalEventMetadata& metadata,
-  const ConstructionParameters& parameters, const std::string& filename)
+  const ConstructionParameters& parameters, const std::string& filename,
+  size_type available_threads)
 {
   validateMetadata(metadata); validatePayloads(files, metadata);
   if(!header.check() || header.path_nodes != metadata.paths ||
@@ -1919,10 +2215,22 @@ storeFinalComponents(const GCSAHeader& header,
       }
       if(!out) { throw eventError("cannot encode final component", partial); }
     };
-    for(size_type task = 0; task < component_tasks; task++)
+    std::vector<size_type> costs(component_tasks, 0);
+    for(size_type comp = 0; comp < metadata.sigma; comp++)
     {
-      encode(task, out, parameters);
+      if(comp > 0 && comp <= metadata.fast_chars)
+      {
+        costs[comp] = metadata.paths;
+      }
+      else { costs[metadata.sigma + 1 + comp] = metadata.paths; }
     }
+    costs[2 * metadata.sigma + 2] = saturatedProduct(metadata.total_edges, 8);
+    costs[2 * metadata.sigma + 3] = saturatedProduct(
+      saturatedSum(metadata.sampled_paths, metadata.sample_ids), 8);
+    costs[2 * metadata.sigma + 4] = saturatedProduct(metadata.occurrence_items, 16);
+    costs[2 * metadata.sigma + 5] = saturatedProduct(metadata.redundant, 8);
+    writeFinalComponents(out, metadata, parameters, costs,
+      available_threads, encode);
 
     out.flush();
     out.close();
@@ -1958,6 +2266,16 @@ storeFinalComponents(const GCSAHeader& header,
     ::unlink(partial.c_str());
     throw;
   }
+}
+
+void
+storeFinalComponents(const GCSAHeader& header,
+  const Alphabet& source_alphabet, const FinalEventFiles& files,
+  const FinalEventMetadata& metadata,
+  const ConstructionParameters& parameters, const std::string& filename)
+{
+  storeFinalComponentsConcurrent(header, source_alphabet, files, metadata,
+    parameters, filename, 1);
 }
 
 } // namespace gcsa

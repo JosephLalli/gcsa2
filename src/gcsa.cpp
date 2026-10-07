@@ -7,6 +7,7 @@
 #include <gcsa/internal.h>
 #include <gcsa/lcp.h>
 #include <gcsa/path_graph.h>
+#include "final_events_internal.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -1152,8 +1153,8 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     this->header.edges = event_metadata.total_edges;
     if(direct_output != nullptr)
     {
-      storeFinalComponents(this->header, graph.alpha, event_files,
-        event_metadata, parameters, *direct_output);
+      storeFinalComponentsConcurrent(this->header, graph.alpha, event_files,
+        event_metadata, parameters, *direct_output, requested_threads);
     }
     else
     {
