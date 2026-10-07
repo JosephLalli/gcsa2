@@ -43,6 +43,8 @@ class ExternalFixedRecordSorter
 {
 public:
   typedef std::function<int(const void*, const void*)> Comparator;
+  // ASCENDING_U64 is an eight-byte little-endian unsigned order.
+  enum class RecordOrder { COMPARATOR, ASCENDING_U64 };
 
   /*
     The reducer is called once for each sorted input record. first_in_group and
@@ -55,10 +57,14 @@ public:
 
   static size_type minimumBudget(size_type record_bytes);
 
+  // Callers may set total_order only when comparator equality implies
+  // byte-identical records. Run formation can then reorder the records
+  // directly instead of preserving equal-record input order through offsets.
   // Sort fixed-width binary records from input_name into output_name.
   static void sort(const std::string& input_name, const std::string& output_name,
     size_type record_bytes, size_type byte_budget, size_type requested_fan_in,
-    const Comparator& compare, ExternalFixedRecordSortStats* stats = nullptr);
+    const Comparator& compare, ExternalFixedRecordSortStats* stats = nullptr,
+    bool total_order = false, RecordOrder order = RecordOrder::COMPARATOR);
 
   // Sort and consume equal-key groups while writing output_name. The reducer,
   // not this class, defines the resulting output record format.
@@ -66,7 +72,8 @@ public:
     const std::string& output_name, size_type record_bytes,
     size_type byte_budget, size_type requested_fan_in,
     const Comparator& compare, const Reducer& reducer,
-    ExternalFixedRecordSortStats* stats = nullptr);
+    ExternalFixedRecordSortStats* stats = nullptr, bool total_order = false,
+    RecordOrder order = RecordOrder::COMPARATOR);
 };
 
 } // namespace gcsa
