@@ -754,11 +754,8 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
 
       PathLabel first, last;
       size_type stack_size = 0;
-      ProgressReporter scan_progress("final event scan",
-        merged_graph.size(), "paths");
       for(size_type i = 0; i < merged_graph.size(); i++, reader[0].advance())
       {
-        scan_progress.advance();
         // Close any predecessor spill reader retained by the preceding path
         // before current-set collection can invoke the external sorter.
         pred_from.clear();
@@ -913,7 +910,6 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
       }
       for(MergedGraphReader& current : reader) { current.close(); }
       lcp_array.close();
-      scan_progress.finish();
       previous.flush(false); stack.flush(false);
       metadata = output.finish();
     }
@@ -945,7 +941,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
 
 void
 GCSA::buildAndStore(InputGraph& graph, const ConstructionParameters& parameters,
-  const std::string& filename)
+  const std::string& gcsa_filename, const std::string& lcp_filename)
 {
   if(!parameters.externalMemory())
   {
@@ -957,18 +953,9 @@ GCSA::buildAndStore(InputGraph& graph, const ConstructionParameters& parameters,
   if(graph.size() == 0)
   {
     GCSA empty;
-    storeEmptyIndexAtomically(empty, filename);
-    return;
+    storeEmptyIndexAtomically(empty, gcsa_filename);
   }
-  GCSA builder(graph, parameters, &filename, requested_threads);
-}
-
-void
-GCSA::buildAndStore(InputGraph& graph, const ConstructionParameters& parameters,
-  const std::string& gcsa_filename, const std::string& lcp_filename)
-{
-  GCSA::buildAndStore(graph, parameters, gcsa_filename);
-  SerialExternalConstruction serial_construction;
+  else { GCSA builder(graph, parameters, &gcsa_filename, requested_threads); }
   LCPArray::buildAndStore(graph, parameters, lcp_filename);
 }
 
@@ -1080,7 +1067,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     size_type prune_buffer = pathMergeInputBudget(parameters);
     const double prune_start = readTimer();
     path_graph.prune(lcp, path_graph.remainingLimit(parameters.getLimitBytes()),
-      prune_buffer, nullptr, externalMaxOpenFiles());
+      prune_buffer, externalMaxOpenFiles());
     const double prune_stop = readTimer();
     if(Verbosity::level >= Verbosity::BASIC)
     {
@@ -1122,7 +1109,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   size_type merge_buffer = pathMergeInputBudget(parameters);
   MergedGraph merged_graph(path_graph, mapper, lcp,
     path_graph.remainingLimit(parameters.getLimitBytes()), merge_buffer,
-    nullptr, externalMaxOpenFiles());
+    externalMaxOpenFiles());
   this->header.path_nodes = merged_graph.size();
   this->header.order = merged_graph.k();
   path_graph.clear();
