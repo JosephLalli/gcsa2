@@ -420,7 +420,6 @@ int main()
   }
   metadata.fast_chars = alphabet.fast_chars;
   sortFinalRedundancy(files, parameters);
-  writeFinalEventMetadata(files, metadata);
 
   GCSA observed = buildViaStore(alphabet, files, metadata,
     parameters, 4, 6, 8);

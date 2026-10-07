@@ -17,9 +17,8 @@ scanKeys(const std::string& name, size_type expected_records,
   size_type buffer_bytes, const Callback& callback)
 {
   if(buffer_bytes < sizeof(key_type)) { buffer_bytes = sizeof(key_type); }
-  // Clamp to the records that exist. expected_records is already in hand and is
-  // validated against below, so a 64 MiB buffer_bytes was value-initialising
-  // 64 MiB twice per DeBruijnGraph for a stream that may hold far less.
+  // Clamp to the records that exist. expected_records is validated below, so
+  // the scan need not allocate unused buffer capacity for a short stream.
   size_type records_per_block = std::max(static_cast<size_type>(1),
     std::min(buffer_bytes / sizeof(key_type),
       std::max(static_cast<size_type>(1), expected_records)));
