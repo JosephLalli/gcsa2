@@ -562,24 +562,11 @@ sortToRun(const std::string& input_name, const SortPlan& plan,
     // addRun() can synchronously merge a full level, so release both the raw
     // run and its offset permutation before it is allowed to allocate merge
     // readers/output buffers. Reallocation for the next run is intentional.
-    // RETIRED, NOT REMOVED: allocating at the planned capacity.
-    //
-    // count was computed one line after the allocation that should have used
-    // it, so a run sized for the memory limit rather than for the input was
-    // fully value-initialised regardless of how few records existed. With
-    // --gcsa-sort-run-size 23G the plan plans 1,350,560,518 records while the
-    // chr21 redundancy stream holds 563,772,793, so 12.589 GB was memset and
-    // never read, on the phase whose page cache then collapsed from 12.67 to
-    // 1.00 GiB. Sizing to count changes no run boundary and no output byte:
-    // count itself is unchanged.
-    //
-    // Set SORT_RUNS_AT_PLANNED_CAPACITY to true to restore the old sizing.
-    constexpr bool SORT_RUNS_AT_PLANNED_CAPACITY = false;
+    // The plan sets an upper bound. The final run owns only the records that
+    // remain, avoiding allocation and initialization of unused capacity.
     size_type count = std::min(remaining, plan.run_records);
-    size_type buffer_records = (SORT_RUNS_AT_PLANNED_CAPACITY ?
-      plan.run_records : count);
-    std::vector<std::uint8_t> records(buffer_records * plan.record_bytes);
-    std::vector<size_type> order(plan.total_order ? 0 : buffer_records);
+    std::vector<std::uint8_t> records(count * plan.record_bytes);
+    std::vector<size_type> order(plan.total_order ? 0 : count);
     input.read(reinterpret_cast<char*>(records.data()), count * plan.record_bytes);
     if(input.gcount() != static_cast<std::streamsize>(count * plan.record_bytes))
     {
@@ -589,12 +576,13 @@ sortToRun(const std::string& input_name, const SortPlan& plan,
     input_bytes += checkedByteOffset(count, plan.record_bytes);
     trimReadCache(input_cache.value, input_bytes, input_cache_released,
       count == remaining);
+
     std::string run;
     if(plan.total_order)
     {
       sortRecordsInPlace(records.data(), count, plan, compare);
-      updateStats(stats, buffer_records,
-        FIXED_BYTES + buffer_records * plan.record_bytes + plan.run_output_bytes);
+      updateStats(stats, count,
+        FIXED_BYTES + count * plan.record_bytes + plan.run_output_bytes);
       run = writeSortedRun(records.data(), count, plan, makeRunName());
     }
     else
@@ -607,11 +595,12 @@ sortToRun(const std::string& input_name, const SortPlan& plan,
             records.data() + right * plan.record_bytes);
           return (result != 0 ? result < 0 : left < right);
         });
-      updateStats(stats, buffer_records,
-        FIXED_BYTES + buffer_records * (plan.record_bytes + sizeof(size_type)) +
+      updateStats(stats, count,
+        FIXED_BYTES + count * (plan.record_bytes + sizeof(size_type)) +
         plan.run_output_bytes);
       run = writeSortedRun(records.data(), order, count, plan, makeRunName());
     }
+
     if(stats != nullptr) { stats->runs++; }
     std::vector<std::uint8_t>().swap(records);
     std::vector<size_type>().swap(order);

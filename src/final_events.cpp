@@ -30,9 +30,6 @@ namespace gcsa
 namespace
 {
 
-constexpr char EVENT_MAGIC[8] = { 'G', 'C', 'S', 'A', 'E', 'V', '1', '\0' };
-constexpr std::uint64_t EVENT_VERSION = 1;
-constexpr size_type EVENT_METADATA_WORDS = 11 + FinalEventMetadata::MAX_SIGMA;
 constexpr off_t CACHE_FLUSH_BYTES = 512 * 1024 * 1024;
 constexpr off_t CACHE_TAIL_BYTES = 64 * 1024 * 1024;
 
@@ -923,7 +920,6 @@ validatePayloads(const FinalEventFiles& files, const FinalEventMetadata& metadat
   {
     throw eventError("edge stream count does not match alphabet");
   }
-  requireFileSize(files.metadata, 8 + EVENT_METADATA_WORDS * 8, 1);
   requireFileSize(files.bwt_masks, metadata.paths, 1);
   for(size_type comp = 0; comp < metadata.sigma; comp++)
   {
@@ -1044,13 +1040,9 @@ struct SpillableNodeSet::Impl
     // after this vector has released its storage.
     this->collection_capacity = std::max(static_cast<size_type>(1),
       this->budget / (2 * sizeof(node_type)));
-    // collection_capacity is the spill threshold, not a size hint. Reserving it
-    // eagerly touched 32 MiB per set for a measured peak of 20,188 nodes
-    // (161,504 bytes, 0.24% of one set's reservation) on chr21, and neither set
-    // ever spilled. push_back grows geometrically to the same ceiling and
-    // touches only what is used. The budget reservation above is kept: it is an
-    // admission number that stops other phases overcommitting, and dropping it
-    // would make the budget dishonest rather than smaller.
+    // collection_capacity is a spill threshold, not a size hint. Let the
+    // vector grow to actual demand while retaining the full admission
+    // reservation for a possible sorter phase.
   }
 
   ~Impl()
@@ -1515,50 +1507,19 @@ serializeRedundantPointers(std::ostream& out, const std::string& redundancy_file
 }
 
 FinalEventFiles::FinalEventFiles(size_type sigma) :
-  metadata(TempFile::getName("gcsa_final_event_meta")),
   bwt_masks(TempFile::getName("gcsa_final_bwt_masks")),
   edge_destinations(),
   sample_positions(TempFile::getName("gcsa_final_sample_paths")),
   sample_ids(TempFile::getName("gcsa_final_sample_ids")),
   sample_ends(TempFile::getName("gcsa_final_sample_ends")),
   occurrences(TempFile::getName("gcsa_final_occurrences")),
-  redundant(TempFile::getName("gcsa_final_redundant")), delete_files(true)
+  redundant(TempFile::getName("gcsa_final_redundant"))
 {
   edge_destinations.reserve(sigma);
   for(size_type comp = 0; comp < sigma; comp++)
   {
     edge_destinations.push_back(TempFile::getName("gcsa_final_edges"));
   }
-}
-
-FinalEventFiles::FinalEventFiles(FinalEventFiles&& source) :
-  metadata(std::move(source.metadata)), bwt_masks(std::move(source.bwt_masks)),
-  edge_destinations(std::move(source.edge_destinations)),
-  sample_positions(std::move(source.sample_positions)),
-  sample_ids(std::move(source.sample_ids)), sample_ends(std::move(source.sample_ends)),
-  occurrences(std::move(source.occurrences)), redundant(std::move(source.redundant)),
-  delete_files(source.delete_files)
-{
-  source.delete_files = false;
-}
-
-FinalEventFiles&
-FinalEventFiles::operator=(FinalEventFiles&& source)
-{
-  if(this != &source)
-  {
-    this->clear();
-    this->metadata = std::move(source.metadata);
-    this->bwt_masks = std::move(source.bwt_masks);
-    this->edge_destinations = std::move(source.edge_destinations);
-    this->sample_positions = std::move(source.sample_positions);
-    this->sample_ids = std::move(source.sample_ids);
-    this->sample_ends = std::move(source.sample_ends);
-    this->occurrences = std::move(source.occurrences);
-    this->redundant = std::move(source.redundant);
-    this->delete_files = source.delete_files; source.delete_files = false;
-  }
-  return *this;
 }
 
 FinalEventFiles::~FinalEventFiles()
@@ -1569,17 +1530,14 @@ FinalEventFiles::~FinalEventFiles()
 void
 FinalEventFiles::clear()
 {
-  if(this->delete_files)
-  {
-    TempFile::remove(this->metadata); TempFile::remove(this->bwt_masks);
-    for(std::string& path : this->edge_destinations) { TempFile::remove(path); }
-    TempFile::remove(this->sample_positions); TempFile::remove(this->sample_ids);
-    TempFile::remove(this->sample_ends); TempFile::remove(this->occurrences);
-    TempFile::remove(this->redundant);
-  }
-  this->metadata.clear(); this->bwt_masks.clear(); this->edge_destinations.clear();
+  TempFile::remove(this->bwt_masks);
+  for(std::string& path : this->edge_destinations) { TempFile::remove(path); }
+  TempFile::remove(this->sample_positions); TempFile::remove(this->sample_ids);
+  TempFile::remove(this->sample_ends); TempFile::remove(this->occurrences);
+  TempFile::remove(this->redundant);
+  this->bwt_masks.clear(); this->edge_destinations.clear();
   this->sample_positions.clear(); this->sample_ids.clear(); this->sample_ends.clear();
-  this->occurrences.clear(); this->redundant.clear(); this->delete_files = false;
+  this->occurrences.clear(); this->redundant.clear();
 }
 
 struct FinalEventWriter::Impl
@@ -1721,8 +1679,7 @@ FinalEventWriter::finish()
 
 void
 sortFinalRedundancy(FinalEventFiles& files,
-  const ConstructionParameters& parameters,
-  ExternalFixedRecordSortStats* stats)
+  const ConstructionParameters& parameters)
 {
   std::string sorted = TempFile::getName("gcsa_final_redundant_sorted");
   try
@@ -1738,7 +1695,7 @@ sortFinalRedundancy(FinalEventFiles& files,
     size_type fan_in = std::min(externalMergeFanIn(),
       (externalMaxOpenFiles() - sorter_descriptors) / 2);
     ExternalFixedRecordSorter::sort(files.redundant, sorted, 8, budget,
-      fan_in, compareEncoded64, stats, true,
+      fan_in, compareEncoded64, nullptr, true,
       ExternalFixedRecordSorter::RecordOrder::ASCENDING_U64);
     TempFile::remove(files.redundant); files.redundant = sorted;
   }
@@ -1746,86 +1703,6 @@ sortFinalRedundancy(FinalEventFiles& files,
   {
     TempFile::remove(sorted); throw;
   }
-}
-
-void
-writeFinalEventMetadata(const FinalEventFiles& files,
-  const FinalEventMetadata& metadata)
-{
-  validateMetadata(metadata);
-  std::vector<std::uint8_t> bytes(8 + EVENT_METADATA_WORDS * 8, 0);
-  std::memcpy(bytes.data(), EVENT_MAGIC, 8);
-  size_type word = 0;
-  const auto append = [&bytes, &word](size_type value)
-  {
-    put64(bytes.data() + 8 + 8 * word, value); word++;
-  };
-  append(EVENT_VERSION); append(metadata.paths); append(metadata.sigma);
-  append(metadata.fast_chars); append(metadata.total_edges);
-  append(metadata.sampled_paths); append(metadata.sample_ids);
-  append(metadata.sample_bits); append(metadata.occurrence_items);
-  append(metadata.occurrence_extra); append(metadata.redundant);
-  for(size_type comp = 0; comp < FinalEventMetadata::MAX_SIGMA; comp++)
-  {
-    append(metadata.bwt_counts[comp]);
-  }
-  if(word != EVENT_METADATA_WORDS) { throw eventError("internal metadata width mismatch"); }
-
-  int descriptor = ::open(files.metadata.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if(descriptor < 0) { throw eventError("cannot create metadata", files.metadata); }
-  try
-  {
-    writeAll(descriptor, bytes.data(), bytes.size(), files.metadata);
-    if(::fdatasync(descriptor) != 0) { throw eventError("metadata fdatasync failed", files.metadata); }
-    if(::close(descriptor) != 0) { descriptor = -1; throw eventError("metadata close failed", files.metadata); }
-    descriptor = -1;
-  }
-  catch(...)
-  {
-    if(descriptor >= 0) { ::close(descriptor); }
-    throw;
-  }
-}
-
-FinalEventMetadata
-readFinalEventMetadata(const FinalEventFiles& files)
-{
-  requireFileSize(files.metadata, 8 + EVENT_METADATA_WORDS * 8, 1);
-  std::vector<std::uint8_t> bytes(8 + EVENT_METADATA_WORDS * 8, 0);
-  int descriptor = ::open(files.metadata.c_str(), O_RDONLY);
-  if(descriptor < 0) { throw eventError("cannot open metadata", files.metadata); }
-  try
-  {
-    readAll(descriptor, bytes.data(), bytes.size(), files.metadata);
-    if(::close(descriptor) != 0) { descriptor = -1; throw eventError("metadata close failed", files.metadata); }
-    descriptor = -1;
-  }
-  catch(...)
-  {
-    if(descriptor >= 0) { ::close(descriptor); }
-    throw;
-  }
-  if(std::memcmp(bytes.data(), EVENT_MAGIC, 8) != 0)
-  {
-    throw eventError("invalid metadata magic", files.metadata);
-  }
-  size_type word = 0;
-  const auto next = [&bytes, &word]() -> size_type
-  {
-    return static_cast<size_type>(get64(bytes.data() + 8 + 8 * word++));
-  };
-  if(next() != EVENT_VERSION) { throw eventError("unsupported metadata version", files.metadata); }
-  FinalEventMetadata metadata;
-  metadata.paths = next(); metadata.sigma = next(); metadata.fast_chars = next();
-  metadata.total_edges = next(); metadata.sampled_paths = next();
-  metadata.sample_ids = next(); metadata.sample_bits = next();
-  metadata.occurrence_items = next(); metadata.occurrence_extra = next();
-  metadata.redundant = next();
-  for(size_type comp = 0; comp < FinalEventMetadata::MAX_SIGMA; comp++)
-  {
-    metadata.bwt_counts[comp] = next();
-  }
-  validateMetadata(metadata); return metadata;
 }
 
 void

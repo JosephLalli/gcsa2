@@ -215,7 +215,6 @@ size_type writeVolume();  // Only for GCSA construction.
 // P, optionally followed by B or iB). Throws std::invalid_argument or
 // std::out_of_range rather than silently wrapping.
 size_type parseBytes(const std::string& value);
-std::string formatBytes(size_type bytes);
 
 //------------------------------------------------------------------------------
 

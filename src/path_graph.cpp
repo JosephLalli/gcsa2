@@ -1457,12 +1457,10 @@ struct SpillableGroup
   size_type            byte_limit, write_bytes, read_bytes, advised_write;
   mutable size_type    cache_offset;
   mutable std::vector<Element> read_cache;
-  size_type*           spill_counter;
 
-  SpillableGroup(size_type limit, size_type* counter = nullptr) : file(-1), elements(0), disk_elements(0), offset(0), file_begin(0),
+  explicit SpillableGroup(size_type limit) : file(-1), elements(0), disk_elements(0), offset(0), file_begin(0),
     byte_limit(std::max(2 * static_cast<size_type>(sizeof(Element)), limit)),
-    write_bytes(this->byte_limit / 2), read_bytes(this->byte_limit - this->write_bytes), advised_write(0), cache_offset(0),
-    spill_counter(counter)
+    write_bytes(this->byte_limit / 2), read_bytes(this->byte_limit - this->write_bytes), advised_write(0), cache_offset(0)
   {
     this->memory.reserve(this->byte_limit / sizeof(Element));
   }
@@ -1485,7 +1483,6 @@ struct SpillableGroup
 #if defined(POSIX_FADV_SEQUENTIAL)
       static_cast<void>(::posix_fadvise(this->file, 0, 0, POSIX_FADV_SEQUENTIAL));
 #endif
-      if(this->spill_counter != nullptr) { (*this->spill_counter)++; }
       // The merger may have already discarded many small label ranges before
       // the first oversized range appears. Spill indexes are absolute merger
       // positions, while the new file starts at the current live window.
@@ -1695,14 +1692,13 @@ struct SpillableDeque
   mutable std::vector<record_type> read_cache;
   bool                 replaced_front;
   Element              front_value;
-  size_type*           spill_counter;
 
-  SpillableDeque(size_type byte_limit, size_type* counter = nullptr) :
+  explicit SpillableDeque(size_type byte_limit) :
     file(-1), begin_index(0), end_index(0), disk_end(0),
     resident_records(std::max(static_cast<size_type>(2), byte_limit / sizeof(record_type))),
     write_records(std::max(static_cast<size_type>(1), this->resident_records / 2)),
     read_records(std::max(static_cast<size_type>(1), this->resident_records - this->write_records)),
-    cache_offset(0), replaced_front(false), front_value(), spill_counter(counter)
+    cache_offset(0), replaced_front(false), front_value()
   {
     this->memory.reserve(this->resident_records);
   }
@@ -1813,7 +1809,6 @@ private:
 #if defined(POSIX_FADV_SEQUENTIAL)
     static_cast<void>(::posix_fadvise(this->file, 0, 0, POSIX_FADV_SEQUENTIAL));
 #endif
-    if(this->spill_counter != nullptr) { (*this->spill_counter)++; }
   }
 
   void flush()

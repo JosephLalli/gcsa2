@@ -330,13 +330,6 @@ ExternalInputPreprocessor::prepare()
 }
 
 size_type
-ExternalInputPreprocessor::keyCount() const
-{
-  const_cast<ExternalInputPreprocessor*>(this)->prepare();
-  return this->key_count_;
-}
-
-size_type
 ExternalInputPreprocessor::startNodeCount() const
 {
   const_cast<ExternalInputPreprocessor*>(this)->prepare();
