@@ -1847,7 +1847,8 @@ private:
 };
 
 size_type
-finalComponentDescriptorWorkers(size_type descriptors_per_worker)
+finalComponentDescriptorWorkers(size_type descriptors_per_worker,
+  size_type reserved_descriptors)
 {
   size_type limit = externalMaxOpenFiles();
   struct rlimit process_limit;
@@ -1866,18 +1867,22 @@ finalComponentDescriptorWorkers(size_type descriptors_per_worker)
     }
   }
   // The coordinator appends spools only after all encoder descriptors close.
-  if(descriptors_per_worker == 0 || open >= limit)
+  // reserved_descriptors covers a concurrent phase whose descriptors may not
+  // all be open during this snapshot.
+  if(descriptors_per_worker == 0 || open >= limit ||
+     reserved_descriptors >= limit - open)
   {
     return 0;
   }
-  return (limit - open) / descriptors_per_worker;
+  return (limit - open - reserved_descriptors) / descriptors_per_worker;
 }
 
 template<class Encoder>
 void
 writeFinalComponents(std::ostream& out, const FinalEventMetadata& metadata,
   const ConstructionParameters& parameters, const std::vector<size_type>& costs,
-  size_type available_threads, const Encoder& encode)
+  size_type available_threads, size_type reserved_descriptors,
+  const Encoder& encode)
 {
   const size_type tasks = costs.size();
   size_type workers = std::min(tasks,
@@ -1885,7 +1890,7 @@ writeFinalComponents(std::ostream& out, const FinalEventMetadata& metadata,
   // The edge component may open all sigma event streams; a spilling encoder
   // owns one more descriptor.
   workers = std::min(workers,
-    finalComponentDescriptorWorkers(metadata.sigma + 1));
+    finalComponentDescriptorWorkers(metadata.sigma + 1, reserved_descriptors));
 
   const size_type goal = parameters.getMemoryLimitBytes();
   const size_type spool_bytes = std::min<size_type>(MEGABYTE,
@@ -2004,7 +2009,7 @@ storeFinalComponentsConcurrent(const GCSAHeader& header,
   const Alphabet& source_alphabet, const FinalEventFiles& files,
   const FinalEventMetadata& metadata,
   const ConstructionParameters& parameters, const std::string& filename,
-  size_type available_threads)
+  size_type available_threads, size_type reserved_descriptors)
 {
   validateMetadata(metadata); validatePayloads(files, metadata);
   if(!header.check() || header.path_nodes != metadata.paths ||
@@ -2230,7 +2235,7 @@ storeFinalComponentsConcurrent(const GCSAHeader& header,
     costs[2 * metadata.sigma + 4] = saturatedProduct(metadata.occurrence_items, 16);
     costs[2 * metadata.sigma + 5] = saturatedProduct(metadata.redundant, 8);
     writeFinalComponents(out, metadata, parameters, costs,
-      available_threads, encode);
+      available_threads, reserved_descriptors, encode);
 
     out.flush();
     out.close();
@@ -2275,7 +2280,7 @@ storeFinalComponents(const GCSAHeader& header,
   const ConstructionParameters& parameters, const std::string& filename)
 {
   storeFinalComponentsConcurrent(header, source_alphabet, files, metadata,
-    parameters, filename, 1);
+    parameters, filename, 1, 0);
 }
 
 } // namespace gcsa

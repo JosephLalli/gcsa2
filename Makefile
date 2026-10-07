@@ -53,7 +53,7 @@ LIBRARY=$(BUILD_LIB)/libgcsa2.a
 PROGRAMS=$(addprefix $(BUILD_BIN)/,build_gcsa convert_graph gcsa_format try_extend)
 OBSOLETE=build_gcsa convert_graph gcsa_format try_extend
 
-.PHONY: all clean directories test external-path-sort-test external-join-test external-sort-test external-preprocessing-test final-events-test disk-array-test internal-buffer-test parameter-test path-graph-prune-test
+.PHONY: all clean directories test external-path-sort-test external-join-test external-sort-test external-preprocessing-test final-events-test disk-array-test internal-buffer-test parameter-test path-graph-prune-test lcp-overlap-test
 all: directories $(LIBRARY) $(PROGRAMS)
 
 directories: $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)
@@ -143,7 +143,14 @@ path-graph-prune-test: directories $(BUILD_OBJ)/test_path_graph_prune.o $(LIBRAR
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_path_graph_prune $(BUILD_OBJ)/test_path_graph_prune.o $(LIBRARY) $(LIBS)
 	$(BUILD_BIN)/test_path_graph_prune
 
-test: external-path-sort-test external-join-test external-sort-test external-preprocessing-test final-events-test disk-array-test internal-buffer-test parameter-test path-graph-prune-test
+$(BUILD_OBJ)/test_lcp_overlap.o:tests/test_lcp_overlap.cpp include/gcsa/algorithms.h include/gcsa/gcsa.h include/gcsa/lcp.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+lcp-overlap-test: directories $(BUILD_OBJ)/test_lcp_overlap.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_lcp_overlap $(BUILD_OBJ)/test_lcp_overlap.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_lcp_overlap
+
+test: external-path-sort-test external-join-test external-sort-test external-preprocessing-test final-events-test disk-array-test internal-buffer-test parameter-test path-graph-prune-test lcp-overlap-test
 
 clean:
 	rm -rf $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)

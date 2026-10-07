@@ -10,7 +10,9 @@
 #include "final_events_internal.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <filesystem>
 #include <fcntl.h>
@@ -19,9 +21,12 @@
 #include <memory>
 #include <random>
 #include <sstream>
+#include <system_error>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 #include <unordered_set>
+#include <utility>
 
 namespace gcsa
 {
@@ -72,9 +77,120 @@ public:
     omp_set_num_threads(this->thread_count);
   }
 
+  int threads() const { return this->thread_count; }
+
 private:
   int thread_count;
 };
+
+std::atomic<size_type> lcp_stage_counter(0);
+
+class ConcurrentLCPBuild
+{
+public:
+  ConcurrentLCPBuild() : started_(false) { }
+  ConcurrentLCPBuild(const ConcurrentLCPBuild&) = delete;
+  ConcurrentLCPBuild& operator=(const ConcurrentLCPBuild&) = delete;
+
+  ~ConcurrentLCPBuild()
+  {
+    if(this->worker.joinable()) { this->worker.join(); }
+    if(!(this->staged.empty())) { ::unlink(this->staged.c_str()); }
+  }
+
+  template<class Builder>
+  bool start(const std::string& target, Builder builder)
+  {
+    this->target = target;
+    this->staged = target + "." +
+      std::to_string(static_cast<unsigned long long>(::getpid())) + "." +
+      std::to_string(lcp_stage_counter.fetch_add(1)) + ".staged";
+    try
+    {
+      this->worker = std::thread([this, builder = std::move(builder)]()
+      {
+        try { builder(this->staged); }
+        catch(...) { this->failure = std::current_exception(); }
+      });
+      this->started_ = true;
+      return true;
+    }
+    catch(const std::system_error&)
+    {
+      this->target.clear(); this->staged.clear();
+      return false;
+    }
+  }
+
+  bool started() const { return this->started_; }
+
+  void finish()
+  {
+    this->worker.join();
+    if(this->failure) { std::rethrow_exception(this->failure); }
+    if(::rename(this->staged.c_str(), this->target.c_str()) != 0)
+    {
+      throw std::runtime_error("cannot publish LCP array " + this->target);
+    }
+    this->staged.clear();
+
+    std::filesystem::path parent = std::filesystem::path(this->target).parent_path();
+    if(parent.empty()) { parent = "."; }
+    int descriptor = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY);
+    if(descriptor < 0 || ::fsync(descriptor) != 0)
+    {
+      if(descriptor >= 0) { ::close(descriptor); }
+      throw std::runtime_error("cannot sync LCP output directory " + this->target);
+    }
+    if(::close(descriptor) != 0)
+    {
+      throw std::runtime_error("cannot close LCP output directory " + this->target);
+    }
+  }
+
+private:
+  bool started_;
+  std::string target, staged;
+  std::thread worker;
+  std::exception_ptr failure;
+};
+
+constexpr size_type LCP_OVERLAP_DESCRIPTORS = 5;
+
+const char*
+lcpOverlapBlocker(const ConstructionParameters& parameters,
+  size_type construction_threads, size_type lcp_budget)
+{
+  // Final component storage holds one output and at most one reader per
+  // alphabet component. The LCP writer uses at most five descriptors. Admit
+  // overlap only when both fit and the writer can retain its ordinary full
+  // stream budget inside the existing one-eighth scheduling share.
+  const size_type component_descriptors = FinalEventMetadata::MAX_SIGMA + 1;
+  if(construction_threads < 2) { return "only one construction thread"; }
+  if(lcp_budget < 2 || lcp_budget > parameters.getMemoryLimitBytes() / 8)
+  {
+    return "aggregate memory target cannot retain the LCP stream budget";
+  }
+  const size_type descriptors = component_descriptors + LCP_OVERLAP_DESCRIPTORS;
+  if(externalMaxOpenFiles() < descriptors)
+  {
+    return "insufficient file descriptors";
+  }
+  std::vector<int> reserved;
+  reserved.reserve(descriptors);
+  for(size_type i = 0; i < descriptors; i++)
+  {
+    int descriptor = ::open("/dev/null", O_RDONLY);
+    if(descriptor < 0)
+    {
+      for(int opened : reserved) { ::close(opened); }
+      return "insufficient file descriptors";
+    }
+    reserved.push_back(descriptor);
+  }
+  for(int descriptor : reserved) { ::close(descriptor); }
+  return nullptr;
+}
 
 // The direct final-component path normally publishes through
 // storeFinalComponents(). An empty InputGraph has no event frontier, but it
@@ -931,7 +1047,7 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
 //------------------------------------------------------------------------------
 
 GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
-  GCSA(graph, parameters, nullptr, 1)
+  GCSA(graph, parameters, nullptr, nullptr, 1)
 {
 }
 
@@ -954,13 +1070,16 @@ GCSA::buildAndStore(InputGraph& graph, const ConstructionParameters& parameters,
   {
     GCSA empty;
     storeEmptyIndexAtomically(empty, gcsa_filename);
+    LCPArray::buildAndStore(graph, parameters, lcp_filename);
+    return;
   }
-  else { GCSA builder(graph, parameters, &gcsa_filename, requested_threads); }
-  LCPArray::buildAndStore(graph, parameters, lcp_filename);
+  GCSA builder(graph, parameters, &gcsa_filename, &lcp_filename,
+    requested_threads);
 }
 
 GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
-  const std::string* direct_output, size_type requested_threads) :
+  const std::string* direct_output, const std::string* lcp_output,
+  size_type requested_threads) :
   GCSA()
 {
   double start = readTimer();
@@ -1151,10 +1270,57 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     sdsl::util::clear(last_char); sdsl::util::clear(from_nodes);
     sdsl::util::clear(mapper);
     this->header.edges = event_metadata.total_edges;
+    ConstructionParameters component_parameters = parameters;
+    size_type component_threads = requested_threads;
+    size_type component_reserved_descriptors = 0;
+    ConcurrentLCPBuild concurrent_lcp;
+    if(lcp_output != nullptr)
+    {
+      const size_type lcp_budget = std::min(parameters.getMemoryLimitBytes(),
+        externalIOBufferSize(parameters));
+      const char* blocker = lcpOverlapBlocker(parameters,
+        requested_threads, lcp_budget);
+      if(blocker == nullptr)
+      {
+        ConstructionParameters lcp_parameters = parameters;
+        lcp_parameters.setMemoryLimitBytes(lcp_budget);
+        const std::string leaf_filename = merged_graph.lcp_name;
+        bool started = concurrent_lcp.start(*lcp_output,
+          [leaf_filename, lcp_parameters](const std::string& staged)
+          {
+            LCPArray::buildAndStore(leaf_filename, lcp_parameters, staged);
+          });
+        if(started)
+        {
+          component_parameters.setMemoryLimitBytes(
+            parameters.getMemoryLimitBytes() - lcp_budget);
+          // One thread and the LCP writer's maximum descriptor set now belong
+          // to the concurrent phase rather than final-component encoding.
+          component_threads = std::max(static_cast<size_type>(1),
+            requested_threads - 1);
+          component_reserved_descriptors = LCP_OVERLAP_DESCRIPTORS;
+          if(Verbosity::level >= Verbosity::EXTENDED)
+          {
+            std::cerr << "GCSA::GCSA(): overlapping LCP storage with final component storage"
+                      << std::endl;
+          }
+        }
+        else if(Verbosity::level >= Verbosity::EXTENDED)
+        {
+          std::cerr << "GCSA::GCSA(): serial LCP fallback: worker unavailable"
+                    << std::endl;
+        }
+      }
+      else if(Verbosity::level >= Verbosity::EXTENDED)
+      {
+        std::cerr << "GCSA::GCSA(): serial LCP fallback: " << blocker << std::endl;
+      }
+    }
     if(direct_output != nullptr)
     {
       storeFinalComponentsConcurrent(this->header, graph.alpha, event_files,
-        event_metadata, parameters, *direct_output, requested_threads);
+        event_metadata, component_parameters, *direct_output, component_threads,
+        component_reserved_descriptors);
     }
     else
     {
@@ -1176,6 +1342,24 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     final_sample_count = event_metadata.sample_ids;
     final_sampled_positions = event_metadata.sampled_paths;
 
+    std::exception_ptr lcp_failure;
+    if(concurrent_lcp.started())
+    {
+      try { concurrent_lcp.finish(); }
+      catch(...) { lcp_failure = std::current_exception(); }
+    }
+
+    // The worker is joined before ownership of its input leaves merged_graph.
+    // Transfer the leaf even when LCP storage failed, so callers can retry the
+    // ordinary LCP writer after the already-published GCSA remains available.
+    TempFile::remove(graph.lcp_name);
+    graph.lcp_name = merged_graph.lcp_name;
+    merged_graph.lcp_name.clear();
+    if(lcp_failure) { std::rethrow_exception(lcp_failure); }
+    if(lcp_output != nullptr && !(concurrent_lcp.started()))
+    {
+      LCPArray::buildAndStore(graph, parameters, *lcp_output);
+    }
   }
   else
   {
@@ -1348,10 +1532,14 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   final_sampled_positions = this->sampledPositions();
   }
 
-  // Transfer the LCP array from MergedGraph to InputGraph.
-  TempFile::remove(graph.lcp_name);
-  graph.lcp_name = merged_graph.lcp_name;
-  merged_graph.lcp_name.clear();
+  // The external route transfers the LCP leaf after its paired writer has
+  // joined. The resident route still transfers it here.
+  if(!(parameters.externalMemory()))
+  {
+    TempFile::remove(graph.lcp_name);
+    graph.lcp_name = merged_graph.lcp_name;
+    merged_graph.lcp_name.clear();
+  }
 
   if(Verbosity::level >= Verbosity::EXTENDED)
   {
