@@ -30,8 +30,8 @@ namespace gcsa
   exposed through the same rewind()/next() interface. The reservation covers
   mutually exclusive collection, external-sort, and readback phases.
 
-  This class is public only so the forced-spill behavior can be unit tested;
-  it is a construction helper and is not part of the query interface.
+  This source-private construction helper is shared by the final scan and its
+  forced-spill regression test; it is not part of the installed interface.
 */
 class SpillableNodeSet
 {
@@ -61,10 +61,9 @@ private:
 
 /*
   The final merged-graph scan is globally ordered and therefore deliberately
-  remains a single atomic task. It writes these immutable streams and commits
-  them together. Component construction can then restart without repeating the
-  scan, and no raw array proportional to all paths has to coexist with the
-  other raw arrays.
+  remains a single atomic task. It writes immutable streams that the next
+  stage validates and consumes in the same construction. No raw array
+  proportional to all paths has to coexist with the other raw arrays.
 
   All integer records are explicitly little-endian uint64 values. Occurrence
   records are pairs (path, extra_occurrences); BWT masks are single bytes.
@@ -83,15 +82,12 @@ struct FinalEventMetadata
 
 struct FinalEventFiles
 {
-  std::string metadata, bwt_masks;
+  std::string bwt_masks;
   std::vector<std::string> edge_destinations;
   std::string sample_positions, sample_ids, sample_ends;
   std::string occurrences, redundant;
-  bool delete_files;
 
-  explicit FinalEventFiles(size_type sigma = 0);
-  FinalEventFiles(FinalEventFiles&& source);
-  FinalEventFiles& operator=(FinalEventFiles&& source);
+  explicit FinalEventFiles(size_type sigma);
   ~FinalEventFiles();
 
   void clear();
@@ -134,21 +130,14 @@ private:
 };
 
 // Sort the (potentially nonmonotone) redundancy positions externally.
-// stats is optional and diagnostic: run count, merge passes and peak resident
-// bytes are what decide whether this sort is worth replacing.
 void sortFinalRedundancy(FinalEventFiles& files,
-  const ConstructionParameters& parameters,
-  ExternalFixedRecordSortStats* stats = nullptr);
-
-// Write/read and validate the small versioned metadata record.
-void writeFinalEventMetadata(const FinalEventFiles& files,
-  const FinalEventMetadata& metadata);
-FinalEventMetadata readFinalEventMetadata(const FinalEventFiles& files);
+  const ConstructionParameters& parameters);
 
 /*
   Stream one fast BWT component directly in the existing bit_vector_il<512>
   serialization. This avoids materializing both a dense bitvector and its
-  interleaved replacement. Public only for exact-format regression tests.
+  interleaved replacement. The source-private declaration also lets the
+  exact-format regression test call the production encoder.
 */
 void serializeFastBWTComponent(std::ostream& out,
   const std::string& mask_file, size_type paths, size_type expected_ones,
@@ -169,7 +158,8 @@ void serializeSampleIds(std::ostream& out, const std::string& sample_file,
   const ConstructionParameters& parameters);
 
 // Stream the ordinary sample-boundary bit_vector and select_support_mcl from
-// the monotone sample-end event stream. Public for exact-format tests.
+// the monotone sample-end event stream. The exact-format test calls this same
+// production encoder through the source-private header.
 void serializeSampleBoundaries(std::ostream& out,
   const std::string& sample_end_file, size_type sample_ids,
   size_type sampled_paths, const ConstructionParameters& parameters);
@@ -182,8 +172,8 @@ void serializeOccurrencePointers(std::ostream& out,
   const ConstructionParameters& parameters);
 
 // Stream SadaCount's ordinary bit_vector and select_support_mcl payload from
-// sorted redundancy events without materializing the dense unary vector.
-// Public only for exact-format regression tests.
+// sorted redundancy events without materializing the dense unary vector. The
+// exact-format test calls this same production encoder.
 void serializeRedundantPointers(std::ostream& out,
   const std::string& redundancy_file, size_type paths, size_type redundant,
   const ConstructionParameters& parameters);
