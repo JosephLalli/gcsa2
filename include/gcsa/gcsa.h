@@ -225,9 +225,6 @@ public:
 //------------------------------------------------------------------------------
 
 private:
-  static void buildAndStore(InputGraph& graph,
-    const ConstructionParameters& parameters, const std::string& filename);
-
   GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     const std::string* direct_output);
   void copy(const GCSA& source);
