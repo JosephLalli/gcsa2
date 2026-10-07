@@ -1,6 +1,7 @@
 #include <gcsa/path_graph.h>
 #include <external_configuration.hpp>
 #include <gcsa/path_graph_external.h>
+#include "path_graph_sort_internal.hpp"
 #include <gcsa/external_sort.h>
 #include <compressed_block.hpp>
 
@@ -9,15 +10,19 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <fcntl.h>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <stdexcept>
+#include <thread>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -658,7 +663,8 @@ struct PathGraphBuilder
   void write(PriorityNode& path);
   void write(std::vector<PathNode>& paths, std::vector<PathNode::rank_type>& labels, size_type memory_limit, size_type file);
 
-  void sort(size_type file, size_type byte_budget, size_type fan_in);
+  void sort(size_type file, size_type byte_budget, size_type fan_in,
+    size_type available_threads);
 };
 
 constexpr size_type PathGraphBuilder::WRITE_BUFFER_SIZE;
@@ -744,10 +750,12 @@ PathGraphBuilder::write(std::vector<PathNode>& paths, std::vector<PathNode::rank
 }
 
 void
-PathGraphBuilder::sort(size_type file, size_type byte_budget, size_type fan_in)
+PathGraphBuilder::sort(size_type file, size_type byte_budget, size_type fan_in,
+  size_type available_threads)
 {
   this->output_files.closeFile(file);
-  externalPathGraphSort(this->graph, file, byte_budget, fan_in);
+  externalPathGraphSortWithThreads(this->graph, file, byte_budget, fan_in,
+    nullptr, available_threads);
 
   if(Verbosity::level >= Verbosity::FULL)
   {
@@ -1003,24 +1011,212 @@ syncPathSortFile(const std::string& name)
   ::close(descriptor);
 }
 
+/*
+  One optional worker reads the next framed run buffer while the merge thread
+  consumes the current buffers. The pool reserves every queued/running/ready
+  buffer before submission. Decoder state remains owned by the run reader and
+  is touched only by this worker while a ticket is live. Native thread stack
+  and the small queue nodes are outside the byte reservation.
+*/
+class PathSortPrefetchPool
+{
+public:
+  struct Task
+  {
+    enum Status { QUEUED, RUNNING, READY, FAILED, CANCELLED };
+
+    CompressedBlockReader* reader;
+    size_type requested_records, reservation;
+    Status status;
+    bool cancel_requested;
+    std::vector<PathSortRecord> data;
+    std::exception_ptr error;
+
+    Task(CompressedBlockReader* input, size_type records, size_type bytes) :
+      reader(input), requested_records(records), reservation(bytes),
+      status(QUEUED), cancel_requested(false), data(), error() { }
+  };
+
+  typedef std::shared_ptr<Task> Ticket;
+
+  explicit PathSortPrefetchPool(size_type byte_limit) :
+    limit(byte_limit), used(0), stopping(false), queue(), worker(), mutex(),
+    work(), changed()
+  {
+    if(this->limit == 0)
+    {
+      throw std::invalid_argument("path sort prefetch: zero byte limit");
+    }
+    this->worker = std::thread(&PathSortPrefetchPool::run, this);
+  }
+
+  ~PathSortPrefetchPool()
+  {
+    {
+      std::lock_guard<std::mutex> lock(this->mutex);
+      this->stopping = true;
+      for(const Ticket& task : this->queue)
+      {
+        task->cancel_requested = true;
+        task->status = Task::CANCELLED;
+        this->release(*task);
+      }
+      this->queue.clear();
+      this->work.notify_all(); this->changed.notify_all();
+    }
+    if(this->worker.joinable()) { this->worker.join(); }
+  }
+
+  Ticket submit(CompressedBlockReader* reader, size_type records)
+  {
+    if(reader == nullptr || records == 0 ||
+       records > std::numeric_limits<size_type>::max() / sizeof(PathSortRecord))
+    {
+      return Ticket();
+    }
+    size_type bytes = records * sizeof(PathSortRecord);
+    Ticket task(new Task(reader, records, bytes));
+    std::lock_guard<std::mutex> lock(this->mutex);
+    if(this->stopping || bytes > this->limit - this->used) { return Ticket(); }
+    try { this->queue.push_back(task); }
+    catch(...) { throw; }
+    this->used += bytes;
+    this->work.notify_one();
+    return task;
+  }
+
+  bool take(Ticket task, std::vector<PathSortRecord>& result)
+  {
+    if(!task) { return false; }
+    std::exception_ptr error;
+    {
+      std::unique_lock<std::mutex> lock(this->mutex);
+      this->changed.wait(lock, [&]()
+      {
+        return task->status == Task::READY || task->status == Task::FAILED ||
+          task->status == Task::CANCELLED;
+      });
+      if(task->status == Task::READY)
+      {
+        result.swap(task->data); this->release(*task);
+      }
+      else if(task->status == Task::FAILED) { error = task->error; }
+      else { return false; }
+    }
+    if(error) { std::rethrow_exception(error); }
+    return true;
+  }
+
+  void cancel(Ticket task)
+  {
+    if(!task) { return; }
+    std::unique_lock<std::mutex> lock(this->mutex);
+    task->cancel_requested = true;
+    if(task->status == Task::QUEUED)
+    {
+      auto queued = std::find(this->queue.begin(), this->queue.end(), task);
+      if(queued != this->queue.end()) { this->queue.erase(queued); }
+      task->status = Task::CANCELLED; this->release(*task);
+    }
+    else if(task->status == Task::RUNNING)
+    {
+      this->changed.wait(lock, [&]() { return task->status != Task::RUNNING; });
+    }
+    if(task->status == Task::READY)
+    {
+      std::vector<PathSortRecord>().swap(task->data);
+      task->status = Task::CANCELLED; this->release(*task);
+    }
+    this->work.notify_all(); this->changed.notify_all();
+  }
+
+private:
+  size_type limit, used;
+  bool stopping;
+  std::deque<Ticket> queue;
+  std::thread worker;
+  std::mutex mutex;
+  std::condition_variable work, changed;
+
+  void release(Task& task)
+  {
+    if(task.reservation > this->used) { std::terminate(); }
+    this->used -= task.reservation; task.reservation = 0;
+  }
+
+  void run()
+  {
+    for(;;)
+    {
+      Ticket task;
+      {
+        std::unique_lock<std::mutex> lock(this->mutex);
+        this->work.wait(lock, [&]() { return this->stopping || !this->queue.empty(); });
+        if(this->stopping && this->queue.empty()) { return; }
+        task = this->queue.front(); this->queue.pop_front();
+        task->status = Task::RUNNING;
+      }
+
+      std::vector<PathSortRecord> data;
+      std::exception_ptr error;
+      try
+      {
+        data.resize(task->requested_records);
+        size_type requested = task->requested_records * sizeof(PathSortRecord);
+        size_type bytes = task->reader->read(data.data(), requested);
+        if(bytes % sizeof(PathSortRecord) != 0)
+        {
+          throw std::runtime_error("path sort prefetch: truncated run");
+        }
+        data.resize(bytes / sizeof(PathSortRecord));
+      }
+      catch(...) { error = std::current_exception(); }
+
+      std::lock_guard<std::mutex> lock(this->mutex);
+      if(task->cancel_requested || this->stopping)
+      {
+        task->status = Task::CANCELLED; this->release(*task);
+      }
+      else if(error)
+      {
+        task->error = error; task->status = Task::FAILED; this->release(*task);
+      }
+      else
+      {
+        task->data.swap(data); task->status = Task::READY;
+      }
+      this->changed.notify_all(); this->work.notify_all();
+    }
+  }
+
+  PathSortPrefetchPool(const PathSortPrefetchPool&) = delete;
+  PathSortPrefetchPool& operator=(const PathSortPrefetchPool&) = delete;
+};
+
 struct PathSortRunReader
 {
   std::ifstream file;
   std::unique_ptr<CompressedBlockReader> framed;
+  std::shared_ptr<PathSortPrefetchPool> prefetch;
+  PathSortPrefetchPool::Ticket pending;
   std::vector<PathSortRecord> buffer;
   size_type offset, buffer_records, total_records;
   bool at_end;
   int cache_descriptor;
   off_t bytes_read, cache_released;
 
-  PathSortRunReader(const std::string& name, size_type requested_records) :
-    file(), framed(), buffer(), offset(0), buffer_records(1), total_records(0), at_end(false),
+  PathSortRunReader(const std::string& name, size_type requested_records,
+    const std::shared_ptr<PathSortPrefetchPool>& pool =
+      std::shared_ptr<PathSortPrefetchPool>()) :
+    file(), framed(), prefetch(), pending(), buffer(), offset(0),
+    buffer_records(1), total_records(0), at_end(false),
     cache_descriptor(-1), bytes_read(0), cache_released(0)
   {
     size_type bytes = 0;
     if(CompressedBlockReader::isFramed(name))
     {
       this->framed.reset(new CompressedBlockReader(name));
+      this->prefetch = pool;
       bytes = static_cast<size_type>(this->framed->logicalSize());
     }
     else
@@ -1043,6 +1239,7 @@ struct PathSortRunReader
 
   PathSortRunReader(PathSortRunReader&& another) noexcept :
     file(std::move(another.file)), framed(std::move(another.framed)),
+    prefetch(std::move(another.prefetch)), pending(std::move(another.pending)),
     buffer(std::move(another.buffer)),
     offset(another.offset), buffer_records(another.buffer_records),
     total_records(another.total_records), at_end(another.at_end),
@@ -1054,6 +1251,7 @@ struct PathSortRunReader
 
   ~PathSortRunReader()
   {
+    if(this->prefetch && this->pending) { this->prefetch->cancel(this->pending); }
     if(this->cache_descriptor >= 0) { ::close(this->cache_descriptor); }
   }
 
@@ -1069,8 +1267,18 @@ struct PathSortRunReader
     size_type requested = this->buffer.size() * sizeof(PathSortRecord);
     if(this->framed)
     {
-      bytes = static_cast<std::streamsize>(this->framed->read(
-        this->buffer.data(), requested));
+      if(this->prefetch && this->pending &&
+         this->prefetch->take(this->pending, this->buffer))
+      {
+        bytes = static_cast<std::streamsize>(
+          this->buffer.size() * sizeof(PathSortRecord));
+      }
+      else
+      {
+        bytes = static_cast<std::streamsize>(this->framed->read(
+          this->buffer.data(), requested));
+      }
+      this->pending.reset();
     }
     else
     {
@@ -1082,6 +1290,11 @@ struct PathSortRunReader
     this->buffer.resize(bytes / sizeof(PathSortRecord));
     this->offset = 0;
     this->at_end = this->buffer.empty();
+    if(!this->at_end && this->prefetch)
+    {
+      this->pending = this->prefetch->submit(this->framed.get(),
+        this->buffer_records);
+    }
   }
 
   const PathSortRecord& current() const { return this->buffer[this->offset]; }
@@ -1146,7 +1359,8 @@ writePathSortRun(const std::string& name,
 
 std::string
 mergePathSortRuns(const std::vector<std::string>& inputs, size_type buffer_records,
-  const PathRunCodec& codec, ExternalPathSortStats* stats)
+  const PathRunCodec& codec, size_type prefetch_bytes,
+  ExternalPathSortStats* stats)
 {
   std::string output_name = TempFile::getName("gcsa_path_sort_run");
   std::ofstream output;
@@ -1165,12 +1379,18 @@ mergePathSortRuns(const std::vector<std::string>& inputs, size_type buffer_recor
     output_cache_descriptor = openPathSortCacheDescriptor(output_name, O_RDWR);
   }
   off_t output_bytes = 0, output_cache_released = 0;
+  std::shared_ptr<PathSortPrefetchPool> prefetch;
+  if(codec.enabled && prefetch_bytes > 0)
+  {
+    try { prefetch.reset(new PathSortPrefetchPool(prefetch_bytes)); }
+    catch(const std::system_error&) { prefetch.reset(); }
+  }
   std::vector<PathSortRunReader> readers;
   readers.reserve(inputs.size());
   size_type input_buffer_records = 0, total_records = 0;
   for(size_type i = 0; i < inputs.size(); i++)
   {
-    readers.emplace_back(inputs[i], buffer_records);
+    readers.emplace_back(inputs[i], buffer_records, prefetch);
     input_buffer_records += readers.back().buffer_records;
     total_records += readers.back().total_records;
   }
@@ -1181,7 +1401,7 @@ mergePathSortRuns(const std::vector<std::string>& inputs, size_type buffer_recor
   updatePathSortStats(stats, input_buffer_records + output_records,
     PATH_SORT_FIXED_BYTES + (input_buffer_records + output_records) * sizeof(PathSortRecord) +
     inputs.size() * (sizeof(PathSortRunReader) + 2 * sizeof(size_type) +
-      codec.reader_bytes) + codec.writer_bytes);
+      codec.reader_bytes) + codec.writer_bytes + prefetch_bytes);
   std::priority_queue<size_type, std::vector<size_type>, PathSortHeapComparator>
     queue{PathSortHeapComparator(&readers)};
   for(size_type i = 0; i < readers.size(); i++)
@@ -1315,24 +1535,27 @@ writeSortedPathPair(const std::string& run_name, const std::string& path_name,
 void
 addPathSortRun(std::vector<std::vector<std::string>>& levels, const std::string& run,
   size_type level, size_type fan_in, size_type buffer_records,
-  const PathRunCodec& codec, ExternalPathSortStats* stats)
+  const PathRunCodec& codec, size_type prefetch_bytes,
+  ExternalPathSortStats* stats)
 {
   if(levels.size() <= level) { levels.resize(level + 1); }
   levels[level].push_back(run);
   if(levels[level].size() < fan_in) { return; }
 
   std::vector<std::string> inputs; inputs.swap(levels[level]);
-  std::string merged = mergePathSortRuns(inputs, buffer_records, codec, stats);
+  std::string merged = mergePathSortRuns(inputs, buffer_records, codec,
+    prefetch_bytes, stats);
   for(size_type i = 0; i < inputs.size(); i++) { TempFile::remove(inputs[i]); }
   if(stats != nullptr) { stats->merge_passes = std::max(stats->merge_passes, level + 1); }
-  addPathSortRun(levels, merged, level + 1, fan_in, buffer_records, codec, stats);
+  addPathSortRun(levels, merged, level + 1, fan_in, buffer_records, codec,
+    prefetch_bytes, stats);
 }
 
 } // namespace
 
 void
-externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, size_type fan_in,
-  ExternalPathSortStats* stats)
+externalPathGraphSortWithThreads(PathGraph& graph, size_type file, size_type byte_budget, size_type fan_in,
+  ExternalPathSortStats* stats, size_type available_threads)
 {
   if(file >= graph.files()) { externalSortFailure("invalid file number"); }
   if(byte_budget < externalPathGraphSortMinimumBudget()) { externalSortFailure("byte budget is too small"); }
@@ -1353,8 +1576,13 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   if(fan_in < 2) { externalSortFailure("byte budget cannot support a two-way merge"); }
   size_type merge_available = available - codec.writer_bytes -
     fan_in * (reader_overhead + codec.reader_bytes);
-  size_type merge_records = merge_available / ((fan_in + 1) * record_bytes);
+  // One optional worker overlaps framed decode with this serial heap merge.
+  // Two separately reserved application buffers bound its queued/ready data.
+  size_type prefetch_buffers = (codec.enabled && available_threads > 1 ? 2 : 0);
+  size_type merge_records = merge_available /
+    ((fan_in + 1 + prefetch_buffers) * record_bytes);
   if(merge_records == 0) { externalSortFailure("byte budget cannot buffer a merge"); }
+  size_type prefetch_bytes = prefetch_buffers * merge_records * record_bytes;
   // Reserve two thirds for sorting records and one third for allocator / I/O slack.
   size_type run_records = std::max((size_type)1,
     (available - codec.writer_bytes) / (3 * record_bytes));
@@ -1399,7 +1627,8 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
       std::sort(records.begin(), records.end(), pathSortLess);
       std::string name = TempFile::getName("gcsa_path_sort_run");
       writePathSortRun(name, records, codec); records.clear();
-      addPathSortRun(levels, name, 0, fan_in, merge_records, codec, stats);
+      addPathSortRun(levels, name, 0, fan_in, merge_records, codec,
+        prefetch_bytes, stats);
       if(stats != nullptr) { stats->runs++; }
     }
   }
@@ -1417,7 +1646,8 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
     std::sort(records.begin(), records.end(), pathSortLess);
     std::string name = TempFile::getName("gcsa_path_sort_run");
     writePathSortRun(name, records, codec);
-    addPathSortRun(levels, name, 0, fan_in, merge_records, codec, stats);
+    addPathSortRun(levels, name, 0, fan_in, merge_records, codec,
+      prefetch_bytes, stats);
     if(stats != nullptr) { stats->runs++; }
   }
   paths.close(); ranks.close();
@@ -1438,7 +1668,8 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
     {
       size_type last = std::min(runs.size(), first + fan_in);
       std::vector<std::string> group(runs.begin() + first, runs.begin() + last);
-      std::string merged = mergePathSortRuns(group, merge_records, codec, stats);
+      std::string merged = mergePathSortRuns(group, merge_records, codec,
+        prefetch_bytes, stats);
       for(size_type i = 0; i < group.size(); i++) { TempFile::remove(group[i]); }
       compacted.push_back(merged);
     }
@@ -1450,7 +1681,8 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
     std::string name = TempFile::getName("gcsa_path_sort_run");
     writePathSortRun(name, records, codec); runs.push_back(name);
   }
-  std::string merged = mergePathSortRuns(runs, merge_records, codec, stats);
+  std::string merged = mergePathSortRuns(runs, merge_records, codec,
+    prefetch_bytes, stats);
   for(size_type i = 0; i < runs.size(); i++) { TempFile::remove(runs[i]); }
 
   std::string final_path = TempFile::getName(PathGraph::PREFIX), final_rank = TempFile::getName(PathGraph::PREFIX);
@@ -1473,6 +1705,13 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   {
     TempFile::remove(old_path); TempFile::remove(old_rank);
   }
+}
+
+void
+externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget,
+  size_type fan_in, ExternalPathSortStats* stats)
+{
+  externalPathGraphSortWithThreads(graph, file, byte_budget, fan_in, stats, 1);
 }
 
 size_type
@@ -2878,7 +3117,9 @@ PathGraph::extend(size_type size_limit, size_type memory_limit)
       externalSortFailure("extension memory limit is below the label-sort minimum");
     }
     size_type sort_budget = std::max(externalPathGraphSortMinimumBudget(), memory_limit / 8);
-    builder.sort(file, sort_budget, 8);
+    // The generation loop above has joined. Reuse its existing thread count to
+    // overlap one framed read with this otherwise serial merge.
+    builder.sort(file, sort_budget, 8, threads);
   }
   builder.close();
   this->clear(); this->swap(builder.graph);
