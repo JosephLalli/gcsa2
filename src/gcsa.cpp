@@ -930,7 +930,7 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
 //------------------------------------------------------------------------------
 
 GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
-  GCSA(graph, parameters, nullptr)
+  GCSA(graph, parameters, nullptr, 1)
 {
 }
 
@@ -946,18 +946,20 @@ GCSA::buildAndStore(InputGraph& graph, const ConstructionParameters& parameters,
   // construction boundary, but does not isolate simultaneous constructions
   // that select different directories.
   TempFile::setDirectory(parameters.work_directory);
+  const size_type requested_threads = static_cast<size_type>(
+    std::max(1, omp_get_max_threads()));
   SerialExternalConstruction serial_construction;
   if(graph.size() == 0)
   {
     GCSA empty;
     storeEmptyIndexAtomically(empty, gcsa_filename);
   }
-  else { GCSA builder(graph, parameters, &gcsa_filename); }
+  else { GCSA builder(graph, parameters, &gcsa_filename, requested_threads); }
   LCPArray::buildAndStore(graph, parameters, lcp_filename);
 }
 
 GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
-  const std::string* direct_output) :
+  const std::string* direct_output, size_type requested_threads) :
   GCSA()
 {
   double start = readTimer();
@@ -1073,8 +1075,9 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     }
     if(parameters.externalMemory())
     {
-      externalPathGraphExtend(path_graph,
-        path_graph.remainingLimit(parameters.getLimitBytes()), parameters);
+      externalPathGraphExtendWithThreads(path_graph,
+        path_graph.remainingLimit(parameters.getLimitBytes()), parameters,
+        requested_threads);
     }
     else
     {
