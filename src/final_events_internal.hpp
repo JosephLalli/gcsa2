@@ -12,7 +12,7 @@ void storeFinalComponentsConcurrent(const GCSAHeader& header,
   const Alphabet& source_alphabet, const FinalEventFiles& files,
   const FinalEventMetadata& metadata,
   const ConstructionParameters& parameters, const std::string& filename,
-  size_type available_threads);
+  size_type available_threads, size_type reserved_descriptors = 0);
 
 } // namespace gcsa
 

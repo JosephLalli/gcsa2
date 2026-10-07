@@ -226,7 +226,8 @@ public:
 
 private:
   GCSA(InputGraph& graph, const ConstructionParameters& parameters,
-    const std::string* direct_output, size_type requested_threads);
+    const std::string* direct_output, const std::string* lcp_output = nullptr,
+    size_type requested_threads = 1);
   void copy(const GCSA& source);
   void setVectors();
   void initSupport();

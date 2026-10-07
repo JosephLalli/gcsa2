@@ -845,12 +845,24 @@ LCPArray::buildAndStore(const InputGraph& graph,
     throw std::runtime_error("LCPArray::buildAndStore(): input graph has no LCP leaf file");
   }
 
+  LCPArray::buildAndStore(graph.lcp_name, parameters, filename);
+}
+
+void
+LCPArray::buildAndStore(const std::string& leaf_filename,
+  const ConstructionParameters& parameters, const std::string& filename)
+{
+  if(!(parameters.externalMemory()))
+  {
+    throw std::invalid_argument("LCPArray::buildAndStore() requires external-memory construction");
+  }
+
   const size_type byte_budget = streamingBudget(parameters);
   if(byte_budget < 2)
   {
     throw std::runtime_error("external LCP construction requires at least two bytes of stream budget");
   }
-  buildLCPAndStore(graph.lcp_name, parameters.getLCPBranching(), byte_budget,
+  buildLCPAndStore(leaf_filename, parameters.getLCPBranching(), byte_budget,
     filename);
 }
 
