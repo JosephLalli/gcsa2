@@ -37,6 +37,25 @@ size_type externalPathGraphSortMinimumBudget();
 void externalPathGraphSort(PathGraph& graph, size_type file,
   size_type byte_budget, size_type fan_in, ExternalPathSortStats* stats = nullptr);
 
+class ExternalPathSortSink
+{
+public:
+  ExternalPathSortSink(PathGraph& graph, size_type file,
+    size_type byte_budget, size_type fan_in, size_type size_limit,
+    size_type& committed_bytes, ExternalPathSortStats* stats = nullptr);
+  ~ExternalPathSortSink();
+
+  void write(const PathNode& node, const PathNode::rank_type* labels);
+  void finish();
+
+private:
+  struct Impl;
+  Impl* impl;
+
+  ExternalPathSortSink(const ExternalPathSortSink&) = delete;
+  ExternalPathSortSink& operator=(const ExternalPathSortSink&) = delete;
+};
+
 // Merge workspace and pair counts used by prune() and MergedGraph.
 size_type pathMergeInputBudget(const ConstructionParameters& parameters);
 size_type pathMergeOutputPairs(size_type max_open_files, size_type logical_inputs);
