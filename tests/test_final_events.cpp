@@ -397,7 +397,6 @@ int main()
   }
   metadata.fast_chars = alphabet.fast_chars;
   sortFinalRedundancy(files, parameters);
-  writeFinalEventMetadata(files, metadata);
 
   GCSA observed = buildViaStore(alphabet, files, metadata,
     parameters, 4, 6, 8);
@@ -441,7 +440,6 @@ int main()
   require(CompressedBlockReader::isFramed(compressed_files.bwt_masks));
   compressed_metadata.fast_chars = alphabet.fast_chars;
   sortFinalRedundancy(compressed_files, compressed_parameters);
-  writeFinalEventMetadata(compressed_files, compressed_metadata);
   GCSA compressed_observed = buildViaStore(alphabet, compressed_files,
     compressed_metadata, compressed_parameters, 4, 6, 8);
   std::ostringstream compressed_bytes;
