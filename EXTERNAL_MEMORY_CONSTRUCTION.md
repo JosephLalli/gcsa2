@@ -78,14 +78,14 @@ leaf; no resume manifest is implied.
 
 ## Required validation
 
-Run from the containing vg checkout with an SSD temporary directory and its
-toolchain wrapper:
+Use the normal vg/owner build instructions in a fresh checkout and put
+`TMPDIR` on SSD storage. After vg has built its dependencies, the owner checks
+are available as `make -C deps/gcsa2 test` and `make -C deps/gcsa2 all`; rebuild
+vg after installing matching GCSA headers and its archive. The local performance
+fork uses `build-local.sh` to invoke these targets safely around frozen binaries;
+that machine-specific wrapper is not required by this library contribution.
 
-```sh
-TMPDIR=/ssd/path JOBS=1 ./build-local.sh -C deps/gcsa2 test
-TMPDIR=/ssd/path JOBS=8 ./build-local.sh -C deps/gcsa2 all
-TMPDIR=/ssd/path JOBS=8 ./build-local.sh bin/vg
-```
+The bounded acceptance fixtures below do not require chromosome datasets.
 
 At one thread, build empty, zero-doubling, and cyclic fixtures through both
 routes; require byte-identical GCSA/LCP files, successful reload/query checks,
