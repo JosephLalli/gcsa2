@@ -35,6 +35,22 @@ namespace
 {
 
 std::string
+formatBytes(size_type bytes)
+{
+  const char* suffixes[] = { "B", "KiB", "MiB", "GiB", "TiB", "PiB" };
+  long double value = bytes;
+  size_type suffix = 0;
+  while(value >= 1024.0L && suffix + 1 < sizeof(suffixes) / sizeof(suffixes[0]))
+  {
+    value /= 1024.0L; suffix++;
+  }
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(value < 10.0L && suffix > 0 ? 2 : 1)
+      << static_cast<double>(value) << ' ' << suffixes[suffix];
+  return out.str();
+}
+
+std::string
 doublingTask(size_type step)
 {
   std::ostringstream result;
@@ -921,7 +937,6 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
       throw std::runtime_error("GCSA::GCSA(): final event path count mismatch");
     }
     sortFinalRedundancy(files, parameters);
-    writeFinalEventMetadata(files, metadata);
   }
   catch(...)
   {

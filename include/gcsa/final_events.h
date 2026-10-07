@@ -62,10 +62,9 @@ private:
 
 /*
   The final merged-graph scan is globally ordered and therefore deliberately
-  remains a single atomic task. It writes these immutable streams and commits
-  them together. Component construction can then restart without repeating the
-  scan, and no raw array proportional to all paths has to coexist with the
-  other raw arrays.
+  remains a single atomic task. It writes immutable streams that the next
+  stage validates and consumes in the same construction. No raw array
+  proportional to all paths has to coexist with the other raw arrays.
 
   All integer records are explicitly little-endian uint64 values. Occurrence
   records are pairs (path, extra_occurrences); BWT masks are single bytes.
@@ -84,15 +83,12 @@ struct FinalEventMetadata
 
 struct FinalEventFiles
 {
-  std::string metadata, bwt_masks;
+  std::string bwt_masks;
   std::vector<std::string> edge_destinations;
   std::string sample_positions, sample_ids, sample_ends;
   std::string occurrences, redundant;
-  bool delete_files;
 
-  explicit FinalEventFiles(size_type sigma = 0);
-  FinalEventFiles(FinalEventFiles&& source);
-  FinalEventFiles& operator=(FinalEventFiles&& source);
+  explicit FinalEventFiles(size_type sigma);
   ~FinalEventFiles();
 
   void clear();
@@ -135,16 +131,8 @@ private:
 };
 
 // Sort the (potentially nonmonotone) redundancy positions externally.
-// stats is optional and diagnostic: run count, merge passes and peak resident
-// bytes are what decide whether this sort is worth replacing.
 void sortFinalRedundancy(FinalEventFiles& files,
-  const ConstructionParameters& parameters,
-  ExternalFixedRecordSortStats* stats = nullptr);
-
-// Write/read and validate the small versioned metadata record.
-void writeFinalEventMetadata(const FinalEventFiles& files,
-  const FinalEventMetadata& metadata);
-FinalEventMetadata readFinalEventMetadata(const FinalEventFiles& files);
+  const ConstructionParameters& parameters);
 
 /*
   Stream one fast BWT component directly in the existing bit_vector_il<512>
