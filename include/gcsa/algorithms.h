@@ -53,6 +53,13 @@ namespace gcsa
 */
 bool verifyIndex(const GCSA& index, const LCPArray* lcp, std::vector<KMer>& kmers, size_type kmer_length, const NodeMapping& mapping = NodeMapping());
 bool verifyIndex(const GCSA& index, const LCPArray* lcp, const InputGraph& graph);
+/*
+  As above, but stream the input and occurrence sets through byte-bounded raw
+  files. Throws std::invalid_argument if byte_budget cannot support one
+  external-sort record.
+*/
+bool verifyIndex(const GCSA& index, const LCPArray* lcp, const InputGraph& graph,
+  size_type byte_budget);
 
 //------------------------------------------------------------------------------
 
