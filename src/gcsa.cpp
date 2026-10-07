@@ -7,6 +7,7 @@
 #include <gcsa/internal.h>
 #include <gcsa/lcp.h>
 #include <gcsa/path_graph.h>
+#include "final_events_internal.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -138,6 +139,8 @@ private:
   std::exception_ptr failure;
 };
 
+constexpr size_type LCP_OVERLAP_DESCRIPTORS = 5;
+
 const char*
 lcpOverlapBlocker(const ConstructionParameters& parameters,
   size_type construction_threads, size_type lcp_budget)
@@ -146,14 +149,13 @@ lcpOverlapBlocker(const ConstructionParameters& parameters,
   // alphabet component. The LCP writer uses at most five descriptors. Admit
   // overlap only when both fit and the writer can retain its ordinary full
   // stream budget inside the existing one-eighth scheduling share.
-  constexpr size_type lcp_descriptors = 5;
   const size_type component_descriptors = FinalEventMetadata::MAX_SIGMA + 1;
   if(construction_threads < 2) { return "only one construction thread"; }
   if(lcp_budget < 2 || lcp_budget > parameters.getMemoryLimitBytes() / 8)
   {
     return "aggregate memory target cannot retain the LCP stream budget";
   }
-  const size_type descriptors = component_descriptors + lcp_descriptors;
+  const size_type descriptors = component_descriptors + LCP_OVERLAP_DESCRIPTORS;
   if(externalMaxOpenFiles() < descriptors)
   {
     return "insufficient file descriptors";
@@ -869,11 +871,8 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
 
       PathLabel first, last;
       size_type stack_size = 0;
-      ProgressReporter scan_progress("final event scan",
-        merged_graph.size(), "paths");
       for(size_type i = 0; i < merged_graph.size(); i++, reader[0].advance())
       {
-        scan_progress.advance();
         // Close any predecessor spill reader retained by the preceding path
         // before current-set collection can invoke the external sorter.
         pred_from.clear();
@@ -1028,7 +1027,6 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
       }
       for(MergedGraphReader& current : reader) { current.close(); }
       lcp_array.close();
-      scan_progress.finish();
       previous.flush(false); stack.flush(false);
       metadata = output.finish();
     }
@@ -1054,7 +1052,7 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
 //------------------------------------------------------------------------------
 
 GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters) :
-  GCSA(graph, parameters, nullptr)
+  GCSA(graph, parameters, nullptr, nullptr, 1)
 {
 }
 
@@ -1066,6 +1064,8 @@ GCSA::buildAndStore(InputGraph& graph, const ConstructionParameters& parameters,
   {
     throw std::invalid_argument("GCSA::buildAndStore() requires external-memory construction");
   }
+  const size_type requested_threads = static_cast<size_type>(
+    std::max(1, omp_get_max_threads()));
   SerialExternalConstruction serial_construction;
   if(graph.size() == 0)
   {
@@ -1075,12 +1075,12 @@ GCSA::buildAndStore(InputGraph& graph, const ConstructionParameters& parameters,
     return;
   }
   GCSA builder(graph, parameters, &gcsa_filename, &lcp_filename,
-    serial_construction.threads());
+    requested_threads);
 }
 
 GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   const std::string* direct_output, const std::string* lcp_output,
-  size_type construction_threads) :
+  size_type requested_threads) :
   GCSA()
 {
   double start = readTimer();
@@ -1187,7 +1187,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     size_type prune_buffer = pathMergeInputBudget(parameters);
     const double prune_start = readTimer();
     path_graph.prune(lcp, path_graph.remainingLimit(parameters.getLimitBytes()),
-      prune_buffer, nullptr, externalMaxOpenFiles());
+      prune_buffer, externalMaxOpenFiles());
     const double prune_stop = readTimer();
     if(Verbosity::level >= Verbosity::BASIC)
     {
@@ -1196,8 +1196,9 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     }
     if(parameters.externalMemory())
     {
-      externalPathGraphExtend(path_graph,
-        path_graph.remainingLimit(parameters.getLimitBytes()), parameters);
+      externalPathGraphExtendWithThreads(path_graph,
+        path_graph.remainingLimit(parameters.getLimitBytes()), parameters,
+        requested_threads);
     }
     else
     {
@@ -1228,7 +1229,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   size_type merge_buffer = pathMergeInputBudget(parameters);
   MergedGraph merged_graph(path_graph, mapper, lcp,
     path_graph.remainingLimit(parameters.getLimitBytes()), merge_buffer,
-    nullptr, externalMaxOpenFiles());
+    externalMaxOpenFiles());
   this->header.path_nodes = merged_graph.size();
   this->header.order = merged_graph.k();
   path_graph.clear();
@@ -1271,13 +1272,15 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     sdsl::util::clear(mapper);
     this->header.edges = event_metadata.total_edges;
     ConstructionParameters component_parameters = parameters;
+    size_type component_threads = requested_threads;
+    size_type component_reserved_descriptors = 0;
     ConcurrentLCPBuild concurrent_lcp;
     if(lcp_output != nullptr)
     {
       const size_type lcp_budget = std::min(parameters.getMemoryLimitBytes(),
         externalIOBufferSize(parameters));
       const char* blocker = lcpOverlapBlocker(parameters,
-        construction_threads, lcp_budget);
+        requested_threads, lcp_budget);
       if(blocker == nullptr)
       {
         ConstructionParameters lcp_parameters = parameters;
@@ -1292,6 +1295,11 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
         {
           component_parameters.setMemoryLimitBytes(
             parameters.getMemoryLimitBytes() - lcp_budget);
+          // One thread and the LCP writer's maximum descriptor set now belong
+          // to the concurrent phase rather than final-component encoding.
+          component_threads = std::max(static_cast<size_type>(1),
+            requested_threads - 1);
+          component_reserved_descriptors = LCP_OVERLAP_DESCRIPTORS;
           if(Verbosity::level >= Verbosity::EXTENDED)
           {
             std::cerr << "GCSA::GCSA(): overlapping LCP storage with final component storage"
@@ -1311,8 +1319,9 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     }
     if(direct_output != nullptr)
     {
-      storeFinalComponents(this->header, graph.alpha, event_files,
-        event_metadata, component_parameters, *direct_output);
+      storeFinalComponentsConcurrent(this->header, graph.alpha, event_files,
+        event_metadata, component_parameters, *direct_output, component_threads,
+        component_reserved_descriptors);
     }
     else
     {

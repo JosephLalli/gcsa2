@@ -220,7 +220,7 @@ physicalId(logical_file_id_t logical, std::uint64_t local_shard)
 ExternalInputPreprocessor::ExternalInputPreprocessor(const InputGraph& graph,
   const ConstructionParameters& parameters) :
   graph_(graph), parameters_(parameters),
-  key_name_(), start_name_(), key_count_(0), start_count_(0), prepared_(false), stats_()
+  key_name_(), start_name_(), key_count_(0), start_count_(0), prepared_(false)
 {
 }
 
@@ -302,14 +302,14 @@ ExternalInputPreprocessor::prepare()
         if(first) { merged_key = key; }
         else { merged_key = Key::merge(merged_key, key); }
         if(last) { output.write(reinterpret_cast<const char*>(&merged_key), sizeof(merged_key)); }
-      }, &this->stats_.key_sort);
+      });
     ExternalFixedRecordSorter::sortAndReduce(start_source, this->start_name_,
       sizeof(node_type), this->sortBudget(), externalMergeFanIn(),
       compareNode,
       [](const void* value, bool first, bool, std::ostream& output)
       {
         if(first) { output.write(reinterpret_cast<const char*>(value), sizeof(node_type)); }
-      }, &this->stats_.start_sort);
+      });
     TempFile::remove(key_source);
     TempFile::remove(start_source);
   }
@@ -325,8 +325,6 @@ ExternalInputPreprocessor::prepare()
   {
     throw std::runtime_error("external preprocessing: input produced no valid keys");
   }
-  this->stats_.unique_keys = this->key_count_;
-  this->stats_.unique_start_nodes = this->start_count_;
   this->prepared_ = true;
 }
 
@@ -456,11 +454,9 @@ ExternalInputPreprocessor::buildInitialPathGraph(PathGraph& result)
           });
         raw.close();
       }
-      ExternalFixedRecordSortStats kmer_stats;
       ExternalFixedRecordSorter::sort(raw_name, sorted_name,
         sizeof(InitialKMerRecord), sort_budget, externalMergeFanIn(),
-        compareInitialKMer, &kmer_stats);
-      this->stats_.logical_kmer_sorts++;
+        compareInitialKMer);
 
       // Mapping uses two bounded readers and two bounded path/rank writers.
       // ioBufferBytes() is at most sortBudget()/8, so their four explicit
@@ -498,7 +494,7 @@ ExternalInputPreprocessor::buildInitialPathGraph(PathGraph& result)
         initial.logical_file_ids.push_back(logical_file_id_t(static_cast<std::uint32_t>(file)));
         initial.physical_shard_ids.push_back(physicalId(logical_file_id_t(static_cast<std::uint32_t>(file)), local_shard));
         initial.path_count += path_count; initial.rank_count += rank_count;
-        local_shard++; this->stats_.physical_shards++;
+        local_shard++;
       };
       open_shard();
       for(size_type i = 0; i < this->graph_.sizes[file]; i++)

@@ -12,12 +12,14 @@
 #include <array>
 #include <cerrno>
 #include <cstdint>
+#include <exception>
 #include <fcntl.h>
 #include <limits>
 #include <map>
 #include <memory>
 #include <queue>
 #include <stdexcept>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -76,11 +78,69 @@ struct JoinRun
     name(path), records(count) { }
 };
 
+class ScopedDescriptor
+{
+public:
+  explicit ScopedDescriptor(int value) : descriptor(value) { }
+
+  ~ScopedDescriptor()
+  {
+    if(this->descriptor >= 0) { ::close(this->descriptor); }
+  }
+
+  int get() const { return this->descriptor; }
+
+  int release()
+  {
+    int result = this->descriptor; this->descriptor = -1;
+    return result;
+  }
+
+private:
+  ScopedDescriptor(const ScopedDescriptor&);
+  ScopedDescriptor& operator=(const ScopedDescriptor&);
+
+  int descriptor;
+};
+
+void
+removeJoinRun(JoinRun& run)
+{
+  if(!run.name.empty()) { TempFile::remove(run.name); }
+}
+
+void
+removeJoinRuns(std::vector<JoinRun>& runs)
+{
+  for(JoinRun& run : runs) { removeJoinRun(run); }
+}
+
 std::runtime_error
 joinError(const std::string& message, const std::string& path = std::string())
 {
   return std::runtime_error("externalPathGraphExtend(): " + message +
     (path.empty() ? std::string() : ": " + path));
+}
+
+size_type
+availableJoinDescriptors()
+{
+  // This privately admits low-numbered slots below the configured ceiling and
+  // RLIMIT_NOFILE. It does not claim a process-wide descriptor count.
+  size_type limit = externalMaxOpenFiles();
+  struct rlimit resource_limit;
+  if(::getrlimit(RLIMIT_NOFILE, &resource_limit) == 0 &&
+     resource_limit.rlim_cur != RLIM_INFINITY &&
+     resource_limit.rlim_cur < static_cast<rlim_t>(limit))
+  {
+    limit = static_cast<size_type>(resource_limit.rlim_cur);
+  }
+  size_type open = 0;
+  for(size_type descriptor = 0; descriptor < limit; descriptor++)
+  {
+    if(::fcntl(static_cast<int>(descriptor), F_GETFD) >= 0 || errno != EBADF) { open++; }
+  }
+  return (open >= limit ? 0 : limit - open);
 }
 
 void
@@ -284,18 +344,26 @@ public:
     name(path), logical_id(logical), key_kind(kind), descriptor(-1), count(0),
     cache_released(0), finished(false), buffer()
   {
-    this->descriptor = ::open(this->name.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
-    if(this->descriptor < 0) { throw joinError("cannot create join run", this->name); }
-    adviseSequential(this->descriptor);
-    std::array<std::uint8_t, JOIN_HEADER_BYTES> header;
-    std::uint8_t* out = header.data();
-    encodeLittle<std::uint64_t>(out, JOIN_HEADER_MAGIC);
-    encodeLittle<std::uint32_t>(out, JOIN_FORMAT_VERSION);
-    encodeLittle<std::uint32_t>(out, static_cast<std::uint32_t>(this->key_kind));
-    encodeLittle<std::uint32_t>(out, this->logical_id.value);
-    encodeLittle<std::uint64_t>(out, 0);
-    writeAll(this->descriptor, header.data(), header.size(), this->name);
-    this->buffer.reserve(JOIN_IO_BUFFER_RECORDS);
+    ScopedDescriptor file(::open(this->name.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644));
+    if(file.get() < 0) { throw joinError("cannot create join run", this->name); }
+    try
+    {
+      adviseSequential(file.get());
+      std::array<std::uint8_t, JOIN_HEADER_BYTES> header;
+      std::uint8_t* out = header.data();
+      encodeLittle<std::uint64_t>(out, JOIN_HEADER_MAGIC);
+      encodeLittle<std::uint32_t>(out, JOIN_FORMAT_VERSION);
+      encodeLittle<std::uint32_t>(out, static_cast<std::uint32_t>(this->key_kind));
+      encodeLittle<std::uint32_t>(out, this->logical_id.value);
+      encodeLittle<std::uint64_t>(out, 0);
+      writeAll(file.get(), header.data(), header.size(), this->name);
+      this->buffer.reserve(JOIN_IO_BUFFER_RECORDS);
+    }
+    catch(...)
+    {
+      ::unlink(this->name.c_str()); throw;
+    }
+    this->descriptor = file.release();
   }
 
   ~JoinFileWriter()
@@ -367,11 +435,11 @@ public:
     cache_released(0), buffer(JOIN_IO_BUFFER_RECORDS), buffer_first(0),
     buffer_records(0)
   {
-    this->descriptor = ::open(this->name.c_str(), O_RDONLY);
-    if(this->descriptor < 0) { throw joinError("cannot open join run", this->name); }
-    adviseSequential(this->descriptor);
+    ScopedDescriptor file(::open(this->name.c_str(), O_RDONLY));
+    if(file.get() < 0) { throw joinError("cannot open join run", this->name); }
+    adviseSequential(file.get());
     std::array<std::uint8_t, JOIN_HEADER_BYTES> header;
-    preadAll(this->descriptor, header.data(), header.size(), 0, this->name);
+    preadAll(file.get(), header.data(), header.size(), 0, this->name);
     const std::uint8_t* in = header.data();
     std::uint64_t magic = decodeLittle<std::uint64_t>(in);
     std::uint32_t version = decodeLittle<std::uint32_t>(in);
@@ -390,13 +458,13 @@ public:
       throw joinError("join run is too large for this build", this->name);
     }
     struct stat info;
-    if(::fstat(this->descriptor, &info) != 0 || static_cast<size_type>(info.st_size) !=
+    if(::fstat(file.get(), &info) != 0 || static_cast<size_type>(info.st_size) !=
        JOIN_HEADER_BYTES + this->record_count * JOIN_RECORD_BYTES + JOIN_FOOTER_BYTES)
     {
       throw joinError("join run length mismatch", this->name);
     }
     std::array<std::uint8_t, JOIN_FOOTER_BYTES> footer;
-    preadAll(this->descriptor, footer.data(), footer.size(),
+    preadAll(file.get(), footer.data(), footer.size(),
       JOIN_HEADER_BYTES + this->record_count * JOIN_RECORD_BYTES, this->name);
     in = footer.data();
     if(decodeLittle<std::uint64_t>(in) != JOIN_FOOTER_MAGIC ||
@@ -404,6 +472,7 @@ public:
     {
       throw joinError("join run footer mismatch", this->name);
     }
+    this->descriptor = file.release();
   }
 
   ~JoinFileReader()
@@ -541,6 +610,14 @@ public:
     }
   }
 
+  ~ExternalJoinSorter()
+  {
+    for(std::vector<JoinRun>& level : this->levels)
+    {
+      for(JoinRun& run : level) { removeJoinRun(run); }
+    }
+  }
+
   void add(const JoinRecord& record)
   {
     this->buffer.push_back(record);
@@ -549,36 +626,47 @@ public:
 
   JoinRun finish()
   {
-    this->flush();
-    std::vector<JoinRecord>().swap(this->buffer);
     std::vector<JoinRun> remaining;
-    for(size_type level = 0; level < this->levels.size(); level++)
+    try
     {
-      remaining.insert(remaining.end(), this->levels[level].begin(), this->levels[level].end());
-      this->levels[level].clear();
-    }
-    if(remaining.empty())
-    {
-      std::string empty_name = TempFile::getName("gcsa_join_run");
-      JoinFileWriter empty(empty_name, this->logical_id, this->key_kind);
-      return empty.finish();
-    }
-    while(remaining.size() > 1)
-    {
-      std::vector<JoinRun> next;
-      for(size_type first = 0; first < remaining.size(); first += this->fan_in)
+      this->flush();
+      std::vector<JoinRecord>().swap(this->buffer);
+      for(size_type level = 0; level < this->levels.size(); level++)
       {
-        size_type last = std::min(remaining.size(), first + this->fan_in);
-        if(last - first == 1) { next.push_back(remaining[first]); continue; }
-        std::vector<JoinRun> group(remaining.begin() + first, remaining.begin() + last);
-        JoinRun merged = mergeJoinRuns(group, this->logical_id, this->key_kind,
-          this->statistics);
-        for(size_type i = 0; i < group.size(); i++) { TempFile::remove(group[i].name); }
-        next.push_back(merged);
+        remaining.insert(remaining.end(), this->levels[level].begin(), this->levels[level].end());
+        this->levels[level].clear();
       }
-      remaining.swap(next);
+      if(remaining.empty())
+      {
+        std::string empty_name = TempFile::getName("gcsa_join_run");
+        JoinFileWriter empty(empty_name, this->logical_id, this->key_kind);
+        return empty.finish();
+      }
+      while(remaining.size() > 1)
+      {
+        std::vector<JoinRun> next;
+        try
+        {
+          for(size_type first = 0; first < remaining.size(); first += this->fan_in)
+          {
+            size_type last = std::min(remaining.size(), first + this->fan_in);
+            if(last - first == 1) { next.push_back(remaining[first]); continue; }
+            std::vector<JoinRun> group(remaining.begin() + first, remaining.begin() + last);
+            JoinRun merged = mergeJoinRuns(group, this->logical_id, this->key_kind,
+              this->statistics);
+            for(size_type i = 0; i < group.size(); i++) { TempFile::remove(group[i].name); }
+            next.push_back(merged);
+          }
+        }
+        catch(...)
+        {
+          removeJoinRuns(remaining); removeJoinRuns(next); throw;
+        }
+        remaining.swap(next);
+      }
+      return remaining.front();
     }
-    return remaining.front();
+    catch(...) { removeJoinRuns(remaining); throw; }
   }
 
 private:
@@ -632,20 +720,22 @@ public:
     path_buffer_first(0), path_buffer_records(0),
     rank_buffer_first(0), rank_buffer_records(0)
   {
-    this->path_descriptor = ::open(this->path_name.c_str(), O_RDONLY);
-    this->rank_descriptor = ::open(this->rank_name.c_str(), O_RDONLY);
-    if(this->path_descriptor < 0 || this->rank_descriptor < 0)
+    ScopedDescriptor path_file(::open(this->path_name.c_str(), O_RDONLY));
+    ScopedDescriptor rank_file(::open(this->rank_name.c_str(), O_RDONLY));
+    if(path_file.get() < 0 || rank_file.get() < 0)
     {
       throw joinError("cannot open path shard", this->path_name);
     }
-    adviseSequential(this->path_descriptor); adviseSequential(this->rank_descriptor);
+    adviseSequential(path_file.get()); adviseSequential(rank_file.get());
     struct stat paths, ranks;
-    if(::fstat(this->path_descriptor, &paths) != 0 || ::fstat(this->rank_descriptor, &ranks) != 0 ||
+    if(::fstat(path_file.get(), &paths) != 0 || ::fstat(rank_file.get(), &ranks) != 0 ||
        static_cast<size_type>(paths.st_size) != this->path_count * sizeof(PathNode) ||
        static_cast<size_type>(ranks.st_size) != this->rank_count * sizeof(PathNode::rank_type))
     {
       throw joinError("path shard length does not match metadata", this->path_name);
     }
+    this->path_descriptor = path_file.release();
+    this->rank_descriptor = rank_file.release();
   }
 
   ~PathShardReader()
@@ -749,119 +839,10 @@ private:
   size_type rank_buffer_first, rank_buffer_records;
 };
 
-class PathPairWriter
-{
-public:
-  PathPairWriter(const PathGraph& graph, size_type file, size_type size_limit,
-    size_type& committed_bytes) :
-    path_name(graph.path_names.at(file)), rank_name(graph.rank_names.at(file)),
-    path_descriptor(-1), rank_descriptor(-1), limit(size_limit),
-    predecessor_bytes(committed_bytes), path_count(0), rank_count(0), bytes(0), closed(false),
-    path_buffer(), rank_buffer()
-  {
-    this->path_descriptor = ::open(this->path_name.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
-    this->rank_descriptor = ::open(this->rank_name.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
-    if(this->path_descriptor < 0 || this->rank_descriptor < 0)
-    {
-      throw joinError("cannot create generated path pair", this->path_name);
-    }
-    adviseSequential(this->path_descriptor); adviseSequential(this->rank_descriptor);
-    this->path_buffer.reserve(std::max(static_cast<size_type>(1),
-      JOIN_IO_BUFFER_BYTES / sizeof(PathNode)));
-    this->rank_buffer.reserve(std::max(static_cast<size_type>(1),
-      JOIN_IO_BUFFER_BYTES / sizeof(PathNode::rank_type)));
-  }
-
-  ~PathPairWriter()
-  {
-    if(this->path_descriptor >= 0) { ::close(this->path_descriptor); }
-    if(this->rank_descriptor >= 0) { ::close(this->rank_descriptor); }
-  }
-
-  void writeRecord(const JoinRecord& record)
-  {
-    size_type record_bytes = sizeof(PathNode) + record.node.ranks() * sizeof(PathNode::rank_type);
-    if(record_bytes > this->limit || this->predecessor_bytes > this->limit - record_bytes ||
-       this->bytes > this->limit - this->predecessor_bytes - record_bytes)
-    {
-      throw joinError("configured disk limit exceeded while generating paths");
-    }
-    if(this->rank_count >= (static_cast<size_type>(1) << 40))
-    {
-      throw joinError("rank sidecar exceeds the 40-bit PathNode pointer format");
-    }
-    PathNode node = record.node; node.setPointer(this->rank_count);
-    if(this->path_buffer.size() >= JOIN_IO_BUFFER_BYTES / sizeof(PathNode))
-    {
-      this->flushPaths();
-    }
-    if(this->rank_buffer.size() + node.ranks() >
-       JOIN_IO_BUFFER_BYTES / sizeof(PathNode::rank_type))
-    {
-      this->flushRanks();
-    }
-    this->path_buffer.push_back(node);
-    this->rank_buffer.insert(this->rank_buffer.end(), record.labels,
-      record.labels + node.ranks());
-    this->path_count++; this->rank_count += node.ranks(); this->bytes += record_bytes;
-  }
-
-  void finish(size_type& committed_bytes)
-  {
-    if(this->closed) { return; }
-    this->flushPaths(); this->flushRanks();
-    trimWrittenCache(this->path_descriptor, this->path_cache_released, true,
-      this->path_name);
-    trimWrittenCache(this->rank_descriptor, this->rank_cache_released, true,
-      this->rank_name);
-    if(::close(this->path_descriptor) != 0 || ::close(this->rank_descriptor) != 0)
-    {
-      throw joinError("cannot close generated path pair", this->path_name);
-    }
-    this->path_descriptor = -1; this->rank_descriptor = -1;
-    committed_bytes += this->bytes; this->closed = true;
-  }
-
-  size_type paths() const { return this->path_count; }
-  size_type ranks() const { return this->rank_count; }
-
-private:
-  void flushPaths()
-  {
-    if(this->path_buffer.empty()) { return; }
-    writeAll(this->path_descriptor, this->path_buffer.data(),
-      this->path_buffer.size() * sizeof(PathNode), this->path_name);
-    this->path_buffer.clear();
-    trimWrittenCache(this->path_descriptor, this->path_cache_released, false,
-      this->path_name);
-  }
-
-  void flushRanks()
-  {
-    if(this->rank_buffer.empty()) { return; }
-    writeAll(this->rank_descriptor, this->rank_buffer.data(),
-      this->rank_buffer.size() * sizeof(PathNode::rank_type), this->rank_name);
-    this->rank_buffer.clear();
-    trimWrittenCache(this->rank_descriptor, this->rank_cache_released, false,
-      this->rank_name);
-  }
-
-  PathPairWriter(const PathPairWriter&);
-  PathPairWriter& operator=(const PathPairWriter&);
-
-  std::string path_name, rank_name;
-  int path_descriptor, rank_descriptor;
-  size_type limit, predecessor_bytes, path_count, rank_count, bytes;
-  off_t path_cache_released = 0, rank_cache_released = 0;
-  bool closed;
-  std::vector<PathNode> path_buffer;
-  std::vector<PathNode::rank_type> rank_buffer;
-};
-
 void
 scanJoinSide(const PathGraph& graph, const std::vector<size_type>& shards,
   logical_file_id_t logical, JoinKeyKind kind, ExternalJoinSorter& sorter,
-  PathPairWriter* bypass, ExternalPathJoinStats* stats)
+  ExternalPathJoinStats* stats)
 {
   std::uint64_t ordinal = 0;
   for(size_type shard : shards)
@@ -875,12 +856,6 @@ scanJoinSide(const PathGraph& graph, const std::vector<size_type>& shards,
       {
         record.key = record.node.from; sorter.add(record);
         if(stats != nullptr) { stats->right_records++; }
-        if(record.node.sorted())
-        {
-          if(bypass == nullptr) { throw joinError("missing sorted-path bypass writer"); }
-          bypass->writeRecord(record);
-          if(stats != nullptr) { stats->sorted_bypass++; }
-        }
       }
       else if(!record.node.sorted())
       {
@@ -913,8 +888,20 @@ extendRecord(const JoinRecord& left, const JoinRecord& right)
 }
 
 void
+writeLabelRecord(const JoinRecord& record, ExternalPathSortSink& output,
+  bool bypass, ExternalPathJoinStats* stats)
+{
+  output.write(record.node, record.labels);
+  if(stats != nullptr)
+  {
+    if(bypass) { stats->sorted_bypass++; }
+    else { stats->generated_records++; }
+  }
+}
+
+void
 joinSortedRuns(const JoinRun& left_run, const JoinRun& right_run,
-  logical_file_id_t logical, size_type byte_budget, PathPairWriter& output,
+  logical_file_id_t logical, size_type byte_budget, ExternalPathSortSink& output,
   ExternalPathJoinStats* stats)
 {
   JoinFileReader left(left_run, logical, LEFT_BY_TO);
@@ -925,7 +912,15 @@ joinSortedRuns(const JoinRun& left_run, const JoinRun& right_run,
   {
     left.read(left_offset, left_record); right.read(right_offset, right_record);
     if(left_record.key < right_record.key) { left_offset++; continue; }
-    if(right_record.key < left_record.key) { right_offset++; continue; }
+    if(right_record.key < left_record.key)
+    {
+      if(right_record.node.sorted())
+      {
+        writeLabelRecord(right_record, output, true, stats);
+      }
+      right_offset++;
+      continue;
+    }
     node_type key = left_record.key;
     size_type left_limit = left_offset;
     do
@@ -941,6 +936,14 @@ joinSortedRuns(const JoinRun& left_run, const JoinRun& right_run,
       if(right_limit >= right.size()) { break; }
       right.read(right_limit, right_record);
     } while(right_record.key == key);
+    for(size_type j = right_offset; j < right_limit; j++)
+    {
+      right.read(j, right_record);
+      if(right_record.node.sorted())
+      {
+        writeLabelRecord(right_record, output, true, stats);
+      }
+    }
     size_type group_records = (left_limit - left_offset) + (right_limit - right_offset);
     if(stats != nullptr && group_records >
        std::max(static_cast<size_type>(1),
@@ -956,11 +959,18 @@ joinSortedRuns(const JoinRun& left_run, const JoinRun& right_run,
       for(size_type j = right_offset; j < right_limit; j++)
       {
         right.read(j, right_record);
-        output.writeRecord(extendRecord(left_record, right_record));
-        if(stats != nullptr) { stats->generated_records++; }
+        writeLabelRecord(extendRecord(left_record, right_record), output, false, stats);
       }
     }
     left_offset = left_limit; right_offset = right_limit;
+  }
+  while(right_offset < right.size())
+  {
+    right.read(right_offset++, right_record);
+    if(right_record.node.sorted())
+    {
+      writeLabelRecord(right_record, output, true, stats);
+    }
   }
 }
 
@@ -978,7 +988,16 @@ externalPathJoinMinimumBudget()
 
 void
 externalPathGraphExtend(PathGraph& graph, size_type size_limit,
-  const ConstructionParameters& parameters, ExternalPathJoinStats* stats)
+  const ConstructionParameters& parameters,
+  ExternalPathJoinStats* stats)
+{
+  externalPathGraphExtendWithThreads(graph, size_limit, parameters, 1, stats);
+}
+
+size_type
+externalPathGraphExtendWithThreads(PathGraph& graph, size_type size_limit,
+  const ConstructionParameters& parameters, size_type requested_threads,
+  ExternalPathJoinStats* stats)
 {
   if(stats != nullptr) { *stats = ExternalPathJoinStats(); }
   if(graph.logical_file_ids.size() != graph.files() ||
@@ -992,24 +1011,35 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
   {
     throw joinError("configured memory limit is below the external path minimum");
   }
-  // Run generation and label sorting are consecutive phases. Each receives the
-  // aggregate limit, while the raw pair exists only on disk between them.
   size_type join_budget = memory_budget;
   size_type sort_budget = memory_budget;
-  if(externalMaxOpenFiles() < 6)
+  size_type join_reader_bytes = JOIN_IO_BUFFER_BYTES + sizeof(JoinRecord) + 256;
+  if(sort_budget < 2 * join_reader_bytes ||
+     sort_budget - 2 * join_reader_bytes < externalPathGraphSortMinimumBudget())
   {
-    throw joinError("max-open-files must be at least 6 for the external join");
+    throw joinError("configured memory limit cannot hold the direct label-sort sink");
   }
-  size_type join_fan_in = std::min(externalMergeFanIn(),
-    externalMaxOpenFiles() - 3);
-  size_type label_fan_in = std::min(externalMergeFanIn(),
-    externalMaxOpenFiles() - 1);
+  size_type direct_sort_budget = sort_budget - 2 * join_reader_bytes;
+  const size_type descriptor_slots = availableJoinDescriptors();
+  // The later serial label sink needs the six fixed descriptors and a two-way
+  // merge before it can report an ordinary construction error.
+  if(descriptor_slots < 10)
+  {
+    throw joinError("available descriptor slots cannot hold the external join");
+  }
 
   std::map<logical_file_id_t, std::vector<size_type>> groups;
   for(size_type file = 0; file < graph.files(); file++)
   {
     groups[graph.logicalFile(file)].push_back(file);
   }
+  struct JoinGroup
+  {
+    logical_file_id_t logical;
+    std::vector<size_type> shards;
+  };
+  std::vector<JoinGroup> inputs;
+  inputs.reserve(groups.size());
   for(auto& group : groups)
   {
     std::sort(group.second.begin(), group.second.end(), [&graph](size_type left, size_type right)
@@ -1020,48 +1050,146 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
       }
       return left < right;
     });
+    inputs.push_back({ group.first, std::move(group.second) });
   }
 
-  PathGraph next(groups.size(), 2 * graph.k(), graph.step() + 1);
-  size_type output_file = 0, committed_bytes = 0;
-  for(const auto& group : groups)
+  const size_type task_minimum = externalPathJoinMinimumBudget();
+  const size_type requested_workers = std::max(static_cast<size_type>(1), requested_threads);
+  const size_type worker_limit = std::min(requested_workers, inputs.size());
+  size_type admitted_workers = 1;
+  for(size_type candidate = worker_limit; candidate > 1; candidate--)
   {
-    logical_file_id_t logical = group.first;
-    next.logical_file_ids[output_file] = logical;
-    next.physical_shard_ids[output_file] = physical_shard_id_t(output_file);
-    PathPairWriter output(next, output_file, size_limit, committed_bytes);
+    if(memory_budget / candidate < task_minimum || descriptor_slots / candidate < 5)
+    {
+      continue;
+    }
+    admitted_workers = candidate;
+    break;
+  }
 
-    ExternalJoinSorter right_sorter(logical, RIGHT_BY_FROM, join_budget,
-      join_fan_in, stats);
-    scanJoinSide(graph, group.second, logical, RIGHT_BY_FROM, right_sorter, &output, stats);
-    JoinRun right = right_sorter.finish();
+  const size_type worker_budget = memory_budget / admitted_workers;
+  const size_type worker_fan_in = std::min(externalMergeFanIn(),
+    descriptor_slots / admitted_workers - 3);
+  const size_type label_fan_in = std::min(externalMergeFanIn(), descriptor_slots - 1);
+  if(worker_fan_in < 2 || label_fan_in < 2)
+  {
+    throw joinError("available descriptor slots cannot hold a two-way join merge");
+  }
 
-    ExternalJoinSorter left_sorter(logical, LEFT_BY_TO, join_budget,
-      join_fan_in, stats);
-    scanJoinSide(graph, group.second, logical, LEFT_BY_TO, left_sorter, nullptr, stats);
-    JoinRun left = left_sorter.finish();
+  struct JoinRuns
+  {
+    JoinRun left, right;
+    ExternalPathJoinStats statistics;
+  };
+  std::vector<JoinRuns> runs(inputs.size());
+  std::vector<std::exception_ptr> failures(inputs.size());
+  size_type active_workers = 1;
 
-    joinSortedRuns(left, right, logical, join_budget, output, stats);
-    TempFile::remove(left.name); TempFile::remove(right.name);
-    output.finish(committed_bytes);
-    next.path_counts[output_file] = output.paths();
-    next.rank_counts[output_file] = output.ranks();
-    next.path_count += output.paths(); next.rank_count += output.ranks();
-    ExternalPathSortStats sort_stats;
-    externalPathGraphSort(next, output_file, sort_budget,
-      label_fan_in, (stats == nullptr ? nullptr : &sort_stats));
+#pragma omp parallel num_threads(admitted_workers)
+  {
+#pragma omp single
+    active_workers = static_cast<size_type>(omp_get_num_threads());
+
+#pragma omp for schedule(dynamic, 1)
+    for(std::int64_t index = 0; index < static_cast<std::int64_t>(inputs.size()); index++)
+    {
+      try
+      {
+        const JoinGroup& input = inputs[static_cast<size_type>(index)];
+        JoinRuns& output = runs[static_cast<size_type>(index)];
+        ExternalJoinSorter right_sorter(input.logical, RIGHT_BY_FROM, worker_budget,
+          worker_fan_in, &output.statistics);
+        scanJoinSide(graph, input.shards, input.logical, RIGHT_BY_FROM,
+          right_sorter, &output.statistics);
+        output.right = right_sorter.finish();
+
+        ExternalJoinSorter left_sorter(input.logical, LEFT_BY_TO, worker_budget,
+          worker_fan_in, &output.statistics);
+        scanJoinSide(graph, input.shards, input.logical, LEFT_BY_TO,
+          left_sorter, &output.statistics);
+        output.left = left_sorter.finish();
+      }
+      catch(...) { failures[static_cast<size_type>(index)] = std::current_exception(); }
+    }
+  }
+
+  for(size_type index = 0; index < runs.size(); index++)
+  {
+    if(failures[index])
+    {
+      for(JoinRuns& output : runs)
+      {
+        removeJoinRun(output.left); removeJoinRun(output.right);
+      }
+      std::rethrow_exception(failures[index]);
+    }
+  }
+
+  try
+  {
     if(stats != nullptr)
     {
-      stats->max_records_resident = std::max(stats->max_records_resident,
-        sort_stats.max_records_resident);
-      stats->max_bytes_resident = std::max(stats->max_bytes_resident,
-        sort_stats.max_bytes_resident);
+      std::vector<size_type> resident_records, resident_bytes;
+      resident_records.reserve(runs.size()); resident_bytes.reserve(runs.size());
+      for(const JoinRuns& output : runs)
+      {
+        stats->left_records += output.statistics.left_records;
+        stats->right_records += output.statistics.right_records;
+        stats->initial_runs += output.statistics.initial_runs;
+        stats->merge_operations += output.statistics.merge_operations;
+        resident_records.push_back(output.statistics.max_records_resident);
+        resident_bytes.push_back(output.statistics.max_bytes_resident);
+      }
+      std::sort(resident_records.rbegin(), resident_records.rend());
+      std::sort(resident_bytes.rbegin(), resident_bytes.rend());
+      size_type aggregate_records = 0, aggregate_bytes = 0;
+      for(size_type i = 0; i < active_workers && i < resident_bytes.size(); i++)
+      {
+        aggregate_records += resident_records[i]; aggregate_bytes += resident_bytes[i];
+      }
+      stats->max_records_resident = aggregate_records;
+      stats->max_bytes_resident = aggregate_bytes;
     }
-    output_file++;
+
+    PathGraph next(inputs.size(), 2 * graph.k(), graph.step() + 1);
+    size_type committed_bytes = 0;
+    for(size_type output_file = 0; output_file < inputs.size(); output_file++)
+    {
+      const JoinGroup& input = inputs[output_file];
+      JoinRuns& join_runs = runs[output_file];
+      next.logical_file_ids[output_file] = input.logical;
+      next.physical_shard_ids[output_file] = physical_shard_id_t(output_file);
+      ExternalPathSortStats sort_stats;
+      ExternalPathSortSink output(next, output_file, direct_sort_budget,
+        label_fan_in, size_limit, committed_bytes,
+        (stats == nullptr ? nullptr : &sort_stats));
+      joinSortedRuns(join_runs.left, join_runs.right, input.logical, join_budget, output, stats);
+      removeJoinRun(join_runs.left); removeJoinRun(join_runs.right);
+      output.finish();
+      if(stats != nullptr)
+      {
+        stats->max_records_resident = std::max(stats->max_records_resident,
+          sort_stats.max_records_resident);
+        size_type direct_pipeline_bytes = sort_stats.max_bytes_resident +
+          2 * join_reader_bytes;
+        stats->max_bytes_resident = std::max(stats->max_bytes_resident,
+          direct_pipeline_bytes);
+      }
+    }
+
+    next.stored_bytes = committed_bytes;
+    graph.clear(); graph.swap(next);
+  }
+  catch(...)
+  {
+    for(JoinRuns& output : runs)
+    {
+      removeJoinRun(output.left); removeJoinRun(output.right);
+    }
+    throw;
   }
 
-  next.stored_bytes = committed_bytes;
-  graph.clear(); graph.swap(next);
+  return active_workers;
 }
 
 } // namespace gcsa
