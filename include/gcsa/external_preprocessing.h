@@ -41,7 +41,6 @@ public:
   // sorted physical PathGraph shards. Every output shard retains its logical ID.
   void buildInitialPathGraph(PathGraph& result);
 
-  size_type keyCount() const;
   size_type startNodeCount() const;
 
   ExternalInputPreprocessor(const ExternalInputPreprocessor&) = delete;
