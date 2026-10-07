@@ -14,19 +14,6 @@
 namespace gcsa
 {
 
-struct ExternalInputPreprocessingStats
-{
-  ExternalFixedRecordSortStats key_sort, start_sort;
-  size_type logical_kmer_sorts, physical_shards;
-  size_type unique_keys, unique_start_nodes;
-
-  ExternalInputPreprocessingStats() :
-    key_sort(), start_sort(), logical_kmer_sorts(0), physical_shards(0),
-    unique_keys(0), unique_start_nodes(0)
-  {
-  }
-};
-
 /*
   Produces the immutable input facts needed by construction without materializing
   global KMer/key/start-node vectors. Key and start streams use bounded scratch
@@ -56,7 +43,6 @@ public:
 
   size_type keyCount() const;
   size_type startNodeCount() const;
-  const ExternalInputPreprocessingStats& stats() const { return this->stats_; }
 
   ExternalInputPreprocessor(const ExternalInputPreprocessor&) = delete;
   ExternalInputPreprocessor& operator=(const ExternalInputPreprocessor&) = delete;
@@ -67,7 +53,6 @@ private:
   std::string key_name_, start_name_;
   size_type key_count_, start_count_;
   bool prepared_;
-  ExternalInputPreprocessingStats stats_;
 
   void prepare();
   size_type sortBudget() const;
