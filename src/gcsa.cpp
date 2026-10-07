@@ -947,6 +947,10 @@ GCSA::buildAndStore(InputGraph& graph, const ConstructionParameters& parameters,
   {
     throw std::invalid_argument("GCSA::buildAndStore() requires external-memory construction");
   }
+  // TempFile is process-global. This binds the configured directory at the
+  // construction boundary, but does not isolate simultaneous constructions
+  // that select different directories.
+  TempFile::setDirectory(parameters.work_directory);
   SerialExternalConstruction serial_construction;
   if(graph.size() == 0)
   {

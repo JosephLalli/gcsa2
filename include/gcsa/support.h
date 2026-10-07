@@ -53,7 +53,6 @@ struct ConstructionParameters
   size_type getMemoryLimitBytes() const { return this->memory_limit; }
   size_type getSamplePeriod() const { return this->sample_period; }
   size_type getLCPBranching() const { return this->lcp_branching; }
-  const std::string& getWorkDirectory() const { return this->work_directory; }
   // The external route is opt-in until all legacy phases have disk-first
   // implementations. The work directory holds scratch generations for one
   // fresh construction.
@@ -71,6 +70,8 @@ struct ConstructionParameters
   size_type sample_period;
   size_type lcp_branching;
 
+private:
+  friend class GCSA;
   std::string work_directory;
 };
 
