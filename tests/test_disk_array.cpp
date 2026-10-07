@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 using namespace gcsa;
 
@@ -18,9 +19,13 @@ void require(bool value) { if(!value) { std::abort(); } }
 int
 main()
 {
-  char root[] = "/tmp/gcsa-disk-array-XXXXXX";
-  require(mkdtemp(root) != nullptr);
-  std::string filename = std::string(root) + "/array.bin";
+  const char* configured = std::getenv("TMPDIR");
+  std::string pattern = std::string(
+    configured != nullptr && configured[0] != '\0' ? configured : "/tmp") +
+    "/gcsa-disk-array-XXXXXX";
+  std::vector<char> root(pattern.begin(), pattern.end()); root.push_back('\0');
+  require(mkdtemp(root.data()) != nullptr);
+  std::string filename = std::string(root.data()) + "/array.bin";
 
   // Two 64-byte cache blocks force repeated direct-map replacement while the
   // logical array remains much larger than the configured resident payload.
@@ -60,6 +65,6 @@ main()
   require(rejected);
 
   require(::unlink(filename.c_str()) == 0);
-  require(::rmdir(root) == 0);
+  require(::rmdir(root.data()) == 0);
   return 0;
 }
