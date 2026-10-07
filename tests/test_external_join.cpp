@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <unistd.h>
@@ -133,6 +134,14 @@ readGraph(const PathGraph& graph)
   return result;
 }
 
+std::vector<char>
+readBytes(const std::string& filename)
+{
+  std::ifstream input(filename.c_str(), std::ios_base::binary);
+  return std::vector<char>(std::istreambuf_iterator<char>(input),
+    std::istreambuf_iterator<char>());
+}
+
 } // namespace
 
 int
@@ -196,6 +205,23 @@ main()
   require(stats.initial_runs > 2 && stats.merge_operations > 0);
   require(stats.blocked_key_groups > 0);
   require(stats.max_bytes_resident <= memory_budget);
+
+  // A larger budget admits private framing for fixed join and path-sort runs.
+  // The installed PathGraph remains the ordinary byte representation.
+  PathGraph framed(left_path, left_rank);
+  framed.order = 1;
+  framed.logical_file_ids[0] = logical_file_id_t(7);
+  framed.physical_shard_ids[0] = physical_shard_id_t(101);
+  appendShard(framed, right_path, right_rank,
+    logical_file_id_t(7), physical_shard_id_t(202));
+  ConstructionParameters framed_parameters = parameters;
+  framed_parameters.setMemoryLimitBytes(64 * MEGABYTE);
+  ExternalPathJoinStats framed_stats;
+  externalPathGraphExtend(framed, GIGABYTE, framed_parameters, &framed_stats);
+  require(readGraph(legacy) == readGraph(framed));
+  require(readBytes(external.path_names[0]) == readBytes(framed.path_names[0]));
+  require(readBytes(external.rank_names[0]) == readBytes(framed.rank_names[0]));
+  require(framed_stats.max_bytes_resident <= 64 * MEGABYTE);
 
   PathGraph separated(left_path, left_rank);
   separated.order = 1;

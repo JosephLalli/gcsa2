@@ -2,6 +2,7 @@
 #include <external_configuration.hpp>
 #include <gcsa/path_graph_external.h>
 #include <gcsa/external_sort.h>
+#include <compressed_block.hpp>
 
 #include <sdsl/wt_algorithm.hpp>
 
@@ -770,6 +771,38 @@ struct PathSortRecord
 
 // Covers stream state, vector control blocks, allocator slack, and the heap.
 constexpr size_type PATH_SORT_FIXED_BYTES = 8192;
+
+struct PathRunCodec
+{
+  bool enabled;
+  size_type block_bytes, writer_bytes, reader_bytes;
+
+  PathRunCodec() : enabled(false), block_bytes(0), writer_bytes(0), reader_bytes(0) { }
+};
+
+PathRunCodec
+pathRunCodec(size_type byte_budget)
+{
+  PathRunCodec result;
+  size_type block = std::max(static_cast<size_type>(sizeof(PathSortRecord)),
+    std::min(static_cast<size_type>(MEGABYTE), byte_budget / 128));
+  result.writer_bytes = CompressedBlockWriter::workingMemoryEstimate(block,
+    CompressedBlockWriter::ZSTD, 1);
+  result.reader_bytes = CompressedBlockReader::workingMemoryEstimate(block);
+  size_type minimum = PATH_SORT_FIXED_BYTES + result.writer_bytes +
+    2 * result.reader_bytes + 3 * sizeof(PathSortRecord) +
+    2 * (sizeof(size_type) + sizeof(void*) + 128);
+  if(minimum <= byte_budget)
+  {
+    result.enabled = true; result.block_bytes = block;
+  }
+  else
+  {
+    result.writer_bytes = 0; result.reader_bytes = 0;
+  }
+  return result;
+}
+
 // Linux charges clean filesystem cache to a cgroup's memory ceiling. The
 // sorter therefore retains only a small sequential tail and periodically
 // syncs completed output prefixes before making them reclaimable. These
@@ -973,6 +1006,7 @@ syncPathSortFile(const std::string& name)
 struct PathSortRunReader
 {
   std::ifstream file;
+  std::unique_ptr<CompressedBlockReader> framed;
   std::vector<PathSortRecord> buffer;
   size_type offset, buffer_records, total_records;
   bool at_end;
@@ -980,18 +1014,27 @@ struct PathSortRunReader
   off_t bytes_read, cache_released;
 
   PathSortRunReader(const std::string& name, size_type requested_records) :
-    file(), buffer(), offset(0), buffer_records(1), total_records(0), at_end(false),
+    file(), framed(), buffer(), offset(0), buffer_records(1), total_records(0), at_end(false),
     cache_descriptor(-1), bytes_read(0), cache_released(0)
   {
-    // The explicit byte-counted vector is the only input buffer. Otherwise
-    // libstdc++ adds an unaccounted buffer for every merge input stream.
-    this->file.rdbuf()->pubsetbuf(nullptr, 0);
-    this->file.open(name.c_str(), std::ios_base::binary);
-    if(!this->file) { externalSortFailure("cannot open run " + name); }
-    size_type bytes = fileSize(this->file);
+    size_type bytes = 0;
+    if(CompressedBlockReader::isFramed(name))
+    {
+      this->framed.reset(new CompressedBlockReader(name));
+      bytes = static_cast<size_type>(this->framed->logicalSize());
+    }
+    else
+    {
+      // The explicit byte-counted vector is the only input buffer. Otherwise
+      // libstdc++ adds an unaccounted buffer for every merge input stream.
+      this->file.rdbuf()->pubsetbuf(nullptr, 0);
+      this->file.open(name.c_str(), std::ios_base::binary);
+      if(!this->file) { externalSortFailure("cannot open run " + name); }
+      bytes = fileSize(this->file);
+      this->cache_descriptor = openPathSortCacheDescriptor(name, O_RDONLY);
+    }
     if(bytes % sizeof(PathSortRecord) != 0) { externalSortFailure("truncated run " + name); }
     this->total_records = bytes / sizeof(PathSortRecord);
-    this->cache_descriptor = openPathSortCacheDescriptor(name, O_RDONLY);
     this->buffer_records = std::max((size_type)1,
       std::min(requested_records, this->total_records));
     this->buffer.resize(this->buffer_records);
@@ -999,7 +1042,8 @@ struct PathSortRunReader
   }
 
   PathSortRunReader(PathSortRunReader&& another) noexcept :
-    file(std::move(another.file)), buffer(std::move(another.buffer)),
+    file(std::move(another.file)), framed(std::move(another.framed)),
+    buffer(std::move(another.buffer)),
     offset(another.offset), buffer_records(another.buffer_records),
     total_records(another.total_records), at_end(another.at_end),
     cache_descriptor(another.cache_descriptor), bytes_read(another.bytes_read),
@@ -1016,10 +1060,23 @@ struct PathSortRunReader
   void refill()
   {
     bool complete = (this->bytes_read == pathSortByteOffset(this->total_records, sizeof(PathSortRecord)));
-    trimPathSortReadCache(this->cache_descriptor, this->bytes_read, this->cache_released, complete);
-    this->file.read(reinterpret_cast<char*>(this->buffer.data()), this->buffer.size() * sizeof(PathSortRecord));
-    std::streamsize bytes = this->file.gcount();
-    DiskIO::read_volume += bytes;
+    if(this->cache_descriptor >= 0)
+    {
+      trimPathSortReadCache(this->cache_descriptor, this->bytes_read,
+        this->cache_released, complete);
+    }
+    std::streamsize bytes = 0;
+    size_type requested = this->buffer.size() * sizeof(PathSortRecord);
+    if(this->framed)
+    {
+      bytes = static_cast<std::streamsize>(this->framed->read(
+        this->buffer.data(), requested));
+    }
+    else
+    {
+      this->file.read(reinterpret_cast<char*>(this->buffer.data()), requested);
+      bytes = this->file.gcount(); DiskIO::read_volume += bytes;
+    }
     if(bytes % (std::streamsize)sizeof(PathSortRecord) != 0) { externalSortFailure("truncated run"); }
     this->bytes_read += bytes;
     this->buffer.resize(bytes / sizeof(PathSortRecord));
@@ -1061,8 +1118,19 @@ struct PathSortHeapComparator
 };
 
 void
-writePathSortRun(const std::string& name, const std::vector<PathSortRecord>& records)
+writePathSortRun(const std::string& name,
+  const std::vector<PathSortRecord>& records, const PathRunCodec& codec)
 {
+  if(codec.enabled)
+  {
+    CompressedBlockWriter output(name, codec.block_bytes,
+      CompressedBlockWriter::ZSTD, 1);
+    for(const PathSortRecord& record : records)
+    {
+      output.writeRecord(&record, sizeof(record));
+    }
+    output.finish(); return;
+  }
   std::ofstream output;
   output.rdbuf()->pubsetbuf(nullptr, 0);
   output.open(name.c_str(), std::ios_base::binary);
@@ -1078,14 +1146,24 @@ writePathSortRun(const std::string& name, const std::vector<PathSortRecord>& rec
 
 std::string
 mergePathSortRuns(const std::vector<std::string>& inputs, size_type buffer_records,
-  ExternalPathSortStats* stats)
+  const PathRunCodec& codec, ExternalPathSortStats* stats)
 {
   std::string output_name = TempFile::getName("gcsa_path_sort_run");
   std::ofstream output;
-  output.rdbuf()->pubsetbuf(nullptr, 0);
-  output.open(output_name.c_str(), std::ios_base::binary);
-  if(!output) { externalSortFailure("cannot create merged run"); }
-  int output_cache_descriptor = openPathSortCacheDescriptor(output_name, O_RDWR);
+  std::unique_ptr<CompressedBlockWriter> framed_output;
+  int output_cache_descriptor = -1;
+  if(codec.enabled)
+  {
+    framed_output.reset(new CompressedBlockWriter(output_name,
+      codec.block_bytes, CompressedBlockWriter::ZSTD, 1));
+  }
+  else
+  {
+    output.rdbuf()->pubsetbuf(nullptr, 0);
+    output.open(output_name.c_str(), std::ios_base::binary);
+    if(!output) { externalSortFailure("cannot create merged run"); }
+    output_cache_descriptor = openPathSortCacheDescriptor(output_name, O_RDWR);
+  }
   off_t output_bytes = 0, output_cache_released = 0;
   std::vector<PathSortRunReader> readers;
   readers.reserve(inputs.size());
@@ -1102,7 +1180,8 @@ mergePathSortRuns(const std::vector<std::string>& inputs, size_type buffer_recor
   output_buffer.reserve(output_records);
   updatePathSortStats(stats, input_buffer_records + output_records,
     PATH_SORT_FIXED_BYTES + (input_buffer_records + output_records) * sizeof(PathSortRecord) +
-    inputs.size() * (sizeof(PathSortRunReader) + 2 * sizeof(size_type)));
+    inputs.size() * (sizeof(PathSortRunReader) + 2 * sizeof(size_type) +
+      codec.reader_bytes) + codec.writer_bytes);
   std::priority_queue<size_type, std::vector<size_type>, PathSortHeapComparator>
     queue{PathSortHeapComparator(&readers)};
   for(size_type i = 0; i < readers.size(); i++)
@@ -1116,22 +1195,38 @@ mergePathSortRuns(const std::vector<std::string>& inputs, size_type buffer_recor
     if(!readers[best].at_end) { queue.push(best); }
     if(output_buffer.size() >= output_buffer.capacity())
     {
-      DiskIO::write(output, output_buffer.data(), output_buffer.size());
+      if(framed_output)
+      {
+        for(const PathSortRecord& record : output_buffer)
+        { framed_output->writeRecord(&record, sizeof(record)); }
+      }
+      else { DiskIO::write(output, output_buffer.data(), output_buffer.size()); }
       addPathSortBytes(output_bytes, output_buffer.size(), sizeof(PathSortRecord));
-      trimPathSortWrittenCache(output, output_cache_descriptor, output_bytes,
-        output_cache_released, false, output_name);
+      if(!framed_output)
+      {
+        trimPathSortWrittenCache(output, output_cache_descriptor, output_bytes,
+          output_cache_released, false, output_name);
+      }
       output_buffer.clear();
     }
   }
   if(!output_buffer.empty())
   {
-    DiskIO::write(output, output_buffer.data(), output_buffer.size());
+    if(framed_output)
+    {
+      for(const PathSortRecord& record : output_buffer)
+      { framed_output->writeRecord(&record, sizeof(record)); }
+    }
+    else { DiskIO::write(output, output_buffer.data(), output_buffer.size()); }
     addPathSortBytes(output_bytes, output_buffer.size(), sizeof(PathSortRecord));
   }
-  trimPathSortWrittenCache(output, output_cache_descriptor, output_bytes,
-    output_cache_released, true, output_name);
-  output.close();
-  ::close(output_cache_descriptor);
+  if(framed_output) { framed_output->finish(); }
+  else
+  {
+    trimPathSortWrittenCache(output, output_cache_descriptor, output_bytes,
+      output_cache_released, true, output_name);
+    output.close(); ::close(output_cache_descriptor);
+  }
   return output_name;
 }
 
@@ -1220,17 +1315,17 @@ writeSortedPathPair(const std::string& run_name, const std::string& path_name,
 void
 addPathSortRun(std::vector<std::vector<std::string>>& levels, const std::string& run,
   size_type level, size_type fan_in, size_type buffer_records,
-  ExternalPathSortStats* stats)
+  const PathRunCodec& codec, ExternalPathSortStats* stats)
 {
   if(levels.size() <= level) { levels.resize(level + 1); }
   levels[level].push_back(run);
   if(levels[level].size() < fan_in) { return; }
 
   std::vector<std::string> inputs; inputs.swap(levels[level]);
-  std::string merged = mergePathSortRuns(inputs, buffer_records, stats);
+  std::string merged = mergePathSortRuns(inputs, buffer_records, codec, stats);
   for(size_type i = 0; i < inputs.size(); i++) { TempFile::remove(inputs[i]); }
   if(stats != nullptr) { stats->merge_passes = std::max(stats->merge_passes, level + 1); }
-  addPathSortRun(levels, merged, level + 1, fan_in, buffer_records, stats);
+  addPathSortRun(levels, merged, level + 1, fan_in, buffer_records, codec, stats);
 }
 
 } // namespace
@@ -1244,8 +1339,11 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   if(stats != nullptr) { *stats = ExternalPathSortStats(); }
   size_type record_bytes = sizeof(PathSortRecord);
   size_type available = byte_budget - PATH_SORT_FIXED_BYTES;
+  PathRunCodec codec = pathRunCodec(byte_budget);
   size_type reader_overhead = sizeof(PathSortRunReader) + 2 * sizeof(size_type);
-  size_type max_fan_in = (available - record_bytes) / (record_bytes + reader_overhead);
+  size_type fixed_merge = codec.writer_bytes + record_bytes;
+  size_type per_reader = record_bytes + reader_overhead + codec.reader_bytes;
+  size_type max_fan_in = (available - fixed_merge) / per_reader;
   max_fan_in = std::min(max_fan_in, pathSortDescriptorFanIn());
   if(max_fan_in < 2)
   {
@@ -1253,11 +1351,13 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   }
   fan_in = std::min(std::max((size_type)2, fan_in), max_fan_in);
   if(fan_in < 2) { externalSortFailure("byte budget cannot support a two-way merge"); }
-  size_type merge_available = available - fan_in * reader_overhead;
+  size_type merge_available = available - codec.writer_bytes -
+    fan_in * (reader_overhead + codec.reader_bytes);
   size_type merge_records = merge_available / ((fan_in + 1) * record_bytes);
   if(merge_records == 0) { externalSortFailure("byte budget cannot buffer a merge"); }
   // Reserve two thirds for sorting records and one third for allocator / I/O slack.
-  size_type run_records = std::max((size_type)1, available / (3 * record_bytes));
+  size_type run_records = std::max((size_type)1,
+    (available - codec.writer_bytes) / (3 * record_bytes));
 
   std::ifstream paths, ranks;
   paths.rdbuf()->pubsetbuf(nullptr, 0); ranks.rdbuf()->pubsetbuf(nullptr, 0);
@@ -1280,7 +1380,8 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   // O(fan_in * log(number_of_runs)) memory rather than one string per run.
   std::vector<std::vector<std::string>> levels;
   std::vector<PathSortRecord> records; records.reserve(run_records);
-  updatePathSortStats(stats, run_records, PATH_SORT_FIXED_BYTES + run_records * record_bytes);
+  updatePathSortStats(stats, run_records, PATH_SORT_FIXED_BYTES +
+    run_records * record_bytes + codec.writer_bytes);
   size_type rank_offset = 0, path_count = 0;
   PathSortRecord record;
   while(readPathSortRecord(paths, ranks, record, rank_offset, graph.rank_counts[file]))
@@ -1297,8 +1398,8 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
     {
       std::sort(records.begin(), records.end(), pathSortLess);
       std::string name = TempFile::getName("gcsa_path_sort_run");
-      writePathSortRun(name, records); records.clear();
-      addPathSortRun(levels, name, 0, fan_in, merge_records, stats);
+      writePathSortRun(name, records, codec); records.clear();
+      addPathSortRun(levels, name, 0, fan_in, merge_records, codec, stats);
       if(stats != nullptr) { stats->runs++; }
     }
   }
@@ -1315,8 +1416,8 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   {
     std::sort(records.begin(), records.end(), pathSortLess);
     std::string name = TempFile::getName("gcsa_path_sort_run");
-    writePathSortRun(name, records);
-    addPathSortRun(levels, name, 0, fan_in, merge_records, stats);
+    writePathSortRun(name, records, codec);
+    addPathSortRun(levels, name, 0, fan_in, merge_records, codec, stats);
     if(stats != nullptr) { stats->runs++; }
   }
   paths.close(); ranks.close();
@@ -1337,7 +1438,7 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
     {
       size_type last = std::min(runs.size(), first + fan_in);
       std::vector<std::string> group(runs.begin() + first, runs.begin() + last);
-      std::string merged = mergePathSortRuns(group, merge_records, stats);
+      std::string merged = mergePathSortRuns(group, merge_records, codec, stats);
       for(size_type i = 0; i < group.size(); i++) { TempFile::remove(group[i]); }
       compacted.push_back(merged);
     }
@@ -1347,9 +1448,9 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   if(runs.empty())
   {
     std::string name = TempFile::getName("gcsa_path_sort_run");
-    writePathSortRun(name, records); runs.push_back(name);
+    writePathSortRun(name, records, codec); runs.push_back(name);
   }
-  std::string merged = mergePathSortRuns(runs, merge_records, stats);
+  std::string merged = mergePathSortRuns(runs, merge_records, codec, stats);
   for(size_type i = 0; i < runs.size(); i++) { TempFile::remove(runs[i]); }
 
   std::string final_path = TempFile::getName(PathGraph::PREFIX), final_rank = TempFile::getName(PathGraph::PREFIX);

@@ -1,4 +1,5 @@
 #include <gcsa/final_events.h>
+#include <compressed_block.hpp>
 #include <gcsa/internal.h>
 
 #include <array>
@@ -413,6 +414,54 @@ int main()
   std::ostringstream observed_bytes, expected_bytes;
   observed.serialize(observed_bytes); expected.serialize(expected_bytes);
   require(observed_bytes.str() == expected_bytes.str());
+
+  // Final-event streams retain their exact logical records when framed in
+  // tiny zstd blocks and consumed directly by final component assembly.
+  FinalEventFiles compressed_files(alphabet.sigma);
+  FinalEventMetadata compressed_metadata;
+  ConstructionParameters compressed_parameters = parameters;
+  compressed_parameters.setMemoryLimitBytes(1024 * MEGABYTE);
+  {
+    MemoryBudget compressed_budget(1024 * MEGABYTE);
+    FinalEventWriter writer(compressed_files, alphabet.sigma, 32,
+      compressed_budget);
+    writer.path((1U << 0) | (1U << 1));
+    writer.edge(0, 0); writer.edge(1, 0);
+    writer.sampledPath(0); writer.sample(5); writer.sample(7); writer.sampleEnd();
+    writer.occurrence(0, 2);
+    writer.path(1U << 1); writer.edge(1, 1);
+    writer.path((1U << 2) | (1U << 5));
+    writer.edge(2, 2); writer.edge(5, 3); writer.occurrence(2, 20);
+    writer.path(1U << 0); writer.edge(0, 2);
+    writer.sampledPath(3); writer.sample(100); writer.sampleEnd();
+    writer.redundancy(2); writer.redundancy(0); writer.redundancy(2);
+    compressed_metadata = writer.finish();
+  }
+  require(CompressedBlockReader::isFramed(compressed_files.bwt_masks));
+  compressed_metadata.fast_chars = alphabet.fast_chars;
+  sortFinalRedundancy(compressed_files, compressed_parameters);
+  writeFinalEventMetadata(compressed_files, compressed_metadata);
+  GCSA compressed_observed = buildViaStore(alphabet, compressed_files,
+    compressed_metadata, compressed_parameters, 4, 6, 8);
+  std::ostringstream compressed_bytes;
+  compressed_observed.serialize(compressed_bytes);
+  require(compressed_bytes.str() == expected_bytes.str());
+  // Each decoder fits alone, but the simultaneous edge readers do not. A
+  // smaller decoder budget must reject the set instead of waiting on itself.
+  ConstructionParameters insufficient_decoder_memory = compressed_parameters;
+  insufficient_decoder_memory.setMemoryLimitBytes(512 * KILOBYTE);
+  const std::string rejected_packed_name = std::string(root) + "/framed-too-small.gcsa";
+  bool rejected_decoder_budget = false;
+  try
+  {
+    storeFinalComponents(compressed_observed.header, alphabet,
+      compressed_files, compressed_metadata,
+      insufficient_decoder_memory, rejected_packed_name);
+  }
+  catch(const std::runtime_error&) { rejected_decoder_budget = true; }
+  require(rejected_decoder_budget);
+  require(!std::filesystem::exists(rejected_packed_name));
+  compressed_files.clear();
 
   // The direct redundancy writer covers duplicate positions, a zero run, and
   // the final suffix-tree slot in the same native SadaCount byte layout.
