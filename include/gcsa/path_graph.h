@@ -246,18 +246,6 @@ struct LCP
   size_type       kmer_length, total_keys;
   sdsl::wt_blcd<> kmer_lcp; // Faster than proper RMQ for small values.
 
-  /*
-    How often the wavelet tree is actually descended, and over how wide a
-    range. min_lcp()/max_lcp() use quantile_freq(..., 0), which is a range
-    minimum answered by a full-depth top-down descent with no early exit, so
-    the cost is one descent per call regardless of range width. A phase total
-    cannot say whether that descent is the merge's dominant cost; these two
-    counters convert the question into a number. They are diagnostic only and
-    are never serialized.
-  */
-  static std::atomic<size_type> range_minimum_queries;
-  static std::atomic<size_type> range_minimum_span;
-
   LCP();
   LCP(const std::vector<key_type>& keys, size_type _kmer_length);
 
@@ -291,27 +279,6 @@ struct LCP
   }
 
   void swap(LCP& another) noexcept;
-};
-
-//------------------------------------------------------------------------------
-
-/*
-  Diagnostics for the bounded merge used by prune() and MergedGraph. The
-  counters are optional and do not affect construction semantics.
-*/
-struct PathGraphMergeStats
-{
-  size_type priority_spills, range_spills, from_set_sorts;
-  size_type max_open_input_pairs, max_open_output_pairs;
-  size_type path_input_reads, rank_input_reads;
-  size_type path_input_refills, rank_input_refills, direct_input_reads;
-  size_type max_input_buffer_bytes;
-  PathGraphMergeStats() :
-    priority_spills(0), range_spills(0), from_set_sorts(0),
-    max_open_input_pairs(0), max_open_output_pairs(0),
-    path_input_reads(0), rank_input_reads(0),
-    path_input_refills(0), rank_input_refills(0), direct_input_reads(0),
-    max_input_buffer_bytes(0) { }
 };
 
 //------------------------------------------------------------------------------
@@ -407,7 +374,6 @@ struct PathGraph
   // equal-label range.
   void prune(const LCP& lcp, size_type size_limit,
     size_type group_buffer_bytes = MEGABYTE,
-    PathGraphMergeStats* stats = nullptr,
     size_type max_open_files = 128);
   void extend(size_type size_limit, size_type memory_limit);
 
@@ -447,7 +413,6 @@ struct MergedGraph
   MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper,
     const LCP& kmer_lcp, size_type size_limit,
     size_type group_buffer_bytes = MEGABYTE,
-    PathGraphMergeStats* stats = nullptr,
     size_type max_open_files = 128);
   ~MergedGraph();
 
