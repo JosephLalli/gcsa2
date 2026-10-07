@@ -1,14 +1,18 @@
 #include <gcsa/final_events.h>
 #include <gcsa/internal.h>
+#include "final_events_internal.hpp"
 
 #include <array>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
@@ -53,6 +57,26 @@ void appendInteger(std::ostream& out, std::uint64_t value)
     encoded[i] = static_cast<std::uint8_t>(value >> (8 * i));
   }
   out.write(reinterpret_cast<const char*>(encoded.data()), encoded.size());
+}
+
+std::string readFile(const std::string& filename)
+{
+  std::ifstream input(filename.c_str(), std::ios_base::binary);
+  return std::string(std::istreambuf_iterator<char>(input),
+    std::istreambuf_iterator<char>());
+}
+
+bool hasComponentSpool(const std::string& directory)
+{
+  for(const auto& entry : std::filesystem::directory_iterator(directory))
+  {
+    if(entry.path().filename().string().find("gcsa_final_component") !=
+       std::string::npos)
+    {
+      return true;
+    }
+  }
+  return false;
 }
 
 void initSupports(GCSA& index)
@@ -629,6 +653,69 @@ int main()
   require(packed.extra_pointers.count(2, 2) == 20);
   require(packed.redundant_pointers.count(2, 2) == 2);
   require(packed.sampleCount() == 3 && packed.sample(2) == 100);
+
+  // The internal construction caller may admit independent component
+  // encoders. Their spools must still publish the exact ordinary byte stream.
+  ConstructionParameters parallel_parameters = parameters;
+  parallel_parameters.setMemoryLimitBytes(192 * KILOBYTE);
+  const std::string parallel_name = std::string(root) + "/parallel.gcsa";
+  storeFinalComponentsConcurrent(observed.header, alphabet, files, metadata,
+    parallel_parameters, parallel_name, 4);
+  require(readFile(parallel_name) == expected_bytes.str());
+  GCSA parallel;
+  require(sdsl::load_from_file(parallel, parallel_name));
+  require(parallel.extra_pointers.count(2, 2) == 20);
+  require(parallel.redundant_pointers.count(2, 2) == 2);
+  require(parallel.sampleCount() == 3 && parallel.sample(2) == 100);
+  require(std::filesystem::remove(parallel_name));
+
+  const std::string memory_fallback_name =
+    std::string(root) + "/memory-fallback.gcsa";
+  storeFinalComponentsConcurrent(observed.header, alphabet, files, metadata,
+    parameters, memory_fallback_name, 4);
+  require(readFile(memory_fallback_name) == expected_bytes.str());
+  require(std::filesystem::remove(memory_fallback_name));
+
+  // A low process descriptor limit admits the unchanged serial route before
+  // starting workers. The resulting bytes remain identical.
+  const std::string fallback_name = std::string(root) + "/fallback.gcsa";
+  pid_t fallback_child = ::fork(); require(fallback_child >= 0);
+  if(fallback_child == 0)
+  {
+    struct rlimit limit = { 16, 16 };
+    if(::setrlimit(RLIMIT_NOFILE, &limit) != 0) { _exit(2); }
+    try
+    {
+      storeFinalComponentsConcurrent(observed.header, alphabet, files,
+        metadata, parallel_parameters, fallback_name, 4);
+    }
+    catch(...) { _exit(3); }
+    _exit(0);
+  }
+  int fallback_status = 0;
+  require(::waitpid(fallback_child, &fallback_status, 0) == fallback_child);
+  require(WIFEXITED(fallback_status) && WEXITSTATUS(fallback_status) == 0);
+  require(readFile(fallback_name) == expected_bytes.str());
+  require(std::filesystem::remove(fallback_name));
+
+  // A semantic failure reached by a component worker must cancel and join
+  // its peers, remove every spool, and leave no partial publication.
+  writeInteger(files.occurrences, 8,
+    std::numeric_limits<std::uint64_t>::max());
+  const std::string failed_name = std::string(root) + "/failed.gcsa";
+  bool parallel_failure_rejected = false;
+  try
+  {
+    storeFinalComponentsConcurrent(observed.header, alphabet, files, metadata,
+      parallel_parameters, failed_name, 4);
+  }
+  catch(const std::runtime_error&) { parallel_failure_rejected = true; }
+  require(parallel_failure_rejected);
+  require(!std::filesystem::exists(failed_name));
+  require(!std::filesystem::exists(failed_name + "." +
+    std::to_string(static_cast<unsigned long long>(::getpid())) + ".partial"));
+  require(!hasComponentSpool(root));
+  writeInteger(files.occurrences, 8, 2);
 
 
 
