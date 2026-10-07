@@ -81,12 +81,16 @@ std::vector<Record> readRecords(const std::string& name)
 
 int main()
 {
-  char root[] = "/tmp/gcsa-fixed-sort-XXXXXX";
-  require(mkdtemp(root) != nullptr);
-  TempFile::setDirectory(root);
-  const std::string input = std::string(root) + "/input.bin";
-  const std::string sorted = std::string(root) + "/sorted.bin";
-  const std::string reduced = std::string(root) + "/reduced.bin";
+  const char* configured = std::getenv("TMPDIR");
+  std::string pattern = std::string(
+    configured != nullptr && configured[0] != '\0' ? configured : "/tmp") +
+    "/gcsa-fixed-sort-XXXXXX";
+  std::vector<char> root(pattern.begin(), pattern.end()); root.push_back('\0');
+  require(mkdtemp(root.data()) != nullptr);
+  TempFile::setDirectory(root.data());
+  const std::string input = std::string(root.data()) + "/input.bin";
+  const std::string sorted = std::string(root.data()) + "/sorted.bin";
+  const std::string reduced = std::string(root.data()) + "/reduced.bin";
 
   std::vector<Record> records;
   std::map<std::uint64_t, Summary> expected;
@@ -143,8 +147,8 @@ int main()
   require(reduce_stats.runs > 2 && reduce_stats.max_bytes_resident <= budget);
 
   {
-    const std::string permuted = std::string(root) + "/permuted.bin";
-    const std::string in_place = std::string(root) + "/in-place.bin";
+    const std::string permuted = std::string(root.data()) + "/permuted.bin";
+    const std::string in_place = std::string(root.data()) + "/in-place.bin";
     ExternalFixedRecordSortStats permuted_stats, in_place_stats;
     ExternalFixedRecordSorter::sort(input, permuted, sizeof(Record), budget, 2,
       compareRecord, &permuted_stats, false);
@@ -155,8 +159,8 @@ int main()
     require(in_place_stats.runs < permuted_stats.runs);
     require(in_place_stats.max_bytes_resident <= budget);
 
-    const std::string permuted_reduced = std::string(root) + "/permuted-reduced.bin";
-    const std::string in_place_reduced = std::string(root) + "/in-place-reduced.bin";
+    const std::string permuted_reduced = std::string(root.data()) + "/permuted-reduced.bin";
+    const std::string in_place_reduced = std::string(root.data()) + "/in-place-reduced.bin";
     auto count_groups = [](const void* value, bool first, bool, std::ostream& stream)
     {
       if(first) { stream.write(static_cast<const char*>(value), sizeof(Record)); }
@@ -172,9 +176,9 @@ int main()
   }
 
   {
-    const std::string u64_input = std::string(root) + "/u64.bin";
-    const std::string comparator_sorted = std::string(root) + "/u64-comparator.bin";
-    const std::string scalar_sorted = std::string(root) + "/u64-scalar.bin";
+    const std::string u64_input = std::string(root.data()) + "/u64.bin";
+    const std::string comparator_sorted = std::string(root.data()) + "/u64-comparator.bin";
+    const std::string scalar_sorted = std::string(root.data()) + "/u64-scalar.bin";
     std::vector<std::uint64_t> values;
     for(std::uint64_t i = 0; i < 5000; i++)
     {
@@ -209,8 +213,8 @@ int main()
   }
 
   {
-    const std::string odd_input = std::string(root) + "/odd.bin";
-    const std::string odd_sorted = std::string(root) + "/odd-sorted.bin";
+    const std::string odd_input = std::string(root.data()) + "/odd.bin";
+    const std::string odd_sorted = std::string(root.data()) + "/odd-sorted.bin";
     std::vector<OddRecord> odd;
     for(std::uint32_t i = 0; i < 400; i++)
     {
@@ -259,6 +263,6 @@ int main()
   require(rejected);
 
   std::remove(input.c_str()); std::remove(sorted.c_str()); std::remove(reduced.c_str());
-  rmdir(root);
+  rmdir(root.data());
   return 0;
 }
