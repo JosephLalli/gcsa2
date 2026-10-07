@@ -211,6 +211,11 @@ size_type memoryUsage();  // Peak memory usage in bytes.
 size_type readVolume();   // Only for GCSA construction.
 size_type writeVolume();  // Only for GCSA construction.
 
+// Parse a non-negative byte count with an optional binary suffix (K, M, G, T,
+// P, optionally followed by B or iB). Throws std::invalid_argument or
+// std::out_of_range rather than silently wrapping.
+size_type parseBytes(const std::string& value);
+
 //------------------------------------------------------------------------------
 
 /*
@@ -224,7 +229,9 @@ size_type writeVolume();  // Only for GCSA construction.
   remaining temporary files are deleted when the program exits (normally or
   with std::exit()).
 
-  TempFile is not thread-safe!
+  getName(), remove(), forget() and setDirectory() hold one mutex, so threads
+  may name and remove temporaries concurrently. temp_dir may be read while no
+  thread is setting it.
 */
 
 namespace TempFile

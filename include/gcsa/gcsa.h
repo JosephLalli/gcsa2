@@ -47,6 +47,15 @@ public:
   */
   GCSA(InputGraph& graph, const ConstructionParameters& parameters = ConstructionParameters());
 
+  /*
+    Build the disk-first GCSA and its LCP array from one graph construction.
+    The GCSA is published first. If LCP publication fails, the GCSA remains
+    available as a complete standalone index.
+  */
+  static void buildAndStore(InputGraph& graph,
+    const ConstructionParameters& parameters, const std::string& gcsa_filename,
+    const std::string& lcp_filename);
+
 //------------------------------------------------------------------------------
 
   /*
@@ -101,7 +110,6 @@ public:
   void locate(size_type path, std::vector<node_type>& results, bool append = false, bool sort = true) const;
   void locate(range_type range, std::vector<node_type>& results, bool append = false, bool sort = true) const;
   void locate(range_type range, size_type max_positions, std::vector<node_type>& results) const;
-
 //------------------------------------------------------------------------------
 
   /*
@@ -217,6 +225,8 @@ public:
 //------------------------------------------------------------------------------
 
 private:
+  GCSA(InputGraph& graph, const ConstructionParameters& parameters,
+    const std::string* direct_output);
   void copy(const GCSA& source);
   void setVectors();
   void initSupport();

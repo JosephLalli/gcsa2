@@ -10,6 +10,24 @@
 namespace gcsa
 {
 
+struct logical_file_id_t
+{
+  explicit logical_file_id_t(uint32_t x = 0) : value(x) { }
+  bool operator==(const logical_file_id_t& another) const { return value == another.value; }
+  bool operator!=(const logical_file_id_t& another) const { return value != another.value; }
+  bool operator<(const logical_file_id_t& another) const { return value < another.value; }
+  uint32_t value;
+};
+
+struct physical_shard_id_t
+{
+  explicit physical_shard_id_t(uint64_t x = 0) : value(x) { }
+  bool operator==(const physical_shard_id_t& another) const { return value == another.value; }
+  bool operator!=(const physical_shard_id_t& another) const { return value != another.value; }
+  bool operator<(const physical_shard_id_t& another) const { return value < another.value; }
+  uint64_t value;
+};
+
 /*
   path_graph.h: Internal graph manipulation methods.
 */
@@ -231,6 +249,12 @@ struct LCP
   LCP();
   LCP(const std::vector<key_type>& keys, size_type _kmer_length);
 
+  // Disk-first equivalent of the vector constructor. key_name is a raw,
+  // label-sorted unique key stream; only the final LCP construction buffer is
+  // materialized.
+  LCP(const std::string& key_name, size_type key_count,
+    size_type _kmer_length, size_type buffer_bytes);
+
   /*
     Computes the minimal/maximal lcp of the path labels corresponding to path nodes a and b.
     a must be before b in lexicographic order, and the ranges must not overlap.
@@ -271,11 +295,21 @@ struct PathGraph
 {
   std::vector<std::string> path_names, rank_names;
   std::vector<size_type>   path_counts, rank_counts;
+  // `file` in the legacy code is a physical stream index. It must never be
+  // used as source-graph identity: one logical graph may have many spill
+  // shards. These strong identifiers make that distinction explicit.
+  std::vector<logical_file_id_t> logical_file_ids;
+  std::vector<physical_shard_id_t> physical_shard_ids;
 
   size_type path_count, rank_count, range_count;
   size_type order, doubling_steps;
 
   size_type unique, redundant, unsorted, nondeterministic;
+
+  // Bytes the shard files physically occupy, or UNKNOWN when no producer has
+  // recorded them. A raw generation occupies exactly bytes(), so UNKNOWN
+  // falls back to it.
+  size_type stored_bytes;
 
   bool delete_files;
 
@@ -298,10 +332,36 @@ struct PathGraph
   inline size_type k() const { return this->order; }
   inline size_type step() const { return this->doubling_steps; }
   inline size_type files() const { return this->path_names.size(); }
+  inline logical_file_id_t logicalFile(size_type file) const { return this->logical_file_ids.at(file); }
+  inline physical_shard_id_t physicalShard(size_type file) const { return this->physical_shard_ids.at(file); }
 
   inline size_type bytes() const
   {
     return this->size() * sizeof(PathNode) + this->ranks() * sizeof(PathNode::rank_type);
+  }
+
+  /*
+    What this generation costs the disk limit. bytes() is the logical
+    PathNode/rank payload, but every generation guard charges what the shards
+    physically occupy. The raw construction path stores exactly bytes(), which
+    is what UNKNOWN means.
+  */
+  inline size_type storedBytes() const
+  {
+    return (this->stored_bytes == UNKNOWN ? this->bytes() : this->stored_bytes);
+  }
+
+  /*
+    The disk budget left for the successor generation. This graph survives on
+    disk until the new one is installed, so it is charged first. The
+    subtraction saturates: a frontier that already exceeds the limit leaves
+    nothing for its successor, which the producer refuses explicitly, rather
+    than wrapping into an unbounded budget that makes every later check vacuous.
+  */
+  inline size_type remainingLimit(size_type total_size_limit) const
+  {
+    size_type resident = this->storedBytes();
+    return (resident >= total_size_limit ? 0 : total_size_limit - resident);
   }
 
   /*
@@ -310,7 +370,11 @@ struct PathGraph
 
       path_graph.prune(lcp, total_size_limit - path_graph.bytes())
   */
-  void prune(const LCP& lcp, size_type size_limit);
+  // Keep bounded spillable state while pruning one potentially very large
+  // equal-label range.
+  void prune(const LCP& lcp, size_type size_limit,
+    size_type group_buffer_bytes = MEGABYTE,
+    size_type max_open_files = 128);
   void extend(size_type size_limit, size_type memory_limit);
 
   void debugExtend();
@@ -320,8 +384,6 @@ struct PathGraph
   PathGraph(const PathGraph&) = delete;
   PathGraph& operator= (const PathGraph&) = delete;
 };
-
-//------------------------------------------------------------------------------
 
 /*
   A merged graph is a path graph with the path nodes in one file, the labels in another
@@ -348,7 +410,10 @@ struct MergedGraph
 
       MergedGraph merged_graph(source, mapper, kmer_lcp, total_size_limit - source.bytes())
   */
-  MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper, const LCP& kmer_lcp, size_type size_limit);
+  MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper,
+    const LCP& kmer_lcp, size_type size_limit,
+    size_type group_buffer_bytes = MEGABYTE,
+    size_type max_open_files = 128);
   ~MergedGraph();
 
   void clear();

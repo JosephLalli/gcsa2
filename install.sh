@@ -59,12 +59,18 @@ if [ $? != 0 ]; then
 	exit 1
 fi
 
-# Install GCSA2.
-cp -R "${INCLUDE_DIR}/${INCLUDE}" "${PREFIX}/${INCLUDE_DIR}" 2> /dev/null
-if [ $? != 0 ]; then
-	echo "Error: Could not install the headers."
-	exit 1
-fi
+# Install the public interface. External construction helpers intentionally
+# remain source-private: callers select the paired direct route through gcsa.h,
+# while its run formats and schedulers can evolve independently.
+mkdir -p "${PREFIX}/${INCLUDE_DIR}/${INCLUDE}" 2> /dev/null
+PUBLIC_HEADERS="algorithms.h dbg.h files.h gcsa.h internal.h lcp.h path_graph.h support.h utils.h"
+for HEADER in ${PUBLIC_HEADERS}; do
+  cp "${INCLUDE_DIR}/${INCLUDE}/${HEADER}" "${PREFIX}/${INCLUDE_DIR}/${INCLUDE}" 2> /dev/null
+  if [ $? != 0 ]; then
+		echo "Error: Could not install public header '${HEADER}'."
+		exit 1
+	fi
+done
 cp "${LIBRARY}" "${PREFIX}/${LIBRARY_DIR}" 2> /dev/null
 if [ $? != 0 ]; then
 	echo "Error: Could not install the headers."

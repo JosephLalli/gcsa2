@@ -44,16 +44,16 @@ ifeq ($(shell uname -s), Darwin)
     endif
 endif
 
-CXX_FLAGS=$(MY_CXX_FLAGS) $(VERIFY_FLAGS) $(PARALLEL_FLAGS) $(MY_CXX_OPT_FLAGS) -Iinclude -I$(INC_DIR)
+CXX_FLAGS=$(MY_CXX_FLAGS) $(VERIFY_FLAGS) $(PARALLEL_FLAGS) $(MY_CXX_OPT_FLAGS) -Iinclude -I$(SOURCE_DIR) -I$(INC_DIR)
 
 HEADERS=$(wildcard include/gcsa/*.h)
-LIBOBJS=$(addprefix $(BUILD_OBJ)/,algorithms.o dbg.o files.o gcsa.o internal.o lcp.o path_graph.o support.o utils.o)
+LIBOBJS=$(addprefix $(BUILD_OBJ)/,algorithms.o dbg.o disk_array.o external_join.o external_preprocessing.o external_sort.o files.o final_events.o gcsa.o internal.o lcp.o path_graph.o support.o utils.o resources.o)
 LIBRARY=$(BUILD_LIB)/libgcsa2.a
 
 PROGRAMS=$(addprefix $(BUILD_BIN)/,build_gcsa convert_graph gcsa_format try_extend)
 OBSOLETE=build_gcsa convert_graph gcsa_format try_extend
 
-.PHONY: all clean directories test
+.PHONY: all clean directories test external-path-sort-test external-join-test external-sort-test external-preprocessing-test final-events-test disk-array-test internal-buffer-test parameter-test path-graph-prune-test
 all: directories $(LIBRARY) $(PROGRAMS)
 
 directories: $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)
@@ -73,8 +73,77 @@ $(BUILD_OBJ)/%.o:$(SOURCE_DIR)/%.cpp $(HEADERS)
 $(LIBRARY):$(LIBOBJS)
 	ar rcs $@ $(LIBOBJS)
 
+# Tests include construction types through multiple helper headers. Rebuild
+# their objects after any library header change, as for the library itself.
+$(patsubst tests/%.cpp,$(BUILD_OBJ)/%.o,$(wildcard tests/test_*.cpp)): $(HEADERS)
+
 $(BUILD_BIN)/%:$(BUILD_OBJ)/%.o $(LIBRARY)
 	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $@ $< $(LIBRARY) $(LIBS)
+
+$(BUILD_OBJ)/test_external_path_sort.o:tests/test_external_path_sort.cpp include/gcsa/path_graph.h include/gcsa/path_graph_external.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+external-path-sort-test: directories $(BUILD_OBJ)/test_external_path_sort.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_external_path_sort $(BUILD_OBJ)/test_external_path_sort.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_external_path_sort
+
+$(BUILD_OBJ)/test_external_sort.o:tests/test_external_sort.cpp include/gcsa/external_sort.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+external-sort-test: directories $(BUILD_OBJ)/test_external_sort.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_external_sort $(BUILD_OBJ)/test_external_sort.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_external_sort
+
+$(BUILD_OBJ)/test_external_preprocessing.o:tests/test_external_preprocessing.cpp include/gcsa/external_preprocessing.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+external-preprocessing-test: directories $(BUILD_OBJ)/test_external_preprocessing.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_external_preprocessing $(BUILD_OBJ)/test_external_preprocessing.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_external_preprocessing
+
+$(BUILD_OBJ)/test_final_events.o:tests/test_final_events.cpp include/gcsa/final_events.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+final-events-test: directories $(BUILD_OBJ)/test_final_events.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_final_events $(BUILD_OBJ)/test_final_events.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_final_events
+
+$(BUILD_OBJ)/test_disk_array.o:tests/test_disk_array.cpp include/gcsa/disk_array.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+disk-array-test: directories $(BUILD_OBJ)/test_disk_array.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_disk_array $(BUILD_OBJ)/test_disk_array.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_disk_array
+
+$(BUILD_OBJ)/test_external_join.o:tests/test_external_join.cpp include/gcsa/path_graph.h include/gcsa/path_graph_external.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+external-join-test: directories $(BUILD_OBJ)/test_external_join.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_external_join $(BUILD_OBJ)/test_external_join.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_external_join
+
+$(BUILD_OBJ)/test_internal_buffers.o:tests/test_internal_buffers.cpp include/gcsa/internal.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+internal-buffer-test: directories $(BUILD_OBJ)/test_internal_buffers.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_internal_buffers $(BUILD_OBJ)/test_internal_buffers.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_internal_buffers
+
+$(BUILD_OBJ)/test_parameters.o:tests/test_parameters.cpp include/gcsa/support.h include/gcsa/utils.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+parameter-test: directories $(BUILD_OBJ)/test_parameters.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_parameters $(BUILD_OBJ)/test_parameters.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_parameters
+
+$(BUILD_OBJ)/test_path_graph_prune.o:tests/test_path_graph_prune.cpp include/gcsa/path_graph.h include/gcsa/support.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+path-graph-prune-test: directories $(BUILD_OBJ)/test_path_graph_prune.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_path_graph_prune $(BUILD_OBJ)/test_path_graph_prune.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_path_graph_prune
+
+test: external-path-sort-test external-join-test external-sort-test external-preprocessing-test final-events-test disk-array-test internal-buffer-test parameter-test path-graph-prune-test
 
 clean:
 	rm -rf $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)

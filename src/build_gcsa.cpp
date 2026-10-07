@@ -23,6 +23,8 @@
   SOFTWARE.
 */
 
+#include <exception>
+#include <getopt.h>
 #include <string>
 #include <unistd.h>
 
@@ -58,16 +60,24 @@ main(int argc, char** argv)
     std::cerr << "  -l N  Limit disk space usage to N gigabytes (default " << ConstructionParameters::SIZE_LIMIT << ")" << std::endl;
     std::cerr << "  -T N  Set the number of threads to N (default and max " << omp_get_max_threads() << " on this system)" << std::endl;
     std::cerr << "  -V N  Set verbosity level to N (default 3)" << std::endl;
+    std::cerr << "      --memory-limit SIZE  Use external-memory construction with this working-set target" << std::endl;
     std::cerr << std::endl;
     std::exit(EXIT_SUCCESS);
   }
   Verbosity::set(Verbosity::FULL);
 
   int c = 0;
-  bool binary = true, load_index = false, verify = false;
+  bool binary = true, load_index = false, verify = false, external_memory = false;
   std::string index_file, lcp_file, mapping_file;
   ConstructionParameters parameters;
-  while((c = getopt(argc, argv, "bto:d:m:s:B:LvD:l:T:V:")) != -1)
+  enum LongOption { OPT_MEMORY_LIMIT = 1000 };
+  static struct option long_options[] =
+  {
+    { "memory-limit", required_argument, nullptr, OPT_MEMORY_LIMIT },
+    { nullptr, 0, nullptr, 0 }
+  };
+  while((c = getopt_long(argc, argv, "bto:d:m:s:B:LvD:l:T:V:",
+    long_options, nullptr)) != -1)
   {
     switch(c)
     {
@@ -99,6 +109,10 @@ main(int argc, char** argv)
       omp_set_num_threads(Range::bound(std::stoul(optarg), 1, omp_get_max_threads())); break;
     case 'V':
       Verbosity::set(std::stoul(optarg)); break;
+    case OPT_MEMORY_LIMIT:
+      parameters.setMemoryLimitBytes(parseBytes(optarg));
+      external_memory = true;
+      break;
     case '?':
       std::exit(EXIT_FAILURE);
     default:
@@ -115,6 +129,7 @@ main(int argc, char** argv)
     index_file = std::string(argv[optind]) + GCSA::EXTENSION;
     lcp_file = std::string(argv[optind]) + LCPArray::EXTENSION;
   }
+  if(external_memory) { parameters.setWorkDirectory(TempFile::temp_dir); }
 
   Version::print(std::cout, "GCSA2 builder");
   for(int i = optind; i < argc; i++)
@@ -145,6 +160,7 @@ main(int argc, char** argv)
 
   GCSA index;
   LCPArray lcp;
+  bool stored_directly = false, lcp_stored_directly = false;
   if(load_index)
   {
     if(!sdsl::load_from_file(index, index_file))
@@ -161,27 +177,68 @@ main(int argc, char** argv)
   else
   {
     double start = readTimer();
-    index = GCSA(graph, parameters);
-    lcp = LCPArray(graph, parameters);
+    if(parameters.externalMemory())
+    {
+      try
+      {
+        GCSA::buildAndStore(graph, parameters, index_file, lcp_file);
+        stored_directly = true;
+        lcp_stored_directly = true;
+      }
+      catch(const std::exception& error)
+      {
+        std::cerr << "build_gcsa: " << error.what() << std::endl;
+        return EXIT_FAILURE;
+      }
+    }
+    else
+    {
+      index = GCSA(graph, parameters);
+      lcp = LCPArray(graph, parameters);
+    }
     double seconds = readTimer() - start;
     std::cout << "Index built in " << seconds << " seconds" << std::endl;
     std::cout << "Memory usage: " << inGigabytes(memoryUsage()) << " GB" << std::endl;
     std::cout << "I/O volume: " << inGigabytes(readVolume()) << " GB read, "
               << inGigabytes(writeVolume()) << " GB write" << std::endl;
     std::cout << std::endl;
-    if(!sdsl::store_to_file(index, index_file))
+    if(!stored_directly && !sdsl::store_to_file(index, index_file))
     {
       std::cerr << "build_gcsa: Cannot write the index to " << index_file << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    if(!sdsl::store_to_file(lcp, lcp_file))
+    if(!lcp_stored_directly && !sdsl::store_to_file(lcp, lcp_file))
     {
       std::cerr << "build_gcsa: Cannot write the LCP array to " << lcp_file << std::endl;
       std::exit(EXIT_FAILURE);
     }
   }
 
-  printStatistics(index, lcp);
+  // Loading the just-written index solely for statistics would defeat the
+  // staged packer's resident-memory reduction. Verification necessarily needs
+  // the query index; otherwise report the durable output without reloading it.
+  if(stored_directly && verify)
+  {
+    if(!sdsl::load_from_file(index, index_file))
+    {
+      std::cerr << "build_gcsa: Cannot reload the index for verification from "
+                << index_file << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    if(!sdsl::load_from_file(lcp, lcp_file))
+    {
+      std::cerr << "build_gcsa: Cannot reload the LCP array for verification from "
+                << lcp_file << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
+  if(!stored_directly || verify) { printStatistics(index, lcp); }
+  else
+  {
+    std::cout << "Index and LCP components stored directly in " << index_file
+              << " and " << lcp_file << " (not reloaded for statistics)"
+              << std::endl << std::endl;
+  }
 
   if(verify) { verifyIndex(index, &lcp, graph); }
 
