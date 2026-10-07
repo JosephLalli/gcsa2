@@ -56,12 +56,16 @@ std::vector<Record> readRecords(const std::string& name)
 
 int main()
 {
-  char root[] = "/tmp/gcsa-fixed-sort-XXXXXX";
-  require(mkdtemp(root) != nullptr);
-  TempFile::setDirectory(root);
-  const std::string input = std::string(root) + "/input.bin";
-  const std::string sorted = std::string(root) + "/sorted.bin";
-  const std::string reduced = std::string(root) + "/reduced.bin";
+  const char* configured = std::getenv("TMPDIR");
+  std::string pattern = std::string(
+    configured != nullptr && configured[0] != '\0' ? configured : "/tmp") +
+    "/gcsa-fixed-sort-XXXXXX";
+  std::vector<char> root(pattern.begin(), pattern.end()); root.push_back('\0');
+  require(mkdtemp(root.data()) != nullptr);
+  TempFile::setDirectory(root.data());
+  const std::string input = std::string(root.data()) + "/input.bin";
+  const std::string sorted = std::string(root.data()) + "/sorted.bin";
+  const std::string reduced = std::string(root.data()) + "/reduced.bin";
 
   std::vector<Record> records;
   std::map<std::uint64_t, Summary> expected;
@@ -127,6 +131,6 @@ int main()
   require(rejected);
 
   std::remove(input.c_str()); std::remove(sorted.c_str()); std::remove(reduced.c_str());
-  rmdir(root);
+  rmdir(root.data());
   return 0;
 }

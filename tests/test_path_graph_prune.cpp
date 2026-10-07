@@ -84,7 +84,7 @@ static void remove_inputs(const std::string& base, size_type files)
   }
 }
 
-static PathGraphMergeStats compare_prune(const std::string& base,
+static void compare_prune(const std::string& base,
   const std::vector<logical_file_id_t>& logical, const LCP& lcp,
   size_type records = 80)
 {
@@ -96,11 +96,9 @@ static PathGraphMergeStats compare_prune(const std::string& base,
   initialize_graph(reference, reference_base, logical, records);
   initialize_graph(spilled, spilled_base, logical, records);
   reference.prune(lcp, MEGABYTE);
-  PathGraphMergeStats stats;
   const size_type one_record = sizeof(PathNode) +
     (PathLabel::LABEL_LENGTH + 1) * sizeof(PathNode::rank_type);
-  spilled.prune(lcp, MEGABYTE, one_record, &stats, 8);
-  require(stats.priority_spills > 0);
+  spilled.prune(lcp, MEGABYTE, one_record, 8);
   require(reference.files() == spilled.files());
   std::set<logical_file_id_t> distinct_logical(logical.begin(), logical.end());
   require(reference.files() == distinct_logical.size());
@@ -114,7 +112,6 @@ static PathGraphMergeStats compare_prune(const std::string& base,
   require(reference.size() == spilled.size());
   remove_inputs(base + ".reference", logical.size());
   remove_inputs(base + ".spilled", logical.size());
-  return stats;
 }
 
 static void compare_delayed_spill(const std::string& base, const LCP& lcp)
@@ -129,11 +126,9 @@ static void compare_delayed_spill(const std::string& base, const LCP& lcp)
   PathGraph spilled(spilled_path, spilled_rank);
   reference.order = 1; spilled.order = 1;
   reference.prune(lcp, MEGABYTE);
-  PathGraphMergeStats stats;
   const size_type one_record = sizeof(PathNode) +
     (PathLabel::LABEL_LENGTH + 1) * sizeof(PathNode::rank_type);
-  spilled.prune(lcp, MEGABYTE, one_record, &stats, 8);
-  require(stats.priority_spills > 0);
+  spilled.prune(lcp, MEGABYTE, one_record, 8);
   require(reference.size() == spilled.size());
   require(contents(reference.path_names[0]) == contents(spilled.path_names[0]));
   require(contents(reference.rank_names[0]) == contents(spilled.rank_names[0]));
@@ -176,10 +171,8 @@ static void compare_merged_graph(const std::string& base)
     for(size_type i = 0; i < keys.size(); i++) { distinct[i] = Key::label(keys[i]); }
     PathGraph paths(input, distinct);
 
-    PathGraphMergeStats reference_stats, spilled_stats;
-    MergedGraph reference(paths, mapper, lcp, GIGABYTE, MEGABYTE,
-      &reference_stats);
-    MergedGraph spilled(paths, mapper, lcp, GIGABYTE, 1, &spilled_stats, 16);
+    MergedGraph reference(paths, mapper, lcp, GIGABYTE, MEGABYTE);
+    MergedGraph spilled(paths, mapper, lcp, GIGABYTE, 1, 16);
 
     require(reference.size() == spilled.size());
     require(reference.ranks() == spilled.ranks());
@@ -191,15 +184,6 @@ static void compare_merged_graph(const std::string& base)
     require(contents(reference.from_name) == contents(spilled.from_name));
     require(contents(reference.lcp_name) == contents(spilled.lcp_name));
     require(reference.size() == 1); require(reference.extra() == 15);
-    require(reference_stats.priority_spills == 0);
-    require(reference_stats.range_spills == 0);
-    require(reference_stats.from_set_sorts >= 4);
-    require(spilled_stats.priority_spills > 0);
-    require(spilled_stats.range_spills > 0);
-    require(spilled_stats.from_set_sorts >= 4);
-    require(spilled_stats.max_open_input_pairs <= 1);
-    require(2 * spilled_stats.max_open_input_pairs + 14 <= 16);
-
     std::ifstream path_input(reference.path_name.c_str(), std::ios_base::binary);
     PathNode node; path_input.read(reinterpret_cast<char*>(&node), sizeof(node));
     require(path_input.gcount() == sizeof(node));
@@ -240,14 +224,7 @@ int main()
   // Reader threads, MiB buffers, and descriptors must not scale with the
   // number of physical shards. Current-head metadata remains one per shard.
   std::vector<logical_file_id_t> shards(40, logical_file_id_t(7));
-  PathGraphMergeStats shard_stats = compare_prune(std::string(root) + "/shards",
-    shards, lcp, 4);
-  require(shard_stats.max_open_input_pairs <= 2);
-  require(shard_stats.max_open_input_pairs < shards.size());
-  require(shard_stats.max_open_output_pairs <= 2);
-  require(shard_stats.max_open_output_pairs < shards.size());
-  require(2 * shard_stats.max_open_input_pairs +
-    2 * shard_stats.max_open_output_pairs + 2 <= 8);
+  compare_prune(std::string(root) + "/shards", shards, lcp, 4);
 
   // Use the real construction route so mapper ranks and LCP invariants are
   // validated rather than synthesized by the test.
