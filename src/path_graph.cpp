@@ -236,9 +236,6 @@ LCP::LCP(const std::string& key_name, size_type key_count,
   directConstruct(this->kmer_lcp, buffer);
 }
 
-std::atomic<size_type> LCP::range_minimum_queries(0);
-std::atomic<size_type> LCP::range_minimum_span(0);
-
 range_type
 LCP::min_lcp(const PathNode& a, const PathNode& b, const std::vector<LCP::rank_type>& labels) const
 {
@@ -265,17 +262,6 @@ LCP::min_lcp(const PathNode& a, const PathNode& b,
   {
     size_type left = a.firstLabel(lcp.first, a_labels) + 1;
     size_type right = std::min((size_type)(b.lastLabel(lcp.first, b_labels)), this->total_keys - 1);
-    // Diagnostic only, and on the library's hottest loop: 753 M descents in a
-    // chr21 merge, where two relaxed fetch_adds measured 3.46 s against plain
-    // increments. Gate them on the verbosity that prints them, so a production
-    // run pays one well-predicted branch and the measurement is still there
-    // when it is asked for.
-    if(Verbosity::level >= Verbosity::EXTENDED)
-    {
-      LCP::range_minimum_queries.fetch_add(1, std::memory_order_relaxed);
-      LCP::range_minimum_span.fetch_add(
-        (right >= left ? right - left + 1 : 0), std::memory_order_relaxed);
-    }
     lcp.second = sdsl::quantile_freq(this->kmer_lcp, left, right, 0).first;
   }
   return lcp;
@@ -295,17 +281,6 @@ LCP::max_lcp(const PathNode& a, const PathNode& b,
   {
     size_type left = a.lastLabel(lcp.first, a_labels) + 1;
     size_type right = b.firstLabel(lcp.first, b_labels);
-    // Diagnostic only, and on the library's hottest loop: 753 M descents in a
-    // chr21 merge, where two relaxed fetch_adds measured 3.46 s against plain
-    // increments. Gate them on the verbosity that prints them, so a production
-    // run pays one well-predicted branch and the measurement is still there
-    // when it is asked for.
-    if(Verbosity::level >= Verbosity::EXTENDED)
-    {
-      LCP::range_minimum_queries.fetch_add(1, std::memory_order_relaxed);
-      LCP::range_minimum_span.fetch_add(
-        (right >= left ? right - left + 1 : 0), std::memory_order_relaxed);
-    }
     lcp.second = sdsl::quantile_freq(this->kmer_lcp, left, right, 0).first;
   }
   return lcp;
@@ -391,12 +366,11 @@ struct PathGraphOutputCache
   std::vector<Entry> entries;
   bool closed;
   size_type clock, max_pairs, pair_buffer_bytes;
-  PathGraphMergeStats* stats;
 
   constexpr static off_t CACHE_FLUSH_BYTES = 4 * MEGABYTE;
 
   PathGraphOutputCache(PathGraph& target, size_type total_buffer_bytes,
-    size_type requested_pairs, PathGraphMergeStats* merge_stats) :
+    size_type requested_pairs) :
     graph(target), entries(), closed(false), clock(0),
     max_pairs(std::max(static_cast<size_type>(1), std::min(requested_pairs,
       total_buffer_bytes / minimumPairBytes()))),
@@ -407,7 +381,7 @@ struct PathGraphOutputCache
     // pages are released anyway, so the watermark is the natural ceiling.
     pair_buffer_bytes(std::max(minimumPairBytes(),
       std::min(static_cast<size_type>(CACHE_FLUSH_BYTES),
-        total_buffer_bytes / this->max_pairs))), stats(merge_stats)
+        total_buffer_bytes / this->max_pairs)))
   {
     this->entries.reserve(this->max_pairs);
   }
@@ -495,11 +469,6 @@ private:
     if(target == nullptr && this->entries.size() < this->max_pairs)
     {
       this->entries.push_back(Entry()); target = &(this->entries.back());
-      if(this->stats != nullptr)
-      {
-        this->stats->max_open_output_pairs = std::max(
-          this->stats->max_open_output_pairs, static_cast<size_type>(this->entries.size()));
-      }
     }
     if(target == nullptr)
     {
@@ -678,7 +647,7 @@ struct PathGraphBuilder
 
   PathGraphBuilder(size_type file_count, size_type path_order, size_type step,
     size_type size_limit, size_type writer_buffer_bytes = MEGABYTE,
-    size_type max_writer_pairs = 16, PathGraphMergeStats* stats = nullptr);
+    size_type max_writer_pairs = 16);
   void close();
 
   /*
@@ -695,9 +664,9 @@ constexpr size_type PathGraphBuilder::WRITE_BUFFER_SIZE;
 
 PathGraphBuilder::PathGraphBuilder(size_type file_count, size_type path_order,
   size_type step, size_type size_limit, size_type writer_buffer_bytes,
-  size_type max_writer_pairs, PathGraphMergeStats* stats) :
+  size_type max_writer_pairs) :
   graph(file_count, path_order, step),
-  output_files(this->graph, writer_buffer_bytes, max_writer_pairs, stats),
+  output_files(this->graph, writer_buffer_bytes, max_writer_pairs),
   limit(size_limit)
 {
   // Materialize every empty shard without retaining a descriptor. Some input
@@ -2000,7 +1969,6 @@ struct PathGraphInputCache
   // pointers because emplace_back may reallocate `entries`.
   std::vector<size_type> file_to_entry;
   size_type clock, max_pairs, window_bytes;
-  PathGraphMergeStats* stats;
 
   constexpr static size_type NO_ENTRY = ~static_cast<size_type>(0);
 
@@ -2008,13 +1976,12 @@ struct PathGraphInputCache
   constexpr static size_type MIN_WINDOW = 4 * KILOBYTE;
   constexpr static size_type MAX_WINDOW = 64 * KILOBYTE;
 
-  PathGraphInputCache(const PathGraph& source, PathGraphMergeStats* merge_stats,
-    size_type requested_pairs, size_type byte_budget = 0) :
+  PathGraphInputCache(const PathGraph& source, size_type requested_pairs,
+    size_type byte_budget = 0) :
     graph(source), entries(), file_to_entry(source.files(), NO_ENTRY), clock(0),
     max_pairs(std::max(static_cast<size_type>(1),
       std::min(requested_pairs, std::max(static_cast<size_type>(1), source.files())))),
-    window_bytes(0),
-    stats(merge_stats)
+    window_bytes(0)
   {
     // At most 2 * max_pairs windows can coexist. Their combined capacity is
     // at most one quarter of this per-structure allowance. Other merger
@@ -2043,7 +2010,6 @@ struct PathGraphInputCache
       sizeof(PathNode));
     this->readWindow(entry.path, entry.path_window, &node, sizeof(node),
       path_offset, path_limit);
-    if(this->stats != nullptr) { this->stats->path_input_reads++; }
     entry.path_high = std::max(entry.path_high,
       path_offset + static_cast<off_t>(sizeof(node)));
     this->trim(entry.path, entry.path_high, entry.path_released);
@@ -2063,7 +2029,6 @@ struct PathGraphInputCache
       sizeof(PathNode::rank_type));
     this->readWindow(entry.rank, entry.rank_window, labels, rank_bytes,
       rank_offset, rank_limit);
-    if(this->stats != nullptr) { this->stats->rank_input_reads++; }
     entry.rank_high = std::max(entry.rank_high,
       rank_offset + static_cast<off_t>(rank_bytes));
     this->trim(entry.rank, entry.rank_high, entry.rank_released);
@@ -2094,12 +2059,6 @@ private:
     {
       target_index = this->entries.size();
       this->entries.emplace_back(this->window_bytes); target = &(this->entries.back());
-      if(this->stats != nullptr)
-      {
-        this->stats->max_open_input_pairs = std::max(
-          this->stats->max_open_input_pairs,
-          static_cast<size_type>(this->entries.size()));
-      }
     }
     else
     {
@@ -2242,7 +2201,6 @@ struct PathGraphMerger
 
   PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lcp,
     size_type group_buffer_bytes = MEGABYTE,
-    PathGraphMergeStats* stats = nullptr,
     size_type max_input_pairs = 32);
   void close();
 
@@ -2292,19 +2250,13 @@ struct PathGraphMerger
 };
 
 PathGraphMerger::PathGraphMerger(const PathGraph& path_graph, const LCP& kmer_lcp,
-  size_type group_buffer_bytes, PathGraphMergeStats* stats,
-  size_type max_input_pairs) :
+  size_type group_buffer_bytes, size_type max_input_pairs) :
   graph(path_graph), lcp(kmer_lcp),
-  ranges(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->range_spills))),
-  buffer(group_buffer_bytes, (stats == nullptr ? nullptr : &(stats->priority_spills))),
-  input_files(path_graph, stats, max_input_pairs, group_buffer_bytes),
+  ranges(group_buffer_bytes), buffer(group_buffer_bytes),
+  input_files(path_graph, max_input_pairs, group_buffer_bytes),
   offsets(path_graph.files()), path_count(0),
   inputs(path_graph.files())
 {
-  if(stats != nullptr)
-  {
-    *stats = PathGraphMergeStats();
-  }
   for(size_type file = 0; file < path_graph.files(); file++)
   {
     if(path_graph.path_counts[file] >
@@ -2747,7 +2699,7 @@ validatePruneShardTails(const PathGraph& source, const LCP& lcp)
   // Prune inputs are sorted within each physical shard, so the last record has
   // its largest first rank. Reject an out-of-domain tail before it reaches the
   // LCP-driven serial merge.
-  PathGraphInputCache input(source, nullptr, 1);
+  PathGraphInputCache input(source, 1);
   PriorityNode tail;
   for(size_type file = 0; file < source.files(); file++)
   {
@@ -2767,10 +2719,9 @@ void
 prunePathRange(const PathGraph& source, const LCP& lcp,
   size_type group_buffer_bytes, size_type input_pairs,
   const PruneOutputLayout& layout,
-  PathGraphBuilder& builder, PathGraphMergeStats* stats,
-  ProgressReporter& progress)
+  PathGraphBuilder& builder)
 {
-  PathGraphMerger merger(source, lcp, group_buffer_bytes, stats, input_pairs);
+  PathGraphMerger merger(source, lcp, group_buffer_bytes, input_pairs);
 
   auto write_output = [&](PriorityNode node)
   {
@@ -2817,7 +2768,6 @@ prunePathRange(const PathGraph& source, const LCP& lcp,
       }
     }
     builder.graph.range_count++;
-    progress.advance(range.second - range.first + 1);
   }
   merger.close();
 }
@@ -2826,8 +2776,7 @@ prunePathRange(const PathGraph& source, const LCP& lcp,
 
 void
 PathGraph::prune(const LCP& lcp, size_type size_limit,
-  size_type group_buffer_bytes, PathGraphMergeStats* stats,
-  size_type max_open_files)
+  size_type group_buffer_bytes, size_type max_open_files)
 {
   size_type old_path_count = this->size();
 
@@ -2854,13 +2803,11 @@ PathGraph::prune(const LCP& lcp, size_type size_limit,
     layout.logical.size());
 
   PathGraphBuilder builder(layout.logical.size(), this->k(), this->step(), size_limit,
-    group_buffer_bytes, output_pairs, stats);
+    group_buffer_bytes, output_pairs);
   builder.graph.logical_file_ids = layout.logical;
   builder.graph.physical_shard_ids = layout.physical;
-  ProgressReporter progress("PathGraph::prune()", this->size(), "paths");
   prunePathRange(*this, lcp, group_buffer_bytes, input_pairs,
-    layout, builder, stats, progress);
-  progress.finish();
+    layout, builder);
   builder.close();
   this->clear(); this->swap(builder.graph);
 
@@ -3234,7 +3181,6 @@ struct SameFromSet
   const PathGraphMerger& merger;
   std::string            selected;
   size_type              selected_nodes, budget, stream_buffer;
-  PathGraphMergeStats*   stats;
   // The two retained vector capacities share the group-buffer allowance.
   // An external fallback may coexist with them and uses a separate sorter
   // allowance. Small sets avoid per-group I/O and allocation.
@@ -3242,14 +3188,13 @@ struct SameFromSet
   size_type              memory_records;
   bool                   selected_in_memory;
 
-  SameFromSet(const PathGraphMerger& source, size_type group_buffer_bytes,
-    PathGraphMergeStats* merge_stats) :
+  SameFromSet(const PathGraphMerger& source, size_type group_buffer_bytes) :
     merger(source), selected(), selected_nodes(0),
     budget(std::max(ExternalFixedRecordSorter::minimumBudget(sizeof(node_type)),
       group_buffer_bytes)),
     stream_buffer(std::max(static_cast<size_type>(sizeof(node_type)),
       std::min(static_cast<size_type>(64 * KILOBYTE), this->budget / 4))),
-    stats(merge_stats), selected_memory(), scratch(),
+    selected_memory(), scratch(),
     memory_records(group_buffer_bytes / (2 * sizeof(node_type))),
     selected_in_memory(false)
   {
@@ -3294,7 +3239,6 @@ struct SameFromSet
         }
         output.close();
       }
-      if(this->stats != nullptr) { this->stats->from_set_sorts++; }
       ExternalFixedRecordSorter::sortAndReduce(raw, reduced, sizeof(node_type), this->budget, 2,
         [](const void* left, const void* right) {
           node_type a, b; std::memcpy(&a, left, sizeof(a)); std::memcpy(&b, right, sizeof(b));
@@ -3428,8 +3372,7 @@ initializeMergedGraphNext(MergedGraph& graph, const DeBruijnGraph& mapper)
 static void
 buildMergedGraphSerial(MergedGraph& result, const PathGraph& source,
   const DeBruijnGraph& mapper, const LCP& kmer_lcp, size_type size_limit,
-  size_type group_buffer_bytes, PathGraphMergeStats* stats,
-  size_type max_open_files)
+  size_type group_buffer_bytes, size_type max_open_files)
 {
   constexpr size_type fixed_descriptors = 14;
   size_type input_pairs = std::max(static_cast<size_type>(1),
@@ -3441,11 +3384,10 @@ buildMergedGraphSerial(MergedGraph& result, const PathGraph& source,
   SequentialRecordWriter<range_type> from_file(result.from_name, output_buffer_bytes);
   SequentialRecordWriter<uint8_t> lcp_file(result.lcp_name, output_buffer_bytes);
 
-  PathGraphMerger merger(source, kmer_lcp, group_buffer_bytes, stats, input_pairs);
-  SameFromSet same_from_set(merger, group_buffer_bytes, stats);
+  PathGraphMerger merger(source, kmer_lcp, group_buffer_bytes, input_pairs);
+  SameFromSet same_from_set(merger, group_buffer_bytes);
   size_type curr_comp = 0;
   size_type bytes = 0;
-  ProgressReporter progress("MergedGraph()", source.size(), "paths");
   for(range_type range = merger.first(); !(merger.atEnd(range)); range = merger.next())
   {
     range_type path_lcp = merger.ranges.front().left_lcp;
@@ -3476,16 +3418,14 @@ buildMergedGraphSerial(MergedGraph& result, const PathGraph& source,
     result.path_count++;
     result.rank_count += curr.node.ranks();
     result.from_count += same_from_set.selected_nodes - 1;
-    progress.advance(range.second - range.first + 1);
   }
-  progress.finish();
   merger.close();
   path_file.close(); rank_file.close(); from_file.close(); lcp_file.close();
 }
 
 MergedGraph::MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper,
   const LCP& kmer_lcp, size_type size_limit, size_type group_buffer_bytes,
-  PathGraphMergeStats* stats, size_type max_open_files) :
+  size_type max_open_files) :
   path_name(TempFile::getName(PREFIX)), rank_name(TempFile::getName(PREFIX)),
   from_name(TempFile::getName(PREFIX)), lcp_name(TempFile::getName(PREFIX)),
   path_count(0), rank_count(0), from_count(0),
@@ -3504,7 +3444,7 @@ MergedGraph::MergedGraph(const PathGraph& source, const DeBruijnGraph& mapper,
   }
   initializeMergedGraphNext(*this, mapper);
   buildMergedGraphSerial(*this, source, mapper, kmer_lcp, size_limit,
-    group_buffer_bytes, stats, max_open_files);
+    group_buffer_bytes, max_open_files);
 
   if(Verbosity::level >= Verbosity::EXTENDED)
   {
