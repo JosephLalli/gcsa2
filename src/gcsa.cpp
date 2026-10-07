@@ -35,6 +35,22 @@ namespace
 {
 
 std::string
+formatBytes(size_type bytes)
+{
+  const char* suffixes[] = { "B", "KiB", "MiB", "GiB", "TiB", "PiB" };
+  long double value = bytes;
+  size_type suffix = 0;
+  while(value >= 1024.0L && suffix + 1 < sizeof(suffixes) / sizeof(suffixes[0]))
+  {
+    value /= 1024.0L; suffix++;
+  }
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(value < 10.0L && suffix > 0 ? 2 : 1)
+      << static_cast<double>(value) << ' ' << suffixes[suffix];
+  return out.str();
+}
+
+std::string
 doublingTask(size_type step)
 {
   std::ostringstream result;
@@ -588,28 +604,8 @@ checkedProduct(size_type first, size_type second, const std::string& label)
   return first * second;
 }
 
-/*
-  FORK: sizing a final-scan stream buffer.
-
-  All three of the final scan's buffer sizes -- readers, writers and the
-  start-node sets -- are getIOBufferSize() unless the budget is too small to
-  afford it. That was sixty lines of nested max/min a reader had to evaluate by
-  hand to discover it is a constant. The share test states it instead: above a
-  comfortable budget it passes and the answer is the target; only a tight budget
-  falls through to the arithmetic.
-
-  Substituting the chr21 configuration, the fall-through binds below roughly
-  6.4 GiB available for readers, 1.63 GiB for writers and 1 GiB for the node
-  sets -- so on every run this subsystem has actually been used for, the answer
-  is the constant. The arithmetic is not dead, though: it is the only thing that
-  lets a deliberately tight --gcsa-memory-limit run proceed instead of failing
-  its reservation, which is the case the whole subsystem exists to serve. Hence
-  a branch rather than a deletion.
-
-  The tight branch is the original expression verbatim, and the ample branch is
-  what that expression returns whenever `share >= target` and the target clears
-  the floor, so this cannot change a size on any budget.
-*/
+// Use the target when a fair stream share can hold it. Under a tight budget,
+// keep the same share calculation while respecting the caller's minimum.
 size_type
 finalScanBuffer(size_type target, size_type minimum, size_type available,
   size_type streams_sharing)
@@ -921,7 +917,6 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
       throw std::runtime_error("GCSA::GCSA(): final event path count mismatch");
     }
     sortFinalRedundancy(files, parameters);
-    writeFinalEventMetadata(files, metadata);
   }
   catch(...)
   {
@@ -947,6 +942,10 @@ GCSA::buildAndStore(InputGraph& graph, const ConstructionParameters& parameters,
   {
     throw std::invalid_argument("GCSA::buildAndStore() requires external-memory construction");
   }
+  // TempFile is process-global. This binds the configured directory at the
+  // construction boundary, but does not isolate simultaneous constructions
+  // that select different directories.
+  TempFile::setDirectory(parameters.work_directory);
   const size_type requested_threads = static_cast<size_type>(
     std::max(1, omp_get_max_threads()));
   SerialExternalConstruction serial_construction;

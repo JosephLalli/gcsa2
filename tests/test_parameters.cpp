@@ -12,6 +12,7 @@ static void require(bool value)
 
 int main()
 {
+  const std::string original_temp_dir = TempFile::temp_dir;
   require(parseBytes("64M") == 64 * MEGABYTE);
   require(parseBytes("1.5GiB") == GIGABYTE + GIGABYTE / 2);
   require(parseBytes("40T") == 40 * KILOBYTE * GIGABYTE);
@@ -25,7 +26,7 @@ int main()
   parameters.setWorkDirectory("/tmp/example.gcsa-work/");
   parameters.setLimitBytes(parseBytes("40T"));
   require(parameters.externalMemory());
-  require(parameters.getWorkDirectory() == "/tmp/example.gcsa-work");
+  require(TempFile::temp_dir == original_temp_dir);
   require(parameters.getMemoryLimitBytes() == 96 * GIGABYTE);
   require(parameters.getLimitBytes() == 40 * KILOBYTE * GIGABYTE);
   // The disk ceiling depends on the route, and the two setters may be called
@@ -48,6 +49,7 @@ int main()
     legacy.setLimit(65536);
     legacy.setWorkDirectory("");                   // leaving the external route
     require(legacy.getLimitBytes() == ConstructionParameters::ABSOLUTE_LIMIT * GIGABYTE);
+    require(TempFile::temp_dir == original_temp_dir);
   }
 
   return 0;
