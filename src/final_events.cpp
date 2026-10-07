@@ -1040,13 +1040,9 @@ struct SpillableNodeSet::Impl
     // after this vector has released its storage.
     this->collection_capacity = std::max(static_cast<size_type>(1),
       this->budget / (2 * sizeof(node_type)));
-    // collection_capacity is the spill threshold, not a size hint. Reserving it
-    // eagerly touched 32 MiB per set for a measured peak of 20,188 nodes
-    // (161,504 bytes, 0.24% of one set's reservation) on chr21, and neither set
-    // ever spilled. push_back grows geometrically to the same ceiling and
-    // touches only what is used. The budget reservation above is kept: it is an
-    // admission number that stops other phases overcommitting, and dropping it
-    // would make the budget dishonest rather than smaller.
+    // collection_capacity is a spill threshold, not a size hint. Let the
+    // vector grow to actual demand while retaining the full admission
+    // reservation for a possible sorter phase.
   }
 
   ~Impl()

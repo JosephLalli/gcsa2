@@ -604,28 +604,8 @@ checkedProduct(size_type first, size_type second, const std::string& label)
   return first * second;
 }
 
-/*
-  FORK: sizing a final-scan stream buffer.
-
-  All three of the final scan's buffer sizes -- readers, writers and the
-  start-node sets -- are getIOBufferSize() unless the budget is too small to
-  afford it. That was sixty lines of nested max/min a reader had to evaluate by
-  hand to discover it is a constant. The share test states it instead: above a
-  comfortable budget it passes and the answer is the target; only a tight budget
-  falls through to the arithmetic.
-
-  Substituting the chr21 configuration, the fall-through binds below roughly
-  6.4 GiB available for readers, 1.63 GiB for writers and 1 GiB for the node
-  sets -- so on every run this subsystem has actually been used for, the answer
-  is the constant. The arithmetic is not dead, though: it is the only thing that
-  lets a deliberately tight --gcsa-memory-limit run proceed instead of failing
-  its reservation, which is the case the whole subsystem exists to serve. Hence
-  a branch rather than a deletion.
-
-  The tight branch is the original expression verbatim, and the ample branch is
-  what that expression returns whenever `share >= target` and the target clears
-  the floor, so this cannot change a size on any budget.
-*/
+// Use the target when a fair stream share can hold it. Under a tight budget,
+// keep the same share calculation while respecting the caller's minimum.
 size_type
 finalScanBuffer(size_type target, size_type minimum, size_type available,
   size_type streams_sharing)

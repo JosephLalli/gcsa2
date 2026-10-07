@@ -31,8 +31,8 @@ namespace gcsa
   exposed through the same rewind()/next() interface. The reservation covers
   mutually exclusive collection, external-sort, and readback phases.
 
-  This class is public only so the forced-spill behavior can be unit tested;
-  it is a construction helper and is not part of the query interface.
+  This source-private construction helper is shared by the final scan and its
+  forced-spill regression test; it is not part of the installed interface.
 */
 class SpillableNodeSet
 {
@@ -137,7 +137,8 @@ void sortFinalRedundancy(FinalEventFiles& files,
 /*
   Stream one fast BWT component directly in the existing bit_vector_il<512>
   serialization. This avoids materializing both a dense bitvector and its
-  interleaved replacement. Public only for exact-format regression tests.
+  interleaved replacement. The source-private declaration also lets the
+  exact-format regression test call the production encoder.
 */
 void serializeFastBWTComponent(std::ostream& out,
   const std::string& mask_file, size_type paths, size_type expected_ones,
@@ -158,7 +159,8 @@ void serializeSampleIds(std::ostream& out, const std::string& sample_file,
   const ConstructionParameters& parameters);
 
 // Stream the ordinary sample-boundary bit_vector and select_support_mcl from
-// the monotone sample-end event stream. Public for exact-format tests.
+// the monotone sample-end event stream. The exact-format test calls this same
+// production encoder through the source-private header.
 void serializeSampleBoundaries(std::ostream& out,
   const std::string& sample_end_file, size_type sample_ids,
   size_type sampled_paths, const ConstructionParameters& parameters);
@@ -171,8 +173,8 @@ void serializeOccurrencePointers(std::ostream& out,
   const ConstructionParameters& parameters);
 
 // Stream SadaCount's ordinary bit_vector and select_support_mcl payload from
-// sorted redundancy events without materializing the dense unary vector.
-// Public only for exact-format regression tests.
+// sorted redundancy events without materializing the dense unary vector. The
+// exact-format test calls this same production encoder.
 void serializeRedundantPointers(std::ostream& out,
   const std::string& redundancy_file, size_type paths, size_type redundant,
   const ConstructionParameters& parameters);
