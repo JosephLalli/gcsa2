@@ -2,8 +2,12 @@
 #include <gcsa/path_graph_external.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
+#include <exception>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <string>
@@ -62,6 +66,17 @@ requireAt(bool condition, const char* expression, int line)
 }
 
 #define require(value) requireAt((value), #value, __LINE__)
+
+size_type
+openDescriptors()
+{
+  size_type result = 0;
+  for(int descriptor = 0; descriptor < 128; descriptor++)
+  {
+    if(::fcntl(descriptor, F_GETFD) >= 0 || errno != EBADF) { result++; }
+  }
+  return result;
+}
 
 void
 writePathPair(const std::string& path_name, const std::string& rank_name,
@@ -206,6 +221,57 @@ main()
   externalPathGraphExtend(separated, GIGABYTE, parameters);
   require(separated.files() == 2);
   require(separated.size() == 2);
+  std::vector<SemanticRecord> separated_records = readGraph(separated);
+
+  ConstructionParameters parallel_parameters;
+  parallel_parameters.setMemoryLimitBytes(2 * memory_budget);
+  parallel_parameters.setWorkDirectory(".");
+  PathGraph parallel(left_path, left_rank);
+  parallel.order = 1;
+  parallel.logical_file_ids[0] = logical_file_id_t(1);
+  parallel.physical_shard_ids[0] = physical_shard_id_t(101);
+  appendShard(parallel, right_path, right_rank,
+    logical_file_id_t(2), physical_shard_id_t(202));
+  ExternalPathJoinStats parallel_stats;
+  require(externalPathGraphExtendWithThreads(parallel, GIGABYTE,
+    parallel_parameters, 2, &parallel_stats) == 2);
+  require(readGraph(parallel) == separated_records);
+  require(parallel_stats.max_bytes_resident <= parallel_parameters.getMemoryLimitBytes());
+
+  PathGraph fallback(left_path, left_rank);
+  fallback.order = 1;
+  fallback.logical_file_ids[0] = logical_file_id_t(1);
+  fallback.physical_shard_ids[0] = physical_shard_id_t(101);
+  appendShard(fallback, right_path, right_rank,
+    logical_file_id_t(2), physical_shard_id_t(202));
+  require(externalPathGraphExtendWithThreads(fallback, GIGABYTE,
+    parameters, 2, nullptr) == 1);
+  require(readGraph(fallback) == separated_records);
+
+  char cleanup_template[] = "test_external_join_cleanup_XXXXXX";
+  char* cleanup_directory = ::mkdtemp(cleanup_template);
+  require(cleanup_directory != nullptr);
+  TempFile::setDirectory(cleanup_directory);
+  PathGraph failing(left_path, left_rank);
+  failing.order = 1;
+  failing.logical_file_ids[0] = logical_file_id_t(1);
+  failing.physical_shard_ids[0] = physical_shard_id_t(101);
+  appendShard(failing, right_path, right_rank,
+    logical_file_id_t(2), physical_shard_id_t(202));
+  failing.rank_counts[1] = 0;
+  bool threw = false;
+  size_type descriptors_before = openDescriptors();
+  try
+  {
+    externalPathGraphExtendWithThreads(failing, GIGABYTE,
+      parallel_parameters, 2, nullptr);
+  }
+  catch(const std::exception&) { threw = true; }
+  TempFile::setDirectory(".");
+  require(threw);
+  require(openDescriptors() == descriptors_before);
+  require(std::filesystem::is_empty(cleanup_directory));
+  require(std::filesystem::remove(cleanup_directory));
 
   std::remove(combined_path.c_str()); std::remove(combined_rank.c_str());
   std::remove(left_path.c_str()); std::remove(left_rank.c_str());

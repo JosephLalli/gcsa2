@@ -78,6 +78,9 @@ struct ExternalPathJoinStats
 size_type externalPathJoinMinimumBudget();
 void externalPathGraphExtend(PathGraph& graph, size_type size_limit,
   const ConstructionParameters& parameters, ExternalPathJoinStats* stats = nullptr);
+size_type externalPathGraphExtendWithThreads(PathGraph& graph,
+  size_type size_limit, const ConstructionParameters& parameters,
+  size_type requested_threads, ExternalPathJoinStats* stats = nullptr);
 
 //------------------------------------------------------------------------------
 
