@@ -10,6 +10,10 @@ See [the wiki](https://github.com/jltsiren/gcsa2/wiki) for further documentation
 
 The input to index construction is a set of paths of length *k* in the input graph. The prefix-doubling algorithm transforms the input into an order-*8k* (order-*2k*, order-*4k*, order-*16k*) pruned de Bruijn graph for paths in the input graph. A pruned de Bruijn graph differs from a de Bruijn graph in that its nodes may have shorter labels than the order of the graph, if the shorter labels uniquely determine the start nodes of the corresponding paths in the input graph. As such, pruned de Bruijn graphs are usually smaller than proper de Bruijn graphs.
 
+The stage ownership, resource boundaries, and publication contract of the
+optional disk-first builder are documented in
+[EXTERNAL_MEMORY_CONSTRUCTION.md](EXTERNAL_MEMORY_CONSTRUCTION.md).
+
 GCSA2 is being developed as a part of [vg](https://github.com/vgteam/vg). The only implemented construction option is based on extracting *k*-mers from vg.
 
 ## Compiling GCSA2

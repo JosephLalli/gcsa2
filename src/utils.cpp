@@ -29,7 +29,6 @@
 #include <cstdlib>
 #include <cctype>
 #include <cmath>
-#include <iomanip>
 #include <limits>
 #include <mutex>
 #include <set>
@@ -205,22 +204,6 @@ parseBytes(const std::string& value)
     throw std::out_of_range("byte count is too large: " + value);
   }
   return static_cast<size_type>(result);
-}
-
-std::string
-formatBytes(size_type bytes)
-{
-  const char* suffixes[] = { "B", "KiB", "MiB", "GiB", "TiB", "PiB" };
-  long double value = bytes;
-  size_type suffix = 0;
-  while(value >= 1024.0L && suffix + 1 < sizeof(suffixes) / sizeof(suffixes[0]))
-  {
-    value /= 1024.0L; suffix++;
-  }
-  std::ostringstream out;
-  out << std::fixed << std::setprecision(value < 10.0L && suffix > 0 ? 2 : 1)
-      << static_cast<double>(value) << ' ' << suffixes[suffix];
-  return out.str();
 }
 
 //------------------------------------------------------------------------------
