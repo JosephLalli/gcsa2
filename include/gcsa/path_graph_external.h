@@ -145,12 +145,12 @@ struct ExternalPathJoinStats
   size_type initial_runs, merge_operations, blocked_key_groups, blocked_key_blocks;
   size_type join_parallel_sorts, label_sort_runs, label_merge_passes, label_parallel_sorts;
   size_type direct_label_records, intermediate_path_bytes_avoided;
-  size_type join_partitions, worker_processes, restored_partitions;
+  size_type join_partitions, join_tasks, join_concurrency, restored_partitions;
   size_type recursive_splits, left_range_splits, right_range_splits;
   size_type sampled_plan_records, radix_plan_bins, radix_plan_splits;
   size_type radix_plan_max_bits, radix_plan_capped;
   size_type radix_boundary_flushes, restored_radix_plans;
-  // Exact process-worker planning streams these compact sidecars. The full
+  // Exact task planning streams these compact sidecars. The full
   // JoinRecord counter must remain zero: the 4096-record sample is the only
   // planner read of the wide run payload.
   size_type sidecar_plan_groups, sidecar_plan_detail_records;
@@ -181,7 +181,7 @@ struct ExternalPathJoinStats
     initial_runs(0), merge_operations(0), blocked_key_groups(0), blocked_key_blocks(0),
     join_parallel_sorts(0), label_sort_runs(0), label_merge_passes(0), label_parallel_sorts(0),
     direct_label_records(0), intermediate_path_bytes_avoided(0),
-    join_partitions(0), worker_processes(0), restored_partitions(0),
+    join_partitions(0), join_tasks(0), join_concurrency(0), restored_partitions(0),
     recursive_splits(0), left_range_splits(0), right_range_splits(0),
     sampled_plan_records(0), radix_plan_bins(0), radix_plan_splits(0),
     radix_plan_max_bits(0), radix_plan_capped(0),
@@ -205,17 +205,13 @@ void externalPathGraphExtend(PathGraph& graph, size_type size_limit,
   const ConstructionParameters& parameters, ExternalPathJoinStats* stats = nullptr,
   BuildWorkspace* workspace = nullptr, const std::string& checkpoint_task = std::string());
 
-// Collapses the join workers' physical shards per logical input to at most the
+// Collapses the join tasks' physical shards per logical input to at most the
 // pairs the next merge holds open. externalPathGraphExtend() calls it after the
 // joins; it is declared for the tests of its concurrent batches.
 void compactLogicalJoinShards(PathGraph& source, size_type size_limit,
   const ConstructionParameters& parameters, size_type label_fan_in,
   MemoryBudget& memory, size_type& committed_bytes,
   ExternalPathJoinStats* stats);
-
-// Hidden child-process entry point used by build_gcsa and vg. The task file is
-// versioned and contains immutable run ranges plus unique output paths.
-int externalPathJoinWorker(const std::string& task_file);
 
 //------------------------------------------------------------------------------
 

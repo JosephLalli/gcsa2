@@ -15,7 +15,6 @@
 #include <stdexcept>
 #include <string>
 #include <sys/resource.h>
-#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
@@ -257,17 +256,13 @@ labelSorted(const PathGraph& graph)
 
 } // namespace
 
-int main(int argc, char** argv)
+int main()
 {
-  if(argc == 3 && std::string(argv[1]) == "gcsa-worker-task")
-  {
-    return externalPathJoinWorker(argv[2]);
-  }
   omp_set_num_threads(1);
 
   // The disk ceiling applies to the peak physical framed pair, not merely its
-  // logical PathNode/rank payload. Verify rejection in a child because the
-  // legacy sorter error path deliberately terminates the current process.
+  // logical PathNode/rank payload. The sink must report rejection without
+  // terminating the process, so threaded task cleanup can unwind normally.
   TempFileCodecParameters limit_codec(TempCompression::ZSTD,
     64 * KILOBYTE, 1, 1);
   const size_type limit_sort_budget = 8 * MEGABYTE;
@@ -283,19 +278,20 @@ int main(int argc, char** argv)
   require(peak_pair_bytes > logical_pair_bytes);
   {
     PathGraph rejected_output(1, 0, 0);
-    pid_t child = ::fork();
-    require(child >= 0);
-    if(child == 0)
+    bool rejected = false;
+    try
     {
       size_type committed = 0;
       ExternalPathSortSink sink(rejected_output, 0, limit_sort_budget, 2,
         logical_pair_bytes, committed, nullptr, limit_codec);
       sink.write(limit_node, limit_ranks);
-      std::_Exit(EXIT_SUCCESS);
     }
-    int status = 0;
-    require(::waitpid(child, &status, 0) == child);
-    require(WIFEXITED(status) && WEXITSTATUS(status) == EXIT_FAILURE);
+    catch(const std::runtime_error& error)
+    {
+      rejected = (std::string(error.what()).find(
+        "configured disk limit exceeded") != std::string::npos);
+    }
+    require(rejected);
   }
   {
     PathGraph admitted_output(1, 0, 0);
@@ -490,115 +486,119 @@ int main(int argc, char** argv)
   BuildWorkspace workspace(workspace_root, semantic, BuildWorkspace::Settings(),
     BuildWorkspace::NEW_WORKSPACE);
 
-  // The same skewed key must be splittable across fork-free worker processes.
+  // The same skewed key must be splittable across fork-free join threads.
   // Every physical result shard retains logical ID 7, and the PathGraph merger
   // must observe exactly the same semantic record multiset as the legacy path.
-  PathGraph process_graph(left_path, left_rank);
-  process_graph.order = 1;
-  process_graph.logical_file_ids[0] = logical_file_id_t(7);
-  process_graph.physical_shard_ids[0] = physical_shard_id_t(101);
-  appendShard(process_graph, right_path, right_rank,
+  PathGraph threaded_graph(left_path, left_rank);
+  threaded_graph.order = 1;
+  threaded_graph.logical_file_ids[0] = logical_file_id_t(7);
+  threaded_graph.physical_shard_ids[0] = physical_shard_id_t(101);
+  appendShard(threaded_graph, right_path, right_rank,
     logical_file_id_t(7), physical_shard_id_t(202));
-  ConstructionParameters process_parameters = parameters;
-  process_parameters.setMemoryLimitBytes(8 * MEGABYTE);
+  ConstructionParameters threaded_parameters = parameters;
+  threaded_parameters.setMemoryLimitBytes(8 * MEGABYTE);
   // Four MiB admits the framed run writer plus two framed run readers and,
   // on the next doubling step, the compressed source-shard decoder pair.
-  process_parameters.setJoinPartitionSize(4 * MEGABYTE);
-  process_parameters.setSortRunSize(2 * MEGABYTE);
-  process_parameters.setCheckpointBytes(32 * KILOBYTE);
-  process_parameters.setProcessWorkers(2);
-  process_parameters.setTempCompression("zstd");
+  threaded_parameters.setJoinPartitionSize(4 * MEGABYTE);
+  threaded_parameters.setSortRunSize(2 * MEGABYTE);
+  threaded_parameters.setCheckpointBytes(32 * KILOBYTE);
+  threaded_parameters.setTempCompression("zstd");
   // 1 KiB frames force both the 40-summary stream and the recursively
   // split 1201-detail stream across several blocks. Planning consequently
   // exercises framed readAt() for nonzero subgroup offsets, rather than only
   // a sequential first-block read.
-  process_parameters.setCompressionBlockSize(KILOBYTE);
-  process_parameters.setCompressionWorkers(1);
+  threaded_parameters.setCompressionBlockSize(KILOBYTE);
+  threaded_parameters.setCompressionWorkers(1);
   // The setter clamps to MIN_OPEN_FILES (64). Compaction retains a bounded
   // multi-run frontier rather than pretending this request limits it to 8.
-  process_parameters.setMaxOpenFiles(8);
-  process_parameters.setWorkerExecutable(argv[0]);
+  threaded_parameters.setMaxOpenFiles(8);
   omp_set_num_threads(4);
-  ExternalPathJoinStats process_stats;
-  externalPathGraphExtend(process_graph, GIGABYTE,
-    process_parameters, &process_stats, &workspace, "step-process");
+  ExternalPathJoinStats threaded_stats;
+  externalPathGraphExtend(threaded_graph, GIGABYTE,
+    threaded_parameters, &threaded_stats, &workspace, "step-threaded");
   omp_set_num_threads(1);
-  require(readGraph(legacy) == readGraph(process_graph));
-  // Many worker partitions remain a bounded set of individually LABEL-sorted
+  require(readGraph(legacy) == readGraph(threaded_graph));
+  // Many task partitions remain a bounded set of individually LABEL-sorted
   // streams for the downstream merger.
-  require(process_graph.files() > 1);
-  require(process_graph.files() <= (process_parameters.getMaxOpenFiles() - 4) / 2);
-  require(labelSorted(process_graph));
-  for(size_type file = 0; file < process_graph.files(); file++)
+  require(threaded_graph.files() > 1);
+  require(threaded_graph.files() <= (threaded_parameters.getMaxOpenFiles() - 4) / 2);
+  require(labelSorted(threaded_graph));
+  for(size_type file = 0; file < threaded_graph.files(); file++)
   {
-    require(process_graph.logicalFile(file) == logical_file_id_t(7));
-    require(process_graph.physicalShard(file) == physical_shard_id_t(file));
-    require(CompressedBlockReader::isFramed(process_graph.path_names[file]));
-    require(CompressedBlockReader::isFramed(process_graph.rank_names[file]));
+    require(threaded_graph.logicalFile(file) == logical_file_id_t(7));
+    require(threaded_graph.physicalShard(file) == physical_shard_id_t(file));
+    require(CompressedBlockReader::isFramed(threaded_graph.path_names[file]));
+    require(CompressedBlockReader::isFramed(threaded_graph.rank_names[file]));
   }
-  require(process_stats.join_partitions > 1);
+  require(threaded_stats.join_partitions > 1);
   // The sampled planner must turn this single high-fanout semantic key into
-  // several deterministic range tasks rather than one worker monopoly.
-  require(process_stats.join_partitions >= 4);
-  require(process_stats.worker_processes == process_stats.join_partitions);
-  require(process_stats.recursive_splits > 0);
-  require(process_stats.left_range_splits > 0);
-  require(process_stats.right_range_splits > 0);
-  require(process_stats.generated_records == left.size() * right.size());
-  require(process_stats.sorted_bypass == 2);
-  require(process_stats.sampled_plan_records > 0);
-  require(process_stats.radix_plan_bins >= 1);
-  require(process_stats.sidecar_plan_groups > 0);
-  require(process_stats.sidecar_plan_detail_records > 0);
-  require(process_stats.sidecar_plan_groups * 48 > KILOBYTE);
-  require(process_stats.sidecar_plan_detail_records > KILOBYTE);
-  require(process_stats.full_record_plan_rescans == 0);
-  require(process_stats.compressed_join_runs > 0);
-  require(process_stats.join_run_stored_bytes <
-    process_stats.join_run_logical_bytes);
-  require(process_stats.compressed_join_sidecars > 0);
-  require(process_stats.join_sidecar_stored_bytes <
-    process_stats.join_sidecar_logical_bytes);
-  require(process_stats.grouped_expansion_records > 0);
-  require(process_stats.expansion_context_bytes_saved > 0);
-  require(process_stats.max_bytes_resident <= process_parameters.getMemoryLimitBytes());
+  // several deterministic range tasks rather than one task monopoly.
+  require(threaded_stats.join_partitions >= 4);
+  require(threaded_stats.join_tasks == threaded_stats.join_partitions);
+  require(threaded_stats.join_concurrency > 1);
+  require(threaded_stats.recursive_splits > 0);
+  require(threaded_stats.left_range_splits > 0);
+  require(threaded_stats.right_range_splits > 0);
+  require(threaded_stats.generated_records == left.size() * right.size());
+  require(threaded_stats.sorted_bypass == 2);
+  require(threaded_stats.sampled_plan_records > 0);
+  require(threaded_stats.radix_plan_bins >= 1);
+  require(threaded_stats.sidecar_plan_groups > 0);
+  require(threaded_stats.sidecar_plan_detail_records > 0);
+  require(threaded_stats.sidecar_plan_groups * 48 > KILOBYTE);
+  require(threaded_stats.sidecar_plan_detail_records > KILOBYTE);
+  require(threaded_stats.full_record_plan_rescans == 0);
+  require(threaded_stats.compressed_join_runs > 0);
+  require(threaded_stats.join_run_stored_bytes <
+    threaded_stats.join_run_logical_bytes);
+  require(threaded_stats.compressed_join_sidecars > 0);
+  require(threaded_stats.join_sidecar_stored_bytes <
+    threaded_stats.join_sidecar_logical_bytes);
+  require(threaded_stats.grouped_expansion_records > 0);
+  require(threaded_stats.expansion_context_bytes_saved > 0);
+  require(threaded_stats.max_bytes_resident <= threaded_parameters.getMemoryLimitBytes());
 
-  // Rebuild the cross-file, high-fanout worker plan without a workspace. The
+  // Rebuild the cross-file, high-fanout threaded plan without a workspace. The
   // compact sidecars must produce the same physical streams, not merely the
   // same logical record multiset.
-  PathGraph fresh_process(left_path, left_rank);
-  fresh_process.order = 1;
-  fresh_process.logical_file_ids[0] = logical_file_id_t(7);
-  fresh_process.physical_shard_ids[0] = physical_shard_id_t(101);
-  appendShard(fresh_process, right_path, right_rank,
+  PathGraph fresh_threaded(left_path, left_rank);
+  fresh_threaded.order = 1;
+  fresh_threaded.logical_file_ids[0] = logical_file_id_t(7);
+  fresh_threaded.physical_shard_ids[0] = physical_shard_id_t(101);
+  appendShard(fresh_threaded, right_path, right_rank,
     logical_file_id_t(7), physical_shard_id_t(202));
-  ConstructionParameters fresh_parameters = process_parameters;
+  ConstructionParameters fresh_parameters = threaded_parameters;
   fresh_parameters.setVerifyWorkspace();
   ExternalPathJoinStats fresh_stats;
-  externalPathGraphExtend(fresh_process, GIGABYTE,
+  omp_set_num_threads(4);
+  externalPathGraphExtend(fresh_threaded, GIGABYTE,
     fresh_parameters, &fresh_stats);
-  requireSameGraph(process_graph, fresh_process, "fresh sidecar worker plan");
-  requireByteIdenticalGraph(process_graph, fresh_process);
+  omp_set_num_threads(1);
+  requireSameGraph(threaded_graph, fresh_threaded, "fresh sidecar threaded plan");
+  requireByteIdenticalGraph(threaded_graph, fresh_threaded);
   require(fresh_stats.full_record_plan_rescans == 0);
 
-  PathGraph resumed_process(left_path, left_rank);
-  resumed_process.order = 1;
-  resumed_process.logical_file_ids[0] = logical_file_id_t(7);
-  resumed_process.physical_shard_ids[0] = physical_shard_id_t(101);
-  appendShard(resumed_process, right_path, right_rank,
+  PathGraph resumed_threaded(left_path, left_rank);
+  resumed_threaded.order = 1;
+  resumed_threaded.logical_file_ids[0] = logical_file_id_t(7);
+  resumed_threaded.physical_shard_ids[0] = physical_shard_id_t(101);
+  appendShard(resumed_threaded, right_path, right_rank,
     logical_file_id_t(7), physical_shard_id_t(202));
   ExternalPathJoinStats resumed_stats;
-  externalPathGraphExtend(resumed_process, GIGABYTE,
-    process_parameters, &resumed_stats, &workspace, "step-process");
-  require(readGraph(process_graph) == readGraph(resumed_process));
-  requireByteIdenticalGraph(process_graph, resumed_process);
-  require(resumed_process.files() == process_graph.files());
-  require(labelSorted(resumed_process));
-  for(size_type file = 0; file < resumed_process.files(); file++)
+  omp_set_num_threads(4);
+  externalPathGraphExtend(resumed_threaded, GIGABYTE,
+    threaded_parameters, &resumed_stats, &workspace, "step-threaded");
+  omp_set_num_threads(1);
+  require(readGraph(threaded_graph) == readGraph(resumed_threaded));
+  requireByteIdenticalGraph(threaded_graph, resumed_threaded);
+  require(resumed_threaded.files() == threaded_graph.files());
+  require(labelSorted(resumed_threaded));
+  for(size_type file = 0; file < resumed_threaded.files(); file++)
   {
-    require(resumed_process.physicalShard(file) == physical_shard_id_t(file));
+    require(resumed_threaded.physicalShard(file) == physical_shard_id_t(file));
   }
-  require(resumed_stats.worker_processes == 0);
+  require(resumed_stats.join_tasks == 0);
+  require(resumed_stats.join_concurrency == 0);
   require(resumed_stats.restored_partitions == resumed_stats.join_partitions);
   require(resumed_stats.restored_radix_plans == 1);
   require(resumed_stats.restored_sidecar_metadata == 2);
@@ -612,12 +612,11 @@ int main(int argc, char** argv)
   second_legacy.order = 1;
   second_legacy.extend(GIGABYTE, 64 * MEGABYTE);
   second_legacy.extend(GIGABYTE, 64 * MEGABYTE);
-  ConstructionParameters second_parameters = process_parameters;
-  second_parameters.setProcessWorkers(1);
+  ConstructionParameters second_parameters = threaded_parameters;
   ExternalPathJoinStats second_stats;
-  externalPathGraphExtend(resumed_process, GIGABYTE, second_parameters,
+  externalPathGraphExtend(resumed_threaded, GIGABYTE, second_parameters,
     &second_stats);
-  requireSameGraph(second_legacy, resumed_process,
+  requireSameGraph(second_legacy, resumed_threaded,
     "compressed source doubling step");
   require(second_stats.max_bytes_resident <=
     second_parameters.getMemoryLimitBytes());
@@ -661,11 +660,13 @@ int main(int argc, char** argv)
   radix_external.physical_shard_ids[0] = physical_shard_id_t(301);
   appendShard(radix_external, radix_right_path, radix_right_rank,
     logical_file_id_t(11), physical_shard_id_t(302));
-  ConstructionParameters radix_parameters = process_parameters;
+  ConstructionParameters radix_parameters = threaded_parameters;
   radix_parameters.setCheckpointBytes(4 * KILOBYTE);
   ExternalPathJoinStats radix_stats;
+  omp_set_num_threads(4);
   externalPathGraphExtend(radix_external, GIGABYTE, radix_parameters,
     &radix_stats, &workspace, "step-msd");
+  omp_set_num_threads(1);
   require(readGraph(radix_legacy) == readGraph(radix_external));
   require(radix_stats.radix_plan_splits > 0);
   require(radix_stats.radix_plan_bins > 1);
@@ -680,16 +681,18 @@ int main(int argc, char** argv)
   appendShard(radix_resumed, radix_right_path, radix_right_rank,
     logical_file_id_t(11), physical_shard_id_t(302));
   ExternalPathJoinStats radix_resumed_stats;
+  omp_set_num_threads(4);
   externalPathGraphExtend(radix_resumed, GIGABYTE, radix_parameters,
     &radix_resumed_stats, &workspace, "step-msd");
+  omp_set_num_threads(1);
   require(readGraph(radix_external) == readGraph(radix_resumed));
   requireByteIdenticalGraph(radix_external, radix_resumed);
   require(radix_resumed_stats.restored_radix_plans == 1);
   require(radix_resumed_stats.restored_sidecar_metadata == 2);
-  require(radix_resumed_stats.worker_processes == 0);
+  require(radix_resumed_stats.join_tasks == 0);
 
   // A same-length run with different payload must not inherit either the plan
-  // or completed worker ranges. Run checksums are part of both task identities.
+  // or completed task ranges. Run checksums are part of both task identities.
   std::vector<TestRecord> changed_left = radix_left;
   changed_left.front().label += 50000;
   std::vector<TestRecord> changed_combined = changed_left;
@@ -710,14 +713,17 @@ int main(int argc, char** argv)
   appendShard(changed_external, radix_right_path, radix_right_rank,
     logical_file_id_t(11), physical_shard_id_t(302));
   ExternalPathJoinStats changed_stats;
+  omp_set_num_threads(4);
   externalPathGraphExtend(changed_external, GIGABYTE, radix_parameters,
     &changed_stats, &workspace, "step-msd");
+  omp_set_num_threads(1);
   require(readGraph(changed_legacy) == readGraph(changed_external));
   require(changed_stats.restored_radix_plans == 0);
   require(changed_stats.restored_partitions == 0);
-  require(changed_stats.worker_processes == changed_stats.join_partitions);
+  require(changed_stats.join_tasks == changed_stats.join_partitions);
+  require(changed_stats.join_concurrency > 1);
 
-  // Requesting multiple workers must remain valid when the deterministic plan
+  // Requesting multiple threads must remain valid when the deterministic plan
   // contains only one task. This is common for small logical inputs.
   PathGraph one_partition(left_path, left_rank);
   one_partition.order = 1;
@@ -725,14 +731,17 @@ int main(int argc, char** argv)
   one_partition.physical_shard_ids[0] = physical_shard_id_t(101);
   appendShard(one_partition, right_path, right_rank,
     logical_file_id_t(7), physical_shard_id_t(202));
-  ConstructionParameters one_parameters = process_parameters;
+  ConstructionParameters one_parameters = threaded_parameters;
   one_parameters.setCheckpointBytes(GIGABYTE);
   ExternalPathJoinStats one_stats;
+  omp_set_num_threads(4);
   externalPathGraphExtend(one_partition, GIGABYTE, one_parameters, &one_stats);
+  omp_set_num_threads(1);
   require(readGraph(legacy) == readGraph(one_partition));
   require(one_partition.files() == 1);
   require(one_stats.join_partitions == 1);
-  require(one_stats.worker_processes == 1);
+  require(one_stats.join_tasks == 1);
+  require(one_stats.join_concurrency == 1);
 
   checkpointPathGraph(workspace, external, "step-01", "extend", 4096);
   require(pathGraphCheckpointExists(workspace, "step-01", "extend"));
@@ -755,7 +764,7 @@ int main(int argc, char** argv)
   require(separated.files() == 2);
   require(separated.size() == 2); // Only the already-sorted bypass paths remain.
 
-  // Join workers leave many physical shards per logical input, and compaction
+  // Join tasks leave many physical shards per logical input, and compaction
   // merges them in batches. With threads to spare, the batches of a pass run
   // at once: the published frontier must be the one the serial loop publishes,
   // stream for stream, and the step must report that the batches overlapped.
@@ -926,8 +935,8 @@ int main(int argc, char** argv)
 
   // Key-range distribution. A logical input of at least 2 x 65,536 paths is
   // split into key ranges, one per thread, whose distributions run at once.
-  // Every route must produce the serial route's records; the ranged process
-  // worker route must also restore its range plan and every partition when
+  // Every route must produce the serial route's records; the ranged threaded
+  // task route must also restore its range plan and every partition when
   // the same step runs again on its workspace.
   {
     const size_type chain = 4 * 65536;
@@ -964,7 +973,8 @@ int main(int argc, char** argv)
     require(serial_chain_stats.generated_records == chain - 1);
     require(serial_chain.size() == chain - 1);
 
-    // Direct joins, one output shard per range.
+    // Threaded joins without a workspace. The checkpoint-sized task shards
+    // are compacted to the bounded frontier the downstream merger can open.
     PathGraph direct_chain(chain_path, chain_rank);
     chain_graph(direct_chain);
     ExternalPathJoinStats direct_chain_stats;
@@ -977,32 +987,41 @@ int main(int argc, char** argv)
     require(direct_chain_stats.left_records == serial_chain_stats.left_records);
     require(direct_chain_stats.right_records == serial_chain_stats.right_records);
     require(direct_chain_stats.max_bytes_resident <= range_parameters.getMemoryLimitBytes());
-    require(direct_chain.files() == 4);
-    requireSameGraph(serial_chain, direct_chain, "key-range distribution, direct joins");
+    require(direct_chain_stats.join_tasks == direct_chain_stats.join_partitions);
+    require(direct_chain_stats.join_concurrency > 1);
+    require(direct_chain_stats.join_partitions > direct_chain.files());
+    require(direct_chain_stats.compaction_batches > 0);
+    require(direct_chain.files() <= pathMergeInputPairs(range_parameters));
+    for(size_type file = 0; file < direct_chain.files(); file++)
+    {
+      require(direct_chain.logicalFile(file) == logical_file_id_t(3));
+      require(direct_chain.physicalShard(file) == physical_shard_id_t(file));
+    }
+    requireSameGraph(serial_chain, direct_chain, "key-range distribution, threaded joins");
 
-    // Process workers over every range's partitions, on a workspace.
+    // Threaded tasks over every range's partitions, on a workspace.
     char range_root[] = "/tmp/gcsa-range-plan-XXXXXX";
     require(mkdtemp(range_root) != nullptr);
     BuildWorkspace::Settings range_semantic;
     range_semantic["fixture"] = "external-join-ranges";
     BuildWorkspace range_workspace(range_root, range_semantic, BuildWorkspace::Settings(),
       BuildWorkspace::NEW_WORKSPACE);
-    ConstructionParameters worker_range_parameters = range_parameters;
-    worker_range_parameters.setProcessWorkers(2);
-    worker_range_parameters.setWorkerExecutable(argv[0]);
-    PathGraph worker_chain(chain_path, chain_rank);
-    chain_graph(worker_chain);
-    ExternalPathJoinStats worker_chain_stats;
+    ConstructionParameters workspace_range_parameters = range_parameters;
+    PathGraph workspace_chain(chain_path, chain_rank);
+    chain_graph(workspace_chain);
+    ExternalPathJoinStats workspace_chain_stats;
     omp_set_num_threads(4);
-    externalPathGraphExtend(worker_chain, GIGABYTE, worker_range_parameters,
-      &worker_chain_stats, &range_workspace, "step-ranges");
+    externalPathGraphExtend(workspace_chain, GIGABYTE, workspace_range_parameters,
+      &workspace_chain_stats, &range_workspace, "step-ranges");
     omp_set_num_threads(1);
-    require(worker_chain_stats.distribution_ranges == 4);
-    require(worker_chain_stats.distribution_concurrency == 4); // one reader per thread, in chunks
-    require(worker_chain_stats.restored_range_plans == 0);
-    require(worker_chain_stats.join_partitions >= 4);
-    require(worker_chain_stats.worker_processes == worker_chain_stats.join_partitions);
-    requireSameGraph(serial_chain, worker_chain, "key-range distribution, process workers");
+    require(workspace_chain_stats.distribution_ranges == 4);
+    require(workspace_chain_stats.distribution_concurrency == 4); // one reader per thread, in chunks
+    require(workspace_chain_stats.restored_range_plans == 0);
+    require(workspace_chain_stats.join_partitions >= 4);
+    require(workspace_chain_stats.join_tasks == workspace_chain_stats.join_partitions);
+    require(workspace_chain_stats.join_concurrency > 1);
+    requireSameGraph(serial_chain, workspace_chain, "key-range distribution, workspace tasks");
+    requireByteIdenticalGraph(direct_chain, workspace_chain);
 
     // The same step again: the committed range plan gives the same ranges
     // whatever the thread count, so the runs, their checksums and every
@@ -1011,16 +1030,17 @@ int main(int argc, char** argv)
     chain_graph(resumed_chain);
     ExternalPathJoinStats resumed_chain_stats;
     omp_set_num_threads(2);
-    externalPathGraphExtend(resumed_chain, GIGABYTE, worker_range_parameters,
+    externalPathGraphExtend(resumed_chain, GIGABYTE, workspace_range_parameters,
       &resumed_chain_stats, &range_workspace, "step-ranges");
     omp_set_num_threads(1);
     require(resumed_chain_stats.restored_range_plans == 1);
     require(resumed_chain_stats.distribution_ranges == 4);
     require(resumed_chain_stats.distribution_concurrency == 2); // one reader per thread, in chunks
     require(resumed_chain_stats.restored_radix_plans > 0);
-    require(resumed_chain_stats.restored_partitions == worker_chain_stats.join_partitions);
-    require(resumed_chain_stats.worker_processes == 0);
-    requireByteIdenticalGraph(worker_chain, resumed_chain);
+    require(resumed_chain_stats.restored_partitions == workspace_chain_stats.join_partitions);
+    require(resumed_chain_stats.join_tasks == 0);
+    require(resumed_chain_stats.join_concurrency == 0);
+    requireByteIdenticalGraph(workspace_chain, resumed_chain);
 
     std::remove(chain_path.c_str()); std::remove(chain_rank.c_str());
     std::filesystem::remove_all(range_root);

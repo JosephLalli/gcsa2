@@ -6,7 +6,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iostream>
-#include <sys/wait.h>
+#include <stdexcept>
 #include <type_traits>
 #include <unistd.h>
 #include <vector>
@@ -115,28 +115,26 @@ static void check_sorted(PathGraph& graph, std::vector<TestRecord> expected)
 static void expect_sort_failure(const std::string& path, const std::string& rank,
   size_type budget, bool invalid_pointer, bool trailing_rank)
 {
-  pid_t child = fork();
-  require(child >= 0);
-  if(child == 0)
+  PathGraph graph(path, rank);
+  graph.delete_files = false;
+  if(invalid_pointer)
   {
-    PathGraph graph(path, rank);
-    if(invalid_pointer)
-    {
-      std::fstream input(path.c_str(), std::ios_base::in | std::ios_base::out | std::ios_base::binary);
-      PathNode node; input.read(reinterpret_cast<char*>(&node), sizeof(node));
-      node.setPointer(1); input.seekp(0); input.write(reinterpret_cast<const char*>(&node), sizeof(node));
-      input.close();
-    }
-    if(trailing_rank)
-    {
-      std::ofstream output(rank.c_str(), std::ios_base::binary | std::ios_base::app);
-      PathNode::rank_type extra = 999; output.write(reinterpret_cast<const char*>(&extra), sizeof(extra));
-    }
-    externalPathGraphSort(graph, 0, budget, 2);
-    _exit(0);
+    std::fstream input(path.c_str(), std::ios_base::in | std::ios_base::out | std::ios_base::binary);
+    PathNode node; input.read(reinterpret_cast<char*>(&node), sizeof(node));
+    node.setPointer(1); input.seekp(0); input.write(reinterpret_cast<const char*>(&node), sizeof(node));
   }
-  int status = 0; require(waitpid(child, &status, 0) == child);
-  require(!WIFEXITED(status) || WEXITSTATUS(status) != 0);
+  if(trailing_rank)
+  {
+    std::ofstream output(rank.c_str(), std::ios_base::binary | std::ios_base::app);
+    PathNode::rank_type extra = 999; output.write(reinterpret_cast<const char*>(&extra), sizeof(extra));
+  }
+  bool rejected = false;
+  try { externalPathGraphSort(graph, 0, budget, 2); }
+  catch(const std::runtime_error& error)
+  {
+    rejected = (std::string(error.what()).find("externalPathGraphSort():") != std::string::npos);
+  }
+  require(rejected);
 }
 
 int main()

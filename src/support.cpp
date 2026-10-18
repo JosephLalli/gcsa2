@@ -87,7 +87,6 @@ ConstructionParameters::ConstructionParameters() :
   io_buffer_size(IO_BUFFER_SIZE),
   sort_run_size(SORT_RUN_SIZE), join_partition_size(JOIN_PARTITION_SIZE),
   merge_fan_in(MERGE_FAN_IN), max_open_files(MAX_OPEN_FILES), concurrent_open_files(0),
-  process_workers(PROCESS_WORKERS),
   checkpoint_records(CHECKPOINT_RECORDS), checkpoint_bytes(CHECKPOINT_BYTES),
   temp_compression(TempCompression::AUTO),
   compression_block_size(COMPRESSION_BLOCK_SIZE),
@@ -271,18 +270,6 @@ raiseOpenFileLimit()
   if(limit.rlim_cur == RLIM_INFINITY || limit.rlim_cur >= target) { return; }
   limit.rlim_cur = target;
   static_cast<void>(::setrlimit(RLIMIT_NOFILE, &limit)); // An unchanged limit is still valid.
-}
-
-void
-ConstructionParameters::setProcessWorkers(size_type workers)
-{
-  this->process_workers = std::max((size_type)1, workers);
-}
-
-void
-ConstructionParameters::setWorkerExecutable(const std::string& executable)
-{
-  this->worker_executable = executable;
 }
 
 void

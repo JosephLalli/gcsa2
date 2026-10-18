@@ -246,7 +246,6 @@ constructionOperationalSettings(const ConstructionParameters& parameters)
   settings["join_partition_size_mode"] = (parameters.joinPartitionSizeIsAutomatic() ? "auto" : "explicit");
   settings["merge_fan_in"] = std::to_string(parameters.getMergeFanIn());
   settings["max_open_files"] = std::to_string(parameters.getMaxOpenFiles());
-  settings["process_workers"] = std::to_string(parameters.getProcessWorkers());
   settings["temp_compression"] = tempCompressionName(parameters.getTempCompression());
   settings["compression_block_size"] = std::to_string(parameters.getCompressionBlockSize());
   settings["compression_workers"] = std::to_string(parameters.getCompressionWorkers());
@@ -3428,7 +3427,7 @@ reportJoinStats(const ExternalPathJoinStats& join_stats)
               << join_stats.initial_runs << " join runs, "
               << join_stats.merge_operations << " join merges, "
               << join_stats.join_partitions << " join partitions, "
-              << join_stats.worker_processes << " worker processes, "
+              << join_stats.join_tasks << " join tasks, "
               << join_stats.restored_partitions << " restored partitions, "
               << join_stats.recursive_splits << " recursive splits, "
               << join_stats.label_sort_runs << " label runs, "
@@ -3955,11 +3954,9 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     restored_prune = false;
     if(parameters.externalMemory())
     {
-      // Separate process workers consume named shard files. Otherwise keep
-      // the complete logical join resident when its live generation fits.
-      const bool resident_extend = (parameters.getProcessWorkers() <= 1 &&
-        path_graph.tryExtendResident(path_graph.remainingLimit(parameters.getLimitBytes()),
-          *merge_memory));
+      // Keep the complete logical join resident when its live generation fits.
+      const bool resident_extend = path_graph.tryExtendResident(
+        path_graph.remainingLimit(parameters.getLimitBytes()), *merge_memory);
       if(!resident_extend)
       {
         path_graph.materialize();

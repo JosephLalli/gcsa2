@@ -1059,9 +1059,39 @@ updatePathSortStats(ExternalPathSortStats* stats, size_type records, size_type b
 inline void
 externalSortFailure(const std::string& message)
 {
-  std::cerr << "externalPathGraphSort(): " << message << std::endl;
-  std::exit(EXIT_FAILURE);
+  throw std::runtime_error("externalPathGraphSort(): " + message);
 }
+
+// These resources used to be reclaimed when the sort worker process exited.
+// Threaded join tasks must release only their own resources while unwinding.
+struct PathSortDescriptor
+{
+  int value;
+  explicit PathSortDescriptor(int descriptor) : value(descriptor) { }
+  ~PathSortDescriptor() { this->close(); }
+  void close() { if(this->value >= 0) { ::close(this->value); this->value = -1; } }
+  operator int() const { return this->value; }
+  PathSortDescriptor(const PathSortDescriptor&) = delete;
+  PathSortDescriptor& operator=(const PathSortDescriptor&) = delete;
+};
+
+struct PathSortFileCleanup
+{
+  std::string name;
+  bool keep = false;
+  explicit PathSortFileCleanup(const std::string& filename) : name(filename) { }
+  ~PathSortFileCleanup() { if(!this->keep) { TempFile::remove(this->name); } }
+};
+
+struct PathSortRunCleanup
+{
+  std::vector<std::string>& runs;
+  explicit PathSortRunCleanup(std::vector<std::string>& names) : runs(names) { }
+  ~PathSortRunCleanup()
+  {
+    for(std::string& run : this->runs) { TempFile::remove(run); }
+  }
+};
 
 inline void
 recordPathSortRun(ExternalPathSortStats* stats, const PathSortRunWriter& writer)
@@ -1261,9 +1291,11 @@ void
 writePathSortRun(const std::string& name, const std::vector<PathSortRecord>& records,
   ExternalPathSortStats* stats)
 {
+  PathSortFileCleanup cleanup(name);
   PathSortRunWriter output(name, records.size(), PATH_SORT_RUN_BUFFER_BYTES);
   for(const PathSortRecord& record : records) { output.write(record); }
   output.finish(); recordPathSortRun(stats, output);
+  cleanup.keep = true;
 }
 
 std::string
@@ -1272,6 +1304,7 @@ mergePathSortRuns(const std::vector<std::string>& inputs, size_type,
 {
   if(stats != nullptr) { stats->merge_operations++; }
   std::string output_name = TempFile::getName("gcsa_path_sort_run");
+  PathSortFileCleanup cleanup(output_name);
   std::vector<std::unique_ptr<PathSortRunReader>> readers;
   readers.reserve(inputs.size());
   size_type total_records = 0;
@@ -1301,6 +1334,7 @@ mergePathSortRuns(const std::vector<std::string>& inputs, size_type,
     if(!(readers[best]->atEnd())) { queue.push(best); }
   }
   output.finish(); recordPathSortRun(stats, output);
+  cleanup.keep = true;
   return output_name;
 }
 
@@ -1352,8 +1386,11 @@ writeSortedPathPair(const std::string& run_name, const std::string& path_name,
   paths.open(path_name.c_str(), std::ios_base::binary);
   ranks.open(rank_name.c_str(), std::ios_base::binary);
   if(!paths || !ranks) { externalSortFailure("cannot create sorted path pair"); }
-  int path_cache_descriptor = openPathSortCacheDescriptor(path_name, O_RDWR);
-  int rank_cache_descriptor = openPathSortCacheDescriptor(rank_name, O_RDWR);
+  // Throw before DiskIO::write() reaches its legacy process-exit branch.
+  paths.exceptions(std::ios_base::badbit | std::ios_base::failbit);
+  ranks.exceptions(std::ios_base::badbit | std::ios_base::failbit);
+  PathSortDescriptor path_cache_descriptor(openPathSortCacheDescriptor(path_name, O_RDWR));
+  PathSortDescriptor rank_cache_descriptor(openPathSortCacheDescriptor(rank_name, O_RDWR));
   off_t path_bytes = 0, rank_bytes = 0;
   off_t path_cache_released = 0, rank_cache_released = 0;
   size_type path_buffer_records = std::max((size_type)1,
@@ -1429,7 +1466,7 @@ writeSortedPathPair(const std::string& run_name, const std::string& path_name,
   trimPathSortWrittenCache(ranks, rank_cache_descriptor, rank_bytes,
     rank_cache_released, true, rank_name);
   paths.close(); ranks.close();
-  ::close(path_cache_descriptor); ::close(rank_cache_descriptor);
+  path_cache_descriptor.close(); rank_cache_descriptor.close();
   if(paths.fail() || ranks.fail()) { externalSortFailure("cannot close sorted path pair"); }
   if(path_count != expected_paths || rank_count != expected_ranks) { externalSortFailure("sorted path pair has incorrect counts"); }
 }
@@ -1705,11 +1742,14 @@ addPathSortRun(std::vector<std::vector<std::string>>& levels, const std::string&
   size_type level, size_type fan_in, size_type buffer_records,
   ExternalPathSortStats* stats)
 {
+  PathSortFileCleanup cleanup(run);
   if(levels.size() <= level) { levels.resize(level + 1); }
   levels[level].push_back(run);
+  cleanup.keep = true; // The level owns this run now.
   if(levels[level].size() < fan_in) { return; }
 
   std::vector<std::string> inputs; inputs.swap(levels[level]);
+  PathSortRunCleanup input_cleanup(inputs);
   std::string merged = mergePathSortRuns(inputs, buffer_records, stats);
   for(size_type i = 0; i < inputs.size(); i++) { TempFile::remove(inputs[i]); }
   if(stats != nullptr) { stats->merge_passes = std::max(stats->merge_passes, level + 1); }
@@ -1861,6 +1901,7 @@ struct ExternalPathSortSink::Impl
     this->flush();
     std::vector<PathSortRecord>().swap(this->records);
     std::vector<std::string> runs;
+    PathSortRunCleanup cleanup(runs);
     for(size_type level = 0; level < this->levels.size(); level++)
     {
       runs.insert(runs.end(), this->levels[level].begin(), this->levels[level].end());
@@ -1869,13 +1910,15 @@ struct ExternalPathSortSink::Impl
     while(runs.size() > this->fan_in)
     {
       std::vector<std::string> compacted;
+      PathSortRunCleanup compacted_cleanup(compacted);
+      compacted.reserve((runs.size() + this->fan_in - 1) / this->fan_in);
       for(size_type first = 0; first < runs.size(); first += this->fan_in)
       {
         size_type last = std::min(runs.size(), first + this->fan_in);
         std::vector<std::string> group(runs.begin() + first, runs.begin() + last);
         std::string merged = mergePathSortRuns(group, this->merge_records, this->stats);
         for(std::string& run : group) { TempFile::remove(run); }
-        compacted.push_back(merged);
+        compacted.push_back(std::move(merged));
       }
       runs.swap(compacted);
       if(this->stats != nullptr) { this->stats->merge_passes++; }
@@ -1886,7 +1929,10 @@ struct ExternalPathSortSink::Impl
       writePathSortRun(name, this->records, this->stats);
       runs.push_back(name);
     }
-    if(runs.size() == 1) { return runs.front(); }
+    if(runs.size() == 1)
+    {
+      std::string result = runs.front(); runs.clear(); return result;
+    }
     std::string merged = mergePathSortRuns(runs, this->merge_records, this->stats);
     for(std::string& run : runs) { TempFile::remove(run); }
     return merged;
@@ -1897,10 +1943,12 @@ struct ExternalPathSortSink::Impl
     if(this->complete) { return; }
     std::uint64_t path_digest, rank_digest;
     std::string merged = this->finishRuns();
+    PathSortFileCleanup merged_cleanup(merged);
     const std::string& final_path = this->graph.path_names[this->file];
     const std::string& final_rank = this->graph.rank_names[this->file];
     std::string partial_path = final_path + ".partial";
     std::string partial_rank = final_rank + ".partial";
+    PathSortFileCleanup path_cleanup(partial_path), rank_cleanup(partial_rank);
     std::remove(partial_path.c_str()); std::remove(partial_rank.c_str());
     writeSortedPathPair(merged, partial_path, partial_rank,
       this->path_count, this->rank_count, this->merge_records, this->stats,
@@ -2026,8 +2074,8 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   paths.rdbuf()->pubsetbuf(path_stream_buffer.data(), path_stream_buffer.size());
   ranks.rdbuf()->pubsetbuf(rank_stream_buffer.data(), rank_stream_buffer.size());
   graph.open(paths, ranks, file);
-  int source_path_cache_descriptor = openPathSortCacheDescriptor(graph.path_names[file], O_RDONLY);
-  int source_rank_cache_descriptor = openPathSortCacheDescriptor(graph.rank_names[file], O_RDONLY);
+  PathSortDescriptor source_path_cache_descriptor(openPathSortCacheDescriptor(graph.path_names[file], O_RDONLY));
+  PathSortDescriptor source_rank_cache_descriptor(openPathSortCacheDescriptor(graph.rank_names[file], O_RDONLY));
   off_t source_path_cache_released = 0, source_rank_cache_released = 0;
   if(graph.path_counts[file] > std::numeric_limits<size_type>::max() / sizeof(PathNode) ||
      graph.rank_counts[file] > std::numeric_limits<size_type>::max() / sizeof(PathNode::rank_type) ||
@@ -2043,6 +2091,17 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   // At most fan_in - 1 runs remain at each level. Run metadata therefore uses
   // O(fan_in * log(number_of_runs)) memory rather than one string per run.
   std::vector<std::vector<std::string>> levels;
+  struct LevelCleanup
+  {
+    std::vector<std::vector<std::string>>& levels;
+    ~LevelCleanup()
+    {
+      for(auto& level : this->levels)
+      {
+        for(std::string& run : level) { TempFile::remove(run); }
+      }
+    }
+  } level_cleanup{levels};
   std::vector<PathSortRecord> records; records.reserve(run_records);
   updatePathSortStats(stats, run_records, PATH_SORT_FIXED_BYTES +
     PATH_SORT_RUN_BUFFER_BYTES + run_records * record_bytes);
@@ -2075,7 +2134,7 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
     pathSortByteOffset(path_count, sizeof(PathNode)), source_path_cache_released, true);
   trimPathSortReadCache(source_rank_cache_descriptor,
     pathSortByteOffset(rank_offset, sizeof(PathNode::rank_type)), source_rank_cache_released, true);
-  ::close(source_path_cache_descriptor); ::close(source_rank_cache_descriptor);
+  source_path_cache_descriptor.close(); source_rank_cache_descriptor.close();
   if(!records.empty())
   {
     sortPathRecords(records, stats);
@@ -2091,6 +2150,7 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   std::vector<PathSortRecord>().swap(records);
 
   std::vector<std::string> runs;
+  PathSortRunCleanup run_cleanup(runs);
   for(size_type level = 0; level < levels.size(); level++)
   {
     runs.insert(runs.end(), levels[level].begin(), levels[level].end());
@@ -2098,13 +2158,15 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   while(runs.size() > fan_in)
   {
     std::vector<std::string> compacted;
+    PathSortRunCleanup compacted_cleanup(compacted);
+    compacted.reserve((runs.size() + fan_in - 1) / fan_in);
     for(size_type first = 0; first < runs.size(); first += fan_in)
     {
       size_type last = std::min(runs.size(), first + fan_in);
       std::vector<std::string> group(runs.begin() + first, runs.begin() + last);
       std::string merged = mergePathSortRuns(group, merge_records, stats);
       for(size_type i = 0; i < group.size(); i++) { TempFile::remove(group[i]); }
-      compacted.push_back(merged);
+      compacted.push_back(std::move(merged));
     }
     runs.swap(compacted);
     if(stats != nullptr) { stats->merge_passes++; }
@@ -2131,6 +2193,8 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
 
   std::string final_path = TempFile::getName(PathGraph::PREFIX), final_rank = TempFile::getName(PathGraph::PREFIX);
   std::string partial_path = final_path + ".partial", partial_rank = final_rank + ".partial";
+  PathSortFileCleanup path_cleanup(final_path), rank_cleanup(final_rank);
+  PathSortFileCleanup partial_path_cleanup(partial_path), partial_rank_cleanup(partial_rank);
   std::uint64_t path_digest, rank_digest;
   writeSortedPathPair(merged, partial_path, partial_rank, graph.path_counts[file],
     graph.rank_counts[file], merge_records, stats, TempFileCodecParameters(), path_digest, rank_digest);
@@ -2142,6 +2206,7 @@ externalPathGraphSort(PathGraph& graph, size_type file, size_type byte_budget, s
   }
   std::string old_path = graph.path_names[file], old_rank = graph.rank_names[file];
   graph.path_names[file] = final_path; graph.rank_names[file] = final_rank;
+  path_cleanup.keep = rank_cleanup.keep = true;
   graph.path_checksums.at(file).record(final_path, path_digest);
   graph.rank_checksums.at(file).record(final_rank, rank_digest);
   // The rewritten pair is raw (writeSortedPathPair above passes a default,

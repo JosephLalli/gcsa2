@@ -391,8 +391,8 @@ struct HeapCompare
 // start, initial k-mer and redundancy sorts ran at one core while 63 idled.
 // Prune and merge workers are std::threads that can each reach a sorter, and
 // a nested team in each would oversubscribe the cores they already occupy, so
-// only the process's main thread fans out: the build's coordinator, or a join
-// worker process whose OpenMP width its coordinator has already divided.
+// only the process's main thread fans out; task-local sorters use their
+// caller's assigned CPU share without creating another independent team.
 constexpr size_type PARALLEL_SORT_RECORDS = size_type(1) << 20;
 
 bool

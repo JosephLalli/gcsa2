@@ -421,7 +421,7 @@ struct PathGraph
     What this generation costs the disk limit. bytes() is the logical
     PathNode/rank payload, but every generation guard charges what the shards
     physically occupy: ExternalPathSortSink::finish() and
-    runJoinWorkerPartitions() commit st_size, and framed admission uses
+    threaded join tasks commit st_size, and framed admission uses
     externalPathGraphShardPeakBytes(). A framed generation stores a fraction of
     its payload when the records compress and more than it when they do not, so
     only this value may be compared with, or subtracted from, a limit. A raw

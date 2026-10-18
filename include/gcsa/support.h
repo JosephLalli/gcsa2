@@ -30,9 +30,8 @@ enum class TempCompression : std::uint8_t
 const char* tempCompressionName(TempCompression compression);
 
 // A copyable description of the codec used for large immutable temporary
-// streams. Keeping this separate from ConstructionParameters makes it safe to
-// serialize into child-process task records without confusing operational
-// knobs with graph semantics.
+// streams. Join tasks can copy these settings without sharing mutable codec
+// state or treating operational knobs as graph semantics.
 struct TempFileCodecParameters
 {
   TempCompression compression;
@@ -86,7 +85,6 @@ struct ConstructionParameters
   // temporary two-way sorter streams. Values below this cannot represent a
   // global descriptor ceiling for the full supported alphabet.
   constexpr static size_type MIN_OPEN_FILES        = 64;
-  constexpr static size_type PROCESS_WORKERS       = 1;
   constexpr static size_type CHECKPOINT_RECORDS    = 16 * MILLION;
   constexpr static size_type CHECKPOINT_BYTES      = GIGABYTE;
   constexpr static size_type COMPRESSION_BLOCK_SIZE = 16 * MEGABYTE;
@@ -113,8 +111,6 @@ struct ConstructionParameters
   void setMergeFanIn(size_type fan_in);
   void setMaxOpenFiles(size_type files);
   void setConcurrentOpenFiles(size_type files);
-  void setProcessWorkers(size_type workers);
-  void setWorkerExecutable(const std::string& executable);
   void setCheckpointRecords(size_type records);
   void setCheckpointBytes(size_type bytes);
   void setTempCompression(TempCompression compression);
@@ -137,7 +133,7 @@ struct ConstructionParameters
   // With no expert override, derive phase workspace from the aggregate memory
   // goal. Sorting receives 3/4 and join blocking 1/4 because the direct
   // join-to-label pipeline needs both at the same time. The overloads repeat
-  // the same policy inside a process worker's smaller reservation.
+  // the same policy inside a join task's smaller reservation.
   size_type getSortRunSize() const;
   size_type getSortRunSize(size_type available_bytes) const;
   size_type getJoinPartitionSize() const;
@@ -152,8 +148,6 @@ struct ConstructionParameters
   // admits workers. Zero derives it from the process's soft open-file limit
   // less that ceiling, and it never falls below the ceiling.
   size_type getConcurrentOpenFiles() const;
-  size_type getProcessWorkers() const { return this->process_workers; }
-  const std::string& getWorkerExecutable() const { return this->worker_executable; }
   size_type getCheckpointRecords() const { return this->checkpoint_records; }
   size_type getCheckpointBytes() const { return this->checkpoint_bytes; }
   TempCompression getTempCompression() const { return this->temp_compression; }
@@ -189,8 +183,6 @@ struct ConstructionParameters
   bool resume, verify_workspace, clean_obsolete;
   size_type io_buffer_size, sort_run_size, join_partition_size;
   size_type merge_fan_in, max_open_files, concurrent_open_files;
-  size_type process_workers;
-  std::string worker_executable;
   size_type checkpoint_records, checkpoint_bytes;
   TempCompression temp_compression;
   size_type compression_block_size, compression_workers;
