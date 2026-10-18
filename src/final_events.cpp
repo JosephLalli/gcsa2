@@ -6,6 +6,7 @@
 
 #include <gcsa/final_events.h>
 
+#include <gcsa/adaptive_record_store.h>
 #include <gcsa/compressed_block.h>
 #include <gcsa/external_sort.h>
 #include <gcsa/internal.h>
@@ -178,28 +179,58 @@ logicalFileBytes(const std::string& path)
   return static_cast<size_type>(logical);
 }
 
-void
-requireFileSize(const std::string& path, size_type records, size_type width)
+struct EventStream
 {
-  size_type expected = checkedBytes(records, width, path);
-  size_type observed = logicalFileBytes(path);
+  std::string path;
+  std::shared_ptr<FinalEventStore> store;
+
+  EventStream(const std::string& filename = std::string(),
+    const std::shared_ptr<FinalEventStore>& records = nullptr) :
+    path(filename), store(records) { }
+
+  bool adaptive() const { return this->store != nullptr; }
+  bool framed() const
+  {
+    return !this->adaptive() && CompressedBlockReader::isFramed(this->path);
+  }
+  size_type bytes() const
+  {
+    return (this->adaptive() ? this->store->count() : logicalFileBytes(this->path));
+  }
+};
+
+void
+requireStreamSize(const EventStream& stream, size_type records, size_type width)
+{
+  size_type expected = checkedBytes(records, width, stream.path);
+  size_type observed = stream.bytes();
   if(observed != expected)
   {
     throw eventError("event stream has " + std::to_string(observed) +
-      " bytes; expected " + std::to_string(expected), path);
+      " bytes; expected " + std::to_string(expected), stream.path);
   }
 }
 
 class BufferedEventWriter
 {
 public:
-  BufferedEventWriter(const std::string& path, size_type buffer_bytes,
+  BufferedEventWriter(const std::string& path,
+    const std::shared_ptr<FinalEventStore>& store, size_type buffer_bytes,
     MemoryBudget& budget, const std::string& task,
     const TempFileCodecParameters& codec) :
-    path_(path), descriptor_(-1), buffer_(), used_(0), written_(0),
+    path_(path), store_(store), descriptor_(-1), buffer_(), used_(0), written_(0),
     checksum_(1469598103934665603ULL), cache_released_(0), closed_(false),
-    reservation_(), framed_()
+    reservation_(), framed_(), budget_(&budget),
+    overflow_buffer_bytes_(std::max(static_cast<size_type>(16), buffer_bytes))
   {
+    if(this->store_)
+    {
+      if(codec.enabled())
+      {
+        throw eventError("compressed adaptive event stream was not switched to file backing", path);
+      }
+      return;
+    }
     if(codec.enabled())
     {
       const CompressedBlockWriter::Mode mode = CompressedBlockWriter::ZSTD;
@@ -276,6 +307,13 @@ public:
   void close()
   {
     if(closed_) { return; }
+    if(this->store_)
+    {
+      flush();
+      std::vector<std::uint8_t>().swap(buffer_);
+      reservation_ = MemoryBudget::Reservation();
+      closed_ = true; return;
+    }
     if(framed_)
     {
       framed_->finish(); framed_.reset(); closed_ = true;
@@ -298,6 +336,7 @@ public:
 
 private:
   std::string path_;
+  std::shared_ptr<FinalEventStore> store_;
   int descriptor_;
   std::vector<std::uint8_t> buffer_;
   size_type used_, written_;
@@ -306,11 +345,32 @@ private:
   bool closed_;
   MemoryBudget::Reservation reservation_;
   std::unique_ptr<CompressedBlockWriter> framed_;
+  MemoryBudget* budget_;
+  size_type overflow_buffer_bytes_;
 
   void append(const void* source, size_type bytes)
   {
     if(closed_) { throw eventError("write after close", path_); }
     const std::uint8_t* data = static_cast<const std::uint8_t*>(source);
+    if(this->store_)
+    {
+      if(this->store_->spilled() && buffer_.empty())
+      {
+        // Overflow released the former resident payload. Reuse any available
+        // allowance for sequential writes; never wait on another event stream.
+        for(size_type capacity = overflow_buffer_bytes_; capacity >= 16; capacity /= 2)
+        {
+          reservation_ = budget_->tryReserve(capacity, "final event overflow buffer");
+          if(reservation_) { buffer_.resize(capacity); break; }
+        }
+      }
+      if(!this->store_->spilled() || buffer_.empty())
+      {
+        this->store_->append(data, bytes);
+        checksum_ = BuildWorkspace::checksum(data, bytes, checksum_);
+        return;
+      }
+    }
     if(framed_)
     {
       framed_->writeRecord(data, bytes);
@@ -331,6 +391,18 @@ private:
   {
     const size_type width = 8 * words;
     std::uint8_t record[16];
+    if(this->store_)
+    {
+      std::array<std::uint8_t, 4096> encoded;
+      while(count > 0)
+      {
+        const size_type take = std::min<size_type>(count, encoded.size() / width);
+        for(size_type i = 0; i < take * words; i++) { put64(encoded.data() + 8 * i, values[i]); }
+        append(encoded.data(), take * width);
+        values += take * words; count -= take;
+      }
+      return;
+    }
     if(framed_)
     {
       for(size_type i = 0; i < count; i++, values += words)
@@ -362,6 +434,10 @@ private:
   void flush()
   {
     if(used_ == 0) { return; }
+    if(this->store_)
+    {
+      this->store_->append(buffer_.data(), used_); used_ = 0; return;
+    }
     writeAll(descriptor_, buffer_.data(), used_, path_);
     written_ += used_; used_ = 0;
     if(static_cast<off_t>(written_) - cache_released_ >= CACHE_FLUSH_BYTES)
@@ -381,15 +457,24 @@ private:
 class BufferedEventReader
 {
 public:
-  BufferedEventReader(const std::string& path, size_type width,
+  BufferedEventReader(const EventStream& stream, size_type width,
     size_type records, size_type buffer_bytes, MemoryBudget& budget,
     const std::string& task) :
-    path_(path), descriptor_(-1), width_(width), records_(records), seen_(0),
+    path_(stream.path), store_(stream.store), resident_(nullptr), descriptor_(-1),
+    width_(width), records_(records), seen_(0),
     buffer_(), buffered_(0), offset_(0), consumed_bytes_(0), cache_released_(0),
     reservation_(), framed_()
   {
-    if(width_ == 0) { throw eventError("zero-width event stream", path); }
-    requireFileSize(path_, records_, width_);
+    if(width_ == 0) { throw eventError("zero-width event stream", path_); }
+    requireStreamSize(stream, records_, width_);
+    if(this->store_)
+    {
+      if(!(this->store_->spilled()))
+      {
+        this->resident_ = this->store_->residentData(); return;
+      }
+      this->path_ = this->store_->filename();
+    }
     size_type capacity = std::max(width_, buffer_bytes - buffer_bytes % width_);
     if(CompressedBlockReader::isFramed(path_))
     {
@@ -421,8 +506,8 @@ public:
     buffer_.resize(capacity);
     if(!framed_)
     {
-      descriptor_ = ::open(path.c_str(), O_RDONLY);
-      if(descriptor_ < 0) { throw eventError("cannot open event stream", path); }
+      descriptor_ = ::open(path_.c_str(), O_RDONLY);
+      if(descriptor_ < 0) { throw eventError("cannot open event stream", path_); }
       adviseSequential(descriptor_);
     }
   }
@@ -468,6 +553,8 @@ public:
 
 private:
   std::string path_;
+  std::shared_ptr<FinalEventStore> store_;
+  const std::uint8_t* resident_;
   int descriptor_;
   size_type width_, records_, seen_;
   std::vector<std::uint8_t> buffer_;
@@ -479,6 +566,12 @@ private:
   bool next(void* target)
   {
     if(seen_ == records_) { return false; }
+    if(this->resident_ != nullptr)
+    {
+      const size_type byte_offset = checkedBytes(seen_, width_, this->path_);
+      std::memcpy(target, this->resident_ + byte_offset, width_);
+      seen_++; return true;
+    }
     if(offset_ == buffered_) { refill(); }
     std::memcpy(target, buffer_.data() + offset_, width_);
     offset_ += width_; seen_++; return true;
@@ -815,10 +908,132 @@ serializePlainBitVector(std::ostream& out, size_type bits, NextPosition next_pos
   if(available) { throw eventError("bit position exceeds bitvector universe"); }
 }
 
+// Select directories and encoded blocks are replayed in a fixed order. Keep
+// them in the construction pool until real overflow, with the legacy file
+// route retained for callers that do not supply a construction pool.
+class FinalByteSpool
+{
+public:
+  FinalByteSpool(MemoryBudget* memory, const std::string& task) :
+    memory_(memory), file_(nullptr), offset_(0), used_(0), cursor_(0), replaying_(false)
+  {
+    if(memory != nullptr) { store_.reset(new FinalEventStore(*memory, task)); }
+    else
+    {
+      name_ = TempFile::getName(task);
+      file_ = std::fopen(name_.c_str(), "w+b");
+      if(file_ == nullptr) { throw eventError("cannot create select spool", name_); }
+    }
+  }
+  ~FinalByteSpool()
+  {
+    if(file_ != nullptr) { std::fclose(file_); }
+    TempFile::remove(name_);
+  }
+  void write(const void* source, size_type bytes)
+  {
+    if(replaying_) { throw eventError("write after select spool replay"); }
+    if(store_)
+    {
+      if(!store_->spilled())
+      {
+        store_->append(static_cast<const std::uint8_t*>(source), bytes); return;
+      }
+      admitBuffer();
+      if(buffer_.empty())
+      {
+        store_->append(static_cast<const std::uint8_t*>(source), bytes); return;
+      }
+      const std::uint8_t* data = static_cast<const std::uint8_t*>(source);
+      while(bytes > 0)
+      {
+        const size_type count = std::min<size_type>(bytes, buffer_.size() - used_);
+        std::memcpy(buffer_.data() + used_, data, count);
+        data += count; used_ += count; bytes -= count;
+        if(used_ == buffer_.size()) { flush(); }
+      }
+    }
+    else
+    {
+      if(std::fwrite(source, 1, bytes, file_) != bytes)
+      {
+        throw eventError("cannot write select spool", name_);
+      }
+      DiskIO::write_volume += bytes;
+    }
+  }
+  void rewind()
+  {
+    if(store_)
+    {
+      if(!replaying_) { flush(); }
+      if(store_->spilled()) { admitBuffer(); }
+    }
+    replaying_ = true; offset_ = used_ = cursor_ = 0;
+    if(file_ != nullptr && (std::fflush(file_) != 0 || std::fseek(file_, 0, SEEK_SET) != 0))
+    {
+      throw eventError("cannot rewind select spool", name_);
+    }
+  }
+  size_type read(void* target, size_type bytes)
+  {
+    if(store_)
+    {
+      if(buffer_.empty())
+      {
+        bytes = std::min(bytes, store_->count() - offset_);
+        store_->readAt(offset_, static_cast<std::uint8_t*>(target), bytes);
+        offset_ += bytes; return bytes;
+      }
+      std::uint8_t* data = static_cast<std::uint8_t*>(target);
+      size_type done = 0;
+      while(done < bytes)
+      {
+        if(cursor_ == used_)
+        {
+          used_ = std::min<size_type>(buffer_.size(), store_->count() - offset_);
+          if(used_ == 0) { break; }
+          store_->readAt(offset_, buffer_.data(), used_);
+          offset_ += used_; cursor_ = 0;
+        }
+        const size_type count = std::min(bytes - done, used_ - cursor_);
+        std::memcpy(data + done, buffer_.data() + cursor_, count);
+        done += count; cursor_ += count;
+      }
+      return done;
+    }
+    size_type got = std::fread(target, 1, bytes, file_);
+    if(std::ferror(file_)) { throw eventError("cannot read select spool", name_); }
+    DiskIO::read_volume += got; return got;
+  }
+private:
+  void admitBuffer()
+  {
+    if(!buffer_.empty()) { return; }
+    for(size_type bytes = 64 * KILOBYTE; bytes >= 16; bytes /= 2)
+    {
+      buffer_memory_ = memory_->tryReserve(bytes, "select overflow buffer");
+      if(buffer_memory_) { buffer_.resize(bytes); return; }
+    }
+  }
+  void flush()
+  {
+    if(used_ != 0) { store_->append(buffer_.data(), used_); used_ = 0; }
+  }
+  MemoryBudget* memory_;
+  MemoryBudget::Reservation buffer_memory_;
+  std::vector<std::uint8_t> buffer_;
+  std::shared_ptr<FinalEventStore> store_;
+  std::string name_;
+  std::FILE* file_;
+  size_type offset_, used_, cursor_;
+  bool replaying_;
+};
+
 template<class NextPosition>
 void
 serializeSelectMCL(std::ostream& out, size_type bits, size_type ones,
-  NextPosition next_position)
+  NextPosition next_position, MemoryBudget* memory = nullptr)
 {
   sdsl::write_member(ones, out);
   if(ones == 0) { return; }
@@ -840,26 +1055,8 @@ serializeSelectMCL(std::ostream& out, size_type bits, size_type ones,
   const size_type logn = sdsl::bits::hi(((bits + 63) / 64) * 64) + 1;
   const size_type logn4 = logn * logn * logn * logn;
   bool has_long_block = false;
-  std::string metadata_name = TempFile::getName("gcsa_select_metadata");
-  std::string payload_name = TempFile::getName("gcsa_select_payload");
-  std::FILE* metadata = std::fopen(metadata_name.c_str(), "w+b");
-  if(metadata == nullptr)
-  {
-    const std::string failed_name = metadata_name;
-    TempFile::remove(metadata_name); TempFile::remove(payload_name);
-    throw eventError("cannot create select metadata spool", failed_name);
-  }
-  std::FILE* payload = std::fopen(payload_name.c_str(), "w+b");
-  if(payload == nullptr)
-  {
-    const std::string failed_name = payload_name;
-    std::fclose(metadata);
-    metadata = nullptr;
-    TempFile::remove(metadata_name); TempFile::remove(payload_name);
-    throw eventError("cannot create select payload spool", failed_name);
-  }
-
-  try
+  FinalByteSpool metadata(memory, "gcsa_select_metadata");
+  FinalByteSpool payload(memory, "gcsa_select_payload");
   {
     std::array<size_type, block_size> positions;
     size_type next = 0, seen = 0, previous = 0;
@@ -904,12 +1101,7 @@ serializeSelectMCL(std::ostream& out, size_type bits, size_type ones,
       std::array<std::uint8_t, 9> block_metadata = {};
       put64(block_metadata.data(), partial_fast_block ? 0 : positions[0]);
       block_metadata[8] = static_cast<std::uint8_t>(!is_long);
-      if(std::fwrite(block_metadata.data(), 1, block_metadata.size(), metadata) !=
-         block_metadata.size())
-      {
-        throw eventError("cannot write select metadata spool");
-      }
-      DiskIO::write_volume += block_metadata.size();
+      metadata.write(block_metadata.data(), block_metadata.size());
       sdsl::int_vector<0> encoded(is_long ? block_size : 64, 0,
         is_long ? sdsl::bits::hi(partial_fast_block ? bits - 1 :
           width_position) + 1 :
@@ -928,31 +1120,20 @@ serializeSelectMCL(std::ostream& out, size_type bits, size_type ones,
       std::ostringstream serialized;
       encoded.serialize(serialized);
       const std::string bytes = serialized.str();
-      if(std::fwrite(bytes.data(), 1, bytes.size(), payload) != bytes.size())
-      {
-        throw eventError("cannot write select payload spool");
-      }
-      DiskIO::write_volume += bytes.size();
+      payload.write(bytes.data(), bytes.size());
     }
     if(available || seen != ones)
     {
       throw eventError("select position count does not match metadata");
     }
 
-    const auto rewind_metadata = [&]()
-    {
-      if(std::fflush(metadata) != 0 || std::fseek(metadata, 0, SEEK_SET) != 0)
-      {
-        throw eventError("cannot rewind select metadata spool");
-      }
-    };
+    const auto rewind_metadata = [&]() { metadata.rewind(); };
     const auto read_metadata = [&](std::array<std::uint8_t, 9>& record)
     {
-      if(std::fread(record.data(), 1, record.size(), metadata) != record.size())
+      if(metadata.read(record.data(), record.size()) != record.size())
       {
         throw eventError("cannot read select metadata spool");
       }
-      DiskIO::read_volume += record.size();
     };
 
     rewind_metadata();
@@ -981,50 +1162,18 @@ serializeSelectMCL(std::ostream& out, size_type bits, size_type ones,
     }
     else { GCSA::bit_vector empty; empty.serialize(out); }
 
-    if(std::fclose(metadata) != 0)
-    {
-      metadata = nullptr;
-      TempFile::remove(metadata_name);
-      throw eventError("cannot close select metadata spool");
-    }
-    metadata = nullptr;
-    TempFile::remove(metadata_name);
-
-    if(std::fflush(payload) != 0 || std::fseek(payload, 0, SEEK_SET) != 0)
-    {
-      throw eventError("cannot rewind select payload spool");
-    }
+    payload.rewind();
     std::array<char, 64 * 1024> buffer;
     while(true)
     {
-      size_type count = std::fread(buffer.data(), 1, buffer.size(), payload);
+      size_type count = payload.read(buffer.data(), buffer.size());
       if(count > 0)
       {
-        DiskIO::read_volume += count;
         out.write(buffer.data(), count);
         if(!out) { throw eventError("cannot serialize select payload"); }
       }
-      if(count < buffer.size())
-      {
-        if(std::ferror(payload)) { throw eventError("cannot read select payload spool"); }
-        break;
-      }
+      if(count < buffer.size()) { break; }
     }
-    if(std::fclose(payload) != 0)
-    {
-      payload = nullptr;
-      TempFile::remove(payload_name);
-      throw eventError("cannot close select payload spool");
-    }
-    payload = nullptr;
-    TempFile::remove(payload_name);
-  }
-  catch(...)
-  {
-    if(metadata != nullptr) { std::fclose(metadata); }
-    if(payload != nullptr) { std::fclose(payload); }
-    TempFile::remove(metadata_name); TempFile::remove(payload_name);
-    throw;
   }
 }
 
@@ -1042,7 +1191,7 @@ serializeSelectMCL(std::ostream& out, size_type bits, size_type ones,
 template<class Replay>
 void
 serializeSparseVector(std::ostream& out, size_type universe, size_type ones,
-  const Replay& replay)
+  const Replay& replay, MemoryBudget* memory = nullptr)
 {
   if(ones > universe)
   {
@@ -1117,7 +1266,7 @@ serializeSparseVector(std::ostream& out, size_type universe, size_type ones,
   });
   encode_high_positions([&](const auto& next_high)
   {
-    serializeSelectMCL(out, high_bits, ones, next_high);
+    serializeSelectMCL(out, high_bits, ones, next_high, memory);
   });
 
   // The high vector has one zero per Elias--Fano bucket. Derive those zero
@@ -1150,7 +1299,7 @@ serializeSparseVector(std::ostream& out, size_type universe, size_type ones,
       }
       return false;
     };
-    serializeSelectMCL(out, high_bits, zeros, next_zero);
+    serializeSelectMCL(out, high_bits, zeros, next_zero, memory);
   });
   if(!out) { throw eventError("cannot serialize sparse vector"); }
 }
@@ -1162,17 +1311,30 @@ validatePayloads(const FinalEventFiles& files, const FinalEventMetadata& metadat
   {
     throw eventError("edge stream count does not match alphabet");
   }
-  requireFileSize(files.metadata, 8 + EVENT_METADATA_WORDS * 8, 1);
-  requireFileSize(files.bwt_masks, metadata.paths, 1);
+  if(files.adaptive() && files.edge_destination_stores.size() != metadata.sigma)
+  {
+    throw eventError("adaptive edge stream count does not match alphabet");
+  }
+  requireStreamSize(EventStream(files.metadata, files.metadata_store),
+    8 + EVENT_METADATA_WORDS * 8, 1);
+  requireStreamSize(EventStream(files.bwt_masks, files.bwt_masks_store),
+    metadata.paths, 1);
   for(size_type comp = 0; comp < metadata.sigma; comp++)
   {
-    requireFileSize(files.edge_destinations[comp], metadata.bwt_counts[comp], 8);
+    requireStreamSize(EventStream(files.edge_destinations[comp],
+      files.adaptive() ? files.edge_destination_stores[comp] : nullptr),
+      metadata.bwt_counts[comp], 8);
   }
-  requireFileSize(files.sample_positions, metadata.sampled_paths, 8);
-  requireFileSize(files.sample_ids, metadata.sample_ids, 8);
-  requireFileSize(files.sample_ends, metadata.sampled_paths, 8);
-  requireFileSize(files.occurrences, metadata.occurrence_items, 16);
-  requireFileSize(files.redundant, metadata.redundant, 8);
+  requireStreamSize(EventStream(files.sample_positions, files.sample_positions_store),
+    metadata.sampled_paths, 8);
+  requireStreamSize(EventStream(files.sample_ids, files.sample_ids_store),
+    metadata.sample_ids, 8);
+  requireStreamSize(EventStream(files.sample_ends, files.sample_ends_store),
+    metadata.sampled_paths, 8);
+  requireStreamSize(EventStream(files.occurrences, files.occurrences_store),
+    metadata.occurrence_items, 16);
+  requireStreamSize(EventStream(files.redundant, files.redundant_store),
+    metadata.redundant, 8);
 }
 
 size_type
@@ -1198,9 +1360,9 @@ componentBufferBytes(const ConstructionParameters& parameters, size_type readers
 class RedundancyCounts
 {
 public:
-  RedundancyCounts(const std::string& filename, size_type paths,
+  RedundancyCounts(const EventStream& stream, size_type paths,
     size_type redundant, const ConstructionParameters& parameters) :
-    filename_(filename), slots_(paths > 0 ? paths - 1 : 0),
+    source_(stream), filename_(stream.path), slots_(paths > 0 ? paths - 1 : 0),
     redundant_(redundant), reader_bytes_(componentBufferBytes(parameters, 1)),
     window_(0), first_(0), last_(0), slot_(0), cumulative_(0),
     wrap_capacity_(redundant / 256), wrap_count_(0), wrap_cursor_(0),
@@ -1208,7 +1370,7 @@ public:
       parameters.getMemoryLimitBytes() / 8),
     reservation_(), counts_(), wraps_(), stats_()
   {
-    requireFileSize(filename_, redundant_, 8);
+    requireStreamSize(source_, redundant_, 8);
     if(slots_ == 0 && redundant_ != 0)
     {
       throw eventError("redundancy rank exceeds suffix-tree slot universe", filename_);
@@ -1217,7 +1379,7 @@ public:
     // BufferedEventReader sizes itself, before the counts take the rest.
     size_type reader = std::max(static_cast<size_type>(8),
       reader_bytes_ - reader_bytes_ % 8);
-    if(CompressedBlockReader::isFramed(filename_))
+    if(source_.framed())
     {
       reader += CompressedBlockReader::workingMemoryEstimate(
         static_cast<size_type>(CompressedBlockReader::declaredBlockSize(filename_)));
@@ -1271,6 +1433,7 @@ public:
   const RedundancyCountStats& stats() const { return stats_; }
 
 private:
+  EventStream source_;
   std::string filename_;
   size_type slots_, redundant_, reader_bytes_;
   size_type window_, first_, last_, slot_, cumulative_;
@@ -1286,7 +1449,7 @@ private:
     first_ = first; last_ = first + std::min(window_, slots_ - first);
     std::memset(counts_.get(), 0, last_ - first_);
     wrap_count_ = wrap_cursor_ = 0;
-    BufferedEventReader input(filename_, 8, redundant_, reader_bytes_, budget_,
+    BufferedEventReader input(source_, 8, redundant_, reader_bytes_, budget_,
       "final-redundancy-reader");
     std::uint64_t value = 0;
     while(input.nextInteger(value))
@@ -1336,21 +1499,23 @@ residentMemoryUsage()
 
 struct SpillableNodeSet::Impl
 {
-  size_type budget, fan_in, collection_capacity, count;
+  size_type budget, fan_in, count;
+  MemoryBudget::Reservation reservation, payload_memory;
+  MemoryBudget* memory;
   std::vector<node_type> values, read_buffer;
   std::string raw_name, sorted_name;
   int raw_descriptor, read_descriptor;
   size_type raw_bytes, read_values, read_offset, values_seen;
   off_t raw_cache_released, read_cache_released;
   bool finished, on_disk;
-  MemoryBudget::Reservation reservation;
 
   Impl(size_type byte_budget, size_type merge_fan_in, MemoryBudget& memory) :
     budget(byte_budget), fan_in(std::max(static_cast<size_type>(2), merge_fan_in)),
-    collection_capacity(0), count(0), values(), read_buffer(), raw_name(),
-    sorted_name(), raw_descriptor(-1), read_descriptor(-1), raw_bytes(0),
-    read_values(0), read_offset(0), values_seen(0), raw_cache_released(0),
-    read_cache_released(0), finished(false), on_disk(false), reservation()
+    count(0), reservation(), payload_memory(), memory(&memory), values(),
+    read_buffer(), raw_name(), sorted_name(), raw_descriptor(-1),
+    read_descriptor(-1), raw_bytes(0), read_values(0), read_offset(0),
+    values_seen(0), raw_cache_released(0), read_cache_released(0),
+    finished(false), on_disk(false)
   {
     if(this->budget < SpillableNodeSet::minimumBudget())
     {
@@ -1358,19 +1523,10 @@ struct SpillableNodeSet::Impl
     }
     this->reservation = memory.reserve(this->budget, "final-start-node-set");
 
-    // Leave half the reservation unused during collection. It covers vector
-    // allocator slack and the small file/stream objects used when the vector
-    // is flushed. The external sorter receives the entire reservation only
-    // after this vector has released its storage.
-    this->collection_capacity = std::max(static_cast<size_type>(1),
-      this->budget / (2 * sizeof(node_type)));
-    // collection_capacity is the spill threshold, not a size hint. Reserving it
-    // eagerly touched 32 MiB per set for a measured peak of 20,188 nodes
-    // (161,504 bytes, 0.24% of one set's reservation) on chr21, and neither set
-    // ever spilled. push_back grows geometrically to the same ceiling and
-    // touches only what is used. The budget reservation above is kept: it is an
-    // admission number that stops other phases overcommitting, and dropping it
-    // would make the budget dishonest rather than smaller.
+    // The reservation guarantees progress through the external sorter after
+    // genuine overflow. While collecting, reuse it for the vector and charge
+    // only capacity beyond it, including old+new overlap during growth.
+
   }
 
   ~Impl()
@@ -1465,10 +1621,42 @@ struct SpillableNodeSet::Impl
     this->finished = this->on_disk = false;
   }
 
+  bool growResident()
+  {
+    if(this->raw_descriptor >= 0) { return false; }
+    const size_type old_capacity = this->values.capacity();
+    if(old_capacity > std::numeric_limits<size_type>::max() / (3 * sizeof(node_type)))
+    {
+      return false;
+    }
+    const size_type capacity = std::max<size_type>(1, 2 * old_capacity);
+    const size_type bytes = capacity * sizeof(node_type);
+    const size_type overlap = (old_capacity + capacity) * sizeof(node_type);
+    const size_type held = this->budget + this->payload_memory.bytes();
+    auto growth = this->memory->tryReserve(overlap > held ? overlap - held : 0,
+      "final start-node capacity growth");
+    if(!growth) { return false; }
+    {
+      std::vector<node_type> replacement;
+      replacement.reserve(capacity);
+      if(replacement.capacity() != capacity) { return false; }
+      replacement.assign(this->values.begin(), this->values.end());
+      this->values.swap(replacement);
+    }
+    this->payload_memory = MemoryBudget::Reservation();
+    growth.shrinkTo(bytes > this->budget ? bytes - this->budget : 0);
+    this->payload_memory = std::move(growth);
+    return true;
+  }
+
   void push(node_type value)
   {
     if(this->finished) { throw eventError("append to completed start-node set"); }
-    if(this->values.size() == this->collection_capacity) { this->flushValues(); }
+    if(this->values.size() == this->values.capacity() && !this->growResident())
+    {
+      if(this->values.empty()) { throw eventError("memory cannot hold one start node"); }
+      this->flushValues();
+    }
     this->values.push_back(value);
   }
 
@@ -1485,6 +1673,7 @@ struct SpillableNodeSet::Impl
 
     this->flushValues(); this->closeRaw(true);
     std::vector<node_type>().swap(this->values);
+    this->payload_memory = MemoryBudget::Reservation();
     this->sorted_name = TempFile::getName("gcsa_final_from_nodes_sorted");
     size_type unique_values = 0;
     try
@@ -1605,8 +1794,8 @@ FinalEventChecksums::FinalEventChecksums(size_type sigma) :
 {
 }
 
-void
-serializeFastBWTComponent(std::ostream& out, const std::string& mask_file,
+static void
+serializeFastBWTComponentFrom(std::ostream& out, const EventStream& masks_source,
   size_type paths, size_type expected_ones, comp_type comp,
   const ConstructionParameters& parameters)
 {
@@ -1616,7 +1805,7 @@ serializeFastBWTComponent(std::ostream& out, const std::string& mask_file,
   }
   MemoryBudget budget(parameters.getMemoryLimitBytes(),
     parameters.getMemoryLimitBytes() / 8);
-  BufferedEventReader masks(mask_file, 1, paths,
+  BufferedEventReader masks(masks_source, 1, paths,
     componentBufferBytes(parameters, 1), budget, "final-bwt-mask-reader");
   size_type observed = serializeFastVector(out, paths, [&]()
   {
@@ -1632,9 +1821,18 @@ serializeFastBWTComponent(std::ostream& out, const std::string& mask_file,
 }
 
 void
-serializeSparseBWTComponent(std::ostream& out, const std::string& mask_file,
+serializeFastBWTComponent(std::ostream& out, const std::string& mask_file,
   size_type paths, size_type expected_ones, comp_type comp,
   const ConstructionParameters& parameters)
+{
+  serializeFastBWTComponentFrom(out, EventStream(mask_file), paths,
+    expected_ones, comp, parameters);
+}
+
+static void
+serializeSparseBWTComponentFrom(std::ostream& out, const EventStream& masks_source,
+  size_type paths, size_type expected_ones, comp_type comp,
+  const ConstructionParameters& parameters, MemoryBudget* memory = nullptr)
 {
   if(comp >= FinalEventMetadata::MAX_SIGMA || expected_ones > paths)
   {
@@ -1645,7 +1843,7 @@ serializeSparseBWTComponent(std::ostream& out, const std::string& mask_file,
   {
     MemoryBudget budget(parameters.getMemoryLimitBytes(),
       parameters.getMemoryLimitBytes() / 8);
-    BufferedEventReader masks(mask_file, 1, paths,
+    BufferedEventReader masks(masks_source, 1, paths,
       componentBufferBytes(parameters, 1), budget, "final-bwt-mask-reader");
     size_type path = 0, observed = 0;
     const auto next = [&](size_type& position)
@@ -1676,11 +1874,20 @@ serializeSparseBWTComponent(std::ostream& out, const std::string& mask_file,
     }
   };
 
-  serializeSparseVector(out, paths, expected_ones, replay);
+  serializeSparseVector(out, paths, expected_ones, replay, memory);
 }
 
 void
-serializeSampleIds(std::ostream& out, const std::string& sample_file,
+serializeSparseBWTComponent(std::ostream& out, const std::string& mask_file,
+  size_type paths, size_type expected_ones, comp_type comp,
+  const ConstructionParameters& parameters)
+{
+  serializeSparseBWTComponentFrom(out, EventStream(mask_file), paths,
+    expected_ones, comp, parameters);
+}
+
+static void
+serializeSampleIdsFrom(std::ostream& out, const EventStream& sample_source,
   size_type samples, size_type sample_bits,
   const ConstructionParameters& parameters)
 {
@@ -1690,7 +1897,7 @@ serializeSampleIds(std::ostream& out, const std::string& sample_file,
   }
   MemoryBudget budget(parameters.getMemoryLimitBytes(),
     parameters.getMemoryLimitBytes() / 8);
-  BufferedEventReader ids(sample_file, 8, samples,
+  BufferedEventReader ids(sample_source, 8, samples,
     componentBufferBytes(parameters, 1), budget, "final-sample-id-reader");
   serializePackedVector(out, samples, sample_bits, [&]()
   {
@@ -1701,9 +1908,18 @@ serializeSampleIds(std::ostream& out, const std::string& sample_file,
 }
 
 void
-serializeSampleBoundaries(std::ostream& out,
-  const std::string& sample_end_file, size_type sample_ids,
-  size_type sampled_paths, const ConstructionParameters& parameters)
+serializeSampleIds(std::ostream& out, const std::string& sample_file,
+  size_type samples, size_type sample_bits,
+  const ConstructionParameters& parameters)
+{
+  serializeSampleIdsFrom(out, EventStream(sample_file), samples,
+    sample_bits, parameters);
+}
+
+static void
+serializeSampleBoundariesFrom(std::ostream& out,
+  const EventStream& sample_end_source, size_type sample_ids,
+  size_type sampled_paths, const ConstructionParameters& parameters, MemoryBudget* memory = nullptr)
 {
   if(sampled_paths > sample_ids ||
      ((sampled_paths == 0) != (sample_ids == 0)))
@@ -1718,7 +1934,7 @@ serializeSampleBoundaries(std::ostream& out,
   {
     MemoryBudget budget(parameters.getMemoryLimitBytes(),
       parameters.getMemoryLimitBytes() / 8);
-    BufferedEventReader ends(sample_end_file, 8, sampled_paths,
+    BufferedEventReader ends(sample_end_source, 8, sampled_paths,
       componentBufferBytes(parameters, 1), budget,
       "final-sample-end-reader");
     size_type consumed = 0, previous = 0;
@@ -1750,15 +1966,24 @@ serializeSampleBoundaries(std::ostream& out,
   });
   pass([&](const auto& next)
   {
-    serializeSelectMCL(out, sample_ids, sampled_paths, next);
+    serializeSelectMCL(out, sample_ids, sampled_paths, next, memory);
   });
 }
 
 void
-serializeOccurrencePointers(std::ostream& out,
-  const std::string& occurrence_file, size_type paths,
+serializeSampleBoundaries(std::ostream& out,
+  const std::string& sample_end_file, size_type sample_ids,
+  size_type sampled_paths, const ConstructionParameters& parameters)
+{
+  serializeSampleBoundariesFrom(out, EventStream(sample_end_file), sample_ids,
+    sampled_paths, parameters);
+}
+
+static void
+serializeOccurrencePointersFrom(std::ostream& out,
+  const EventStream& occurrence_source, size_type paths,
   size_type occurrence_items, size_type occurrence_extra,
-  const ConstructionParameters& parameters)
+  const ConstructionParameters& parameters, MemoryBudget* memory = nullptr)
 {
   if(occurrence_items > paths || occurrence_items > occurrence_extra ||
      (paths == 0 && (occurrence_items != 0 || occurrence_extra != 0)))
@@ -1773,7 +1998,7 @@ serializeOccurrencePointers(std::ostream& out,
   {
     MemoryBudget budget(parameters.getMemoryLimitBytes(),
       parameters.getMemoryLimitBytes() / 8);
-    BufferedEventReader input(occurrence_file, 16, occurrence_items,
+    BufferedEventReader input(occurrence_source, 16, occurrence_items,
       componentBufferBytes(parameters, 1), budget, "final-occurrence-reader");
     size_type seen = 0, tail = 0;
     std::uint64_t previous = 0;
@@ -1803,7 +2028,7 @@ serializeOccurrencePointers(std::ostream& out,
   serializeSparseVector(out, paths, occurrence_items, [&](const auto& consume)
   {
     replay(false, consume);
-  });
+  }, memory);
   SadaSparse::sd_vector::rank_1_type empty_rank;
   empty_rank.serialize(out);
 
@@ -1811,16 +2036,27 @@ serializeOccurrencePointers(std::ostream& out,
     [&](const auto& consume)
     {
       replay(true, consume);
-    });
+    }, memory);
   SadaSparse::sd_vector::select_1_type empty_select;
   empty_select.serialize(out);
   if(!out) { throw eventError("cannot serialize occurrence pointers"); }
 }
 
 void
-serializeRedundantPointers(std::ostream& out, const std::string& redundancy_file,
+serializeOccurrencePointers(std::ostream& out,
+  const std::string& occurrence_file, size_type paths,
+  size_type occurrence_items, size_type occurrence_extra,
+  const ConstructionParameters& parameters)
+{
+  serializeOccurrencePointersFrom(out, EventStream(occurrence_file), paths,
+    occurrence_items, occurrence_extra, parameters);
+}
+
+static void
+serializeRedundantPointersFrom(std::ostream& out,
+  const EventStream& redundancy_source,
   size_type paths, size_type redundant, const ConstructionParameters& parameters,
-  RedundancyCountStats* stats)
+  RedundancyCountStats* stats, MemoryBudget* memory = nullptr)
 {
   if(paths == 0 && redundant != 0)
   {
@@ -1834,7 +2070,7 @@ serializeRedundantPointers(std::ostream& out, const std::string& redundancy_file
   const size_type bits = slots + redundant;
   // Both members walk the same counts, so the stream is read once unless the
   // goal forced windows.
-  RedundancyCounts counts(redundancy_file, paths, redundant, parameters);
+  RedundancyCounts counts(redundancy_source, paths, redundant, parameters);
   serializePlainBitVector(out, bits, [&](size_type& position)
   {
     return counts.next(position);
@@ -1843,11 +2079,20 @@ serializeRedundantPointers(std::ostream& out, const std::string& redundancy_file
   serializeSelectMCL(out, bits, slots, [&](size_type& position)
   {
     return counts.next(position);
-  });
+  }, memory);
   if(stats != nullptr) { *stats = counts.stats(); }
 }
 
-FinalEventFiles::FinalEventFiles(size_type sigma) :
+void
+serializeRedundantPointers(std::ostream& out, const std::string& redundancy_file,
+  size_type paths, size_type redundant, const ConstructionParameters& parameters,
+  RedundancyCountStats* stats)
+{
+  serializeRedundantPointersFrom(out, EventStream(redundancy_file), paths,
+    redundant, parameters, stats);
+}
+
+FinalEventFiles::FinalEventFiles(size_type sigma, MemoryBudget* memory) :
   metadata(TempFile::getName("gcsa_final_event_meta")),
   bwt_masks(TempFile::getName("gcsa_final_bwt_masks")),
   edge_destinations(),
@@ -1855,12 +2100,36 @@ FinalEventFiles::FinalEventFiles(size_type sigma) :
   sample_ids(TempFile::getName("gcsa_final_sample_ids")),
   sample_ends(TempFile::getName("gcsa_final_sample_ends")),
   occurrences(TempFile::getName("gcsa_final_occurrences")),
-  redundant(TempFile::getName("gcsa_final_redundant")), delete_files(true)
+  redundant(TempFile::getName("gcsa_final_redundant")),
+  metadata_store(), bwt_masks_store(), edge_destination_stores(),
+  sample_positions_store(), sample_ids_store(), sample_ends_store(),
+  occurrences_store(), redundant_store(), delete_files(true)
 {
   edge_destinations.reserve(sigma);
+  edge_destination_stores.reserve(sigma);
   for(size_type comp = 0; comp < sigma; comp++)
   {
     edge_destinations.push_back(TempFile::getName("gcsa_final_edges"));
+  }
+  if(memory != nullptr)
+  {
+    metadata_store = std::make_shared<FinalEventStore>(*memory, "final-event-metadata");
+    bwt_masks_store = std::make_shared<FinalEventStore>(*memory, "final-event-bwt-masks");
+    for(size_type comp = 0; comp < sigma; comp++)
+    {
+      edge_destination_stores.push_back(std::make_shared<FinalEventStore>(
+        *memory, "final-event-edges-" + std::to_string(comp)));
+    }
+    sample_positions_store = std::make_shared<FinalEventStore>(
+      *memory, "final-event-sampled-paths");
+    sample_ids_store = std::make_shared<FinalEventStore>(
+      *memory, "final-event-sample-ids");
+    sample_ends_store = std::make_shared<FinalEventStore>(
+      *memory, "final-event-sample-ends");
+    occurrences_store = std::make_shared<FinalEventStore>(
+      *memory, "final-event-occurrences");
+    redundant_store = std::make_shared<FinalEventStore>(
+      *memory, "final-event-redundancy");
   }
 }
 
@@ -1870,6 +2139,14 @@ FinalEventFiles::FinalEventFiles(FinalEventFiles&& source) :
   sample_positions(std::move(source.sample_positions)),
   sample_ids(std::move(source.sample_ids)), sample_ends(std::move(source.sample_ends)),
   occurrences(std::move(source.occurrences)), redundant(std::move(source.redundant)),
+  metadata_store(std::move(source.metadata_store)),
+  bwt_masks_store(std::move(source.bwt_masks_store)),
+  edge_destination_stores(std::move(source.edge_destination_stores)),
+  sample_positions_store(std::move(source.sample_positions_store)),
+  sample_ids_store(std::move(source.sample_ids_store)),
+  sample_ends_store(std::move(source.sample_ends_store)),
+  occurrences_store(std::move(source.occurrences_store)),
+  redundant_store(std::move(source.redundant_store)),
   delete_files(source.delete_files)
 {
   source.delete_files = false;
@@ -1889,6 +2166,14 @@ FinalEventFiles::operator=(FinalEventFiles&& source)
     this->sample_ends = std::move(source.sample_ends);
     this->occurrences = std::move(source.occurrences);
     this->redundant = std::move(source.redundant);
+    this->metadata_store = std::move(source.metadata_store);
+    this->bwt_masks_store = std::move(source.bwt_masks_store);
+    this->edge_destination_stores = std::move(source.edge_destination_stores);
+    this->sample_positions_store = std::move(source.sample_positions_store);
+    this->sample_ids_store = std::move(source.sample_ids_store);
+    this->sample_ends_store = std::move(source.sample_ends_store);
+    this->occurrences_store = std::move(source.occurrences_store);
+    this->redundant_store = std::move(source.redundant_store);
     this->delete_files = source.delete_files; source.delete_files = false;
   }
   return *this;
@@ -1912,7 +2197,60 @@ FinalEventFiles::clear()
   }
   this->metadata.clear(); this->bwt_masks.clear(); this->edge_destinations.clear();
   this->sample_positions.clear(); this->sample_ids.clear(); this->sample_ends.clear();
-  this->occurrences.clear(); this->redundant.clear(); this->delete_files = false;
+  this->occurrences.clear(); this->redundant.clear();
+  this->metadata_store.reset(); this->bwt_masks_store.reset();
+  this->edge_destination_stores.clear();
+  this->sample_positions_store.reset(); this->sample_ids_store.reset();
+  this->sample_ends_store.reset(); this->occurrences_store.reset();
+  this->redundant_store.reset(); this->delete_files = false;
+}
+
+void
+FinalEventFiles::materializeAll() const
+{
+  if(!this->adaptive()) { return; }
+  if(this->edge_destination_stores.size() != this->edge_destinations.size())
+  {
+    throw eventError("adaptive edge stream count does not match filenames");
+  }
+  this->metadata_store->materialize(this->metadata);
+  this->bwt_masks_store->materialize(this->bwt_masks);
+  for(size_type comp = 0; comp < this->edge_destinations.size(); comp++)
+  {
+    this->edge_destination_stores[comp]->materialize(this->edge_destinations[comp]);
+  }
+  this->sample_positions_store->materialize(this->sample_positions);
+  this->sample_ids_store->materialize(this->sample_ids);
+  this->sample_ends_store->materialize(this->sample_ends);
+  this->occurrences_store->materialize(this->occurrences);
+  this->redundant_store->materialize(this->redundant);
+}
+
+void
+FinalEventFiles::useFileBacked()
+{
+  if(!this->adaptive()) { return; }
+  const auto empty = [](const std::shared_ptr<FinalEventStore>& store)
+  {
+    return store == nullptr || store->count() == 0;
+  };
+  bool all_empty = empty(this->metadata_store) && empty(this->bwt_masks_store) &&
+    empty(this->sample_positions_store) && empty(this->sample_ids_store) &&
+    empty(this->sample_ends_store) && empty(this->occurrences_store) &&
+    empty(this->redundant_store);
+  for(const auto& store : this->edge_destination_stores)
+  {
+    all_empty = all_empty && empty(store);
+  }
+  if(!all_empty)
+  {
+    throw eventError("cannot replace nonempty adaptive event streams with files");
+  }
+  this->metadata_store.reset(); this->bwt_masks_store.reset();
+  this->edge_destination_stores.clear();
+  this->sample_positions_store.reset(); this->sample_ids_store.reset();
+  this->sample_ends_store.reset(); this->occurrences_store.reset();
+  this->redundant_store.reset();
 }
 
 struct FinalEventWriter::Impl
@@ -1939,6 +2277,18 @@ struct FinalEventWriter::Impl
     metadata.sigma = sigma;
     const size_type streams = sigma + 6;
     TempFileCodecParameters codec = requested_codec;
+    if(files.adaptive())
+    {
+      // AUTO may select raw storage. In RAM this avoids codec work entirely;
+      // if the shared pool later fills, AdaptiveRecordStore spills those same
+      // native bytes. Forced zstd is handled by switching FinalEventFiles to
+      // its established file-backed route before constructing this writer.
+      if(codec.compression == TempCompression::ZSTD)
+      {
+        throw eventError("forced zstd final events require file backing");
+      }
+      codec.compression = TempCompression::NONE;
+    }
     if(codec.enabled())
     {
       const size_type minimum_block = 16;
@@ -1968,32 +2318,35 @@ struct FinalEventWriter::Impl
         }
       }
     }
-    masks.reset(new BufferedEventWriter(files.bwt_masks, codec.enabled() ?
+    masks.reset(new BufferedEventWriter(files.bwt_masks, files.bwt_masks_store,
+      codec.enabled() ?
       codec.block_size : buffer_bytes, budget, "final-event-bwt-mask", codec));
     edges.reserve(sigma);
     for(size_type comp = 0; comp < sigma; comp++)
     {
       edges.emplace_back(new BufferedEventWriter(files.edge_destinations[comp],
+        files.adaptive() ? files.edge_destination_stores.at(comp) : nullptr,
         codec.enabled() ? codec.block_size : buffer_bytes, budget,
         "final-event-edge", codec));
     }
     sample_positions.reset(new BufferedEventWriter(files.sample_positions,
+      files.sample_positions_store,
       codec.enabled() ? codec.block_size : buffer_bytes, budget,
       "final-event-sampled-path", codec));
-    sample_ids.reset(new BufferedEventWriter(files.sample_ids,
+    sample_ids.reset(new BufferedEventWriter(files.sample_ids, files.sample_ids_store,
       codec.enabled() ? codec.block_size : buffer_bytes, budget,
       "final-event-sample-id", codec));
-    sample_ends.reset(new BufferedEventWriter(files.sample_ends,
+    sample_ends.reset(new BufferedEventWriter(files.sample_ends, files.sample_ends_store,
       codec.enabled() ? codec.block_size : buffer_bytes, budget,
       "final-event-sample-end", codec));
-    occurrences.reset(new BufferedEventWriter(files.occurrences,
+    occurrences.reset(new BufferedEventWriter(files.occurrences, files.occurrences_store,
       codec.enabled() ? codec.block_size : buffer_bytes, budget,
       "final-event-occurrence", codec));
     // Kept raw: the writer's incremental checksum then adopts it without the
     // full reread a framed stream needs, and component construction reads it
     // once to count events per slot.
     const TempFileCodecParameters raw_codec;
-    redundant.reset(new BufferedEventWriter(files.redundant,
+    redundant.reset(new BufferedEventWriter(files.redundant, files.redundant_store,
       buffer_bytes, budget, "final-event-redundancy", raw_codec));
   }
 
@@ -2261,6 +2614,16 @@ writeFinalEventMetadata(const FinalEventFiles& files,
   }
   if(word != EVENT_METADATA_WORDS) { throw eventError("internal metadata width mismatch"); }
 
+  if(files.metadata_store)
+  {
+    if(files.metadata_store->count() != 0)
+    {
+      throw eventError("metadata store is already populated", files.metadata);
+    }
+    files.metadata_store->append(bytes.data(), bytes.size());
+    return;
+  }
+
   int descriptor = ::open(files.metadata.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if(descriptor < 0) { throw eventError("cannot create metadata", files.metadata); }
   try
@@ -2280,20 +2643,28 @@ writeFinalEventMetadata(const FinalEventFiles& files,
 FinalEventMetadata
 readFinalEventMetadata(const FinalEventFiles& files)
 {
-  requireFileSize(files.metadata, 8 + EVENT_METADATA_WORDS * 8, 1);
+  const EventStream source(files.metadata, files.metadata_store);
+  requireStreamSize(source, 8 + EVENT_METADATA_WORDS * 8, 1);
   std::vector<std::uint8_t> bytes(8 + EVENT_METADATA_WORDS * 8, 0);
-  int descriptor = ::open(files.metadata.c_str(), O_RDONLY);
-  if(descriptor < 0) { throw eventError("cannot open metadata", files.metadata); }
-  try
+  if(source.adaptive())
   {
-    readAll(descriptor, bytes.data(), bytes.size(), files.metadata);
-    if(::close(descriptor) != 0) { descriptor = -1; throw eventError("metadata close failed", files.metadata); }
-    descriptor = -1;
+    source.store->readAt(0, bytes.data(), bytes.size());
   }
-  catch(...)
+  else
   {
-    if(descriptor >= 0) { ::close(descriptor); }
-    throw;
+    int descriptor = ::open(files.metadata.c_str(), O_RDONLY);
+    if(descriptor < 0) { throw eventError("cannot open metadata", files.metadata); }
+    try
+    {
+      readAll(descriptor, bytes.data(), bytes.size(), files.metadata);
+      if(::close(descriptor) != 0) { descriptor = -1; throw eventError("metadata close failed", files.metadata); }
+      descriptor = -1;
+    }
+    catch(...)
+    {
+      if(descriptor >= 0) { ::close(descriptor); }
+      throw;
+    }
   }
   if(std::memcmp(bytes.data(), EVENT_MAGIC, 8) != 0)
   {
@@ -2323,6 +2694,10 @@ checkpointFinalEvents(BuildWorkspace& workspace,
   const FinalEventFiles& files, const FinalEventMetadata& metadata,
   size_type buffer_bytes, const FinalEventChecksums* checksums)
 {
+  // Checkpointing is an explicit durability boundary. The ordinary RAM-first
+  // path does not call this function, and therefore never materializes solely
+  // to preserve a development resume point.
+  files.materializeAll();
   validatePayloads(files, metadata);
   if(checksums != nullptr &&
      checksums->edge_destinations.size() != metadata.sigma)
@@ -2372,6 +2747,7 @@ restoreFinalEvents(const BuildWorkspace& workspace,
   bool verify_checksum)
 {
   if(!workspace.task_completed(FINAL_TASK, FINAL_PHASE)) { return false; }
+  files.useFileBacked();
   restoreFile(workspace, metadataArtifact(), physical_shard_id_t(0),
     files.metadata, 1, 8 + EVENT_METADATA_WORDS * 8, buffer_bytes,
     verify_checksum);
@@ -2422,10 +2798,12 @@ namespace
 class FinalComponentSpool : public std::streambuf
 {
 public:
-  FinalComponentSpool(size_type buffer_bytes, const std::atomic<bool>& cancelled) :
+  FinalComponentSpool(size_type buffer_bytes, const std::atomic<bool>& cancelled,
+    MemoryBudget* memory = nullptr) :
     buffer_(buffer_bytes), filename_(), descriptor_(-1), file_bytes_(0),
-    cancelled_(cancelled)
+    cancelled_(cancelled), store_()
   {
+    if(memory != nullptr) { store_.reset(new FinalEventStore(*memory, "final component spool")); }
     this->setp(buffer_.data(), buffer_.data() + buffer_.size());
   }
 
@@ -2438,6 +2816,7 @@ public:
   // Encoder side, after the last write.
   void finish()
   {
+    if(store_) { flushBuffer(); return; }
     if(descriptor_ < 0) { return; }
     flushBuffer();
     const int descriptor = descriptor_;
@@ -2449,14 +2828,24 @@ public:
     std::vector<char>().swap(buffer_); this->setp(nullptr, nullptr);
   }
 
-  bool spilled() const { return !filename_.empty(); }
-  size_type spilledBytes() const { return file_bytes_; }
+  bool spilled() const { return (store_ ? store_->spilled() : !filename_.empty()); }
+  size_type spilledBytes() const { return (store_ ? (store_->spilled() ? store_->count() : 0) : file_bytes_); }
 
   // Coordinator side: append the component, then release its buffer and
   // temporary file. scratch is the coordinator's copy buffer.
   void appendTo(std::ostream& out, std::vector<char>& scratch)
   {
-    if(filename_.empty())
+    if(store_)
+    {
+      for(size_type offset = 0; offset < store_->count();)
+      {
+        const size_type bytes = std::min<size_type>(scratch.size(), store_->count() - offset);
+        store_->readAt(offset, reinterpret_cast<std::uint8_t*>(scratch.data()), bytes);
+        out.write(scratch.data(), bytes); offset += bytes;
+      }
+      store_.reset();
+    }
+    else if(filename_.empty())
     {
       out.write(this->pbase(), this->pptr() - this->pbase());
     }
@@ -2521,6 +2910,7 @@ private:
   int descriptor_;
   size_type file_bytes_;
   const std::atomic<bool>& cancelled_;
+  std::shared_ptr<FinalEventStore> store_;
 
   void flushBuffer()
   {
@@ -2532,6 +2922,11 @@ private:
     }
     const size_type bytes = this->pptr() - this->pbase();
     if(bytes == 0) { return; }
+    if(store_)
+    {
+      store_->append(reinterpret_cast<const std::uint8_t*>(this->pbase()), bytes);
+      this->pbump(-static_cast<int>(bytes)); return;
+    }
     if(descriptor_ < 0)
     {
       filename_ = TempFile::getName("gcsa_final_component");
@@ -2567,12 +2962,73 @@ redundancyCountLimit(size_type paths, size_type redundant,
   return need + need / 7 + 8;
 }
 
+constexpr size_type SELECT_SCRATCH_BYTES = 4 * 4096 * sizeof(std::uint64_t);
+
+// Match BufferedEventReader and RedundancyCounts admission, including their
+// reader-buffer floors and local one-eighth margin. Only the edge component
+// keeps sigma readers open; other components replay their streams in order.
+size_type
+componentReaderGoal(const FinalEventFiles& files, const FinalEventMetadata& metadata,
+  const ConstructionParameters& parameters)
+{
+  const auto codec = [&](const std::string& path)
+  {
+    return (!files.adaptive() && CompressedBlockReader::isFramed(path) ?
+      CompressedBlockReader::workingMemoryEstimate(
+        CompressedBlockReader::declaredBlockSize(path)) : size_type(0));
+  };
+  size_type edge_codecs = 0, largest_codec = 0;
+  for(const auto& path : files.edge_destinations)
+  {
+    const size_type bytes = codec(path);
+    if(bytes > std::numeric_limits<size_type>::max() - edge_codecs)
+    {
+      throw eventError("component codec workspace overflows");
+    }
+    edge_codecs += bytes; largest_codec = std::max(largest_codec, bytes);
+  }
+  for(const auto& path : { files.bwt_masks, files.sample_positions, files.sample_ids,
+      files.sample_ends, files.occurrences, files.redundant })
+  {
+    largest_codec = std::max(largest_codec, codec(path));
+  }
+  const auto fits = [&](size_type goal, size_type readers, size_type codecs, size_type extra)
+  {
+    size_type remaining = goal - goal / 8;
+    const size_type buffer = std::max<size_type>(16,
+      std::min(parameters.getIOBufferSize(), goal / (4 * readers)));
+    const size_type buffers = readers * buffer;
+    if(codecs > remaining) { return false; } remaining -= codecs;
+    if(buffers > remaining) { return false; } remaining -= buffers;
+    return extra <= remaining;
+  };
+  const size_type wrap_bytes = checkedBytes(metadata.redundant / 256,
+    sizeof(size_type), files.redundant);
+  const size_type extra = wrap_bytes + (metadata.paths > 1 ? 1 : 0);
+  if(extra < wrap_bytes) { throw eventError("component count workspace overflows"); }
+  const size_type redundant_codec = codec(files.redundant);
+  const auto sufficient = [&](size_type goal)
+  {
+    return fits(goal, metadata.sigma, edge_codecs, 0) &&
+      fits(goal, 1, largest_codec, 0) &&
+      fits(goal, 1, redundant_codec, extra);
+  };
+  size_type low = 1, high = parameters.getMemoryLimitBytes();
+  if(!sufficient(high)) { throw eventError("memory cannot hold component readers and counts"); }
+  while(low < high)
+  {
+    const size_type middle = low + (high - low) / 2;
+    if(sufficient(middle)) { high = middle; } else { low = middle + 1; }
+  }
+  return low;
+}
+
 template<class Encoder>
 void
 writeFinalComponents(std::ostream& out, const FinalEventFiles& files,
   const FinalEventMetadata& metadata, const ConstructionParameters& parameters,
   const std::vector<FinalComponentTask>& plan, const Encoder& encode,
-  FinalComponentStats* stats)
+  FinalComponentStats* stats, MemoryBudget* construction_memory)
 {
   const size_type tasks = plan.size();
   // A worker may open all sigma edge streams, a framed stream may transiently
@@ -2594,7 +3050,7 @@ writeFinalComponents(std::ostream& out, const FinalEventFiles& files,
   std::vector<std::string> inputs = files.edge_destinations;
   inputs.insert(inputs.end(), { files.bwt_masks, files.sample_positions,
     files.sample_ids, files.sample_ends, files.occurrences, files.redundant });
-  if(workers > 1)
+  if((workers > 1 || construction_memory != nullptr) && !files.adaptive())
   {
     for(const auto& path : inputs)
     {
@@ -2606,7 +3062,9 @@ writeFinalComponents(std::ostream& out, const FinalEventFiles& files,
       }
     }
   }
-  const size_type goal = parameters.getMemoryLimitBytes();
+  const size_type goal = (construction_memory != nullptr ?
+    std::min(parameters.getMemoryLimitBytes(), construction_memory->available()) :
+    parameters.getMemoryLimitBytes());
   // Components up to spool_bytes stay in memory until appended. The
   // reservation covers every spool buffer and the coordinator's copy buffer.
   const size_type spool_bytes = std::min<size_type>(MEGABYTE,
@@ -2618,19 +3076,71 @@ writeFinalComponents(std::ostream& out, const FinalEventFiles& files,
   {
     // Half the remaining budget at most, so a grant cannot starve the
     // ordinary shares; a task without one works within its share.
-    if(plan[task].memory > 0 && plan[task].memory <= worker_budget / 2)
+    if(construction_memory == nullptr && plan[task].memory > 0 &&
+       plan[task].memory <= worker_budget / 2)
     {
       granted[task] = plan[task].memory; worker_budget -= plan[task].memory;
     }
   }
-  size_type minimum_worker = 64 * KILOBYTE;
-  if(codec_bytes > (std::numeric_limits<size_type>::max() / (4 * metadata.sigma)) - 16)
+  const size_type reader_goal = (construction_memory != nullptr ?
+    componentReaderGoal(files, metadata, parameters) : 0);
+  if(reader_goal > std::numeric_limits<size_type>::max() - SELECT_SCRATCH_BYTES)
   {
-    workers = 0;
+    throw eventError("component workspace overflows");
   }
-  else { minimum_worker = std::max(minimum_worker, 4 * metadata.sigma * (codec_bytes + 16)); }
+  const size_type minimum_worker = (construction_memory != nullptr ?
+    reader_goal + SELECT_SCRATCH_BYTES :
+    std::max<size_type>(64 * KILOBYTE, 4 * metadata.sigma * (codec_bytes + 16)));
   workers = std::min(workers, worker_budget / minimum_worker);
   if(spool_bytes < 16 || workers < 2) { workers = 1; }
+  MemoryBudget::Reservation fixed_memory;
+  if(construction_memory != nullptr)
+  {
+    // Admit fixed encoder work before any out-of-order spool starts growing.
+    // Each worker may try for extra task-specific space without waiting on a
+    // completed spool that only the coordinator can retire.
+    workers = std::min(workers, goal >= spool_reservation ?
+      (goal - spool_reservation) / minimum_worker : 0);
+    workers = std::max(static_cast<size_type>(1), workers);
+    const size_type fixed = workers * minimum_worker +
+      (workers > 1 ? spool_reservation : 0);
+    fixed_memory = construction_memory->tryReserve(fixed, "final component encoder work");
+    if(!fixed_memory)
+    {
+      throw eventError("memory cannot hold final component encoder work: requires " +
+        std::to_string(fixed) + " bytes, available " +
+        std::to_string(construction_memory->available()));
+    }
+    worker_budget = workers * minimum_worker;
+    std::fill(granted.begin(), granted.end(), 0);
+  }
+  bool disk_readers = !files.adaptive();
+  const auto spilled = [](const auto& store) { return store && store->spilled(); };
+  for(const auto& store : files.edge_destination_stores) { disk_readers |= spilled(store); }
+  for(const auto& store : { files.bwt_masks_store, files.sample_positions_store,
+      files.sample_ids_store, files.sample_ends_store, files.occurrences_store,
+      files.redundant_store }) { disk_readers |= spilled(store); }
+  const auto encode_with_budget = [&](size_type task, std::ostream& stream,
+      const ConstructionParameters& configuration)
+  {
+    if(construction_memory == nullptr) { encode(task, stream, configuration); return; }
+    ConstructionParameters local(configuration);
+    size_type bytes = reader_goal;
+    MemoryBudget::Reservation extra;
+    const size_type sequential_readers = (disk_readers ?
+      4 * metadata.sigma * std::min<size_type>(64 * KILOBYTE, parameters.getIOBufferSize()) : 0);
+    const size_type desired = std::max(plan[task].memory, sequential_readers);
+    size_type request = (desired > bytes ?
+      std::min(desired - bytes, construction_memory->available()) : 0);
+    while(request > 0)
+    {
+      extra = construction_memory->tryReserve(request, "final component additional work");
+      if(extra) { bytes += request; break; }
+      request /= 2;
+    }
+    local.setMemoryLimitBytes(bytes);
+    encode(task, stream, local);
+  };
   if(stats != nullptr)
   {
     stats->tasks = tasks; stats->workers = workers;
@@ -2647,7 +3157,7 @@ writeFinalComponents(std::ostream& out, const FinalEventFiles& files,
   }
   if(workers == 1)
   {
-    for(size_type task = 0; task < tasks; task++) { encode(task, out, parameters); }
+    for(size_type task = 0; task < tasks; task++) { encode_with_budget(task, out, parameters); }
     return;
   }
 
@@ -2668,7 +3178,7 @@ writeFinalComponents(std::ostream& out, const FinalEventFiles& files,
   std::vector<std::unique_ptr<FinalComponentSpool>> spools;
   for(size_type task = 0; task < tasks; task++)
   {
-    spools.emplace_back(new FinalComponentSpool(spool_bytes, failed));
+    spools.emplace_back(new FinalComponentSpool(spool_bytes, failed, construction_memory));
   }
   std::vector<char> scratch(spool_bytes);
   std::vector<bool> done(tasks, false);
@@ -2707,7 +3217,7 @@ writeFinalComponents(std::ostream& out, const FinalEventFiles& files,
             }
             std::ostream stream(spools[task].get());
             stream.exceptions(std::ios::badbit | std::ios::failbit);
-            encode(task, stream, local[task]);
+            encode_with_budget(task, stream, local[task]);
             stream.flush(); spools[task]->finish();
             {
               std::lock_guard<std::mutex> lock(state_mutex);
@@ -2761,12 +3271,30 @@ writeFinalComponents(std::ostream& out, const FinalEventFiles& files,
 }
 
 } // namespace
+
+size_type
+finalComponentMinimumMemory(const FinalEventFiles& files,
+  const FinalEventMetadata& metadata, const ConstructionParameters& parameters)
+{
+  validateMetadata(metadata);
+  if(files.edge_destinations.size() != metadata.sigma)
+  {
+    throw eventError("component edge stream count differs from alphabet");
+  }
+  const size_type readers = componentReaderGoal(files, metadata, parameters);
+  if(readers > std::numeric_limits<size_type>::max() - SELECT_SCRATCH_BYTES)
+  {
+    throw eventError("component workspace overflows");
+  }
+  return readers + SELECT_SCRATCH_BYTES;
+}
+
 void
 storeFinalComponents(const GCSAHeader& header,
   const Alphabet& source_alphabet, const FinalEventFiles& files,
   const FinalEventMetadata& metadata,
   const ConstructionParameters& parameters, const std::string& filename,
-  FinalComponentStats* stats)
+  FinalComponentStats* stats, MemoryBudget* construction_memory)
 {
   validateMetadata(metadata); validatePayloads(files, metadata);
   if(!header.check() || header.path_nodes != metadata.paths ||
@@ -2812,7 +3340,8 @@ storeFinalComponents(const GCSAHeader& header,
         const size_type comp = task;
         if(comp > 0 && comp <= metadata.fast_chars)
         {
-          serializeFastBWTComponent(out, files.bwt_masks, metadata.paths,
+          serializeFastBWTComponentFrom(out,
+            EventStream(files.bwt_masks, files.bwt_masks_store), metadata.paths,
             metadata.bwt_counts[comp], static_cast<comp_type>(comp), parameters);
         }
         else { GCSA::fast_vector empty; write(empty); }
@@ -2833,8 +3362,9 @@ storeFinalComponents(const GCSAHeader& header,
         }
         else
         {
-          serializeSparseBWTComponent(out, files.bwt_masks, metadata.paths,
-            metadata.bwt_counts[comp], static_cast<comp_type>(comp), parameters);
+          serializeSparseBWTComponentFrom(out,
+            EventStream(files.bwt_masks, files.bwt_masks_store), metadata.paths,
+            metadata.bwt_counts[comp], static_cast<comp_type>(comp), parameters, construction_memory);
         }
       }
       else if(task == 2 * metadata.sigma + 1)
@@ -2854,7 +3384,9 @@ storeFinalComponents(const GCSAHeader& header,
         std::vector<bool> available(metadata.sigma, false);
         for(size_type comp = 0; comp < metadata.sigma; comp++)
         {
-          readers.emplace_back(new BufferedEventReader(files.edge_destinations[comp],
+          readers.emplace_back(new BufferedEventReader(EventStream(
+            files.edge_destinations[comp], files.adaptive() ?
+              files.edge_destination_stores.at(comp) : nullptr),
             8, metadata.bwt_counts[comp], buffer_bytes, budget, "final-edge-reader"));
           available[comp] = readers.back()->nextInteger(current[comp]);
         }
@@ -2915,7 +3447,8 @@ storeFinalComponents(const GCSAHeader& header,
           parameters.getMemoryLimitBytes() / 8);
         size_type buffer_bytes = componentBufferBytes(parameters, 1);
         {
-          BufferedEventReader positions(files.sample_positions, 8,
+          BufferedEventReader positions(EventStream(files.sample_positions,
+            files.sample_positions_store), 8,
             metadata.sampled_paths, buffer_bytes, budget,
             "final-sample-path-reader");
           std::uint64_t next_sample = 0, previous = 0;
@@ -2949,18 +3482,21 @@ storeFinalComponents(const GCSAHeader& header,
         GCSA::fast_vector::rank_1_type empty_rank;
         write(empty_rank);
 
-        serializeSampleIds(out, files.sample_ids, metadata.sample_ids,
+        serializeSampleIdsFrom(out, EventStream(files.sample_ids,
+          files.sample_ids_store), metadata.sample_ids,
           metadata.sample_bits, parameters);
         if(!out) { throw eventError("cannot write partial final index", partial); }
-        serializeSampleBoundaries(out, files.sample_ends, metadata.sample_ids,
-          metadata.sampled_paths, parameters);
+        serializeSampleBoundariesFrom(out, EventStream(files.sample_ends,
+          files.sample_ends_store), metadata.sample_ids,
+          metadata.sampled_paths, parameters, construction_memory);
         if(!out) { throw eventError("cannot write partial final index", partial); }
       }
 
       else if(task == 2 * metadata.sigma + 4)
       {
-        serializeOccurrencePointers(out, files.occurrences, metadata.paths,
-          metadata.occurrence_items, metadata.occurrence_extra, parameters);
+        serializeOccurrencePointersFrom(out, EventStream(files.occurrences,
+          files.occurrences_store), metadata.paths,
+          metadata.occurrence_items, metadata.occurrence_extra, parameters, construction_memory);
         if(!out) { throw eventError("cannot write partial final index", partial); }
       }
       else
@@ -2974,8 +3510,9 @@ storeFinalComponents(const GCSAHeader& header,
         {
           throw eventError("redundancy bitvector length overflows");
         }
-        serializeRedundantPointers(out, files.redundant, metadata.paths,
-          metadata.redundant, parameters, &redundancy_stats);
+        serializeRedundantPointersFrom(out, EventStream(files.redundant,
+          files.redundant_store), metadata.paths,
+          metadata.redundant, parameters, &redundancy_stats, construction_memory);
         if(!out) { throw eventError("cannot write partial final index", partial); }
       }
       if(!out) { throw eventError("cannot encode final component", partial); }
@@ -2997,7 +3534,7 @@ storeFinalComponents(const GCSAHeader& header,
     plan[2 * metadata.sigma + 5].cost = 8 * metadata.redundant + metadata.paths;
     plan[2 * metadata.sigma + 5].memory = redundancyCountLimit(metadata.paths,
       metadata.redundant, parameters);
-    writeFinalComponents(out, files, metadata, parameters, plan, encode, stats);
+    writeFinalComponents(out, files, metadata, parameters, plan, encode, stats, construction_memory);
     if(stats != nullptr) { stats->redundancy = redundancy_stats; }
     if(Verbosity::level >= Verbosity::EXTENDED)
     {

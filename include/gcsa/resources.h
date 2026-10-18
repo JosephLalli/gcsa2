@@ -25,6 +25,7 @@ public:
     Reservation& operator=(Reservation&& other);
     ~Reservation();
     uint64_t bytes() const { return amount; }
+    void shrinkTo(uint64_t bytes);
     explicit operator bool() const { return owner != 0; }
   private:
     friend class MemoryBudget;
@@ -36,11 +37,15 @@ public:
   // ceiling includes the margin: no more than ceiling - safety_margin is reservable.
   MemoryBudget(uint64_t ceiling, uint64_t safety_margin = 0);
   Reservation reserve(uint64_t bytes, const std::string& task);
+  // Returns an empty reservation when the currently available budget cannot
+  // admit bytes. Unlike reserve(), this never waits for another owner.
+  Reservation tryReserve(uint64_t bytes, const std::string& task);
   Stats stats() const;
   uint64_t available() const;
 private:
   friend class Reservation;
   void release(const std::string& task, uint64_t bytes);
+  void shrink(Reservation& reservation, uint64_t bytes);
   uint64_t ceiling_, margin_, current_, maximum_, largest_;
   std::string largest_task_;
   mutable std::mutex mutex_; std::condition_variable changed_;

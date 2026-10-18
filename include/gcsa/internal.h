@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include <gcsa/utils.h>
+#include <gcsa/adaptive_record_store.h>
 #include <gcsa/compressed_block.h>
 
 namespace gcsa
@@ -345,6 +346,10 @@ struct ReadBuffer
   std::unique_ptr<ReadAhead> read_ahead;  // guarded by mtx after open()
   // Set when the file is framed (compressed); reads then go through it, under mtx.
   std::unique_ptr<CompressedBlockReader> compressed;
+  // A store-backed reader keeps the source alive. Resident stores serve stable
+  // references directly; spilled stores use the normal descriptor path.
+  std::shared_ptr<AdaptiveRecordStore<Element>> record_store;
+  bool                    store_is_resident;
 
   // Reader thread.
   std::vector<Element>    read_buffer;
@@ -364,9 +369,15 @@ struct ReadBuffer
   void open(const std::string& filename,
     size_type buffer_bytes = DEFAULT_BUFFER_BYTES,
     bool release_cache = false);
+  void open(const std::shared_ptr<AdaptiveRecordStore<Element>>& store,
+    size_type buffer_bytes = DEFAULT_BUFFER_BYTES,
+    bool release_cache = false);
   void close();
   // A framed file has no descriptor of its own; test this, not the descriptor.
-  inline bool isOpen() const { return (this->descriptor >= 0 || this->compressed != nullptr); }
+  inline bool isOpen() const
+  {
+    return (this->descriptor >= 0 || this->compressed != nullptr || this->record_store != nullptr);
+  }
 
   inline size_type size() const { return this->elements; }
 
@@ -376,6 +387,10 @@ struct ReadBuffer
   */
   inline Element& operator[] (size_type i)
   {
+    if(this->record_store != nullptr && this->store_is_resident)
+    {
+      return this->record_store->residentData()[i];
+    }
     if(!(this->buffer.buffered(i))) { this->read(i); }
     return this->buffer[i];
   }
@@ -398,6 +413,7 @@ ReadBuffer<Element>::ReadBuffer()
 {
   this->descriptor = -1; this->elements = 0; this->file_offset = 0;
   this->release_file_cache = false; this->cache_released = 0;
+  this->store_is_resident = false;
   this->buffer_elements = std::max((size_type)1, DEFAULT_BUFFER_BYTES / sizeof(Element));
   this->minimum_elements = std::max((size_type)1, this->buffer_elements / 2);
 }
@@ -420,7 +436,7 @@ void
 ReadBuffer<Element>::open(const std::string& filename, size_type buffer_bytes,
   bool release_cache)
 {
-  if(this->descriptor >= 0 || this->compressed)
+  if(this->descriptor >= 0 || this->compressed || this->record_store != nullptr)
   {
     std::cerr << "ReadBuffer::open(): The file is already open" << std::endl;
     std::exit(EXIT_FAILURE);
@@ -488,8 +504,56 @@ ReadBuffer<Element>::open(const std::string& filename, size_type buffer_bytes,
 
 template<class Element>
 void
+ReadBuffer<Element>::open(const std::shared_ptr<AdaptiveRecordStore<Element>>& store,
+  size_type buffer_bytes, bool release_cache)
+{
+  if(store == nullptr)
+  {
+    throw std::invalid_argument("ReadBuffer::open(): null adaptive record store");
+  }
+  if(this->descriptor >= 0 || this->compressed || this->record_store != nullptr)
+  {
+    std::cerr << "ReadBuffer::open(): The file is already open" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+
+  if(store->spilled())
+  {
+    // Keep the source alive while the ordinary file reader and its background
+    // thread consume an anonymous spill file.
+    this->open(store->filename(), buffer_bytes, release_cache);
+    this->record_store = store;
+    this->store_is_resident = false;
+    return;
+  }
+
+  this->record_store = store;
+  this->store_is_resident = true;
+  this->elements = store->count();
+  this->file_offset = 0;
+  this->release_file_cache = false;
+  this->cache_released = 0;
+  this->buffer_elements = std::max((size_type)1, buffer_bytes / sizeof(Element));
+  this->minimum_elements = std::max((size_type)1, this->buffer_elements / 2);
+  sdsl::util::clear(this->buffer);
+  sdsl::util::clear(this->read_buffer);
+}
+
+template<class Element>
+void
 ReadBuffer<Element>::close()
 {
+  if(this->record_store != nullptr && this->store_is_resident)
+  {
+    this->record_store.reset();
+    this->store_is_resident = false;
+    this->elements = 0; this->file_offset = 0;
+    this->release_file_cache = false; this->cache_released = 0;
+    sdsl::util::clear(this->buffer);
+    sdsl::util::clear(this->read_buffer);
+    return;
+  }
+
   // We need to stop the reader thread.
   this->mtx.lock();
   this->file_offset = this->size();
@@ -503,6 +567,8 @@ ReadBuffer<Element>::close()
   if(this->descriptor >= 0) { ::close(this->descriptor); }
   this->descriptor = -1;
   this->compressed.reset();
+  this->record_store.reset();
+  this->store_is_resident = false;
   this->elements = 0;
   this->file_offset = 0;
   this->release_file_cache = false; this->cache_released = 0;
@@ -516,6 +582,13 @@ void
 ReadBuffer<Element>::seek(size_type i)
 {
   if(i >= this->size()) { return; }
+
+  if(this->record_store != nullptr && this->store_is_resident)
+  {
+    this->buffer.seek(i);
+    this->file_offset = i;
+    return;
+  }
 
   // Move the buffer to the new position.
   // Clear the buffer and seek in the file if file offset is wrong.
@@ -561,6 +634,7 @@ void
 ReadBuffer<Element>::read(size_type i)
 {
   if(i >= this->size()) { return; }
+  if(this->record_store != nullptr && this->store_is_resident) { return; }
   if(i < this->buffer.offset) { this->seek(i); return; }
 
   std::unique_lock<std::mutex> lock(this->mtx);
@@ -572,6 +646,7 @@ template<class Element>
 void
 ReadBuffer<Element>::forceRead()
 {
+  if(this->record_store != nullptr && this->store_is_resident) { return; }
   if(this->read_buffer.empty())
   {
     this->read_buffer.resize(std::min(this->buffer_elements, this->size() - this->file_offset));
@@ -591,6 +666,10 @@ ReadBuffer<Element>::readBlock(size_type offset, Element* target,
   size_type count)
 {
   if(count == 0) { return; }
+  if(this->record_store != nullptr && this->store_is_resident)
+  {
+    this->record_store->readAt(offset, target, count); return;
+  }
   if(offset > std::numeric_limits<size_type>::max() / sizeof(Element) ||
      count > std::numeric_limits<size_type>::max() / sizeof(Element))
   {
@@ -639,6 +718,7 @@ template<class Element>
 void
 ReadBuffer<Element>::releaseCache(size_type before, bool complete)
 {
+  if(this->record_store != nullptr && this->store_is_resident) { return; }
 #if defined(POSIX_FADV_DONTNEED)
   if(!(this->release_file_cache) || this->descriptor < 0) { return; }
   constexpr size_type CACHE_TAIL_BYTES = 8 * MEGABYTE;

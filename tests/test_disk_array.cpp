@@ -1,4 +1,5 @@
 #include <gcsa/disk_array.h>
+#include <gcsa/internal.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -18,9 +19,11 @@ void require(bool value) { if(!value) { std::abort(); } }
 int
 main()
 {
-  char root[] = "/tmp/gcsa-disk-array-XXXXXX";
-  require(mkdtemp(root) != nullptr);
-  std::string filename = std::string(root) + "/array.bin";
+  const char* temporary = std::getenv("TMPDIR");
+  std::string root = std::string(temporary != nullptr ? temporary : "/tmp") +
+    "/gcsa-disk-array-XXXXXX";
+  require(mkdtemp(root.data()) != nullptr);
+  std::string filename = root + "/array.bin";
 
   // Two 64-byte cache blocks force repeated direct-map replacement while the
   // logical array remains much larger than the configured resident payload.
@@ -60,6 +63,28 @@ main()
   require(rejected);
 
   require(::unlink(filename.c_str()) == 0);
-  require(::rmdir(root) == 0);
+  for(bool overflow : { false, true })
+  {
+    MemoryBudget pool(16 * KILOBYTE);
+    MemoryBudget::Reservation pressure;
+    if(overflow) { pressure = pool.reserve(15 * KILOBYTE, "array fixture pressure"); }
+    const size_type written = DiskIO::write_volume.load();
+    {
+      DiskBackedArray64 array(filename, 1024, 160, pool, true, 64, true);
+      require((::access(filename.c_str(), F_OK) == 0) == overflow);
+      for(size_type i = 0; i < array.size(); i++)
+      {
+        require(array.get(i) == 0); array.set(i, 3 * i + 7);
+      }
+      for(size_type i = 0; i < array.size(); i++) { require(array.get(i) == 3 * i + 7); }
+      array.flush();
+    }
+    require(pool.stats().maximum <= 16 * KILOBYTE);
+    pressure = MemoryBudget::Reservation();
+    require(pool.stats().current == 0);
+    if(overflow) { require(::unlink(filename.c_str()) == 0); }
+    else { require(DiskIO::write_volume.load() == written); }
+  }
+  require(::rmdir(root.c_str()) == 0);
   return 0;
 }

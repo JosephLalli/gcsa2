@@ -1,4 +1,5 @@
 #include <gcsa/lcp.h>
+#include <gcsa/internal.h>
 #include <gcsa/workspace.h>
 
 #include <algorithm>
@@ -164,6 +165,37 @@ externalStore(const std::string& leaf_filename, const std::string& work_director
   graph.lcp_name.clear();
 }
 
+void
+compareAdaptive(const std::string& root, const std::vector<std::uint8_t>& values,
+  size_type branching, size_type budget_bytes, bool expect_spill)
+{
+  const std::string leaf = root + "/adaptive-leaf.raw";
+  const std::string reference = root + "/adaptive-reference.lcp";
+  const std::string observed = root + "/adaptive-observed.lcp";
+  writeLeaves(leaf, values);
+  LCPArray::buildAndStore(leaf, branching, 2, reference);
+  MemoryBudget memory(budget_bytes);
+  auto records = std::make_shared<AdaptiveRecordStore<std::uint8_t>>(memory,
+    "adaptive LCP fixture");
+  records->append(values.data(), values.size());
+  require(records->spilled() == expect_spill);
+  const size_type before = DiskIO::write_volume.load();
+  LCPStreamingStats stats;
+  LCPArray::buildAndStore(records, branching, 2, observed, memory, nullptr, &stats);
+  const auto bytes = readFile(observed);
+  require(bytes == readFile(reference));
+  if(!expect_spill)
+  {
+    // Only the public LCP output was written; no leaf or parent-level spool.
+    require(DiskIO::write_volume.load() - before == bytes.size());
+    require(records->resident());
+  }
+  require(memory.stats().maximum <= budget_bytes);
+  records.reset();
+  require(memory.stats().current == 0);
+  std::remove(leaf.c_str()); std::remove(reference.c_str()); std::remove(observed.c_str());
+}
+
 } // namespace
 
 int
@@ -174,6 +206,17 @@ main()
   char root[] = "/tmp/gcsa-lcp-streaming-XXXXXX";
   require(mkdtemp(root) != nullptr);
   TempFile::setDirectory(root);
+  compareAdaptive(root, {}, 4, 4096, false);
+  compareAdaptive(root, { 0 }, 4, 4096, false);
+  compareAdaptive(root, { 255, 9, 7, 201, 3, 19, 41, 2, 88 }, 4, 4096, false);
+  compareAdaptive(root, std::vector<std::uint8_t>(17, 0), 3, 4096, false);
+  std::vector<std::uint8_t> overflow_values(1025);
+  for(size_type i = 0; i < overflow_values.size(); i++)
+  {
+    overflow_values[i] = static_cast<std::uint8_t>((17 * i + 11) % 255);
+  }
+  compareAdaptive(root, overflow_values, 4, 4096, false);
+  compareAdaptive(root, overflow_values, 4, 256, true);
   const std::string leaf = std::string(root) + "/merged-leaf.lcp";
   const size_type branching = 4, byte_budget = 2;
 

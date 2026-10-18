@@ -121,10 +121,11 @@ pathGraphCheckpointExists(const BuildWorkspace& workspace,
 }
 
 void
-checkpointPathGraph(BuildWorkspace& workspace, const PathGraph& graph,
+checkpointPathGraph(BuildWorkspace& workspace, PathGraph& graph,
   const std::string& task, const std::string& phase, size_type buffer_bytes)
 {
   if(buffer_bytes == 0) { throw std::invalid_argument("checkpoint buffer must be nonzero"); }
+  graph.materialize();
   if(graph.files() > (PATH_GRAPH_METADATA_LIMIT - PATH_GRAPH_METADATA_FIXED) /
      PATH_GRAPH_METADATA_PER_FILE)
   {

@@ -493,9 +493,12 @@ physicalId(logical_file_id_t logical, std::uint64_t local_shard)
 } // namespace
 
 ExternalInputPreprocessor::ExternalInputPreprocessor(const InputGraph& graph,
-  const ConstructionParameters& parameters, BuildWorkspace* workspace) :
+  const ConstructionParameters& parameters, BuildWorkspace* workspace,
+  MemoryBudget* memory) :
   graph_(graph), parameters_(parameters), workspace_(workspace),
-  key_name_(), start_name_(), key_count_(0), start_count_(0), prepared_(false), stats_()
+  key_name_(), start_name_(), key_count_(0), start_count_(0), prepared_(false), stats_(),
+  memory_(memory), keys_(), starts_(), facts_memory_(), resident_(false),
+  predecessor_edges_(0)
 {
 }
 
@@ -514,6 +517,7 @@ ExternalInputPreprocessor::sortBudget() const
       ExternalFixedRecordSorter::minimumBudget(sizeof(InitialKMerRecord))));
   size_type budget = std::min(this->parameters_.getMemoryLimitBytes(),
     this->parameters_.getSortRunSize());
+  if(this->memory_ != nullptr) { budget = std::min(budget, this->memory_->available()); }
   if(budget < minimum)
   {
     throw std::runtime_error("external preprocessing: memory/sort-run budget is below the fixed-record sort minimum");
@@ -524,7 +528,8 @@ ExternalInputPreprocessor::sortBudget() const
 size_type
 ExternalInputPreprocessor::ioBufferBytes() const
 {
-  size_type budget = this->sortBudget();
+  size_type budget = std::min(this->parameters_.getMemoryLimitBytes(),
+    this->parameters_.getSortRunSize());
   size_type result = std::min(this->parameters_.getIOBufferSize(), budget / 8);
   return std::max(static_cast<size_type>(sizeof(InitialKMerRecord)), result);
 }
@@ -533,9 +538,25 @@ void
 ExternalInputPreprocessor::prepare()
 {
   if(this->prepared_) { return; }
+  // A durable old preprocessing checkpoint remains readable. New small inputs
+  // need no key/start files: count-sized vectors and the decode block share
+  // the same lifetime budget as the path generations that follow.
+  if((this->workspace_ == nullptr ||
+      !this->workspace_->task_completed(PREPROCESS_TASK, PREPROCESS_PHASE)) &&
+     this->tryPrepareResident())
+  {
+    this->prepared_ = true; return;
+  }
   this->key_name_ = TempFile::getName("gcsa_unique_keys");
   this->start_name_ = TempFile::getName("gcsa_unique_starts");
-  const size_type io_bytes = this->ioBufferBytes();
+  const size_type sort_budget = this->sortBudget();
+  const size_type io_bytes = std::min(this->ioBufferBytes(), sort_budget / 8);
+  MemoryBudget::Reservation phase_memory;
+  if(this->memory_ != nullptr)
+  {
+    phase_memory = this->memory_->tryReserve(sort_budget, "external key/start preprocessing");
+    if(!phase_memory) { throw std::runtime_error("cannot admit external preprocessing sort"); }
+  }
   if(this->workspace_ != nullptr &&
      this->workspace_->task_completed(PREPROCESS_TASK, PREPROCESS_PHASE))
   {
@@ -566,7 +587,7 @@ ExternalInputPreprocessor::prepare()
       // would violate the external working-set contract.
       RawWriter keys(key_source, io_bytes), starts(start_source, io_bytes);
       const size_type block_bytes = std::max(static_cast<size_type>(sizeof(KMer)),
-        std::min(this->sortBudget() / 8, this->parameters_.getMemoryLimitBytes() / 8));
+        std::min(sort_budget / 8, this->parameters_.getMemoryLimitBytes() / 8));
       for(size_type file = 0; file < this->graph_.files(); file++)
       {
         this->graph_.scanKMerBlocks(file, block_bytes,
@@ -602,14 +623,18 @@ ExternalInputPreprocessor::prepare()
     // scalars in place, the order the legacy readKeys() uses as well.
     key_type merged_key = 0;
     ExternalFixedRecordSorter::sortAndReduce(key_source, this->key_name_,
-      sizeof(key_type), this->sortBudget(), this->parameters_.getMergeFanIn(),
+      sizeof(key_type), sort_budget, this->parameters_.getMergeFanIn(),
       compareKeyLabel,
-      [&merged_key](const void* value, bool first, bool last, std::ostream& output)
+      [&merged_key, this](const void* value, bool first, bool last, std::ostream& output)
       {
         key_type key = *static_cast<const key_type*>(value);
         if(first) { merged_key = key; }
         else { merged_key = Key::merge(merged_key, key); }
-        if(last) { output.write(reinterpret_cast<const char*>(&merged_key), sizeof(merged_key)); }
+        if(last)
+        {
+          this->predecessor_edges_ += sdsl::bits::lt_cnt[Key::predecessors(merged_key)];
+          output.write(reinterpret_cast<const char*>(&merged_key), sizeof(merged_key));
+        }
       }, &this->stats_.key_sort, true,
       ExternalFixedRecordSorter::RecordOrder::ASCENDING_U64, key_copy.tap());
     key_copy.drain();
@@ -618,7 +643,7 @@ ExternalInputPreprocessor::prepare()
       start_copy.open(*this->workspace_, startArtifact(), physical_shard_id_t(1), io_bytes);
     }
     ExternalFixedRecordSorter::sortAndReduce(start_source, this->start_name_,
-      sizeof(node_type), this->sortBudget(), this->parameters_.getMergeFanIn(),
+      sizeof(node_type), sort_budget, this->parameters_.getMergeFanIn(),
       compareNode,
       [](const void* value, bool first, bool, std::ostream& output)
       {
@@ -655,6 +680,108 @@ ExternalInputPreprocessor::prepare()
   this->prepared_ = true;
 }
 
+bool
+ExternalInputPreprocessor::tryPrepareResident()
+{
+  if(this->memory_ == nullptr || this->graph_.size() == 0) { return false; }
+  const size_type record_bytes = sizeof(key_type) + sizeof(node_type);
+  if(this->graph_.size() > std::numeric_limits<size_type>::max() / record_bytes)
+  {
+    return false;
+  }
+  MemoryBudget::Reservation facts = this->memory_->tryReserve(
+    this->graph_.size() * record_bytes, "preprocessing keys and starts");
+  if(!facts) { return false; }
+  const size_type block_records = std::max(static_cast<size_type>(1),
+    std::min(this->graph_.size(), this->parameters_.getIOBufferSize() / sizeof(KMer)));
+  MemoryBudget::Reservation scratch = this->memory_->tryReserve(
+    block_records * sizeof(KMer), "preprocessing decode block");
+  if(!scratch) { return false; }
+
+  std::vector<key_type> keys;
+  std::vector<node_type> starts;
+  keys.reserve(this->graph_.size()); starts.reserve(this->graph_.size());
+  // reserve() is permitted to allocate more than requested. Do not leave that
+  // excess outside the pool if a different standard library chooses to do so.
+  MemoryBudget::Reservation excess = this->memory_->tryReserve(
+    (keys.capacity() - this->graph_.size()) * sizeof(key_type) +
+    (starts.capacity() - this->graph_.size()) * sizeof(node_type),
+    "preprocessing vector excess");
+  if(!excess) { return false; }
+  if(excess.bytes() != 0)
+  {
+    // The exact-capacity allocator used by the supported toolchain takes the
+    // usual route. Other implementations can use the bounded external path.
+    return false;
+  }
+  for(size_type file = 0; file < this->graph_.files(); file++)
+  {
+    this->graph_.scanKMerBlocks(file, block_records * sizeof(KMer),
+      [&keys, &starts, this](size_type, const std::vector<KMer>& kmers)
+      {
+        for(const KMer& kmer : kmers)
+        {
+          if(keys.size() == this->graph_.size())
+          {
+            throw std::runtime_error("resident preprocessing: input record count changed");
+          }
+          keys.push_back(kmer.key);
+          starts.push_back(mapStart(kmer.from, this->graph_.mapping));
+        }
+      });
+  }
+  if(keys.size() != this->graph_.size())
+  {
+    throw std::runtime_error("resident preprocessing: input record count changed");
+  }
+  parallelQuickSort(keys.begin(), keys.end());
+  size_type distinct = 0;
+  for(size_type i = 0; i < keys.size(); i++)
+  {
+    if(distinct != 0 && Key::label(keys[distinct - 1]) == Key::label(keys[i]))
+    {
+      keys[distinct - 1] = Key::merge(keys[distinct - 1], keys[i]);
+    }
+    else { keys[distinct++] = keys[i]; }
+  }
+  keys.resize(distinct);
+  for(key_type key : keys)
+  {
+    this->predecessor_edges_ += sdsl::bits::lt_cnt[Key::predecessors(key)];
+  }
+  removeDuplicates(starts, true);
+  this->keys_.swap(keys); this->starts_.swap(starts);
+  this->facts_memory_ = std::move(facts);
+  this->key_count_ = this->keys_.size(); this->start_count_ = this->starts_.size();
+  this->stats_.unique_keys = this->key_count_;
+  this->stats_.unique_start_nodes = this->start_count_;
+  this->resident_ = true;
+  return true;
+}
+
+void
+ExternalInputPreprocessor::materializeFacts()
+{
+  if(!this->resident_) { return; }
+  this->key_name_ = TempFile::getName("gcsa_unique_keys");
+  this->start_name_ = TempFile::getName("gcsa_unique_starts");
+  for(size_type file = 0; file < 2; file++)
+  {
+    const std::string& name = (file == 0 ? this->key_name_ : this->start_name_);
+    std::ofstream output;
+    output.rdbuf()->pubsetbuf(nullptr, 0);
+    output.open(name, std::ios_base::binary);
+    if(!output) { throw std::runtime_error("resident preprocessing: cannot write " + name); }
+    if(file == 0) { DiskIO::write(output, this->keys_.data(), this->keys_.size()); }
+    else { DiskIO::write(output, this->starts_.data(), this->starts_.size()); }
+    output.close();
+    if(!output) { throw std::runtime_error("resident preprocessing: cannot close " + name); }
+  }
+  sdsl::util::clear(this->keys_); sdsl::util::clear(this->starts_);
+  this->facts_memory_ = MemoryBudget::Reservation();
+  this->resident_ = false;
+}
+
 size_type
 ExternalInputPreprocessor::keyCount() const
 {
@@ -667,6 +794,79 @@ ExternalInputPreprocessor::startNodeCount() const
 {
   const_cast<ExternalInputPreprocessor*>(this)->prepare();
   return this->start_count_;
+}
+
+namespace
+{
+
+size_type supportSum(size_type left, size_type right)
+{
+  if(left > std::numeric_limits<size_type>::max() - right)
+  {
+    throw std::runtime_error("preprocessing support size overflows");
+  }
+  return left + right;
+}
+
+size_type supportBytes(size_type count, size_type width)
+{
+  if(count > (std::numeric_limits<size_type>::max() - 16 * KILOBYTE) / width)
+  {
+    throw std::runtime_error("preprocessing support size overflows");
+  }
+  return count * width + 16 * KILOBYTE;
+}
+
+} // namespace
+
+size_type
+ExternalInputPreprocessor::lcpMemoryBytes()
+{
+  this->prepare();
+  // The byte vector, its ram-file copy, wavelet construction and retained
+  // bitmap/rank storage coexist. The constant covers the 256-symbol tables.
+  return supportSum(supportBytes(this->key_count_, 8), this->ioBufferBytes());
+}
+
+size_type
+ExternalInputPreprocessor::mapperMemoryBytes()
+{
+  this->prepare();
+  if(this->predecessor_edges_ == 0 && this->key_count_ != 0)
+  {
+    // Old checkpoints did not record edge counts. Only that explicit resume
+    // route needs this extra scan; ordinary reduction counts them as it writes.
+    RawReader keys(this->key_name_, sizeof(key_type), this->key_count_, this->ioBufferBytes());
+    key_type key = 0;
+    while(keys.next(&key))
+    {
+      this->predecessor_edges_ += sdsl::bits::lt_cnt[Key::predecessors(key)];
+    }
+    keys.finish();
+  }
+  const size_type bwt_positions = (this->resident_ ? this->predecessor_edges_ : this->key_count_);
+  const size_type bwt = supportBytes(bwt_positions, this->graph_.alpha.sigma);
+  const size_type nodes = supportBytes(this->predecessor_edges_, 1);
+  // Source bits and interleaved-rank copies overlap during assignment. Three
+  // raw-sized copies conservatively cover the pinned bit_vector_il layout.
+  return supportSum(supportBytes(supportSum(bwt, nodes) / 8 + 16, 3),
+    this->ioBufferBytes());
+}
+
+size_type
+ExternalInputPreprocessor::lastCharacterMemoryBytes()
+{
+  this->prepare();
+  return supportSum(supportBytes(this->key_count_, 1), this->ioBufferBytes());
+}
+
+size_type
+ExternalInputPreprocessor::startNodeMemoryBytes()
+{
+  this->prepare();
+  // Elias--Fano low bits are at most 64 per start; high bits, select tables
+  // and builder-to-vector overlap are included in the remaining allowance.
+  return supportSum(supportBytes(this->start_count_, 24), this->ioBufferBytes());
 }
 
 void
@@ -682,6 +882,11 @@ void
 ExternalInputPreprocessor::buildMapper(DeBruijnGraph& mapper)
 {
   this->prepare();
+  if(this->resident_)
+  {
+    mapper = DeBruijnGraph(this->keys_, this->graph_.k(), this->graph_.alpha);
+    return;
+  }
   const size_type io_bytes = this->ioBufferBytes();
   mapper = DeBruijnGraph(this->key_name_, this->key_count_, this->graph_.k(),
     this->graph_.alpha, io_bytes);
@@ -691,6 +896,7 @@ void
 ExternalInputPreprocessor::buildLCP(LCP& lcp)
 {
   this->prepare();
+  if(this->resident_) { lcp = LCP(this->keys_, this->graph_.k()); return; }
   const size_type io_bytes = this->ioBufferBytes();
   lcp = LCP(this->key_name_, this->key_count_, this->graph_.k(), io_bytes);
 }
@@ -699,6 +905,7 @@ void
 ExternalInputPreprocessor::buildLastCharacters(sdsl::int_vector<0>& last_char)
 {
   this->prepare();
+  if(this->resident_) { Key::lastChars(this->keys_, last_char); return; }
   const size_type io_bytes = this->ioBufferBytes();
   last_char = sdsl::int_vector<0>(this->key_count_, 0, Key::GCSA_CHAR_WIDTH);
   RawReader keys(this->key_name_, sizeof(key_type), this->key_count_, io_bytes);
@@ -715,6 +922,11 @@ void
 ExternalInputPreprocessor::buildStartNodes(sdsl::sd_vector<>& from_nodes)
 {
   this->prepare();
+  if(this->resident_)
+  {
+    from_nodes = sdsl::sd_vector<>(this->starts_.begin(), this->starts_.end());
+    return;
+  }
   if(this->start_count_ == 0)
   {
     from_nodes = sdsl::sd_vector<>(); return;
@@ -749,10 +961,127 @@ ExternalInputPreprocessor::buildStartNodes(sdsl::sd_vector<>& from_nodes)
   from_nodes = sdsl::sd_vector<>(builder);
 }
 
+bool
+ExternalInputPreprocessor::tryBuildResidentInitial(PathGraph& result)
+{
+  size_type largest_input = 0;
+  for(size_type records : this->graph_.sizes) { largest_input = std::max(largest_input, records); }
+  if(largest_input > std::numeric_limits<size_type>::max() / sizeof(InitialKMerRecord))
+  {
+    return false;
+  }
+  const size_type block_records = std::max(static_cast<size_type>(1),
+    std::min(largest_input, this->parameters_.getIOBufferSize() / sizeof(KMer)));
+  MemoryBudget::Reservation sorting = this->memory_->tryReserve(
+    largest_input * sizeof(InitialKMerRecord), "initial logical KMer sort");
+  MemoryBudget::Reservation decoding = this->memory_->tryReserve(
+    block_records * sizeof(KMer), "initial decode block");
+  if(!sorting || !decoding) { return false; }
+
+  const size_type path_bytes = sizeof(PathNode) + 2 * sizeof(PathNode::rank_type);
+  // Storage placement must not change the configured physical shard layout.
+  const size_type configured_sort = std::min(this->parameters_.getMemoryLimitBytes(),
+    this->parameters_.getSortRunSize());
+  const size_type paths_per_shard = std::max(static_cast<size_type>(1),
+    std::min(this->parameters_.getCheckpointRecords(),
+      std::max(path_bytes, configured_sort / 2) / path_bytes));
+  PathGraph initial(0, this->graph_.k(), 0, this->memory_);
+  // Admit the complete initial generation alongside its largest logical sort
+  // before doing work. A failed admission leaves no partial files or frontier.
+  for(size_type file = 0; file < this->graph_.files(); file++)
+  {
+    if(file > std::numeric_limits<std::uint32_t>::max())
+    {
+      throw std::runtime_error("resident preprocessing: too many logical input files");
+    }
+    for(size_type offset = 0, shard = 0; offset < this->graph_.sizes[file]; shard++)
+    {
+      const size_type count = std::min(paths_per_shard, this->graph_.sizes[file] - offset);
+      auto paths = std::make_shared<AdaptiveRecordStore<PathNode>>(
+        *this->memory_, "initial paths");
+      auto ranks = std::make_shared<AdaptiveRecordStore<PathNode::rank_type>>(
+        *this->memory_, "initial ranks");
+      if(!paths->tryReserveRecords(count) || !ranks->tryReserveRecords(2 * count))
+      {
+        return false;
+      }
+      paths->resize(count); ranks->resize(2 * count);
+      initial.path_names.emplace_back(); initial.rank_names.emplace_back();
+      initial.path_stores.push_back(std::move(paths));
+      initial.rank_stores.push_back(std::move(ranks));
+      initial.path_counts.push_back(count); initial.rank_counts.push_back(2 * count);
+      initial.path_checksums.emplace_back(); initial.rank_checksums.emplace_back();
+      logical_file_id_t logical(static_cast<std::uint32_t>(file));
+      initial.logical_file_ids.push_back(logical);
+      initial.physical_shard_ids.push_back(physicalId(logical, shard));
+      initial.path_count += count; initial.rank_count += 2 * count;
+      offset += count;
+    }
+  }
+
+  size_type output_shard = 0;
+  for(size_type file = 0; file < this->graph_.files(); file++)
+  {
+    std::vector<InitialKMerRecord> records(this->graph_.sizes[file]);
+    size_type seen = 0;
+    this->graph_.scanKMerBlocks(file, block_records * sizeof(KMer),
+      [&records, &seen](size_type, const std::vector<KMer>& kmers)
+      {
+        for(const KMer& kmer : kmers)
+        {
+          if(seen == records.size())
+          {
+            throw std::runtime_error("resident preprocessing: logical input grew");
+          }
+          records[seen].kmer = kmer; records[seen].ordinal = seen; seen++;
+        }
+      });
+    if(seen != records.size())
+    {
+      throw std::runtime_error("resident preprocessing: logical input shrank");
+    }
+    parallelQuickSort(records.begin(), records.end(),
+      [](const InitialKMerRecord& a, const InitialKMerRecord& b)
+      {
+        return (compareInitialKMer(&a, &b) < 0);
+      });
+    size_type key_rank = 0, local = 0;
+    for(const InitialKMerRecord& record : records)
+    {
+      const size_type label = Key::label(record.kmer.key);
+      while(key_rank < this->keys_.size() && Key::label(this->keys_[key_rank]) < label)
+      {
+        key_rank++;
+      }
+      if(key_rank == this->keys_.size() || Key::label(this->keys_[key_rank]) != label)
+      {
+        throw std::runtime_error("resident preprocessing: KMer label absent from keys");
+      }
+      PathNode node;
+      node.from = record.kmer.from; node.to = record.kmer.to; node.fields = 0;
+      if(record.kmer.sorted()) { node.makeSorted(); }
+      node.setPredecessors(Key::predecessors(record.kmer.key));
+      node.setOrder(1); node.setLCP(1); node.setPointer(2 * local);
+      initial.path_stores[output_shard]->residentData()[local] = node;
+      auto* ranks = initial.rank_stores[output_shard]->residentData();
+      ranks[2 * local] = static_cast<PathNode::rank_type>(key_rank);
+      ranks[2 * local + 1] = 0;
+      if(++local == initial.path_counts[output_shard]) { output_shard++; local = 0; }
+    }
+    this->stats_.logical_kmer_sorts++;
+  }
+  this->stats_.physical_shards = initial.files();
+  initial.stored_bytes = 0;
+  result.swap(initial);
+  return true;
+}
+
 void
 ExternalInputPreprocessor::buildInitialPathGraph(PathGraph& result)
 {
   this->prepare();
+  if(this->resident_ && this->tryBuildResidentInitial(result)) { return; }
+  this->materializeFacts();
   result.clear();
   PathGraph initial(0, this->graph_.k(), 0);
   if(this->graph_.files() > std::numeric_limits<std::uint32_t>::max())
@@ -760,7 +1089,13 @@ ExternalInputPreprocessor::buildInitialPathGraph(PathGraph& result)
     throw std::runtime_error("external preprocessing: too many logical input files");
   }
   const size_type sort_budget = this->sortBudget();
-  const size_type io_bytes = this->ioBufferBytes();
+  const size_type io_bytes = std::min(this->ioBufferBytes(), sort_budget / 8);
+  MemoryBudget::Reservation phase_memory;
+  if(this->memory_ != nullptr)
+  {
+    phase_memory = this->memory_->tryReserve(sort_budget, "external initial preprocessing");
+    if(!phase_memory) { throw std::runtime_error("cannot admit external initial sort"); }
+  }
   const size_type path_bytes = sizeof(PathNode) + 2 * sizeof(PathNode::rank_type);
   const size_type target_shard_bytes = std::max(path_bytes, sort_budget / 2);
   const size_type paths_per_shard = std::max(static_cast<size_type>(1),

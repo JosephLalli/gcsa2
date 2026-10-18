@@ -1215,6 +1215,69 @@ static void compare_split_depth_prune(const std::string& root)
   omp_set_num_threads(previous_threads); omp_set_dynamic(previous_dynamic);
 }
 
+static void compare_shared_pool_prune(const std::string& base, const LCP& lcp,
+  size_type pool_bytes, bool expect_spill, bool resident_input = false)
+{
+  MemoryBudget pool(pool_bytes);
+  {
+    const size_type records = 8192;
+    const std::vector<logical_file_id_t> logical = { logical_file_id_t(7) };
+    const std::string reference_base = base + ".reference";
+    const std::string candidate_base = base + ".candidate";
+    write_input(reference_base + ".0.path", reference_base + ".0.rank", records, 42);
+    write_input(candidate_base + ".0.path", candidate_base + ".0.rank", records, 42);
+    PathGraph reference(reference_base + ".0.path", reference_base + ".0.rank");
+    PathGraph candidate(candidate_base + ".0.path", candidate_base + ".0.rank");
+    initialize_graph(reference, reference_base, logical, records);
+    initialize_graph(candidate, candidate_base, logical, records);
+    std::shared_ptr<AdaptiveRecordStore<PathNode>> source_paths;
+    std::shared_ptr<AdaptiveRecordStore<PathNode::rank_type>> source_ranks;
+    MemoryBudget::Reservation pressure;
+    if(resident_input)
+    {
+      std::vector<PathNode> paths;
+      std::vector<PathNode::rank_type> ranks;
+      candidate.read(paths, ranks, 0);
+      source_paths = std::make_shared<AdaptiveRecordStore<PathNode>>(pool, "resident input paths");
+      source_ranks = std::make_shared<AdaptiveRecordStore<PathNode::rank_type>>(pool, "resident input ranks");
+      source_paths->append(paths.data(), paths.size());
+      source_ranks->append(ranks.data(), ranks.size());
+      require(source_paths->resident() && source_ranks->resident());
+      candidate.path_stores = { source_paths }; candidate.rank_stores = { source_ranks };
+      candidate.resident_memory = &pool;
+      pressure = pool.reserve(pool.available() - 32, "competing owner before prune");
+    }
+    PathGraphMergeStats reference_stats, candidate_stats;
+    reference.prune(lcp, 4 * MEGABYTE, 4 * MEGABYTE, &reference_stats, 8);
+    // The group is much larger than this former local quota. A shared pool
+    // must keep it resident while the aggregate allocation can still fit.
+    candidate.prune(lcp, 4 * MEGABYTE, 4 * KILOBYTE, &candidate_stats,
+      8, 0, 1, 0, &pool);
+    require(reference_stats.priority_spills == 0);
+    require((candidate_stats.priority_spills > 0) == expect_spill);
+    if(resident_input) { require(source_paths->spilled() && source_ranks->spilled()); }
+    require(reference.size() == candidate.size());
+    require(reference.files() == candidate.files());
+    for(size_type file = 0; file < reference.files(); file++)
+    {
+      require(reference.logicalFile(file) == candidate.logicalFile(file));
+      std::vector<PathNode> paths;
+      std::vector<PathNode::rank_type> ranks;
+      candidate.read(paths, ranks, file);
+      const auto expected_paths = contents(reference.path_names[file]);
+      const auto expected_ranks = contents(reference.rank_names[file]);
+      require(expected_paths.size() == paths.size() * sizeof(PathNode));
+      require(expected_ranks.size() == ranks.size() * sizeof(PathNode::rank_type));
+      require(std::memcmp(expected_paths.data(), paths.data(), expected_paths.size()) == 0);
+      require(std::memcmp(expected_ranks.data(), ranks.data(), expected_ranks.size()) == 0);
+    }
+    require(pool.stats().maximum <= pool_bytes);
+    remove_inputs(reference_base, logical.size());
+    remove_inputs(candidate_base, logical.size());
+  }
+  require(pool.stats().current == 0);
+}
+
 int main()
 {
   const char* configured_tmp = std::getenv("TMPDIR");
@@ -1233,6 +1296,9 @@ int main()
   // First consume a small range, then spill. Absolute merger offsets must not
   // be confused with offsets relative to a newly created spill file.
   compare_delayed_spill(std::string(root) + "/delayed", lcp);
+  compare_shared_pool_prune(root + "/shared-resident", lcp, 4 * MEGABYTE, false);
+  compare_shared_pool_prune(root + "/shared-overflow", lcp, 512 * KILOBYTE, true);
+  compare_shared_pool_prune(root + "/resident-eviction", lcp, 4 * MEGABYTE, true, true);
   // Physical shards 0/1 represent logical input 7; shard 2 is logical input 8.
   // The spill path must retain exactly the same multi-logical-file output semantics.
   compare_prune(std::string(root) + "/many", { logical_file_id_t(7), logical_file_id_t(7), logical_file_id_t(8) }, lcp);

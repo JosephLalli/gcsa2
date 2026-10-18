@@ -2,13 +2,17 @@
 #define GCSA_LCP_H
 
 #include <string>
+#include <memory>
 
 #include <gcsa/files.h>
+#include <gcsa/resources.h>
 
 namespace gcsa
 {
 
 class BuildWorkspace;
+class MemoryBudget;
+template<class Element> class AdaptiveRecordStore;
 
 /*
   lcp.h: LCP array that provides additional functionality to a GCSA index.
@@ -139,6 +143,17 @@ public:
   static void buildAndStore(const std::string& leaf_filename,
     size_type branching, size_type byte_budget, const std::string& filename,
     BuildWorkspace* workspace = nullptr, LCPStreamingStats* stats = nullptr);
+
+  // RAM-first equivalent of the raw-leaf overload. Internal levels use the
+  // same construction-lifetime budget and spill individually only when the
+  // shared allowance cannot retain them. Supplying a workspace is an explicit
+  // durability request and may materialize the leaf.
+  static void buildAndStore(
+    const std::shared_ptr<AdaptiveRecordStore<std::uint8_t>>& leaf_store,
+    size_type branching, size_type byte_budget, const std::string& filename,
+    MemoryBudget& memory, BuildWorkspace* workspace = nullptr,
+    LCPStreamingStats* stats = nullptr,
+    MemoryBudget::Reservation scratch = MemoryBudget::Reservation());
 
 //------------------------------------------------------------------------------
 

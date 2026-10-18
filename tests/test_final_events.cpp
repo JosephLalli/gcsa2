@@ -22,7 +22,15 @@ using namespace gcsa;
 namespace
 {
 
-void require(bool value) { if(!value) { std::abort(); } }
+void requireAt(bool value, int line)
+{
+  if(!value)
+  {
+    std::fprintf(stderr, "test_final_events: requirement failed at line %d\n", line);
+    std::abort();
+  }
+}
+#define require(...) requireAt((__VA_ARGS__), __LINE__)
 
 void writeByte(const std::string& filename, std::streamoff offset,
   std::uint8_t value)
@@ -201,7 +209,8 @@ GCSA legacyEquivalent(const Alphabet& alphabet)
 GCSA
 buildViaStore(const Alphabet& alphabet, const FinalEventFiles& files,
   const FinalEventMetadata& metadata, const ConstructionParameters& parameters,
-  size_type path_nodes, size_type edges, size_type order)
+  size_type path_nodes, size_type edges, size_type order,
+  MemoryBudget* memory = nullptr)
 {
   GCSAHeader header;
   header.path_nodes = path_nodes; header.edges = edges; header.order = order;
@@ -209,7 +218,7 @@ buildViaStore(const Alphabet& alphabet, const FinalEventFiles& files,
   GCSA result;
   try
   {
-    storeFinalComponents(header, alphabet, files, metadata, parameters, published);
+    storeFinalComponents(header, alphabet, files, metadata, parameters, published, nullptr, memory);
     if(!sdsl::load_from_file(result, published))
     {
       throw std::runtime_error("buildViaStore(): cannot load the published index");
@@ -461,9 +470,9 @@ int main()
   FinalEventFiles files(alphabet.sigma);
   FinalEventMetadata metadata;
   FinalEventChecksums event_checksums(alphabet.sigma);
+  const auto emit_fixture = [&](const FinalEventFiles& target, MemoryBudget& budget)
   {
-    MemoryBudget budget(4096);
-    FinalEventWriter writer(files, alphabet.sigma, 32, budget);
+    FinalEventWriter writer(target, alphabet.sigma, 32, budget);
     writer.path((1U << 0) | (1U << 1));
     writer.edge(0, 0); writer.edge(1, 0);
     writer.sampledPath(0); writer.sample(5); writer.sample(7); writer.sampleEnd();
@@ -481,8 +490,13 @@ int main()
     // Deliberately unsorted with a duplicate; counting must produce counts
     // [1, 0, 2] for the three suffix-tree slots without a sort.
     writer.redundancy(2); writer.redundancy(0); writer.redundancy(2);
-    metadata = writer.finish();
-    event_checksums = writer.checksums();
+    auto result = writer.finish();
+    return std::make_pair(result, writer.checksums());
+  };
+  {
+    MemoryBudget budget(4096);
+    auto emitted = emit_fixture(files, budget);
+    metadata = emitted.first; event_checksums = emitted.second;
   }
   require(event_checksums.bwt_masks == checksumFile(files.bwt_masks));
   for(size_type comp = 0; comp < alphabet.sigma; comp++)
@@ -497,6 +511,63 @@ int main()
   require(event_checksums.redundant == checksumFile(files.redundant));
   metadata.fast_chars = alphabet.fast_chars;
   writeFinalEventMetadata(files, metadata);
+
+  for(bool overflow : { false, true })
+  {
+    MemoryBudget memory(4 * MEGABYTE);
+    FinalEventFiles adaptive(alphabet.sigma, &memory);
+    MemoryBudget::Reservation pressure;
+    if(overflow) { pressure = memory.reserve(4 * MEGABYTE - 64, "fixture pressure"); }
+    const size_type writes_before = DiskIO::write_volume.load();
+    auto emitted = emit_fixture(adaptive, memory);
+    emitted.first.fast_chars = alphabet.fast_chars;
+    writeFinalEventMetadata(adaptive, emitted.first);
+    pressure = MemoryBudget::Reservation();
+    require(adaptive.metadata_store->spilled() == overflow);
+    const auto compare_stream = [&](const std::shared_ptr<FinalEventStore>& store,
+        const std::string& reference)
+    {
+      std::ifstream input(reference, std::ios_base::binary);
+      const std::string bytes((std::istreambuf_iterator<char>(input)),
+        std::istreambuf_iterator<char>());
+      std::vector<std::uint8_t> observed(store->count());
+      store->readAt(0, observed.data(), observed.size());
+      require(bytes.size() == observed.size());
+      require(std::memcmp(bytes.data(), observed.data(), bytes.size()) == 0);
+    };
+    compare_stream(adaptive.metadata_store, files.metadata);
+    compare_stream(adaptive.bwt_masks_store, files.bwt_masks);
+    for(size_type comp = 0; comp < alphabet.sigma; comp++)
+    {
+      compare_stream(adaptive.edge_destination_stores[comp], files.edge_destinations[comp]);
+    }
+    compare_stream(adaptive.sample_positions_store, files.sample_positions);
+    compare_stream(adaptive.sample_ids_store, files.sample_ids);
+    compare_stream(adaptive.sample_ends_store, files.sample_ends);
+    compare_stream(adaptive.occurrences_store, files.occurrences);
+    compare_stream(adaptive.redundant_store, files.redundant);
+    ConstructionParameters adaptive_parameters(parameters);
+    adaptive_parameters.setMemoryLimitBytes(4 * MEGABYTE);
+    GCSA index = buildViaStore(alphabet, adaptive, emitted.first, adaptive_parameters,
+      metadata.paths, metadata.total_edges, 16, &memory);
+    const size_type candidate_writes = DiskIO::write_volume.load() - writes_before;
+    GCSA reference = buildViaStore(alphabet, files, metadata, parameters,
+      metadata.paths, metadata.total_edges, 16);
+    std::ostringstream observed_bytes, reference_bytes;
+    index.serialize(observed_bytes); reference.serialize(reference_bytes);
+    require(observed_bytes.str() == reference_bytes.str());
+    if(!overflow)
+    {
+      require(!std::filesystem::exists(adaptive.metadata));
+      require(!std::filesystem::exists(adaptive.bwt_masks));
+      // DiskIO counts intermediate record writes; public ostream output is
+      // excluded. Event, select and component spools must all stay resident.
+      require(candidate_writes == 0);
+    }
+    require(memory.stats().maximum <= 4 * MEGABYTE);
+    adaptive.clear();
+    require(memory.stats().current == 0);
+  }
 
   BuildWorkspace::Settings semantic;
   semantic["fixture"] = "final-events";
