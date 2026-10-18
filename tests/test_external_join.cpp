@@ -800,10 +800,8 @@ int main(int argc, char** argv)
     build_shards(concurrent_graph, "concurrent");
     ExternalPathJoinStats serial_stats, concurrent_stats;
     size_type serial_committed = 0, concurrent_committed = 0;
-    MemoryBudget serial_memory(compaction_parameters.getMemoryLimitBytes(),
-      compaction_parameters.getMemoryLimitBytes() / 16);
-    MemoryBudget concurrent_memory(compaction_parameters.getMemoryLimitBytes(),
-      compaction_parameters.getMemoryLimitBytes() / 16);
+    MemoryBudget serial_memory(compaction_parameters.getMemoryLimitBytes());
+    MemoryBudget concurrent_memory(compaction_parameters.getMemoryLimitBytes());
     omp_set_num_threads(1);
     compactLogicalJoinShards(serial_graph, GIGABYTE, compaction_parameters,
       label_fan_in, serial_memory, serial_committed, &serial_stats);
@@ -878,8 +876,7 @@ int main(int argc, char** argv)
     build_limited(graph, "ceiling");
     ExternalPathJoinStats stats;
     size_type committed = 0;
-    MemoryBudget memory(limited_parameters.getMemoryLimitBytes(),
-      limited_parameters.getMemoryLimitBytes() / 16);
+    MemoryBudget memory(limited_parameters.getMemoryLimitBytes());
     size_type open_now = 0; // Includes the listing's own descriptor, closed again below.
     for(const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) { static_cast<void>(entry); open_now++; }
     struct rlimit original, limited;
@@ -910,8 +907,7 @@ int main(int argc, char** argv)
     build_limited(budgeted, "budgeted");
     ExternalPathJoinStats budgeted_stats;
     size_type budgeted_committed = 0;
-    MemoryBudget budgeted_memory(limited_parameters.getMemoryLimitBytes(),
-      limited_parameters.getMemoryLimitBytes() / 16);
+    MemoryBudget budgeted_memory(limited_parameters.getMemoryLimitBytes());
     omp_set_num_threads(8);
     compactLogicalJoinShards(budgeted, GIGABYTE, limited_parameters,
       std::min(limited_parameters.getMergeFanIn(), max_open - 1), budgeted_memory,

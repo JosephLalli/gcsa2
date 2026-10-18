@@ -229,12 +229,12 @@ static void test_retirement_families()
 
 static void test_nonblocking_memory_budget()
 {
-  MemoryBudget budget(100, 4);
-  require(!budget.tryReserve(97, "oversized"));
-  MemoryBudget::Reservation full = budget.tryReserve(96, "full");
+  MemoryBudget budget(100);
+  require(!budget.tryReserve(101, "oversized"));
+  MemoryBudget::Reservation full = budget.tryReserve(100, "full");
   require(static_cast<bool>(full));
   require(!budget.tryReserve(1, "unavailable"));
-  require(budget.stats().current == 96);
+  require(budget.stats().current == 100);
   full.shrinkTo(64);
   require(budget.stats().current == 64 && full.bytes() == 64);
   auto spare = budget.tryReserve(32, "spare");
@@ -278,7 +278,7 @@ static void test_nonblocking_memory_budget()
   }
   for(std::thread& worker : workers) { worker.join(); }
   require(budget.stats().current == 0);
-  require(budget.stats().maximum == 96);
+  require(budget.stats().maximum == 100);
 }
 
 int main() {

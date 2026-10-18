@@ -222,8 +222,10 @@ tokens. Buffers, decoded records, priority queues, hash tables, thread-local
 output, compression workspaces, and bounded queues must reserve before
 allocation. A task whose reservation does not fit waits; a single request larger
 than the usable ceiling is an error in the algorithm or configuration and must
-be subdivided. The configured ceiling includes an explicit safety margin for
-allocator, OpenMP, SDSL, and library overhead.
+be subdivided. The full configured working-memory target is available for
+reservations; construction does not withhold a fixed safety percentage.
+Allocator, OpenMP, SDSL, library, and filesystem-cache overhead still require a
+separate deployment-level process limit.
 
 I/O buffer settings are bytes. The element capacity is computed as
 `max(1, bytes / sizeof(T))`. Compute concurrency and I/O concurrency are
@@ -317,8 +319,8 @@ partial output names, and explicit memory/disk reservations. Workers finalize
 artifacts, but only the coordinator validates them and commits task markers.
 This isolates allocator fragmentation and worker crashes and permits per-worker
 cgroup controls. It never `fork`s a live OpenMP process. The parent admits the
-sum of worker reservations under one byte-token budget with a 1/16 safety
-margin, divides OpenMP threads among admitted children, validates exact output
+sum of worker reservations against the full configured byte-token budget,
+divides OpenMP threads among admitted children, validates exact output
 counts and lengths, and kills sibling workers after a failure. Each completed
 semantic range is committed independently, so a resumed generation restores
 valid ranges and only respawns missing work. Cgroup-charged filesystem cache

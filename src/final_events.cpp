@@ -1366,8 +1366,7 @@ public:
     redundant_(redundant), reader_bytes_(componentBufferBytes(parameters, 1)),
     window_(0), first_(0), last_(0), slot_(0), cumulative_(0),
     wrap_capacity_(redundant / 256), wrap_count_(0), wrap_cursor_(0),
-    budget_(parameters.getMemoryLimitBytes(),
-      parameters.getMemoryLimitBytes() / 8),
+    budget_(parameters.getMemoryLimitBytes()),
     reservation_(), counts_(), wraps_(), stats_()
   {
     requireStreamSize(source_, redundant_, 8);
@@ -1803,8 +1802,7 @@ serializeFastBWTComponentFrom(std::ostream& out, const EventStream& masks_source
   {
     throw eventError("fast BWT component is outside the mask width");
   }
-  MemoryBudget budget(parameters.getMemoryLimitBytes(),
-    parameters.getMemoryLimitBytes() / 8);
+  MemoryBudget budget(parameters.getMemoryLimitBytes());
   BufferedEventReader masks(masks_source, 1, paths,
     componentBufferBytes(parameters, 1), budget, "final-bwt-mask-reader");
   size_type observed = serializeFastVector(out, paths, [&]()
@@ -1841,8 +1839,7 @@ serializeSparseBWTComponentFrom(std::ostream& out, const EventStream& masks_sour
 
   const auto replay = [&](const auto& consume)
   {
-    MemoryBudget budget(parameters.getMemoryLimitBytes(),
-      parameters.getMemoryLimitBytes() / 8);
+    MemoryBudget budget(parameters.getMemoryLimitBytes());
     BufferedEventReader masks(masks_source, 1, paths,
       componentBufferBytes(parameters, 1), budget, "final-bwt-mask-reader");
     size_type path = 0, observed = 0;
@@ -1895,8 +1892,7 @@ serializeSampleIdsFrom(std::ostream& out, const EventStream& sample_source,
   {
     throw eventError("invalid stored-sample width");
   }
-  MemoryBudget budget(parameters.getMemoryLimitBytes(),
-    parameters.getMemoryLimitBytes() / 8);
+  MemoryBudget budget(parameters.getMemoryLimitBytes());
   BufferedEventReader ids(sample_source, 8, samples,
     componentBufferBytes(parameters, 1), budget, "final-sample-id-reader");
   serializePackedVector(out, samples, sample_bits, [&]()
@@ -1932,8 +1928,7 @@ serializeSampleBoundariesFrom(std::ostream& out,
   // configured input buffer instead of a bit for every stored sample ID.
   const auto pass = [&](const auto& serialize)
   {
-    MemoryBudget budget(parameters.getMemoryLimitBytes(),
-      parameters.getMemoryLimitBytes() / 8);
+    MemoryBudget budget(parameters.getMemoryLimitBytes());
     BufferedEventReader ends(sample_end_source, 8, sampled_paths,
       componentBufferBytes(parameters, 1), budget,
       "final-sample-end-reader");
@@ -1996,8 +1991,7 @@ serializeOccurrencePointersFrom(std::ostream& out,
   // does not grow with the number of paths or nonzero occurrence values.
   const auto replay = [&](bool cumulative_values, const auto& consume)
   {
-    MemoryBudget budget(parameters.getMemoryLimitBytes(),
-      parameters.getMemoryLimitBytes() / 8);
+    MemoryBudget budget(parameters.getMemoryLimitBytes());
     BufferedEventReader input(occurrence_source, 16, occurrence_items,
       componentBufferBytes(parameters, 1), budget, "final-occurrence-reader");
     size_type seen = 0, tail = 0;
@@ -2951,7 +2945,7 @@ struct FinalComponentTask
 };
 
 // The goal a redundancy encoder needs to count every slot in one window: the
-// counts, the wrap list and its reader, over the 7/8 its MemoryBudget leaves.
+// counts, the wrap list and its reader.
 size_type
 redundancyCountLimit(size_type paths, size_type redundant,
   const ConstructionParameters& parameters)
@@ -2959,13 +2953,13 @@ redundancyCountLimit(size_type paths, size_type redundant,
   const size_type slots = (paths > 0 ? paths - 1 : 0);
   const size_type need = slots + 8 * (redundant / 256) +
     parameters.getIOBufferSize() + 64;
-  return need + need / 7 + 8;
+  return need;
 }
 
 constexpr size_type SELECT_SCRATCH_BYTES = 4 * 4096 * sizeof(std::uint64_t);
 
 // Match BufferedEventReader and RedundancyCounts admission, including their
-// reader-buffer floors and local one-eighth margin. Only the edge component
+// reader-buffer floors. Only the edge component
 // keeps sigma readers open; other components replay their streams in order.
 size_type
 componentReaderGoal(const FinalEventFiles& files, const FinalEventMetadata& metadata,
@@ -2994,7 +2988,7 @@ componentReaderGoal(const FinalEventFiles& files, const FinalEventMetadata& meta
   }
   const auto fits = [&](size_type goal, size_type readers, size_type codecs, size_type extra)
   {
-    size_type remaining = goal - goal / 8;
+    size_type remaining = goal;
     const size_type buffer = std::max<size_type>(16,
       std::min(parameters.getIOBufferSize(), goal / (4 * readers)));
     const size_type buffers = readers * buffer;
@@ -3376,8 +3370,7 @@ storeFinalComponents(const GCSAHeader& header,
       }
       else if(task == 2 * metadata.sigma + 2)
       {
-        MemoryBudget budget(parameters.getMemoryLimitBytes(),
-          parameters.getMemoryLimitBytes() / 8);
+        MemoryBudget budget(parameters.getMemoryLimitBytes());
         size_type buffer_bytes = componentBufferBytes(parameters, metadata.sigma);
         std::vector<std::unique_ptr<BufferedEventReader>> readers;
         std::vector<std::uint64_t> current(metadata.sigma);
@@ -3443,8 +3436,7 @@ storeFinalComponents(const GCSAHeader& header,
 
       else if(task == 2 * metadata.sigma + 3)
       {
-        MemoryBudget budget(parameters.getMemoryLimitBytes(),
-          parameters.getMemoryLimitBytes() / 8);
+        MemoryBudget budget(parameters.getMemoryLimitBytes());
         size_type buffer_bytes = componentBufferBytes(parameters, 1);
         {
           BufferedEventReader positions(EventStream(files.sample_positions,

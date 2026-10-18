@@ -3681,10 +3681,9 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   std::unique_ptr<MemoryBudget> merge_memory;
   if(parameters.externalMemory())
   {
-    // Use the construction scheduler's existing safety margin. The shared
-    // remainder belongs to all live merge buffers, not to equal worker quotas.
-    merge_memory.reset(new MemoryBudget(parameters.getMemoryLimitBytes(),
-      parameters.getMemoryLimitBytes() / 8));
+    // All live merge buffers share the configured target. Charge their actual
+    // allocations instead of withholding a fixed fraction or equal worker quotas.
+    merge_memory.reset(new MemoryBudget(parameters.getMemoryLimitBytes()));
   }
   std::unique_ptr<ExternalInputPreprocessor> external_preprocessor;
   auto reserve_merge_support = [&](size_type bytes, const std::string& task)

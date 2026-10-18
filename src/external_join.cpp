@@ -5171,11 +5171,9 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
     pair_reader_bytes, "minimum compressed worker join scan");
   size_type minimum_worker = checkedJoinAdd(externalPathGraphSortMinimumBudget(),
     minimum_join, "minimum worker reservation");
-  // Leave room for the coordinator, allocator metadata, dynamic-library state,
-  // and the checkpoint copy buffer. Tiny test budgets retain the same fraction
-  // instead of relying on a fixed margin that would make them unusable.
-  size_type safety_margin = parameters.getMemoryLimitBytes() / 16;
-  size_type usable_memory = parameters.getMemoryLimitBytes() - safety_margin;
+  // Admit worker workspace against the full configured target. Each worker
+  // accounts for its sort and join buffers within its reservation.
+  size_type usable_memory = parameters.getMemoryLimitBytes();
   size_type maximum_by_memory = usable_memory / minimum_worker;
   size_type concurrency = std::min(requested, maximum_by_memory);
   if(concurrency < 1)
@@ -5257,7 +5255,7 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
       "limit of " + formatBytes(size_limit));
   }
 
-  MemoryBudget memory(parameters.getMemoryLimitBytes(), safety_margin);
+  MemoryBudget memory(parameters.getMemoryLimitBytes());
   std::vector<ActiveJoinWorker> active;
   active.reserve(concurrency);
   // Step 4 of a chromosome-scale build spends hours here. Partitions are the
@@ -6150,7 +6148,7 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
     for(RangeJoin& job : jobs) { removeJoinRun(job.left); removeJoinRun(job.right); }
   }
 
-  MemoryBudget compaction_memory(memory_budget, memory_budget / 16);
+  MemoryBudget compaction_memory(memory_budget);
   compactLogicalJoinShards(next, size_limit, parameters, label_fan_in,
     compaction_memory, committed_bytes, stats);
   // Every sink, worker and restored partition charged this generation its
