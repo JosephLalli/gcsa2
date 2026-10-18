@@ -1,9 +1,11 @@
 #ifndef GCSA_PATH_GRAPH_H
 #define GCSA_PATH_GRAPH_H
 
+#include <gcsa/adaptive_record_store.h>
 #include <gcsa/dbg.h>
 #include <gcsa/files.h>
 #include <gcsa/internal.h>
+#include <gcsa/resources.h>
 #include <gcsa/workspace.h>
 
 #include <sdsl/wt_blcd.hpp>
@@ -350,7 +352,15 @@ struct PathGraphMergeStats
 
 struct PathGraph
 {
+  // Covers resident vector capacity for a successor graph until that capacity
+  // is released with the graph itself.
+  std::unique_ptr<MemoryBudget::Reservation> resident_metadata_memory;
   std::vector<std::string> path_names, rank_names;
+  // A non-null entry is the raw-record equivalent of its filename. The two
+  // vectors stay aligned with physical shards; materialize() is the explicit
+  // conversion to file-backed payloads.
+  std::vector<std::shared_ptr<AdaptiveRecordStore<PathNode>>> path_stores;
+  std::vector<std::shared_ptr<AdaptiveRecordStore<PathNode::rank_type>>> rank_stores;
   std::vector<size_type>   path_counts, rank_counts;
   // Optional closed-writer provenance; absent/stale entries use checksum scans.
   std::vector<ClosedPayloadChecksum> path_checksums, rank_checksums;
@@ -372,17 +382,24 @@ struct PathGraph
   size_type stored_bytes;
 
   bool delete_files;
+  MemoryBudget* resident_memory = nullptr;
 
   constexpr static size_type UNKNOWN = ~(size_type)0;
   const static std::string PREFIX;  // gcsa
 
   PathGraph(const InputGraph& source, sdsl::int_vector<0>& distinct_labels);
-  PathGraph(size_type file_count, size_type path_order, size_type steps);
+  PathGraph(size_type file_count, size_type path_order, size_type steps,
+    MemoryBudget* memory = nullptr);
   PathGraph(const std::string& path_name, const std::string& rank_name);  // For debugging.
   ~PathGraph();
 
   void clear();
   void swap(PathGraph& another) noexcept;
+
+  // Explicitly retain a durable raw-file representation and release all
+  // resident payloads. This is required before checkpointing or file-only
+  // consumers; ordinary resident phases do not call it.
+  void materialize();
 
   void open(std::ifstream& path_file, std::ifstream& rank_file, size_type file) const;
 
@@ -404,7 +421,7 @@ struct PathGraph
     What this generation costs the disk limit. bytes() is the logical
     PathNode/rank payload, but every generation guard charges what the shards
     physically occupy: ExternalPathSortSink::finish() and
-    runJoinWorkerPartitions() commit st_size, and framed admission uses
+    threaded join tasks commit st_size, and framed admission uses
     externalPathGraphShardPeakBytes(). A framed generation stores a fraction of
     its payload when the records compress and more than it when they do not, so
     only this value may be compared with, or subtracted from, a limit. A raw
@@ -450,7 +467,9 @@ struct PathGraph
     size_type max_open_files = 128,
     size_type input_cache_bytes = 0,
     size_type prune_workers = 1,
-    size_type concurrent_open_files = 0);
+    size_type concurrent_open_files = 0,
+    MemoryBudget* phase_memory = nullptr);
+  bool tryExtendResident(size_type size_limit, MemoryBudget& phase_memory);
   void extend(size_type size_limit, size_type memory_limit);
 
   void debugExtend();
@@ -470,6 +489,10 @@ struct PathGraph
 struct MergedGraph
 {
   std::string path_name, rank_name, from_name, lcp_name;
+  std::shared_ptr<AdaptiveRecordStore<PathNode>> path_store;
+  std::shared_ptr<AdaptiveRecordStore<PathNode::rank_type>> rank_store;
+  std::shared_ptr<AdaptiveRecordStore<range_type>> from_store;
+  std::shared_ptr<AdaptiveRecordStore<uint8_t>> lcp_store;
 
   size_type path_count, rank_count, from_count;
   size_type order;
@@ -492,7 +515,8 @@ struct MergedGraph
     PathGraphMergeStats* stats = nullptr,
     size_type max_open_files = 128,
     size_type input_cache_bytes = 0,
-    const TempFileCodecParameters* output_codec = nullptr);
+    const TempFileCodecParameters* output_codec = nullptr,
+    MemoryBudget* phase_memory = nullptr);
   ~MergedGraph();
 
   void clear();

@@ -1080,6 +1080,143 @@ LCPArray::buildAndStore(const InputGraph& graph,
 }
 
 void
+LCPArray::buildAndStore(
+  const std::shared_ptr<AdaptiveRecordStore<std::uint8_t>>& leaf_store,
+  size_type branching, size_type byte_budget, const std::string& filename,
+  MemoryBudget& memory, BuildWorkspace* workspace, LCPStreamingStats* stats,
+  MemoryBudget::Reservation scratch)
+{
+  if(leaf_store == nullptr) { throw std::invalid_argument("missing LCP leaf store"); }
+  if(workspace != nullptr)
+  {
+    // An explicitly requested durable hierarchy keeps the established
+    // checkpoint representation, including old resumed level artifacts.
+    buildAndStore(leaf_store->materialize(), branching, byte_budget, filename,
+      workspace, stats);
+    return;
+  }
+  if(branching < 2 || byte_budget < 2)
+  {
+    throw std::invalid_argument("adaptive LCP requires branching >= 2 and byte budget >= 2");
+  }
+  LCPStreamingStats local_stats;
+  LCPStreamingStats& telemetry = (stats == nullptr ? local_stats : *stats);
+  telemetry = LCPStreamingStats();
+  const std::vector<size_type> sizes = levelSizes(leaf_store->count(), branching);
+  telemetry.levels = sizes.size();
+  const size_type metadata_bytes = (2 * sizes.size() + 1) * sizeof(size_type);
+  const size_type scratch_bytes = std::min(byte_budget,
+    std::max(static_cast<size_type>(2), leaf_store->count()));
+  if(!scratch)
+  {
+    scratch = memory.tryReserve(metadata_bytes + scratch_bytes, "LCP stream buffers and offsets");
+  }
+  if(!scratch || scratch.bytes() < metadata_bytes + scratch_bytes)
+  {
+    throw std::runtime_error("memory cannot hold LCP stream buffers and offsets");
+  }
+  sdsl::int_vector<64> offsets(sizes.size() + 1, 0);
+  size_type total_values = 0;
+  for(size_type level = 0; level < sizes.size(); level++)
+  {
+    if(total_values > std::numeric_limits<size_type>::max() - sizes[level])
+    {
+      throw std::runtime_error("LCP hierarchy size overflows the address space");
+    }
+    total_values += sizes[level]; offsets[level + 1] = total_values;
+  }
+  // Keep one input block. PackedLCPWriter receives zero heap buffer and emits
+  // complete machine words through the final output stream.
+  std::vector<std::uint8_t> block(scratch_bytes);
+  noteBuffers(telemetry, scratch_bytes + metadata_bytes);
+  const auto consume = [&](const std::shared_ptr<AdaptiveRecordStore<std::uint8_t>>& source,
+      auto value)
+  {
+    for(size_type offset = 0; offset < source->count();)
+    {
+      const size_type count = std::min(scratch_bytes, source->count() - offset);
+      source->readAt(offset, block.data(), count);
+      for(size_type i = 0; i < count; i++) { value(block[i]); }
+      offset += count;
+    }
+  };
+  std::uint8_t maximum = 0;
+  consume(leaf_store, [&](std::uint8_t value) { maximum = std::max(maximum, value); });
+  const size_type width = bit_length(maximum);
+  LCPHeader header;
+  header.size = leaf_store->count(); header.branching = branching;
+  publishLCP(filename, [&](std::ostream& out)
+  {
+    header.serialize(out);
+    const auto levels = [&](auto& writer)
+    {
+      auto current = leaf_store;
+      for(size_type level = 0; level < sizes.size(); level++)
+      {
+        std::shared_ptr<AdaptiveRecordStore<std::uint8_t>> next;
+        if(level + 1 < sizes.size())
+        {
+          next = std::make_shared<AdaptiveRecordStore<std::uint8_t>>(memory,
+            "LCP range minimum level");
+          // Exact-sized admission avoids geometric reallocation overlap for
+          // an immutable level whose final length is already known.
+          next->tryReserveRecords(sizes[level + 1]);
+        }
+        size_type group = 0;
+        std::uint8_t minimum = std::numeric_limits<std::uint8_t>::max();
+        for(size_type offset = 0; offset < current->count();)
+        {
+          const size_type count = std::min(scratch_bytes, current->count() - offset);
+          current->readAt(offset, block.data(), count);
+          size_type produced = 0;
+          for(size_type i = 0; i < count; i++)
+          {
+            const std::uint8_t value = block[i];
+            writer.write(value);
+            if(next != nullptr)
+            {
+              minimum = std::min(minimum, value);
+              if(++group == branching)
+              {
+                // Each minimum replaces only already-consumed input. A
+                // spilled parent receives one contiguous run per input block.
+                block[produced++] = minimum; group = 0;
+                minimum = std::numeric_limits<std::uint8_t>::max();
+              }
+            }
+          }
+          if(next != nullptr) { next->append(block.data(), produced); }
+          offset += count;
+        }
+        if(next != nullptr)
+        {
+          if(group != 0) { next->append(minimum); }
+          if(next->count() != sizes[level + 1])
+          {
+            throw std::runtime_error("adaptive LCP level count mismatch");
+          }
+          telemetry.generated_levels++;
+        }
+        current = std::move(next);
+      }
+      writer.finish();
+    };
+    if(usesLegacyPadding(total_values, width))
+    {
+      LegacyPackedLCPWriter writer(out, total_values, width); levels(writer);
+    }
+    else
+    {
+      PackedLCPWriter writer(out, total_values, width,
+        maximum == std::numeric_limits<std::uint8_t>::max(), 0);
+      levels(writer);
+    }
+    offsets.serialize(out);
+    if(!out) { throw std::runtime_error("cannot write adaptive LCP offsets"); }
+  });
+}
+
+void
 LCPArray::buildAndStore(const std::string& leaf_filename,
   size_type branching, size_type byte_budget, const std::string& filename,
   BuildWorkspace* workspace, LCPStreamingStats* stats)

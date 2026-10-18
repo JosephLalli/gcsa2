@@ -246,7 +246,6 @@ constructionOperationalSettings(const ConstructionParameters& parameters)
   settings["join_partition_size_mode"] = (parameters.joinPartitionSizeIsAutomatic() ? "auto" : "explicit");
   settings["merge_fan_in"] = std::to_string(parameters.getMergeFanIn());
   settings["max_open_files"] = std::to_string(parameters.getMaxOpenFiles());
-  settings["process_workers"] = std::to_string(parameters.getProcessWorkers());
   settings["temp_compression"] = tempCompressionName(parameters.getTempCompression());
   settings["compression_block_size"] = std::to_string(parameters.getCompressionBlockSize());
   settings["compression_workers"] = std::to_string(parameters.getCompressionWorkers());
@@ -352,18 +351,13 @@ storeEmptyIndexAtomically(const GCSA& index, const std::string& filename)
   about 60 s at 0.22 threads on the joint chr2+chr18 input, although the leaf
   file is complete when the merge ends.
 
-  The thread runs the caller's LCPArray::buildAndStore(graph, ...) unchanged,
-  with its own resumable workspace, so the bytes and resume behavior are those
-  of the call it replaces. It writes to a staged name beside the target, and
-  finish() renames that into place after the index is published, so a failed
-  index build never leaves a new .lcp beside an old or missing .gcsa. The
-  thread is not admitted against the scan's budgets: it holds about one stream
-  budget, min(--memory-limit, --io-buffer-size), well inside the eighth of
-  the memory goal the scan keeps as allocator margin, and at most five
-  descriptors, above the --max-open-files ceiling the scan is sized to. The
-  destructor joins the thread (a joinable std::thread would terminate the
-  process) and discards the staged file, so an exception on the main thread
-  neither strands the thread nor publishes a partial result.
+  Store-backed leaves retain their ownership through the worker. Both the
+  adaptive and file-backed routes pre-admit their streaming buffers from the
+  construction pool before starting the thread. The configured I/O size is a
+  ceiling, so a tight budget uses a smaller valid buffer instead of spilling
+  resident payloads to preserve a preferred buffer size. Staged publication
+  keeps a failed index build from publishing a new LCP beside an old index.
+  The destructor joins the worker and removes an unpublished staged file.
 */
 class ConcurrentLCPBuild
 {
@@ -381,24 +375,93 @@ public:
   // graph.lcp_name must already name the merged LCP leaf file, and neither it
   // nor graph.size() may change until finish().
   void start(const InputGraph& graph, const ConstructionParameters& parameters,
+    const std::string& target, MemoryBudget* memory = nullptr)
+  {
+    this->target = target;
+    this->staged = target + "." + std::to_string(static_cast<unsigned long long>(::getpid())) +
+      ".staged";
+    ConstructionParameters settings(parameters);
+    MemoryBudget::Reservation scratch;
+    if(memory != nullptr)
+    {
+      constexpr size_type offsets_bytes = 131 * sizeof(size_type);
+      const size_type available = memory->available();
+      if(available < offsets_bytes + KILOBYTE)
+      {
+        throw std::runtime_error("memory cannot admit file-backed LCP buffers");
+      }
+      const size_type stream_bytes = std::min(parameters.getIOBufferSize(),
+        available - offsets_bytes);
+      scratch = memory->tryReserve(stream_bytes + offsets_bytes, "file-backed LCP buffers");
+      if(!scratch) { throw std::runtime_error("memory cannot admit file-backed LCP buffers"); }
+      settings.setIOBufferSize(stream_bytes);
+    }
+    this->worker = std::thread([this, &graph, settings, scratch = std::move(scratch)]()
+    {
+      try { LCPArray::buildAndStore(graph, settings, this->staged); }
+      catch(...) { this->failure = std::current_exception(); }
+    });
+  }
+
+  static size_type minimumMemoryBytes(
+    const std::shared_ptr<AdaptiveRecordStore<std::uint8_t>>& leaves,
+    const ConstructionParameters& parameters)
+  {
+    const size_type branching = parameters.getLCPBranching();
+    if(branching < 2) { throw std::invalid_argument("LCP branching must be at least two"); }
+    size_type levels = 1;
+    for(size_type size = leaves->count(); size > 1; levels++)
+    {
+      size = size / branching + (size % branching != 0);
+    }
+    return 2 + (2 * levels + 1) * sizeof(size_type);
+  }
+
+  void start(const std::shared_ptr<AdaptiveRecordStore<std::uint8_t>>& leaves,
+    const ConstructionParameters& parameters, MemoryBudget& memory,
     const std::string& target)
   {
     this->target = target;
     this->staged = target + "." + std::to_string(static_cast<unsigned long long>(::getpid())) +
       ".staged";
-    this->worker = std::thread([this, &graph, &parameters]()
+    const size_type branching = parameters.getLCPBranching();
+    const size_type metadata = minimumMemoryBytes(leaves, parameters) - 2;
+    if(memory.available() < metadata + 2)
     {
-      try { LCPArray::buildAndStore(graph, parameters, this->staged); }
+      throw std::runtime_error("memory cannot admit concurrent LCP buffers");
+    }
+    // The I/O setting is a ceiling. A bounded sequential block leaves the
+    // shared remainder available to parent levels and the final event scan.
+    const size_type stream_bytes = std::min(memory.available() - metadata,
+      std::min(static_cast<size_type>(64 * KILOBYTE),
+        std::min(parameters.getIOBufferSize(),
+          std::max(static_cast<size_type>(2), leaves->count()))));
+    const size_type bytes = metadata + stream_bytes;
+    auto scratch = memory.tryReserve(bytes, "LCP stream buffers and offsets");
+    if(!scratch) { throw std::runtime_error("memory cannot admit concurrent LCP buffers"); }
+    this->worker = std::thread([this, leaves, branching, stream_bytes, &memory,
+      scratch = std::move(scratch)]() mutable
+    {
+      try
+      {
+        LCPArray::buildAndStore(leaves, branching, stream_bytes, this->staged, memory,
+          nullptr, nullptr, std::move(scratch));
+      }
       catch(...) { this->failure = std::current_exception(); }
     });
   }
 
   bool started() const { return !(this->target.empty()); }
 
+  void wait()
+  {
+    if(this->worker.joinable()) { this->worker.join(); }
+    if(this->failure) { std::rethrow_exception(this->failure); }
+  }
+
   void finish()
   {
-    this->worker.join();
-    if(this->failure) { std::rethrow_exception(this->failure); }
+    this->wait();
     if(::rename(this->staged.c_str(), this->target.c_str()) != 0)
     {
       throw std::runtime_error("cannot publish LCP array " + this->target);
@@ -700,6 +763,16 @@ struct MergedGraphReader
   the from-node stream: the ordered reader below remains responsible for that
   stream, so preparing a batch neither advances nor rereads global scan state.
 */
+template<class Element>
+void
+openMergedRecords(ReadBuffer<Element>& reader,
+  const std::shared_ptr<AdaptiveRecordStore<Element>>& store,
+  const std::string& filename, size_type buffer_bytes, bool release_cache)
+{
+  if(store) { reader.open(store, buffer_bytes, release_cache); }
+  else { reader.open(filename, buffer_bytes, release_cache); }
+}
+
 struct MergedGraphLabelReader
 {
   ReadBuffer<PathNode> paths;
@@ -710,8 +783,8 @@ struct MergedGraphLabelReader
 
   void init(const MergedGraph& graph, size_type buffer_bytes)
   {
-    this->paths.open(graph.path_name, buffer_bytes, true);
-    this->labels.open(graph.rank_name, buffer_bytes, true);
+    openMergedRecords(this->paths, graph.path_store, graph.path_name, buffer_bytes, true);
+    openMergedRecords(this->labels, graph.rank_store, graph.rank_name, buffer_bytes, true);
     this->path = 0;
     if(this->paths.size() > 0)
     {
@@ -742,9 +815,9 @@ MergedGraphReader::init(const MergedGraph& graph,
   const DeBruijnGraph* _mapper, const sdsl::int_vector<0>* _last_char,
   size_type buffer_bytes, bool release_cache)
 {
-  this->paths.open(graph.path_name, buffer_bytes, release_cache);
-  this->labels.open(graph.rank_name, buffer_bytes, release_cache);
-  this->from_nodes.open(graph.from_name, buffer_bytes, release_cache);
+  openMergedRecords(this->paths, graph.path_store, graph.path_name, buffer_bytes, release_cache);
+  openMergedRecords(this->labels, graph.rank_store, graph.rank_name, buffer_bytes, release_cache);
+  openMergedRecords(this->from_nodes, graph.from_store, graph.from_name, buffer_bytes, release_cache);
 
   this->path = this->rank = this->from = 0; this->path_count = graph.size();
   this->seek();
@@ -757,11 +830,11 @@ void
 MergedGraphReader::init(const MergedGraph& graph, size_type comp,
   size_type buffer_bytes, bool release_cache, bool read_from_nodes)
 {
-  this->paths.open(graph.path_name, buffer_bytes, release_cache);
-  this->labels.open(graph.rank_name, buffer_bytes, release_cache);
+  openMergedRecords(this->paths, graph.path_store, graph.path_name, buffer_bytes, release_cache);
+  openMergedRecords(this->labels, graph.rank_store, graph.rank_name, buffer_bytes, release_cache);
   if(read_from_nodes)
   {
-    this->from_nodes.open(graph.from_name, buffer_bytes, release_cache);
+    openMergedRecords(this->from_nodes, graph.from_store, graph.from_name, buffer_bytes, release_cache);
   }
 
   this->path = graph.next[comp]; this->path_count = graph.size();
@@ -776,7 +849,7 @@ void
 MergedGraphReader::initFromOnly(const MergedGraph& graph,
   size_type buffer_bytes, bool release_cache, size_type comp)
 {
-  this->from_nodes.open(graph.from_name, buffer_bytes, release_cache);
+  openMergedRecords(this->from_nodes, graph.from_store, graph.from_name, buffer_bytes, release_cache);
   this->path = (comp == MergedGraph::UNKNOWN ? 0 : graph.next[comp]);
   this->from = (comp == MergedGraph::UNKNOWN ? 0 : graph.next_from[comp]);
   this->rank = 0; this->path_count = graph.size();
@@ -968,6 +1041,27 @@ MergedGraphReader::fromNodes(SpillableNodeSet& results,
 
 namespace
 {
+
+// Only admission failures before the first event can be retried after joining
+// a concurrent LCP builder. Data, I/O and algorithm errors must propagate.
+struct FinalScanAdmissionError : public std::runtime_error
+{
+  explicit FinalScanAdmissionError(const std::string& message) :
+    std::runtime_error(message) { }
+};
+
+size_type
+finalScanMinimumBytes(size_type sigma)
+{
+  const size_type streams = 3 * (sigma + 1) + 1;
+  const size_type record = std::max(sizeof(PathNode),
+    std::max(sizeof(PathNode::rank_type), sizeof(range_type)));
+  // Include both minimum array caches and the bounded resident stack, whose
+  // full admission must leave at least a previous-occurrence cache.
+  return 2 * SpillableNodeSet::minimumBudget() + 2 * streams * record +
+    (sigma + 6) * 16 + 2 * DiskBackedArray64::minimumCacheBytes() +
+    3 * (static_cast<size_type>(std::numeric_limits<std::uint8_t>::max()) + 2) * sizeof(size_type);
+}
 
 struct ExternalFinalScanStats
 {
@@ -1384,9 +1478,15 @@ copyBufferedRange(ReadBuffer<Element>& buffer, size_type first, size_type count,
   Output* output)
 {
   if(count == 0) { return; }
-  if(first + count > buffer.size())
+  if(first > buffer.size() || count > buffer.size() - first)
   {
     throw std::runtime_error("GCSA::GCSA(): final scan read past a merged-graph stream");
+  }
+  if(buffer.record_store != nullptr && buffer.store_is_resident)
+  {
+    const Element* begin = buffer.record_store->residentData() + first;
+    std::copy(begin, begin + count, output);
+    return;
   }
   buffer[first + count - 1];
   if(!(buffer.buffer.buffered(first)))
@@ -1475,14 +1575,12 @@ producePipelinedFinalEvents(const MergedGraph& merged_graph,
   const sdsl::sd_vector<>& from_nodes, size_type unique_from_nodes,
   const InputGraph& graph, const ConstructionParameters& parameters,
   BuildWorkspace& workspace, FinalEventFiles& files, size_type checkpoint_buffer,
-  ExternalFinalScanStats* stats, FinalEventMetadata& metadata,
+  MemoryBudget& memory, ExternalFinalScanStats* stats, FinalEventMetadata& metadata,
   std::string& declined)
 {
   const size_type sigma = graph.alpha.sigma;
   const size_type path_count = merged_graph.size();
   const size_type threads = static_cast<size_type>(std::max(1, omp_get_max_threads()));
-  const size_type memory_limit = parameters.getMemoryLimitBytes();
-  MemoryBudget memory(memory_limit, memory_limit / 8);
 
   // The same streams, descriptors and minimum workspace as the serial scan:
   // the loader reads paths, labels, start nodes and LCP bytes, and each
@@ -1497,7 +1595,8 @@ producePipelinedFinalEvents(const MergedGraph& merged_graph,
     static_cast<size_type>(16), "minimum final writer reservation");
   const size_type minimum_node_set = SpillableNodeSet::minimumBudget();
   const size_type non_set_minimum = reader_minimum + writer_minimum;
-  if(memory.available() < non_set_minimum + 2 * minimum_node_set)
+  const size_type scan_available = memory.available();
+  if(scan_available < non_set_minimum + 2 * minimum_node_set)
   {
     declined = "memory limit below the final-scan minimum"; return false;
   }
@@ -1519,9 +1618,9 @@ producePipelinedFinalEvents(const MergedGraph& merged_graph,
 
   size_type desired_node_set = std::max(minimum_node_set,
     std::min(parameters.getIOBufferSize(), parameters.getSortRunSize()));
-  size_type node_set_cap = (memory.available() - non_set_minimum) / 2;
+  size_type node_set_cap = (scan_available - non_set_minimum) / 2;
   size_type node_set_budget = std::min(node_set_cap,
-    finalScanBuffer(desired_node_set, minimum_node_set, memory.available(), 16));
+    finalScanBuffer(desired_node_set, minimum_node_set, scan_available, 16));
   size_type node_set_fan_in = std::min(parameters.getMergeFanIn(),
     (parameters.getMaxOpenFiles() - fixed_descriptors -
       sorter_fixed_descriptors) / 2);
@@ -1531,11 +1630,11 @@ producePipelinedFinalEvents(const MergedGraph& merged_graph,
   // at most half of what the readers leave, and the slots at most half of the
   // rest, which keeps the remainder for the previous-occurrence array.
   const size_type node_set_bytes = 2 * node_set_budget;
-  if(memory.available() < node_set_bytes)
+  if(scan_available < node_set_bytes)
   {
     declined = "memory limit below the start-node sets"; return false;
   }
-  const size_type after_sets = memory.available() - node_set_bytes;
+  const size_type after_sets = scan_available - node_set_bytes;
   const size_type reader_buffer = finalScanBuffer(parameters.getIOBufferSize(),
     minimum_reader, after_sets, 4 * reader_streams);
   const size_type reader_reservation_bytes = checkedProduct(2 * reader_streams,
@@ -1577,7 +1676,7 @@ producePipelinedFinalEvents(const MergedGraph& merged_graph,
       if(checkedProduct(writer_streams, writer_buffer,
           "final writer reservation") > memory.available())
       {
-        throw std::runtime_error("GCSA::GCSA(): memory limit cannot hold final event buffers");
+        throw FinalScanAdmissionError("GCSA::GCSA(): memory limit cannot hold final event buffers");
       }
       FinalEventWriter output(files, sigma, writer_buffer, memory,
         parameters.getTempFileCodecParameters());
@@ -1586,7 +1685,7 @@ producePipelinedFinalEvents(const MergedGraph& merged_graph,
         slot_bytes, "final scan slots");
       if(all_slot_bytes > memory.available())
       {
-        throw std::runtime_error("GCSA::GCSA(): memory limit cannot hold the final scan slots");
+        throw FinalScanAdmissionError("GCSA::GCSA(): memory limit cannot hold the final scan slots");
       }
       MemoryBudget::Reservation slot_reservation = memory.reserve(all_slot_bytes,
         "final-scan-slots");
@@ -1595,6 +1694,10 @@ producePipelinedFinalEvents(const MergedGraph& merged_graph,
       {
         slot.allocate(batch_paths, node_capacity, edge_capacity, sigma);
       }
+      const size_type stack_capacity = 3 *
+        (static_cast<size_type>(std::numeric_limits<std::uint8_t>::max()) + 2);
+      auto stack_reservation = memory.reserve(stack_capacity * sizeof(size_type),
+        "final suffix tree stack");
 
       // Previous occurrences in RAM when the goal admits them (4.25 GB for
       // the joint chr2+chr18 graph, about 44 GB for the whole genome), or
@@ -1624,7 +1727,7 @@ producePipelinedFinalEvents(const MergedGraph& merged_graph,
         size_type previous_cache = memory.available() / 2;
         if(unique_from_nodes > 0 && previous_cache < DiskBackedArray64::minimumCacheBytes())
         {
-          throw std::runtime_error("GCSA::GCSA(): memory limit cannot hold previous-occurrence cache");
+          throw FinalScanAdmissionError("GCSA::GCSA(): memory limit cannot hold previous-occurrence cache");
         }
         previous_disk.reset(new DiskBackedArray64(previous_name,
           unique_from_nodes, previous_cache, memory, true, 64 * KILOBYTE));
@@ -1633,10 +1736,6 @@ producePipelinedFinalEvents(const MergedGraph& merged_graph,
 
       // The suffix-tree stack holds one frame of (LCP, first, last) per
       // distinct LCP value (see the serial scan), so it is a small array.
-      typedef std::uint8_t merged_lcp_type;
-      constexpr size_type distinct_lcp_values =
-        static_cast<size_type>(std::numeric_limits<merged_lcp_type>::max()) + 2;
-      const size_type stack_capacity = 3 * distinct_lcp_values;
       std::vector<size_type> stack(stack_capacity, 0);
       size_type stack_size = 0;
 
@@ -1646,7 +1745,7 @@ producePipelinedFinalEvents(const MergedGraph& merged_graph,
       const size_type scan_read_start = DiskIO::read_volume;
       MergedGraphLabelReader source;
       MergedGraphReader start_reader;
-      ReadBuffer<merged_lcp_type> lcp_array;
+      ReadBuffer<std::uint8_t> lcp_array;
       std::vector<MergedGraphReader> destination(sigma), sampling(sigma);
 
       FinalScanPool pool(pool_workers);
@@ -2230,7 +2329,8 @@ producePipelinedFinalEvents(const MergedGraph& merged_graph,
         launch([&]() {
           source.init(merged_graph, reader_buffer);
           start_reader.initFromOnly(merged_graph, reader_buffer, true);
-          lcp_array.open(merged_graph.lcp_name, reader_buffer, true);
+          openMergedRecords(lcp_array, merged_graph.lcp_store,
+            merged_graph.lcp_name, reader_buffer, true);
           for(size_type b = 0; ; b++)
           {
             FinalScanSlot& slot = slots[b % FINAL_SCAN_SLOTS];
@@ -2447,8 +2547,11 @@ producePipelinedFinalEvents(const MergedGraph& merged_graph,
         throw std::runtime_error("GCSA::GCSA(): final event path count mismatch");
       }
       writeFinalEventMetadata(files, metadata);
-      checkpointFinalEvents(workspace, files, metadata, checkpoint_buffer,
-        &event_checksums);
+      if(!files.adaptive() || parameters.getStopAfter() == "final-events")
+      {
+        checkpointFinalEvents(workspace, files, metadata, checkpoint_buffer,
+          &event_checksums);
+      }
     }
   }
   catch(...)
@@ -2473,7 +2576,7 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
   size_type unique_from_nodes, const InputGraph& graph,
   const ConstructionParameters& parameters, BuildWorkspace& workspace,
   FinalEventFiles& files, size_type checkpoint_buffer,
-  ExternalFinalScanStats* stats)
+  MemoryBudget& memory, ExternalFinalScanStats* stats)
 {
   FinalEventMetadata metadata;
   FinalEventChecksums event_checksums(graph.alpha.sigma);
@@ -2498,7 +2601,7 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
     std::string declined;
     if(producePipelinedFinalEvents(merged_graph, mapper, last_char, from_nodes,
       unique_from_nodes, graph, parameters, workspace, files, checkpoint_buffer,
-      stats, metadata, declined))
+      memory, stats, metadata, declined))
     {
       return metadata;
     }
@@ -2509,9 +2612,6 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
                 << "; running the serial scan" << std::endl;
     }
   }
-  const size_type memory_limit = parameters.getMemoryLimitBytes();
-  const size_type safety_margin = memory_limit / 8;
-  MemoryBudget memory(memory_limit, safety_margin);
 
   const size_type requested_predecessor_workers = std::min(graph.alpha.sigma,
     static_cast<size_type>(std::max(1, omp_get_max_threads())));
@@ -2538,15 +2638,16 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
   // common case; an oversized set becomes a sorted, deduplicated disk stream.
   const size_type minimum_node_set = SpillableNodeSet::minimumBudget();
   const size_type non_set_minimum = reader_minimum + writer_minimum + array_minimum;
-  if(memory.available() < non_set_minimum + 2 * minimum_node_set)
+  const size_type scan_available = memory.available();
+  if(scan_available < non_set_minimum + 2 * minimum_node_set)
   {
-    throw std::runtime_error("GCSA::GCSA(): memory limit cannot hold the minimum final-scan workspace");
+    throw FinalScanAdmissionError("GCSA::GCSA(): memory limit cannot hold the minimum final-scan workspace");
   }
   size_type desired_node_set = std::max(minimum_node_set,
     std::min(parameters.getIOBufferSize(), parameters.getSortRunSize()));
-  size_type node_set_cap = (memory.available() - non_set_minimum) / 2;
+  size_type node_set_cap = (scan_available - non_set_minimum) / 2;
   size_type node_set_budget = std::min(node_set_cap,
-    finalScanBuffer(desired_node_set, minimum_node_set, memory.available(), 16));
+    finalScanBuffer(desired_node_set, minimum_node_set, scan_available, 16));
 
   // ExternalFixedRecordSorter owns two descriptors per merge input and four
   // fixed descriptors. The predecessor set may be sorted while the current
@@ -2589,7 +2690,7 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
       if(checkedProduct(writer_streams, writer_buffer,
           "final writer reservation") > memory.available())
       {
-        throw std::runtime_error("GCSA::GCSA(): memory limit cannot hold final event buffers");
+        throw FinalScanAdmissionError("GCSA::GCSA(): memory limit cannot hold final event buffers");
       }
       FinalEventWriter output(files, graph.alpha.sigma, writer_buffer, memory,
         parameters.getTempFileCodecParameters());
@@ -2672,19 +2773,18 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
         stats->predecessor_parallel_fallback = true;
       }
 
-      size_type cache_bytes = memory.available();
+      size_type cache_bytes = std::min(memory.available(),
+        std::max(static_cast<size_type>(64 * KILOBYTE), parameters.getIOBufferSize()));
       size_type previous_cache = cache_bytes / 2;
       size_type stack_cache = cache_bytes - previous_cache;
       if(unique_from_nodes > 0 && previous_cache < DiskBackedArray64::minimumCacheBytes())
       {
-        throw std::runtime_error("GCSA::GCSA(): memory limit cannot hold previous-occurrence cache");
+        throw FinalScanAdmissionError("GCSA::GCSA(): memory limit cannot hold previous-occurrence cache");
       }
       if(merged_graph.size() > 0 && stack_cache < DiskBackedArray64::minimumCacheBytes())
       {
-        throw std::runtime_error("GCSA::GCSA(): memory limit cannot hold suffix-tree stack cache");
+        throw FinalScanAdmissionError("GCSA::GCSA(): memory limit cannot hold suffix-tree stack cache");
       }
-      DiskBackedArray64 previous(previous_name, unique_from_nodes,
-        previous_cache, memory, true, 64 * KILOBYTE);
       // RETIRED, NOT REMOVED: the whole-graph capacity below.
       //
       // The array was sized at 3 * merged_graph.size() elements -- 9.59 GB for
@@ -2714,8 +2814,17 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
       size_type stack_capacity = (WHOLE_GRAPH_SUFFIX_TREE_STACK ?
         checkedProduct(merged_graph.size(), 3, "suffix-tree stack") :
         checkedProduct(distinct_lcp_values, 3, "suffix-tree stack"));
+      const bool resident_stack = (unique_from_nodes == 0 || memory.available() >=
+        stack_capacity * sizeof(std::uint64_t) + DiskBackedArray64::minimumCacheBytes());
       DiskBackedArray64 stack(stack_name, stack_capacity,
-        stack_cache, memory, true, 64 * KILOBYTE);
+        stack_cache, memory, true, 64 * KILOBYTE, resident_stack);
+      previous_cache = std::min(previous_cache, memory.available());
+      if(unique_from_nodes > 0 && previous_cache < DiskBackedArray64::minimumCacheBytes())
+      {
+        throw FinalScanAdmissionError("memory cannot hold previous-occurrence cache after stack admission");
+      }
+      DiskBackedArray64 previous(previous_name, unique_from_nodes,
+        previous_cache, memory, true, 64 * KILOBYTE, true);
 
       const size_type scan_read_start = DiskIO::read_volume;
       std::vector<MergedGraphReader> reader(graph.alpha.sigma + 1);
@@ -2744,7 +2853,8 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
         predecessor_source.init(merged_graph, reader_buffer);
       }
       ReadBuffer<merged_lcp_type> lcp_array;
-      lcp_array.open(merged_graph.lcp_name, reader_buffer, true);
+      openMergedRecords(lcp_array, merged_graph.lcp_store,
+            merged_graph.lcp_name, reader_buffer, true);
 
       PathLabel first, last;
       size_type stack_size = 0;
@@ -3221,8 +3331,11 @@ produceExternalFinalEvents(const MergedGraph& merged_graph,
     // The redundancy stream is committed unsorted: component construction
     // needs only its per-slot counts.
     writeFinalEventMetadata(files, metadata);
-    checkpointFinalEvents(workspace, files, metadata, checkpoint_buffer,
-      &event_checksums);
+    if(!files.adaptive() || parameters.getStopAfter() == "final-events")
+    {
+      checkpointFinalEvents(workspace, files, metadata, checkpoint_buffer,
+        &event_checksums);
+    }
   }
   catch(...)
   {
@@ -3314,7 +3427,7 @@ reportJoinStats(const ExternalPathJoinStats& join_stats)
               << join_stats.initial_runs << " join runs, "
               << join_stats.merge_operations << " join merges, "
               << join_stats.join_partitions << " join partitions, "
-              << join_stats.worker_processes << " worker processes, "
+              << join_stats.join_tasks << " join tasks, "
               << join_stats.restored_partitions << " restored partitions, "
               << join_stats.recursive_splits << " recursive splits, "
               << join_stats.label_sort_runs << " label runs, "
@@ -3558,24 +3671,55 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   }
 
   // Extract key and start-node facts. The legacy branch retains its historical
-  // vectors exactly. With a workspace, ExternalInputPreprocessor instead
-  // streams immutable record files through bounded sort/merge passes and
-  // checkpoints the reduced key/start streams for resume. Only the LCP support
+  // vectors. The external route keeps facts in the shared pool when they fit,
+  // or uses the established bounded sort/merge passes on genuine overflow.
+  // Only the LCP support
   // is needed during prefix doubling; mapper, last-character, and start-node
   // supports are deliberately delayed so they do not inflate the longest and
   // largest spill phase's resident set.
+  std::unique_ptr<MemoryBudget> merge_memory;
+  if(parameters.externalMemory())
+  {
+    // All live merge buffers share the configured target. Charge their actual
+    // allocations instead of withholding a fixed fraction or equal worker quotas.
+    merge_memory.reset(new MemoryBudget(parameters.getMemoryLimitBytes()));
+  }
+  std::unique_ptr<ExternalInputPreprocessor> external_preprocessor;
+  auto reserve_merge_support = [&](size_type bytes, const std::string& task)
+    -> MemoryBudget::Reservation
+  {
+    if(!merge_memory) { return MemoryBudget::Reservation(); }
+    MemoryBudget::Reservation result = merge_memory->tryReserve(bytes, task);
+    if(!result && external_preprocessor)
+    {
+      external_preprocessor->spillFacts();
+      result = merge_memory->tryReserve(bytes, task);
+    }
+    if(!result)
+    {
+      std::ostringstream message;
+      message << "GCSA construction: " << task << " requires " << bytes
+              << " bytes, but only " << merge_memory->available() << " are available";
+      throw std::runtime_error(message.str());
+    }
+    return result;
+  };
+  MemoryBudget::Reservation merge_lcp_memory, merge_mapper_memory;
+  MemoryBudget::Reservation merge_last_memory, merge_start_memory;
   DeBruijnGraph mapper;
   LCP lcp;
   sdsl::int_vector<0> last_char;
   sdsl::sd_vector<> from_nodes;
   size_type unique_from_nodes = 0;
-  std::unique_ptr<ExternalInputPreprocessor> external_preprocessor;
   sdsl::int_vector<0> distinct_labels;
   if(parameters.externalMemory())
   {
     external_preprocessor.reset(new ExternalInputPreprocessor(graph, parameters,
-      workspace.get()));
+      workspace.get(), merge_memory.get()));
+    merge_lcp_memory = reserve_merge_support(external_preprocessor->lcpMemoryBytes(),
+      "merge LCP construction");
     external_preprocessor->buildLCP(lcp);
+    merge_lcp_memory.shrinkTo(sdsl::size_in_bytes(lcp.kmer_lcp));
   }
   else
   {
@@ -3603,6 +3747,21 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   // Create or restore the initial PathGraph. Resumption still rebuilds the
   // compact key/LCP support above, but never repeats a committed doubling phase.
   PathGraph path_graph(0, graph.k(), 0);
+  const auto checkpoint_needed = [&](const std::string& stop_phase)
+  {
+    if(parameters.getStopAfter() == stop_phase) { return true; }
+    // Resident frontiers are deliberately recomputable after a crash. A task
+    // marker must never imply that their payload has reached durable storage.
+    for(const auto& store : path_graph.path_stores)
+    {
+      if(store && !store->spilled()) { return false; }
+    }
+    for(const auto& store : path_graph.rank_stores)
+    {
+      if(store && !store->spilled()) { return false; }
+    }
+    return true;
+  };
   const auto checkpoint_path_graph = [&](const std::string& task,
       const std::string& phase) {
     const std::uint64_t scan_before =
@@ -3701,7 +3860,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
       initial_graph.swap(legacy_initial);
     }
     path_graph.swap(initial_graph);
-    if(workspace)
+    if(workspace && checkpoint_needed("initial"))
     {
       checkpoint_path_graph("initial", "paths");
       frontier_task = "initial"; frontier_phase = "paths";
@@ -3734,7 +3893,12 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     {
       size_type prune_buffer = pathMergeInputBudget(parameters, path_graph);
       PathGraphMergeStats merge_stats;
-      const size_type merge_inputs = path_graph.files();
+      size_type merge_inputs = 0;
+      for(size_type file = 0; file < path_graph.files(); file++)
+      {
+        if(file >= path_graph.path_stores.size() || !path_graph.path_stores[file] ||
+           !path_graph.path_stores[file]->resident()) { merge_inputs++; }
+      }
       // Parallel prune may retain several physical shards for one logical
       // input. The external extender joins across those shards by logical id;
       // legacy PathGraph::extend() still joins only within each physical file.
@@ -3746,7 +3910,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
       path_graph.prune(lcp, path_graph.remainingLimit(parameters.getLimitBytes()),
         prune_buffer, &merge_stats, parameters.getMaxOpenFiles(),
         pathMergeInputCacheBudget(parameters, path_graph),
-        prune_workers, parameters.getConcurrentOpenFiles());
+        prune_workers, parameters.getConcurrentOpenFiles(), merge_memory.get());
       const double prune_stop = readTimer();
       if(Verbosity::level >= Verbosity::BASIC)
       {
@@ -3776,7 +3940,7 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
                   << " to about " << (4 * merge_inputs + 2) << "." << std::endl;
       }
       reportPruneMergeStats(merge_stats);
-      if(workspace)
+      if(workspace && checkpoint_needed(task + "-prune"))
       {
         checkpoint_path_graph(task, "prune");
         if(parameters.getCleanObsolete() && !frontier_task.empty())
@@ -3790,18 +3954,25 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     restored_prune = false;
     if(parameters.externalMemory())
     {
-      ExternalPathJoinStats join_stats;
-      externalPathGraphExtend(path_graph,
-        path_graph.remainingLimit(parameters.getLimitBytes()), parameters, &join_stats,
-        workspace.get(), task);
-      reportJoinStats(join_stats);
+      // Keep the complete logical join resident when its live generation fits.
+      const bool resident_extend = path_graph.tryExtendResident(
+        path_graph.remainingLimit(parameters.getLimitBytes()), *merge_memory);
+      if(!resident_extend)
+      {
+        path_graph.materialize();
+        ExternalPathJoinStats join_stats;
+        externalPathGraphExtend(path_graph,
+          path_graph.remainingLimit(parameters.getLimitBytes()), parameters, &join_stats,
+          workspace.get(), task);
+        reportJoinStats(join_stats);
+      }
     }
     else
     {
       path_graph.extend(path_graph.remainingLimit(parameters.getLimitBytes()),
         parameters.getMemoryLimitBytes());
     }
-    if(workspace)
+    if(workspace && checkpoint_needed(task + "-extend"))
     {
       checkpoint_path_graph(task, "extend");
       if(parameters.getCleanObsolete() && !frontier_task.empty())
@@ -3844,7 +4015,12 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     // event scan. Build it after doubling rather than carrying it through all
     // generated path generations.
     SubPhaseProbe mapper_probe("merge/mapper");
+    const size_type mapper_peak = external_preprocessor->mapperMemoryBytes();
+    if(mapper_peak > merge_memory->available()) { external_preprocessor->spillFacts(); }
+    if(mapper_peak > merge_memory->available()) { path_graph.materialize(); }
+    merge_mapper_memory = reserve_merge_support(mapper_peak, "merge de Bruijn graph construction");
     external_preprocessor->buildMapper(mapper);
+    merge_mapper_memory.shrinkTo(sdsl::size_in_bytes(mapper));
     mapper_probe.report();
   }
   size_type merge_buffer = pathMergeInputBudget(parameters, path_graph);
@@ -3870,13 +4046,14 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   MergedGraph merged_graph(path_graph, mapper, lcp,
     path_graph.remainingLimit(parameters.getLimitBytes()), merge_buffer,
     &final_merge_stats, parameters.getMaxOpenFiles(), merge_cache,
-    (framed_merge ? &merge_codec : nullptr));
+    (framed_merge ? &merge_codec : nullptr), merge_memory.get());
   merge_probe.report();
   reportFinalMergeStats(final_merge_stats);
   this->header.path_nodes = merged_graph.size();
   this->header.order = merged_graph.k();
   path_graph.clear();
   sdsl::util::clear(lcp);
+  merge_lcp_memory = MemoryBudget::Reservation();
   if(Verbosity::level >= Verbosity::EXTENDED)
   {
     double stop = readTimer();
@@ -3891,12 +4068,56 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   // merged graph owns is removed. A configured stop always precedes the end
   // of construction, where the LCP array would be published, so a stopping
   // build starts no thread.
+  const auto make_support_room = [&](size_type bytes)
+  {
+    if(bytes > merge_memory->available() && external_preprocessor)
+    {
+      external_preprocessor->spillFacts();
+    }
+    const auto spill = [&](auto& store, std::string& name)
+    {
+      if(bytes > merge_memory->available() && store && !store->spilled())
+      {
+        name = store->materialize(); store->releaseMaterializedFile();
+      }
+    };
+    // These streams have not acquired readers yet. Spill only as many live
+    // payloads as the next mandatory support's admitted peak actually needs.
+    spill(merged_graph.lcp_store, merged_graph.lcp_name);
+    spill(merged_graph.from_store, merged_graph.from_name);
+    spill(merged_graph.rank_store, merged_graph.rank_name);
+    spill(merged_graph.path_store, merged_graph.path_name);
+  };
+  if(parameters.externalMemory())
+  {
+    const size_type last_peak = external_preprocessor->lastCharacterMemoryBytes();
+    make_support_room(last_peak);
+    merge_last_memory = reserve_merge_support(last_peak, "final last characters");
+    external_preprocessor->buildLastCharacters(last_char);
+    merge_last_memory.shrinkTo(sdsl::size_in_bytes(last_char));
+    const size_type starts_peak = external_preprocessor->startNodeMemoryBytes();
+    make_support_room(starts_peak);
+    merge_start_memory = reserve_merge_support(starts_peak, "final start-node construction");
+    external_preprocessor->buildStartNodes(from_nodes);
+    merge_start_memory.shrinkTo(sdsl::size_in_bytes(from_nodes));
+    unique_from_nodes = external_preprocessor->startNodeCount();
+    external_preprocessor.reset();
+  }
   ConcurrentLCPBuild concurrent_lcp;
   if(lcp_output != nullptr && parameters.getStopAfter().empty())
   {
-    TempFile::remove(graph.lcp_name);
-    graph.lcp_name = merged_graph.lcp_name;
-    concurrent_lcp.start(graph, parameters, *lcp_output);
+    if(merged_graph.lcp_store)
+    {
+      make_support_room(ConcurrentLCPBuild::minimumMemoryBytes(merged_graph.lcp_store, parameters));
+      concurrent_lcp.start(merged_graph.lcp_store, parameters, *merge_memory, *lcp_output);
+    }
+    else
+    {
+      TempFile::remove(graph.lcp_name);
+      graph.lcp_name = merged_graph.lcp_name;
+      if(merge_memory) { make_support_room(131 * sizeof(size_type) + KILOBYTE); }
+      concurrent_lcp.start(graph, parameters, *lcp_output, merge_memory.get());
+    }
     if(Verbosity::level >= Verbosity::EXTENDED)
     {
       std::cerr << "GCSA::GCSA(): Building the LCP array during the final-event scan"
@@ -3905,6 +4126,22 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   }
 
   // Structures used for building GCSA.
+  bool lcp_joined = false;
+  const auto wait_lcp = [&]()
+  {
+    if(!concurrent_lcp.started() || lcp_joined) { return; }
+    SubPhaseProbe lcp_probe("construct/lcp-join");
+    concurrent_lcp.wait(); lcp_joined = true;
+    lcp_probe.report();
+  };
+  const auto release_lcp_leaf = [&]()
+  {
+    // A resident store owns its overflow file; an explicitly materialized
+    // leaf may instead be borrowed by the store and owned by MergedGraph.
+    // Both the LCP builder and event scan must have finished consuming it.
+    merged_graph.lcp_store.reset();
+    TempFile::remove(merged_graph.lcp_name); merged_graph.lcp_name.clear();
+  };
   if(Verbosity::level >= Verbosity::BASIC)
   {
     std::cerr << "GCSA::GCSA(): Building the index" << std::endl;
@@ -3918,16 +4155,31 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     // structures during prefix doubling. The external scan takes its start-node
     // ranks from sd_vector::successor, so it needs no rank support at all --
     // only the legacy route below builds one.
-    external_preprocessor->buildLastCharacters(last_char);
-    external_preprocessor->buildStartNodes(from_nodes);
-    unique_from_nodes = external_preprocessor->startNodeCount();
 
-    FinalEventFiles event_files(graph.alpha.sigma);
+    FinalEventFiles event_files(graph.alpha.sigma, merge_memory.get());
+    if(parameters.getTempFileCodecParameters().compression == TempCompression::ZSTD)
+    {
+      event_files.useFileBacked();
+    }
     ExternalFinalScanStats event_stats;
     SubPhaseProbe events_probe("construct/final-event-scan");
-    FinalEventMetadata event_metadata = produceExternalFinalEvents(merged_graph,
-      mapper, last_char, from_nodes, unique_from_nodes, graph,
-      parameters, *workspace, event_files, checkpoint_buffer, &event_stats);
+    const auto scan = [&]()
+    {
+      return produceExternalFinalEvents(merged_graph, mapper, last_char, from_nodes,
+        unique_from_nodes, graph, parameters, *workspace, event_files,
+        checkpoint_buffer, *merge_memory, &event_stats);
+    };
+    FinalEventMetadata event_metadata;
+    try { event_metadata = scan(); }
+    catch(const FinalScanAdmissionError&)
+    {
+      // A transient LCP level is not a proof that the scan cannot fit. No
+      // event has been emitted at these gates; all scratch has unwound.
+      wait_lcp();
+      make_support_room(finalScanMinimumBytes(graph.alpha.sigma));
+      event_stats = ExternalFinalScanStats();
+      event_metadata = scan();
+    }
     events_probe.report();
     stopAfterCommittedPhase(parameters, "final-events");
 
@@ -3935,13 +4187,40 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
     // Releasing them before component assembly is an important part of the
     // working-set reduction.
     sdsl::util::clear(last_char); sdsl::util::clear(from_nodes);
+    merge_last_memory = MemoryBudget::Reservation();
+    merge_start_memory = MemoryBudget::Reservation();
     sdsl::util::clear(mapper);
+    merge_mapper_memory = MemoryBudget::Reservation();
+    merged_graph.path_store.reset(); merged_graph.rank_store.reset();
+    merged_graph.from_store.reset();
+    // Keep LCP overlapped with the expensive scan, then release its levels
+    // and leaf before admitting component encoders from the same pool.
+    wait_lcp();
+    if(concurrent_lcp.started()) { release_lcp_leaf(); }
+    const size_type component_minimum = finalComponentMinimumMemory(
+      event_files, event_metadata, parameters);
+    make_support_room(component_minimum);
+    std::vector<std::shared_ptr<FinalEventStore>> event_stores =
+      event_files.edge_destination_stores;
+    event_stores.insert(event_stores.end(), { event_files.metadata_store,
+      event_files.bwt_masks_store, event_files.sample_positions_store,
+      event_files.sample_ids_store, event_files.sample_ends_store,
+      event_files.occurrences_store, event_files.redundant_store });
+    std::sort(event_stores.begin(), event_stores.end(), [](const auto& a, const auto& b)
+    {
+      return (a ? a->capacity() : 0) > (b ? b->capacity() : 0);
+    });
+    for(const auto& store : event_stores)
+    {
+      if(merge_memory->available() >= component_minimum) { break; }
+      if(store && store->resident()) { store->materialize(); }
+    }
     this->header.edges = event_metadata.total_edges;
     if(direct_output != nullptr)
     {
       SubPhaseProbe store_probe("construct/store-components");
       storeFinalComponents(this->header, graph.alpha, event_files,
-        event_metadata, parameters, *direct_output);
+        event_metadata, parameters, *direct_output, nullptr, merge_memory.get());
       store_probe.report();
     }
     else
@@ -3990,7 +4269,9 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   {
     reader[comp + 1].init(merged_graph, comp);
   }
-  ReadBuffer<uint8_t> lcp_array; lcp_array.open(merged_graph.lcp_name);
+  ReadBuffer<uint8_t> lcp_array;
+  openMergedRecords(lcp_array, merged_graph.lcp_store, merged_graph.lcp_name,
+    ReadBuffer<uint8_t>::DEFAULT_BUFFER_BYTES, false);
 
   // The actual construction.
   PathLabel first, last;
@@ -4142,16 +4423,22 @@ GCSA::GCSA(InputGraph& graph, const ConstructionParameters& parameters,
   // after the builder has finished reading the file.
   if(concurrent_lcp.started())
   {
-    SubPhaseProbe lcp_probe("construct/lcp-join");
-    concurrent_lcp.finish();
-    lcp_probe.report();
-    merged_graph.lcp_name.clear();
+    wait_lcp(); concurrent_lcp.finish(); release_lcp_leaf();
   }
   else
   {
     TempFile::remove(graph.lcp_name);
-    graph.lcp_name = merged_graph.lcp_name;
-    merged_graph.lcp_name.clear();
+    if(merged_graph.lcp_store)
+    {
+      graph.lcp_name = merged_graph.lcp_store->materialize();
+      merged_graph.lcp_store->releaseMaterializedFile();
+      merged_graph.lcp_store.reset();
+    }
+    else
+    {
+      graph.lcp_name = merged_graph.lcp_name;
+      merged_graph.lcp_name.clear();
+    }
     if(lcp_output != nullptr) { LCPArray::buildAndStore(graph, parameters, *lcp_output); }
   }
 

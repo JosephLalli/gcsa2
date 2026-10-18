@@ -15,12 +15,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <cerrno>
-#include <csignal>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
-#include <dirent.h>
 #include <exception>
 #include <fcntl.h>
 #include <fstream>
@@ -30,14 +28,10 @@
 #include <memory>
 #include <mutex>
 #include <queue>
-#include <spawn.h>
 #include <stdexcept>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <system_error>
 #include <unistd.h>
-
-extern char** environ;
 
 namespace gcsa
 {
@@ -1294,7 +1288,7 @@ boundedJoinRunCodec(const TempFileCodecParameters& requested,
       // This is the join sorter's own phase share. The concurrently active
       // label sorter has an independent reservation outside this ceiling.
       if(joinRunSortMinimumBudget(result) > join_sort_budget) { return false; }
-      // With process workers the runs this block produces are consumed by
+      // With threaded join tasks the runs this block produces are consumed by
       // planJoinPartitions(), which opens two run readers and four sidecar
       // readers against the whole memory budget. Admitting a block the sorter
       // fits but the planner does not built every run and sidecar and then
@@ -2199,16 +2193,16 @@ private:
   they run in, or if they run at once. The only shared mutable state is the
   statistics pointer.
 
-  That matters because distribution is serial and precedes the worker phase
+  That matters because distribution is serial and precedes the join-task phase
   entirely: measured on chr2's step-1 join, one core at 0.784 utilisation
   produced 13.2 MB/s while the device sat at 1.6% and 95 cores idled.
-  --gcsa-process-workers does not apply until distribution has finished.
+  Threaded partition joins do not begin until distribution has finished.
 
   Each side therefore gets its own statistics object, merged here. Adding every
   field is correct rather than merely convenient: a field neither scan touches
   is zero in both copies. The scans touch left_records / right_records (one
   each, disjoint) and, through ExternalJoinSorter, initial_runs and
-  join_parallel_sorts. The six fields below are maxima or phase settings, not
+  join_parallel_sorts. The seven fields below are maxima or phase settings, not
   counts, so they take the larger value instead.
 */
 void
@@ -2216,10 +2210,11 @@ mergeJoinScanStats(ExternalPathJoinStats& into, const ExternalPathJoinStats& fro
 {
   static_assert(sizeof(ExternalPathJoinStats) % sizeof(size_type) == 0,
     "ExternalPathJoinStats must be a flat block of size_type counters");
-  // Capture the six non-additive fields before the sweep, because the sweep
+  // Capture the seven non-additive fields before the sweep, because the sweep
   // covers every field and would otherwise leave them holding into + from.
   const size_type max_records = into.max_records_resident;
   const size_type max_bytes = into.max_bytes_resident;
+  const size_type join_concurrency = into.join_concurrency;
   const size_type radix_bits = into.radix_plan_max_bits;
   const size_type distribution_budget = into.distribution_sort_budget;
   const size_type label_budget = into.label_sort_budget;
@@ -2232,6 +2227,7 @@ mergeJoinScanStats(ExternalPathJoinStats& into, const ExternalPathJoinStats& fro
 
   into.max_records_resident = std::max(max_records, from.max_records_resident);
   into.max_bytes_resident = std::max(max_bytes, from.max_bytes_resident);
+  into.join_concurrency = std::max(join_concurrency, from.join_concurrency);
   into.radix_plan_max_bits = std::max(radix_bits, from.radix_plan_max_bits);
   into.distribution_sort_budget =
     std::max(distribution_budget, from.distribution_sort_budget);
@@ -2532,7 +2528,7 @@ joinSortedRuns(const JoinRun& left_run, const JoinRun& right_run,
   right_end = std::min(right_end, right.size());
   if(left_begin > left_end || right_begin > right_end)
   {
-    throw joinError("invalid worker join range");
+    throw joinError("invalid join-task range");
   }
   if(stats != nullptr)
   {
@@ -3686,7 +3682,7 @@ planJoinPartitions(const JoinRun& left_run, const JoinRun& right_run,
       group_input_bytes > target_bytes ||
       group_ranks > (static_cast<size_type>(1) << 40));
     // The bounded histogram lets a repeated semantic key begin range tiling
-    // before it monopolizes an otherwise balanced worker task. Exact counts
+    // before it monopolizes an otherwise balanced join task. Exact counts
     // above still decide the output contract and retain logical-file identity.
     bool sampled_heavy_group = (selected_left != nullptr && selected_right != nullptr &&
       std::binary_search(radix_plan.heavy_keys.begin(),
@@ -3766,397 +3762,99 @@ planJoinPartitions(const JoinRun& left_run, const JoinRun& right_run,
   return result;
 }
 
-constexpr std::uint64_t WORKER_TASK_MAGIC = 0x314b535441534347ULL;   // "GCSATSK1"
-constexpr std::uint64_t WORKER_RESULT_MAGIC = 0x3153455241534347ULL; // "GCSARES1"
-constexpr std::uint32_t WORKER_FORMAT_VERSION = 6;
-constexpr size_type WORKER_CONTROL_LIMIT = MEGABYTE;
-
-struct ExternalJoinWorkerTask
+struct ExternalJoinTask
 {
   logical_file_id_t logical;
   JoinRun left, right;
   JoinPartition partition;
-  std::string output_path, output_rank, temp_directory;
-  size_type sort_budget, join_block_budget, fan_in, threads;
+  std::string output_path, output_rank;
+  size_type sort_budget, join_block_budget, fan_in;
   TempFileCodecParameters codec;
   bool verify_payloads;
 };
 
-struct ExternalJoinWorkerResult
+struct ExternalJoinTaskResult
 {
   ClosedPayloadChecksum path_checksum, rank_checksum;
   size_type paths, ranks, bytes, stored_bytes;
   size_type generated, bypassed, label_runs, label_merge_passes, label_parallel_sorts;
   size_type grouped_records, group_headers, context_bytes_saved;
-  size_type max_records, max_bytes, blocks, bytes_read, bytes_written;
+  size_type max_records, max_bytes, blocks;
 
-  ExternalJoinWorkerResult() : paths(0), ranks(0), bytes(0), stored_bytes(0), generated(0),
+  ExternalJoinTaskResult() : paths(0), ranks(0), bytes(0), stored_bytes(0), generated(0),
     bypassed(0), label_runs(0), label_merge_passes(0), label_parallel_sorts(0),
     grouped_records(0), group_headers(0), context_bytes_saved(0),
-    max_records(0), max_bytes(0), blocks(0), bytes_read(0), bytes_written(0) { }
+    max_records(0), max_bytes(0), blocks(0) { }
 };
 
-template<class Value>
-void
-appendWorkerValue(std::vector<std::uint8_t>& target, Value value)
+ExternalJoinTaskResult
+runExternalJoinTask(const ExternalJoinTask& task)
 {
-  size_type old_size = target.size();
-  target.resize(old_size + sizeof(Value));
-  std::uint8_t* output = target.data() + old_size;
-  encodeLittle<Value>(output, value);
-}
-
-void
-appendWorkerString(std::vector<std::uint8_t>& target, const std::string& value)
-{
-  appendWorkerValue<std::uint64_t>(target, value.size());
-  target.insert(target.end(), value.begin(), value.end());
-}
-
-template<class Value>
-Value
-readWorkerValue(const std::vector<std::uint8_t>& source, size_type& offset)
-{
-  if(offset > source.size() || sizeof(Value) > source.size() - offset)
+  if(task.partition.left_end > task.left.records ||
+     task.partition.right_end > task.right.records ||
+     task.partition.left_begin > task.partition.left_end ||
+     task.partition.right_begin > task.partition.right_end)
   {
-    throw joinError("truncated worker control file");
+    throw joinError("join task range exceeds its immutable input run");
   }
-  const std::uint8_t* input = source.data() + offset;
-  Value result = decodeLittle<Value>(input);
-  offset += sizeof(Value); return result;
-}
+  if(task.partition.expected_ranks > (static_cast<size_type>(1) << 40))
+  {
+    throw joinError("join task partition exceeds the 40-bit rank pointer range");
+  }
 
-std::string
-readWorkerString(const std::vector<std::uint8_t>& source, size_type& offset)
-{
-  size_type length = readWorkerValue<std::uint64_t>(source, offset);
-  if(offset > source.size() || length > source.size() - offset)
-  {
-    throw joinError("truncated worker control string");
-  }
-  std::string result(reinterpret_cast<const char*>(source.data() + offset), length);
-  offset += length; return result;
-}
+  ::unlink(task.output_path.c_str()); ::unlink(task.output_rank.c_str());
+  ::unlink((task.output_path + ".partial").c_str());
+  ::unlink((task.output_rank + ".partial").c_str());
 
-std::vector<std::uint8_t>
-readWorkerControl(const std::string& path)
-{
-  std::ifstream input(path.c_str(), std::ios_base::binary);
-  if(!input) { throw joinError("cannot open worker control file", path); }
-  input.seekg(0, std::ios_base::end);
-  std::streamoff end = input.tellg();
-  if(end < 0 || static_cast<size_type>(end) > WORKER_CONTROL_LIMIT)
+  PathGraph output(1, 0, 0);
+  TempFile::remove(output.path_names[0]); TempFile::remove(output.rank_names[0]);
+  output.path_names[0] = task.output_path;
+  output.rank_names[0] = task.output_rank;
+  output.logical_file_ids[0] = task.logical;
+  size_type committed_bytes = 0;
+  ExternalPathSortStats sort_stats;
+  ExternalPathJoinStats join_stats;
+  const size_type peak_output_bytes = externalPathGraphShardPeakBytes(
+    task.partition.expected_paths, task.partition.expected_ranks,
+    task.sort_budget, task.codec);
+  ExternalPathSortSink sink(output, 0, task.sort_budget, task.fan_in,
+    peak_output_bytes, committed_bytes, &sort_stats, task.codec);
+  joinSortedRuns(task.left, task.right, task.logical, task.join_block_budget,
+    sink, task.verify_payloads, &join_stats,
+    task.partition.left_begin, task.partition.left_end,
+    task.partition.right_begin, task.partition.right_end,
+    task.partition.emit_bypass);
+  sink.finish();
+  if(output.path_counts[0] != task.partition.expected_paths ||
+     output.rank_counts[0] != task.partition.expected_ranks ||
+     sink.bytes() != task.partition.expected_bytes ||
+     join_stats.generated_records != task.partition.generated_paths ||
+     join_stats.sorted_bypass != task.partition.bypass_paths)
   {
-    throw joinError("invalid worker control file size", path);
+    throw joinError("join task output does not match its deterministic partition plan");
   }
-  input.seekg(0, std::ios_base::beg);
-  std::vector<std::uint8_t> result(static_cast<size_type>(end));
-  if(!result.empty() && !DiskIO::read(input, result.data(), result.size()))
-  {
-    throw joinError("short worker control file", path);
-  }
+
+  ExternalJoinTaskResult result;
+  result.paths = output.path_counts[0]; result.ranks = output.rank_counts[0];
+  result.bytes = sink.bytes(); result.stored_bytes = sink.storedBytes();
+  result.path_checksum = output.path_checksums.at(0);
+  result.rank_checksum = output.rank_checksums.at(0);
+  result.generated = join_stats.generated_records;
+  result.bypassed = join_stats.sorted_bypass; result.label_runs = sort_stats.runs;
+  result.label_merge_passes = sort_stats.merge_passes;
+  result.label_parallel_sorts = sort_stats.parallel_sorts;
+  result.grouped_records = sort_stats.grouped_records;
+  result.group_headers = sort_stats.group_headers;
+  result.context_bytes_saved = sort_stats.context_bytes_saved;
+  result.max_records = sort_stats.max_records_resident;
+  result.max_bytes = checkedJoinAdd(sort_stats.max_bytes_resident,
+    join_stats.max_bytes_resident, "task combined resident bytes");
+  result.blocks = join_stats.blocked_key_blocks;
+  // The coordinator owns these completed files and will either admit them into
+  // the next PathGraph or remove them while unwinding another task's failure.
+  output.delete_files = false;
   return result;
 }
-
-void
-writeWorkerControl(const std::string& path, const std::vector<std::uint8_t>& data)
-{
-  std::string partial = path + "." +
-    std::to_string(static_cast<unsigned long long>(getpid())) + ".partial";
-  int descriptor = ::open(partial.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
-  if(descriptor < 0) { throw joinError("cannot create worker control file", partial); }
-  try
-  {
-    writeAll(descriptor, data.data(), data.size(), partial);
-    if(::fdatasync(descriptor) != 0) { throw joinError("cannot sync worker control file", partial); }
-    if(::close(descriptor) != 0) { descriptor = -1; throw joinError("cannot close worker control file", partial); }
-    descriptor = -1;
-    if(::rename(partial.c_str(), path.c_str()) != 0)
-    {
-      throw joinError("cannot publish worker control file", path);
-    }
-  }
-  catch(...)
-  {
-    if(descriptor >= 0) { ::close(descriptor); }
-    ::unlink(partial.c_str()); throw;
-  }
-}
-
-std::vector<std::uint8_t>
-encodeWorkerTask(const ExternalJoinWorkerTask& task)
-{
-  std::vector<std::uint8_t> data;
-  appendWorkerValue<std::uint64_t>(data, WORKER_TASK_MAGIC);
-  appendWorkerValue<std::uint32_t>(data, WORKER_FORMAT_VERSION);
-  appendWorkerValue<std::uint32_t>(data, task.logical.value);
-  appendWorkerValue<std::uint64_t>(data, task.left.records);
-  appendWorkerValue<std::uint64_t>(data, task.right.records);
-  appendWorkerValue<std::uint64_t>(data, task.left.checksum);
-  appendWorkerValue<std::uint64_t>(data, task.right.checksum);
-  appendWorkerValue<std::uint64_t>(data, task.partition.left_begin);
-  appendWorkerValue<std::uint64_t>(data, task.partition.left_end);
-  appendWorkerValue<std::uint64_t>(data, task.partition.right_begin);
-  appendWorkerValue<std::uint64_t>(data, task.partition.right_end);
-  appendWorkerValue<std::uint64_t>(data, task.partition.expected_paths);
-  appendWorkerValue<std::uint64_t>(data, task.partition.expected_ranks);
-  appendWorkerValue<std::uint64_t>(data, task.partition.expected_bytes);
-  appendWorkerValue<std::uint64_t>(data, task.partition.generated_paths);
-  appendWorkerValue<std::uint64_t>(data, task.partition.bypass_paths);
-  appendWorkerValue<std::uint64_t>(data, task.sort_budget);
-  appendWorkerValue<std::uint64_t>(data, task.join_block_budget);
-  appendWorkerValue<std::uint64_t>(data, task.fan_in);
-  appendWorkerValue<std::uint64_t>(data, task.threads);
-  appendWorkerValue<std::uint8_t>(data,
-    static_cast<std::uint8_t>(task.codec.compression));
-  appendWorkerValue<std::uint64_t>(data, task.codec.block_size);
-  appendWorkerValue<std::uint64_t>(data, task.codec.workers);
-  appendWorkerValue<std::uint32_t>(data,
-    static_cast<std::uint32_t>(static_cast<std::int32_t>(task.codec.level)));
-  appendWorkerValue<std::uint8_t>(data, task.partition.emit_bypass ? 1 : 0);
-  appendWorkerValue<std::uint8_t>(data, task.verify_payloads ? 1 : 0);
-  appendWorkerString(data, task.left.name);
-  appendWorkerString(data, task.right.name);
-  appendWorkerString(data, task.output_path);
-  appendWorkerString(data, task.output_rank);
-  appendWorkerString(data, task.temp_directory);
-  return data;
-}
-
-ExternalJoinWorkerTask
-decodeWorkerTask(const std::vector<std::uint8_t>& data)
-{
-  size_type offset = 0;
-  if(readWorkerValue<std::uint64_t>(data, offset) != WORKER_TASK_MAGIC ||
-     readWorkerValue<std::uint32_t>(data, offset) != WORKER_FORMAT_VERSION)
-  {
-    throw joinError("incompatible worker task format");
-  }
-  ExternalJoinWorkerTask task;
-  task.logical = logical_file_id_t(readWorkerValue<std::uint32_t>(data, offset));
-  task.left.records = readWorkerValue<std::uint64_t>(data, offset);
-  task.right.records = readWorkerValue<std::uint64_t>(data, offset);
-  task.left.checksum = readWorkerValue<std::uint64_t>(data, offset);
-  task.right.checksum = readWorkerValue<std::uint64_t>(data, offset);
-  task.partition.left_begin = readWorkerValue<std::uint64_t>(data, offset);
-  task.partition.left_end = readWorkerValue<std::uint64_t>(data, offset);
-  task.partition.right_begin = readWorkerValue<std::uint64_t>(data, offset);
-  task.partition.right_end = readWorkerValue<std::uint64_t>(data, offset);
-  task.partition.expected_paths = readWorkerValue<std::uint64_t>(data, offset);
-  task.partition.expected_ranks = readWorkerValue<std::uint64_t>(data, offset);
-  task.partition.expected_bytes = readWorkerValue<std::uint64_t>(data, offset);
-  task.partition.generated_paths = readWorkerValue<std::uint64_t>(data, offset);
-  task.partition.bypass_paths = readWorkerValue<std::uint64_t>(data, offset);
-  task.sort_budget = readWorkerValue<std::uint64_t>(data, offset);
-  task.join_block_budget = readWorkerValue<std::uint64_t>(data, offset);
-  task.fan_in = readWorkerValue<std::uint64_t>(data, offset);
-  task.threads = readWorkerValue<std::uint64_t>(data, offset);
-  const std::uint8_t compression = readWorkerValue<std::uint8_t>(data, offset);
-  if(compression > static_cast<std::uint8_t>(TempCompression::ZSTD))
-  {
-    throw joinError("invalid temporary compression mode in worker task");
-  }
-  task.codec.compression = static_cast<TempCompression>(compression);
-  task.codec.block_size = readWorkerValue<std::uint64_t>(data, offset);
-  task.codec.workers = readWorkerValue<std::uint64_t>(data, offset);
-  task.codec.level = static_cast<std::int32_t>(
-    readWorkerValue<std::uint32_t>(data, offset));
-  if(task.codec.block_size == 0 || task.codec.workers == 0 ||
-     task.codec.level < -5 || task.codec.level > 22)
-  {
-    throw joinError("invalid temporary compression settings in worker task");
-  }
-  task.partition.emit_bypass = (readWorkerValue<std::uint8_t>(data, offset) != 0);
-  task.verify_payloads = (readWorkerValue<std::uint8_t>(data, offset) != 0);
-  task.left.name = readWorkerString(data, offset);
-  task.right.name = readWorkerString(data, offset);
-  task.output_path = readWorkerString(data, offset);
-  task.output_rank = readWorkerString(data, offset);
-  task.temp_directory = readWorkerString(data, offset);
-  if(offset != data.size()) { throw joinError("worker task has trailing data"); }
-  return task;
-}
-
-void
-appendWorkerChecksum(std::vector<std::uint8_t>& data, const ClosedPayloadChecksum& digest)
-{
-  if(!digest.valid) { throw joinError("worker omitted closed-writer checksum"); }
-  appendWorkerValue<std::uint64_t>(data, digest.value);
-  appendWorkerValue<std::uint64_t>(data, digest.identity.st_dev);
-  appendWorkerValue<std::uint64_t>(data, digest.identity.st_ino);
-  appendWorkerValue<std::uint64_t>(data, digest.identity.st_size);
-  appendWorkerValue<std::uint64_t>(data, digest.identity.st_mtim.tv_sec);
-  appendWorkerValue<std::uint64_t>(data, digest.identity.st_mtim.tv_nsec);
-  appendWorkerValue<std::uint64_t>(data, digest.identity.st_ctim.tv_sec);
-  appendWorkerValue<std::uint64_t>(data, digest.identity.st_ctim.tv_nsec);
-}
-
-ClosedPayloadChecksum
-readWorkerChecksum(const std::vector<std::uint8_t>& data, size_type& offset)
-{
-  ClosedPayloadChecksum digest;
-  digest.value = readWorkerValue<std::uint64_t>(data, offset);
-  digest.identity.st_dev = readWorkerValue<std::uint64_t>(data, offset);
-  digest.identity.st_ino = readWorkerValue<std::uint64_t>(data, offset);
-  digest.identity.st_size = readWorkerValue<std::uint64_t>(data, offset);
-  digest.identity.st_mtim.tv_sec = readWorkerValue<std::uint64_t>(data, offset);
-  digest.identity.st_mtim.tv_nsec = readWorkerValue<std::uint64_t>(data, offset);
-  digest.identity.st_ctim.tv_sec = readWorkerValue<std::uint64_t>(data, offset);
-  digest.identity.st_ctim.tv_nsec = readWorkerValue<std::uint64_t>(data, offset);
-  digest.valid = true;
-  return digest;
-}
-
-std::vector<std::uint8_t>
-encodeWorkerResult(const ExternalJoinWorkerResult& result)
-{
-  std::vector<std::uint8_t> data;
-  appendWorkerValue<std::uint64_t>(data, WORKER_RESULT_MAGIC);
-  appendWorkerValue<std::uint32_t>(data, WORKER_FORMAT_VERSION);
-  appendWorkerValue<std::uint64_t>(data, result.paths);
-  appendWorkerValue<std::uint64_t>(data, result.ranks);
-  appendWorkerValue<std::uint64_t>(data, result.bytes);
-  appendWorkerValue<std::uint64_t>(data, result.stored_bytes);
-  appendWorkerValue<std::uint64_t>(data, result.generated);
-  appendWorkerValue<std::uint64_t>(data, result.bypassed);
-  appendWorkerValue<std::uint64_t>(data, result.label_runs);
-  appendWorkerValue<std::uint64_t>(data, result.label_merge_passes);
-  appendWorkerValue<std::uint64_t>(data, result.label_parallel_sorts);
-  appendWorkerValue<std::uint64_t>(data, result.grouped_records);
-  appendWorkerValue<std::uint64_t>(data, result.group_headers);
-  appendWorkerValue<std::uint64_t>(data, result.context_bytes_saved);
-  appendWorkerValue<std::uint64_t>(data, result.max_records);
-  appendWorkerValue<std::uint64_t>(data, result.max_bytes);
-  appendWorkerValue<std::uint64_t>(data, result.blocks);
-  appendWorkerValue<std::uint64_t>(data, result.bytes_read);
-  appendWorkerValue<std::uint64_t>(data, result.bytes_written);
-  appendWorkerChecksum(data, result.path_checksum);
-  appendWorkerChecksum(data, result.rank_checksum);
-  return data;
-}
-
-ExternalJoinWorkerResult
-decodeWorkerResult(const std::vector<std::uint8_t>& data)
-{
-  size_type offset = 0;
-  if(readWorkerValue<std::uint64_t>(data, offset) != WORKER_RESULT_MAGIC ||
-     readWorkerValue<std::uint32_t>(data, offset) != WORKER_FORMAT_VERSION)
-  {
-    throw joinError("incompatible worker result format");
-  }
-  ExternalJoinWorkerResult result;
-  result.paths = readWorkerValue<std::uint64_t>(data, offset);
-  result.ranks = readWorkerValue<std::uint64_t>(data, offset);
-  result.bytes = readWorkerValue<std::uint64_t>(data, offset);
-  result.stored_bytes = readWorkerValue<std::uint64_t>(data, offset);
-  result.generated = readWorkerValue<std::uint64_t>(data, offset);
-  result.bypassed = readWorkerValue<std::uint64_t>(data, offset);
-  result.label_runs = readWorkerValue<std::uint64_t>(data, offset);
-  result.label_merge_passes = readWorkerValue<std::uint64_t>(data, offset);
-  result.label_parallel_sorts = readWorkerValue<std::uint64_t>(data, offset);
-  result.grouped_records = readWorkerValue<std::uint64_t>(data, offset);
-  result.group_headers = readWorkerValue<std::uint64_t>(data, offset);
-  result.context_bytes_saved = readWorkerValue<std::uint64_t>(data, offset);
-  result.max_records = readWorkerValue<std::uint64_t>(data, offset);
-  result.max_bytes = readWorkerValue<std::uint64_t>(data, offset);
-  result.blocks = readWorkerValue<std::uint64_t>(data, offset);
-  result.bytes_read = readWorkerValue<std::uint64_t>(data, offset);
-  result.bytes_written = readWorkerValue<std::uint64_t>(data, offset);
-  result.path_checksum = readWorkerChecksum(data, offset);
-  result.rank_checksum = readWorkerChecksum(data, offset);
-  if(offset != data.size()) { throw joinError("worker result has trailing data"); }
-  return result;
-}
-
-} // namespace
-
-int
-externalPathJoinWorker(const std::string& task_file)
-{
-  try
-  {
-    ExternalJoinWorkerTask task = decodeWorkerTask(readWorkerControl(task_file));
-    if(task.partition.left_end > task.left.records ||
-       task.partition.right_end > task.right.records ||
-       task.partition.left_begin > task.partition.left_end ||
-       task.partition.right_begin > task.partition.right_end)
-    {
-      throw joinError("worker task range exceeds its immutable input run");
-    }
-    if(task.partition.expected_ranks > (static_cast<size_type>(1) << 40))
-    {
-      throw joinError("worker partition exceeds the 40-bit rank pointer range");
-    }
-    TempFile::setDirectory(task.temp_directory);
-    omp_set_num_threads(std::max(static_cast<size_type>(1), task.threads));
-    ::unlink(task.output_path.c_str()); ::unlink(task.output_rank.c_str());
-    ::unlink((task.output_path + ".partial").c_str());
-    ::unlink((task.output_rank + ".partial").c_str());
-    ::unlink((task_file + ".result").c_str());
-
-    size_type read_start = DiskIO::read_volume.load();
-    size_type write_start = DiskIO::write_volume.load();
-    PathGraph output(1, 0, 0);
-    TempFile::remove(output.path_names[0]); TempFile::remove(output.rank_names[0]);
-    output.path_names[0] = task.output_path;
-    output.rank_names[0] = task.output_rank;
-    output.logical_file_ids[0] = task.logical;
-    size_type committed_bytes = 0;
-    ExternalPathSortStats sort_stats;
-    ExternalPathJoinStats join_stats;
-    const size_type peak_output_bytes = externalPathGraphShardPeakBytes(
-      task.partition.expected_paths, task.partition.expected_ranks,
-      task.sort_budget, task.codec);
-    ExternalPathSortSink sink(output, 0, task.sort_budget, task.fan_in,
-      peak_output_bytes, committed_bytes, &sort_stats, task.codec);
-    joinSortedRuns(task.left, task.right, task.logical, task.join_block_budget,
-      sink, task.verify_payloads, &join_stats,
-      task.partition.left_begin, task.partition.left_end,
-      task.partition.right_begin, task.partition.right_end,
-      task.partition.emit_bypass);
-    sink.finish();
-    if(output.path_counts[0] != task.partition.expected_paths ||
-       output.rank_counts[0] != task.partition.expected_ranks ||
-       sink.bytes() != task.partition.expected_bytes ||
-       join_stats.generated_records != task.partition.generated_paths ||
-       join_stats.sorted_bypass != task.partition.bypass_paths)
-    {
-      throw joinError("worker output does not match its deterministic partition plan");
-    }
-
-    ExternalJoinWorkerResult result;
-    result.paths = output.path_counts[0]; result.ranks = output.rank_counts[0];
-    result.bytes = sink.bytes(); result.stored_bytes = sink.storedBytes();
-    result.path_checksum = output.path_checksums.at(0);
-    result.rank_checksum = output.rank_checksums.at(0);
-    result.generated = join_stats.generated_records;
-    result.bypassed = join_stats.sorted_bypass; result.label_runs = sort_stats.runs;
-    result.label_merge_passes = sort_stats.merge_passes;
-    result.label_parallel_sorts = sort_stats.parallel_sorts;
-    result.grouped_records = sort_stats.grouped_records;
-    result.group_headers = sort_stats.group_headers;
-    result.context_bytes_saved = sort_stats.context_bytes_saved;
-    result.max_records = sort_stats.max_records_resident;
-    result.max_bytes = checkedJoinAdd(sort_stats.max_bytes_resident,
-      join_stats.max_bytes_resident, "worker combined resident bytes");
-    result.blocks = join_stats.blocked_key_blocks;
-    result.bytes_read = DiskIO::read_volume.load() - read_start;
-    result.bytes_written = DiskIO::write_volume.load() - write_start;
-    // The parent owns these completed files and will either admit them into the
-    // next PathGraph or remove them if another worker fails.
-    output.delete_files = false;
-    writeWorkerControl(task_file + ".result", encodeWorkerResult(result));
-    return EXIT_SUCCESS;
-  }
-  catch(const std::exception& error)
-  {
-    std::cerr << "externalPathJoinWorker(): " << error.what() << std::endl;
-    return EXIT_FAILURE;
-  }
-}
-
-namespace
-{
 
 size_type
 appendOutputShard(PathGraph& graph, logical_file_id_t logical,
@@ -4949,7 +4647,7 @@ restoredJoinPartitionBytes(const BuildWorkspace& workspace,
     storedJoinBytes(workspace.artifact_path(
       joinPartitionArtifact(task, "ranks", "path-ranks-v1"), logical,
       physical_shard_id_t(0))),
-    "restored worker output bytes");
+    "restored join-task output bytes");
 }
 
 void
@@ -4972,60 +4670,14 @@ restoreJoinPartition(const BuildWorkspace& workspace, const std::string& task,
       physical_shard_id_t(0))), buffer_bytes, true);
 }
 
-struct ActiveJoinWorker
-{
-  pid_t pid;
-  size_type shard, maximum_stored_bytes;
-  JoinPartition partition;
-  std::string task_file, checkpoint_name;
-  MemoryBudget::Reservation reservation;
-
-  ActiveJoinWorker(pid_t process, size_type output_shard,
-    const JoinPartition& range, const std::string& task,
-    const std::string& checkpoint, size_type stored_limit,
-    MemoryBudget::Reservation memory) :
-    pid(process), shard(output_shard), maximum_stored_bytes(stored_limit),
-    partition(range), task_file(task),
-    checkpoint_name(checkpoint),
-    reservation(std::move(memory)) { }
-
-  ActiveJoinWorker(ActiveJoinWorker&&) = default;
-  ActiveJoinWorker& operator=(ActiveJoinWorker&&) = default;
-
-private:
-  ActiveJoinWorker(const ActiveJoinWorker&);
-  ActiveJoinWorker& operator=(const ActiveJoinWorker&);
-};
-
-pid_t
-spawnJoinWorker(const std::string& executable, const std::string& task_file)
-{
-  std::vector<std::string> arguments;
-  arguments.push_back(executable);
-  arguments.push_back("gcsa-worker-task");
-  arguments.push_back(task_file);
-  std::vector<char*> argv;
-  for(std::string& argument : arguments) { argv.push_back(&argument[0]); }
-  argv.push_back(nullptr);
-  pid_t child = -1;
-  int result = ::posix_spawnp(&child, executable.c_str(), nullptr, nullptr,
-    argv.data(), environ);
-  if(result != 0)
-  {
-    throw joinError("cannot spawn external join worker: " +
-      std::string(std::strerror(result)), executable);
-  }
-  return child;
-}
-
 void
-validateWorkerOutput(const std::string& path, size_type expected_bytes)
+validateTaskOutput(const std::string& path, size_type expected_bytes)
 {
   if(CompressedBlockReader::isFramed(path))
   {
     if(CompressedBlockReader::declaredLogicalSize(path) != expected_bytes)
     {
-      throw joinError("compressed worker output length mismatch", path);
+      throw joinError("compressed join-task output length mismatch", path);
     }
     return;
   }
@@ -5033,7 +4685,7 @@ validateWorkerOutput(const std::string& path, size_type expected_bytes)
   if(::stat(path.c_str(), &info) != 0 || info.st_size < 0 ||
      static_cast<size_type>(info.st_size) != expected_bytes)
   {
-    throw joinError("worker output length mismatch", path);
+    throw joinError("join-task output length mismatch", path);
   }
 }
 
@@ -5098,45 +4750,6 @@ allocateConcurrentPathBudgets(const ConstructionParameters& parameters,
   return ConcurrentPathBudgets(sort_bytes, join_bytes);
 }
 
-// A worker killed by SIGTERM runs no destructors, so the static TempFile
-// handler that would remove its label-sort runs never executes and those files
-// outlive the build: they carry the dead child's pid and a worker-local
-// counter, so neither the coordinator's own handler nor BuildWorkspace's
-// recovery sweep (which knows only .partial, .index. and uncommitted .bin
-// names) can name them. TempFile::getName() composes every temporary as
-// <dir>/<part>_<host>_<pid>_<counter> with <part> always beginning "gcsa", so
-// the reaped pid identifies exactly this child's files. Call this only after
-// waitpid() has returned for the pid: the files were created before the kill,
-// and no live sibling can own a name carrying it.
-void
-removeWorkerTemporaries(const std::string& directory, pid_t pid)
-{
-  if(directory.empty() || pid <= 0) { return; }
-  char hostname[32];
-  if(::gethostname(hostname, sizeof(hostname)) != 0) { return; }
-  hostname[sizeof(hostname) - 1] = 0;
-  const std::string suffix = std::string("_") + hostname + "_" +
-    std::to_string(static_cast<long long>(pid)) + "_";
-  DIR* handle = ::opendir(directory.c_str());
-  if(handle == nullptr) { return; }
-  for(dirent* entry = ::readdir(handle); entry != nullptr; entry = ::readdir(handle))
-  {
-    const std::string name(entry->d_name);
-    if(name.compare(0, 4, "gcsa") != 0) { continue; }
-    const size_t at = name.rfind(suffix);
-    if(at == std::string::npos || at + suffix.size() >= name.size()) { continue; }
-    // Everything after the pid must be the decimal counter, so a longer pid
-    // that merely ends in these digits cannot match.
-    bool counter = true;
-    for(size_t i = at + suffix.size(); i < name.size(); i++)
-    {
-      if(name[i] < '0' || name[i] > '9') { counter = false; break; }
-    }
-    if(counter) { std::remove((directory + "/" + name).c_str()); }
-  }
-  ::closedir(handle);
-}
-
 // The sorted runs of one key range of a logical input, and the partitions the
 // planner cut them into. The serial distribution is the single range.
 struct RangeJoin
@@ -5146,17 +4759,13 @@ struct RangeJoin
 };
 
 void
-runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
+runJoinThreadPartitions(const std::vector<RangeJoin>& jobs,
   logical_file_id_t logical,
   size_type size_limit, const ConstructionParameters& parameters,
   size_type label_fan_in, PathGraph& next, size_type& next_physical,
   size_type& committed_bytes, ExternalPathJoinStats* stats,
   BuildWorkspace* workspace, const std::string& checkpoint_task)
 {
-  if(parameters.getWorkerExecutable().empty())
-  {
-    throw joinError("process workers require a worker executable");
-  }
   size_type total_partitions = 0, pair_reader_bytes = 0;
   for(const RangeJoin& job : jobs)
   {
@@ -5166,35 +4775,79 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
       joinRunReaderPairMemory(job.left, job.right));
   }
   if(total_partitions == 0) { return; }
-  size_type requested = std::min(parameters.getProcessWorkers(), total_partitions);
-  size_type minimum_join = checkedJoinAdd(joinRawMinimumBudget(),
-    pair_reader_bytes, "minimum compressed worker join scan");
-  size_type minimum_worker = checkedJoinAdd(externalPathGraphSortMinimumBudget(),
-    minimum_join, "minimum worker reservation");
-  // Leave room for the coordinator, allocator metadata, dynamic-library state,
-  // and the checkpoint copy buffer. Tiny test budgets retain the same fraction
-  // instead of relying on a fixed margin that would make them unusable.
-  size_type safety_margin = parameters.getMemoryLimitBytes() / 16;
-  size_type usable_memory = parameters.getMemoryLimitBytes() - safety_margin;
-  size_type maximum_by_memory = usable_memory / minimum_worker;
-  size_type concurrency = std::min(requested, maximum_by_memory);
+
+  const size_type thread_limit =
+    static_cast<size_type>(std::max(1, omp_get_max_threads()));
+  const size_type minimum_join = checkedJoinAdd(joinRawMinimumBudget(),
+    pair_reader_bytes, "minimum compressed task join scan");
+  const size_type minimum_task = checkedJoinAdd(externalPathGraphSortMinimumBudget(),
+    minimum_join, "minimum join-task reservation");
+  const size_type usable_memory = parameters.getMemoryLimitBytes();
+
+  // Each task keeps both join runs and their two sidecars open (six files).
+  // A label-run merge adds fan-in readers and one writer; final materialization
+  // adds one run reader and, for framed output, two payload/index writer pairs.
+  // Share the configured concurrent descriptor budget rather than letting every
+  // in-process task claim the full per-operation fan-in.
+  constexpr size_type FIXED_TASK_DESCRIPTORS = 11;
+  constexpr size_type DESCRIPTORS_BEFORE_LABEL_FAN_IN = 7;
+  const size_type maximum_by_memory = usable_memory / minimum_task;
+  const size_type maximum_by_descriptors =
+    parameters.getConcurrentOpenFiles() / FIXED_TASK_DESCRIPTORS;
+  size_type concurrency = std::min({ total_partitions, thread_limit,
+    maximum_by_memory, maximum_by_descriptors });
   if(concurrency < 1)
   {
-    throw joinError("memory limit cannot admit one external join worker process");
+    throw joinError("memory or concurrent file limit cannot admit one external join task");
   }
-  size_type worker_reservation = usable_memory / concurrency;
-  ConcurrentPathBudgets worker_budgets = allocateConcurrentPathBudgets(parameters,
-    worker_reservation, minimum_join, "per-worker workspace");
-  size_type sort_budget = worker_budgets.sort;
-  size_type join_block_budget = worker_budgets.join;
-  size_type worker_threads = std::max(static_cast<size_type>(1),
-    static_cast<size_type>(omp_get_max_threads()) / concurrency);
-  TempFileCodecParameters worker_codec = parameters.getTempFileCodecParameters();
-  // Process workers are the outer parallelism layer. Bound zstd's inner pool
-  // before calculating the same framed-output limit the child will enforce.
-  worker_codec.workers = std::min(worker_codec.workers, worker_threads);
-  size_type checkpoint_buffer = std::min(parameters.getIOBufferSize(),
-    std::max(static_cast<size_type>(KILOBYTE), worker_reservation / 8));
+
+  size_type task_reservation = 0, sort_budget = 0, join_block_budget = 0;
+  size_type task_threads = 1;
+  TempFileCodecParameters task_codec;
+  while(true)
+  {
+    task_reservation = usable_memory / concurrency;
+    try
+    {
+      const ConcurrentPathBudgets task_budgets = allocateConcurrentPathBudgets(
+        parameters, task_reservation, minimum_join, "per-task workspace");
+      sort_budget = task_budgets.sort;
+      join_block_budget = task_budgets.join;
+      task_threads = std::max(static_cast<size_type>(1),
+        thread_limit / concurrency);
+      task_codec = parameters.getTempFileCodecParameters();
+      // The task's caller is the synchronous codec worker when the value is
+      // one. ZSTD_compress2() is blocking, so the path and rank contexts do
+      // not have active jobs at the same time. With zstd's asynchronous mode
+      // the caller feeds at most task_threads - 1 compression workers,
+      // keeping all task compute within its CPU share.
+      task_codec.workers = std::min(task_codec.workers,
+        std::max(static_cast<size_type>(1), task_threads - 1));
+
+      // The raw sorter minimum does not include the two final path/rank codec
+      // contexts. Probe the same bounded codec admission the sink will use;
+      // if it cannot fit, reduce task concurrency and divide the configured
+      // ceiling into larger reservations instead of changing compression.
+      static_cast<void>(externalPathGraphShardPeakBytes(0, 0,
+        sort_budget, task_codec));
+      break;
+    }
+    catch(const std::runtime_error&)
+    {
+      if(concurrency == 1) { throw; }
+      concurrency--;
+    }
+  }
+  const size_type descriptor_share =
+    parameters.getConcurrentOpenFiles() / concurrency;
+  const size_type task_label_fan_in = std::min(label_fan_in,
+    descriptor_share - DESCRIPTORS_BEFORE_LABEL_FAN_IN);
+  if(task_label_fan_in < 2)
+  {
+    throw joinError("concurrent file limit cannot admit a two-way task label merge");
+  }
+  const size_type checkpoint_buffer = std::min(parameters.getIOBufferSize(),
+    std::max(static_cast<size_type>(KILOBYTE), task_reservation / 8));
 
   size_type planned_bytes = 0;
   size_type largest_peak = 0, largest_paths = 0, largest_ranks = 0;
@@ -5203,9 +4856,9 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
   {
     const size_type peak_bytes = externalPathGraphShardPeakBytes(
       partition.expected_paths, partition.expected_ranks,
-      sort_budget, worker_codec);
+      sort_budget, task_codec);
     planned_bytes = checkedJoinAdd(planned_bytes, peak_bytes,
-      "all worker peak output bytes");
+      "all task peak output bytes");
     planned_paths = checkedJoinAdd(planned_paths, partition.expected_paths,
       "all partition expected paths");
     planned_ranks = checkedJoinAdd(planned_ranks, partition.expected_ranks,
@@ -5222,13 +4875,6 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
     }
   }
 
-  /*
-    Report the plan whether or not it fits. planned_bytes sums, over every
-    partition, the peak its output pair can reach -- so it is the disk the next
-    generation needs, not a transient figure. That sum was invisible until it
-    was too large, and the throw alone could not distinguish "raise
-    --gcsa-disk-limit by this much" from "the per-partition estimate is wrong".
-  */
   if(Verbosity::level >= Verbosity::EXTENDED)
   {
     std::cerr << "externalPathGraphExtend(): partition plan: "
@@ -5246,9 +4892,6 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
   }
   if(planned_bytes > size_limit || committed_bytes > size_limit - planned_bytes)
   {
-    // Report the arithmetic. Without it an operator cannot tell whether to
-    // raise --gcsa-disk-limit, and by how much, or whether the plan itself is
-    // pathological -- the difference between a one-flag fix and a bug.
     throw joinError("configured disk limit exceeded by deterministic partition plan"
       ": " + std::to_string(total_partitions) + " partitions plan " +
       formatBytes(planned_bytes) + " (largest " + formatBytes(largest_peak) +
@@ -5257,107 +4900,248 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
       "limit of " + formatBytes(size_limit));
   }
 
-  MemoryBudget memory(parameters.getMemoryLimitBytes(), safety_margin);
-  std::vector<ActiveJoinWorker> active;
-  active.reserve(concurrency);
-  // Step 4 of a chromosome-scale build spends hours here. Partitions are the
-  // natural progress unit: each is a committed, resumable unit of work, so the
-  // count is meaningful across a resume as well as within one run.
+  struct PlannedPartition
+  {
+    const RangeJoin* job;
+    const JoinPartition* partition;
+    size_type shard, peak;
+    std::string checkpoint;
+    bool restored;
+  };
+  std::vector<PlannedPartition> planned;
+  planned.reserve(total_partitions);
+  for(const RangeJoin& job : jobs) for(const JoinPartition& partition : job.partitions)
+  {
+    PlannedPartition item;
+    item.job = &job; item.partition = &partition;
+    item.peak = externalPathGraphShardPeakBytes(partition.expected_paths,
+      partition.expected_ranks, sort_budget, task_codec);
+    item.shard = appendOutputShard(next, logical,
+      physical_shard_id_t(next_physical++));
+    item.checkpoint = (checkpoint_task.empty() ? std::string() :
+      joinPartitionTaskName(checkpoint_task, logical, partition,
+        job.left.checksum, job.right.checksum));
+    item.restored = (workspace != nullptr && !item.checkpoint.empty() &&
+      workspace->task_completed(item.checkpoint, "join-partition"));
+    planned.push_back(item);
+  }
+
+  std::vector<size_type> sequence;
+  sequence.reserve(planned.size());
+  for(size_type i = 0; i < planned.size(); i++)
+  {
+    if(planned[i].restored) { sequence.push_back(i); }
+  }
+  const size_type first_task = sequence.size();
+  for(size_type i = 0; i < planned.size(); i++)
+  {
+    if(!planned[i].restored) { sequence.push_back(i); }
+  }
+  std::stable_sort(sequence.begin() + first_task, sequence.end(),
+    [&planned](size_type a, size_type b)
+    {
+      return planned[a].peak > planned[b].peak;
+    });
+
+  MemoryBudget memory(usable_memory);
   ProgressReporter partition_progress("join partitions", total_partitions,
     "partitions");
-  // Collect whichever worker finishes first. Waiting on the oldest one left
-  // every slot behind a long partition idle: on the joint chr2+chr18 input one
-  // step-4 worker ran alone for about 18 minutes. Output shards are numbered
-  // when partitions are planned and every count below is a sum, so the order
-  // of collection does not change the output.
-  auto collect_one = [&]()
+
+  // Restores run before task threads exist. Their copy buffers therefore never
+  // overlap a fully reserved task set, and every restored range is published by
+  // the coordinator in deterministic plan order.
+  for(size_type position = 0; position < first_task; position++)
   {
-    if(active.empty()) { return; }
-    size_type index = active.size();
-    int status = 0;
-    pid_t waited = -1;
-    while(index == active.size())
+    const PlannedPartition& item = planned[sequence[position]];
+    const JoinPartition& partition = *(item.partition);
+    const size_type restored_bytes = restoredJoinPartitionBytes(*workspace,
+      item.checkpoint, logical);
+    if(restored_bytes > size_limit ||
+       committed_bytes > size_limit - restored_bytes)
     {
-      for(size_type i = 0; i < active.size(); i++)
+      throw joinError("restored join partition does not fit the configured"
+        " disk limit: it stores " + std::to_string(restored_bytes) +
+        " bytes under the temporary compression of the run that committed"
+        " it, and --disk-limit leaves " +
+        std::to_string(size_limit - std::min(committed_bytes, size_limit)) +
+        " bytes", item.checkpoint);
+    }
+    restoreJoinPartition(*workspace, item.checkpoint, logical, partition,
+      next.path_names[item.shard], next.rank_names[item.shard], checkpoint_buffer);
+    validateTaskOutput(next.path_names[item.shard],
+      partition.expected_paths * sizeof(PathNode));
+    validateTaskOutput(next.rank_names[item.shard],
+      partition.expected_ranks * sizeof(PathNode::rank_type));
+    next.path_counts[item.shard] = partition.expected_paths;
+    next.rank_counts[item.shard] = partition.expected_ranks;
+    next.path_count += partition.expected_paths;
+    next.rank_count += partition.expected_ranks;
+    committed_bytes = checkedJoinAdd(committed_bytes, restored_bytes,
+      "committed restored output bytes");
+    partition_progress.advance();
+    if(stats != nullptr)
+    {
+      stats->restored_partitions++;
+      stats->generated_records += partition.generated_paths;
+      stats->sorted_bypass += partition.bypass_paths;
+      stats->direct_label_records += partition.expected_paths;
+      stats->intermediate_path_bytes_avoided += partition.expected_bytes;
+    }
+  }
+
+  std::vector<size_type> work(sequence.begin() + first_task, sequence.end());
+  if(work.empty())
+  {
+    partition_progress.finish();
+    if(stats != nullptr)
+    {
+      stats->join_partitions += total_partitions;
+      stats->max_bytes_resident = std::max(stats->max_bytes_resident,
+        static_cast<size_type>(memory.stats().maximum));
+    }
+    return;
+  }
+  std::vector<ExternalJoinTaskResult> results(planned.size());
+  std::vector<std::exception_ptr> errors(planned.size());
+  struct ThreadState
+  {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::vector<size_type> completed;
+    std::vector<bool> acknowledged;
+    size_type next, completed_head, completed_tail;
+    size_type workers, active, maximum_active;
+    bool start, stop;
+
+    explicit ThreadState(size_type items) :
+      completed(items), acknowledged(items, false), next(0),
+      completed_head(0), completed_tail(0), workers(0), active(0),
+      maximum_active(0), start(false), stop(false) { }
+  } state(planned.size());
+
+  auto task_loop = [&]()
+  {
+    const int previous_dynamic = omp_get_dynamic();
+    const int previous_threads = omp_get_max_threads();
+    omp_set_dynamic(0);
+    omp_set_num_threads(static_cast<int>(task_threads));
+    while(true)
+    {
+      size_type item_index = 0;
       {
-        pid_t polled;
-        do { polled = ::waitpid(active[i].pid, &status, WNOHANG); }
-        while(polled < 0 && errno == EINTR);
-        if(polled == active[i].pid || polled < 0) { index = i; waited = polled; break; }
+        std::unique_lock<std::mutex> lock(state.mutex);
+        state.changed.wait(lock, [&]() { return state.start || state.stop; });
+        if(state.stop || state.next >= work.size()) { break; }
+        item_index = work[state.next++];
+        state.active++;
+        state.maximum_active = std::max(state.maximum_active, state.active);
       }
-      if(index < active.size()) { break; }
-      // Block until some child exits, without reaping it, then poll again.
-      siginfo_t info; std::memset(&info, 0, sizeof(info));
-      int ready;
-      do { ready = ::waitid(P_ALL, 0, &info, WEXITED | WNOWAIT); }
-      while(ready < 0 && errno == EINTR);
-      bool ours = false;
-      for(const ActiveJoinWorker& candidate : active) { ours = ours || (candidate.pid == info.si_pid); }
-      if(ready < 0 || !ours) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+
+      std::exception_ptr task_error;
+      try
+      {
+        MemoryBudget::Reservation reservation = memory.reserve(task_reservation,
+          "join-task-" + std::to_string(planned[item_index].shard));
+        const PlannedPartition& item = planned[item_index];
+        ExternalJoinTask task;
+        task.logical = logical;
+        task.left = item.job->left; task.right = item.job->right;
+        task.partition = *(item.partition);
+        task.output_path = next.path_names[item.shard];
+        task.output_rank = next.rank_names[item.shard];
+        task.sort_budget = sort_budget;
+        task.join_block_budget = join_block_budget;
+        task.fan_in = task_label_fan_in;
+        task.codec = task_codec;
+        task.verify_payloads = parameters.getVerifyWorkspace();
+        results[item_index] = runExternalJoinTask(task);
+      }
+      catch(...)
+      {
+        task_error = std::current_exception();
+      }
+
+      {
+        std::unique_lock<std::mutex> lock(state.mutex);
+        state.active--;
+        errors[item_index] = task_error;
+        if(task_error) { state.stop = true; }
+        state.completed[state.completed_tail++] = item_index;
+        state.changed.notify_all();
+        // The task reservation has been released, but this worker cannot claim
+        // another task until the coordinator acknowledges publication. Thus a
+        // whole task slot remains free for validation and the checkpoint copy
+        // buffer while at most concurrency - 1 task reservations stay live.
+        if(!state.stop)
+        {
+          state.changed.wait(lock, [&]()
+          {
+            return state.acknowledged[item_index] || state.stop;
+          });
+        }
+        if(state.stop) { break; }
+      }
     }
-    ActiveJoinWorker& worker = active[index];
-    const pid_t reaped = worker.pid;
-    worker.pid = -1;
-    if(waited < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != EXIT_SUCCESS)
+    omp_set_num_threads(previous_threads);
+    omp_set_dynamic(previous_dynamic);
     {
-      // This child is the one that aborts the build, and it is already reaped,
-      // so the catch(...) below skips it: its pid is cleared and its guard is
-      // pid > 0. Sweep here, or the worker whose failure ends the run is the
-      // one worker whose label-sort runs are certain to be left behind.
-      removeWorkerTemporaries(TempFile::temp_dir, reaped);
-      throw joinError("external join worker failed", worker.task_file);
+      std::lock_guard<std::mutex> lock(state.mutex);
+      state.workers--;
+      state.changed.notify_all();
     }
-    // The completed child no longer owns a working set. Return its tokens
-    // before validating and checkpointing with the parent's bounded buffer.
-    worker.reservation = MemoryBudget::Reservation();
-    std::string result_file = worker.task_file + ".result";
-    ExternalJoinWorkerResult result = decodeWorkerResult(readWorkerControl(result_file));
-    if(result.max_bytes > worker_reservation)
+  };
+
+  auto publish = [&](size_type item_index)
+  {
+    const PlannedPartition& item = planned[item_index];
+    const JoinPartition& partition = *(item.partition);
+    const ExternalJoinTaskResult& result = results[item_index];
+    if(result.max_bytes > task_reservation)
     {
-      throw joinError("worker exceeded its combined join/sort reservation", result_file);
+      throw joinError("join task exceeded its combined join/sort reservation");
     }
-    if(result.paths != worker.partition.expected_paths ||
-       result.ranks != worker.partition.expected_ranks ||
-       result.bytes != worker.partition.expected_bytes)
+    if(result.paths != partition.expected_paths ||
+       result.ranks != partition.expected_ranks ||
+       result.bytes != partition.expected_bytes)
     {
-      throw joinError("worker result disagrees with partition plan", result_file);
+      throw joinError("join task result disagrees with partition plan");
     }
-    validateWorkerOutput(next.path_names[worker.shard],
+    validateTaskOutput(next.path_names[item.shard],
       result.paths * sizeof(PathNode));
-    validateWorkerOutput(next.rank_names[worker.shard],
+    validateTaskOutput(next.rank_names[item.shard],
       result.ranks * sizeof(PathNode::rank_type));
-    const size_type actual_stored_bytes = checkedJoinAdd(
-      storedJoinBytes(next.path_names[worker.shard]),
-      storedJoinBytes(next.rank_names[worker.shard]),
-      "worker stored output bytes");
+    const size_type stored_path = storedJoinBytes(next.path_names[item.shard]);
+    const size_type stored_rank = storedJoinBytes(next.rank_names[item.shard]);
+    const size_type actual_stored_bytes = checkedJoinAdd(stored_path, stored_rank,
+      "task stored output bytes");
     if(result.stored_bytes != actual_stored_bytes ||
-       result.stored_bytes > worker.maximum_stored_bytes)
+       result.stored_bytes > item.peak)
     {
-      throw joinError("worker stored output exceeds the peak admitted for the"
-        " configured temporary-compression settings", result_file);
+      throw joinError("join task stored output exceeds the peak admitted for the"
+        " configured temporary-compression settings");
     }
-    if(!result.path_checksum.matches(next.path_names[worker.shard],
-         storedJoinBytes(next.path_names[worker.shard])) ||
-       !result.rank_checksum.matches(next.rank_names[worker.shard],
-         storedJoinBytes(next.rank_names[worker.shard])))
-    { throw joinError("worker payload changed after writer close", result_file); }
-    if(workspace != nullptr && !worker.checkpoint_name.empty())
+    if(!result.path_checksum.matches(next.path_names[item.shard], stored_path) ||
+       !result.rank_checksum.matches(next.rank_names[item.shard], stored_rank))
     {
-      checkpointJoinPartition(*workspace, worker.checkpoint_name, logical,
-        worker.partition, next.path_names[worker.shard],
-        next.rank_names[worker.shard], checkpoint_buffer,
-        &result.path_checksum, &result.rank_checksum);
+      throw joinError("join task payload changed after writer close");
     }
-    // Our checkpoint hardlinks change ctime without changing the payload.
-    next.path_checksums.at(worker.shard).record(next.path_names[worker.shard], result.path_checksum.value);
-    next.rank_checksums.at(worker.shard).record(next.rank_names[worker.shard], result.rank_checksum.value);
-    next.path_counts[worker.shard] = result.paths;
-    next.rank_counts[worker.shard] = result.ranks;
-    next.path_count += result.paths; next.rank_count += result.ranks;
+    if(workspace != nullptr && !item.checkpoint.empty())
+    {
+      checkpointJoinPartition(*workspace, item.checkpoint, logical,
+        partition, next.path_names[item.shard], next.rank_names[item.shard],
+        checkpoint_buffer, &result.path_checksum, &result.rank_checksum);
+    }
+    // A checkpoint hardlink changes ctime without changing the payload.
+    next.path_checksums.at(item.shard).record(next.path_names[item.shard],
+      result.path_checksum.value);
+    next.rank_checksums.at(item.shard).record(next.rank_names[item.shard],
+      result.rank_checksum.value);
+    next.path_counts[item.shard] = result.paths;
+    next.rank_counts[item.shard] = result.ranks;
+    next.path_count += result.paths;
+    next.rank_count += result.ranks;
     committed_bytes = checkedJoinAdd(committed_bytes, result.stored_bytes,
-      "committed worker output bytes");
-    DiskIO::read_volume += result.bytes_read;
-    DiskIO::write_volume += result.bytes_written;
+      "committed task output bytes");
     if(stats != nullptr)
     {
       stats->generated_records += result.generated;
@@ -5368,175 +5152,98 @@ runJoinWorkerPartitions(const std::vector<RangeJoin>& jobs,
       stats->label_merge_passes = std::max(stats->label_merge_passes,
         result.label_merge_passes);
       stats->label_parallel_sorts = checkedJoinAdd(stats->label_parallel_sorts,
-        result.label_parallel_sorts, "worker parallel label sorts");
+        result.label_parallel_sorts, "task parallel label sorts");
       stats->grouped_expansion_records = checkedJoinAdd(
         stats->grouped_expansion_records, result.grouped_records,
-        "worker grouped expansion records");
+        "task grouped expansion records");
       stats->expansion_context_bytes_saved = checkedJoinAdd(
         stats->expansion_context_bytes_saved, result.context_bytes_saved,
-        "worker expansion context bytes saved");
+        "task expansion context bytes saved");
       stats->max_records_resident = std::max(stats->max_records_resident,
         checkedJoinMultiply(result.max_records, concurrency,
-          "concurrent worker resident records"));
-      stats->max_bytes_resident = std::max(stats->max_bytes_resident,
-        checkedJoinMultiply(result.max_bytes, concurrency,
-          "concurrent worker resident bytes"));
+          "concurrent task resident records"));
       stats->blocked_key_blocks = checkedJoinAdd(stats->blocked_key_blocks,
-        result.blocks, "worker join blocks");
-      stats->worker_processes++;
+        result.blocks, "task join blocks");
+      stats->join_tasks++;
     }
-    std::remove(result_file.c_str());
-    TempFile::remove(worker.task_file);
     partition_progress.advance();
-    active.erase(active.begin() + index);
   };
 
+  std::exception_ptr failure;
+  std::vector<std::thread> threads;
+  threads.reserve(concurrency);
   try
   {
-    // Output shards are numbered in plan order, as before. Completed partitions
-    // are restored first; the rest launch largest first, so a long partition
-    // starts early instead of becoming the step's tail.
-    struct PlannedPartition
+    for(size_type i = 0; i < concurrency; i++)
     {
-      const RangeJoin* job; const JoinPartition* partition;
-      size_type shard, peak; std::string checkpoint; bool restored;
-    };
-    std::vector<PlannedPartition> planned;
-    planned.reserve(total_partitions);
-    for(const RangeJoin& job : jobs) for(const JoinPartition& partition : job.partitions)
-    {
-      PlannedPartition item;
-      item.job = &job; item.partition = &partition;
-      item.peak = externalPathGraphShardPeakBytes(partition.expected_paths,
-        partition.expected_ranks, sort_budget, worker_codec);
-      item.shard = appendOutputShard(next, logical, physical_shard_id_t(next_physical++));
-      item.checkpoint = (checkpoint_task.empty() ? std::string() :
-        joinPartitionTaskName(checkpoint_task, logical, partition,
-          job.left.checksum, job.right.checksum));
-      item.restored = (workspace != nullptr && !item.checkpoint.empty() &&
-        workspace->task_completed(item.checkpoint, "join-partition"));
-      planned.push_back(item);
+      threads.emplace_back(task_loop);
     }
-    std::vector<size_type> sequence;
-    sequence.reserve(planned.size());
-    for(size_type i = 0; i < planned.size(); i++) { if(planned[i].restored) { sequence.push_back(i); } }
-    const size_type first_launch = sequence.size();
-    for(size_type i = 0; i < planned.size(); i++) { if(!planned[i].restored) { sequence.push_back(i); } }
-    std::stable_sort(sequence.begin() + first_launch, sequence.end(),
-      [&planned](size_type a, size_type b) { return planned[a].peak > planned[b].peak; });
-
-    for(size_type item_index : sequence)
-    {
-      const PlannedPartition& item = planned[item_index];
-      const JoinRun& left = item.job->left;
-      const JoinRun& right = item.job->right;
-      const JoinPartition& partition = *(item.partition);
-      const size_type peak_output_bytes = item.peak;
-      const size_type shard = item.shard;
-      const std::string& partition_checkpoint = item.checkpoint;
-      if(item.restored)
-      {
-        // Do not overlap restore buffers with fully admitted child working
-        // sets. Completed tasks are cheap to restore and never respawn.
-        while(!active.empty()) { collect_one(); }
-        // A restored shard was written by an earlier run, whose codec is an
-        // operational setting and may differ from this one. Its physical size
-        // therefore says nothing about this run's admitted peak: a framed pair
-        // committed under zstd is larger than the raw payload that peak
-        // describes when the resuming run uses --temp-compression none, and
-        // AUTO reduces to NONE on its own under a smaller sort budget. The
-        // artifact is authenticated against the workspace's own completion
-        // record by restoreJoinPartition() (exact committed length, and the
-        // payload checksum under --verify-workspace), so only disk accounting
-        // is left: charge the guard the exact stored size, reserved before the
-        // restore because its cross-filesystem fallback copies those bytes.
-        const size_type restored_bytes = restoredJoinPartitionBytes(*workspace,
-          partition_checkpoint, logical);
-        if(restored_bytes > size_limit ||
-           committed_bytes > size_limit - restored_bytes)
-        {
-          throw joinError("restored join partition does not fit the configured"
-            " disk limit: it stores " + std::to_string(restored_bytes) +
-            " bytes under the temporary compression of the run that committed"
-            " it, and --disk-limit leaves " +
-            std::to_string(size_limit - std::min(committed_bytes, size_limit)) +
-            " bytes", partition_checkpoint);
-        }
-        restoreJoinPartition(*workspace, partition_checkpoint, logical, partition,
-          next.path_names[shard], next.rank_names[shard], checkpoint_buffer);
-        validateWorkerOutput(next.path_names[shard],
-          partition.expected_paths * sizeof(PathNode));
-        validateWorkerOutput(next.rank_names[shard],
-          partition.expected_ranks * sizeof(PathNode::rank_type));
-        next.path_counts[shard] = partition.expected_paths;
-        next.rank_counts[shard] = partition.expected_ranks;
-        next.path_count += partition.expected_paths;
-        next.rank_count += partition.expected_ranks;
-        committed_bytes = checkedJoinAdd(committed_bytes, restored_bytes,
-          "committed restored output bytes");
-        partition_progress.advance();
-        if(stats != nullptr)
-        {
-          stats->restored_partitions++;
-          stats->generated_records += partition.generated_paths;
-          stats->sorted_bypass += partition.bypass_paths;
-          stats->direct_label_records += partition.expected_paths;
-          stats->intermediate_path_bytes_avoided += partition.expected_bytes;
-        }
-        continue;
-      }
-      while(active.size() >= concurrency) { collect_one(); }
-      ExternalJoinWorkerTask task;
-      task.logical = logical; task.left = left; task.right = right;
-      task.partition = partition;
-      task.output_path = next.path_names[shard];
-      task.output_rank = next.rank_names[shard];
-      task.temp_directory = TempFile::temp_dir;
-      task.sort_budget = sort_budget; task.join_block_budget = join_block_budget;
-      task.fan_in = label_fan_in;
-      task.threads = worker_threads;
-      task.codec = worker_codec;
-      task.verify_payloads = parameters.getVerifyWorkspace();
-      std::string task_file = TempFile::getName("gcsa_join_worker_task");
-      writeWorkerControl(task_file, encodeWorkerTask(task));
-      MemoryBudget::Reservation reservation = memory.reserve(worker_reservation,
-        "join-worker-" + std::to_string(shard));
-      pid_t child = -1;
-      try
-      {
-        child = spawnJoinWorker(parameters.getWorkerExecutable(), task_file);
-      }
-      catch(...)
-      {
-        TempFile::remove(task_file);
-        throw;
-      }
-      active.emplace_back(child, shard, partition, task_file,
-        partition_checkpoint, peak_output_bytes,
-        std::move(reservation));
-    }
-    while(!active.empty()) { collect_one(); }
-    partition_progress.finish();
   }
   catch(...)
   {
-    for(ActiveJoinWorker& worker : active)
-    {
-      if(worker.pid > 0)
-      {
-        ::kill(worker.pid, SIGTERM);
-        while(::waitpid(worker.pid, nullptr, 0) < 0 && errno == EINTR) { }
-        removeWorkerTemporaries(TempFile::temp_dir, worker.pid);
-      }
-      std::string result_file = worker.task_file + ".result";
-      std::remove(result_file.c_str());
-      TempFile::remove(worker.task_file);
-    }
-    throw;
+    failure = std::current_exception();
   }
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.workers = threads.size();
+    state.start = true;
+    if(failure) { state.stop = true; }
+    state.changed.notify_all();
+  }
+
+  while(true)
+  {
+    size_type item_index = 0;
+    {
+      std::unique_lock<std::mutex> lock(state.mutex);
+      state.changed.wait(lock, [&]()
+      {
+        return state.completed_head < state.completed_tail || state.workers == 0;
+      });
+      if(state.completed_head == state.completed_tail)
+      {
+        if(state.workers == 0) { break; }
+        continue;
+      }
+      item_index = state.completed[state.completed_head++];
+    }
+
+    if(!failure && errors[item_index])
+    {
+      failure = errors[item_index];
+      std::lock_guard<std::mutex> lock(state.mutex);
+      state.stop = true;
+      state.changed.notify_all();
+    }
+    if(!failure)
+    {
+      try
+      {
+        publish(item_index);
+      }
+      catch(...)
+      {
+        failure = std::current_exception();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.stop = true;
+        state.changed.notify_all();
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(state.mutex);
+      state.acknowledged[item_index] = true;
+      state.changed.notify_all();
+    }
+  }
+  for(std::thread& thread : threads) { thread.join(); }
+  if(failure) { std::rethrow_exception(failure); }
+
+  partition_progress.finish();
   if(stats != nullptr)
   {
     stats->join_partitions += total_partitions;
+    stats->join_concurrency = std::max(stats->join_concurrency,
+      state.maximum_active);
     stats->max_bytes_resident = std::max(stats->max_bytes_resident,
       static_cast<size_type>(memory.stats().maximum));
   }
@@ -5583,6 +5290,8 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
     throw joinError("path graph shard identity metadata is incomplete");
   }
   size_type memory_budget = parameters.getMemoryLimitBytes();
+  const size_type thread_limit =
+    static_cast<size_type>(std::max(1, omp_get_max_threads()));
   // Distribution and join-to-label expansion are different lifetimes. The
   // former shares memory only with one source shard reader, so forcing it into
   // the later concurrent join share can create hundreds of thousands of tiny
@@ -5605,7 +5314,7 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
   }
   TempFileCodecParameters join_codec = boundedJoinRunCodec(
     parameters.getTempFileCodecParameters(), maximum_distribution_sort,
-    (parameters.getProcessWorkers() > 1 ? memory_budget : 0));
+    (thread_limit > 1 ? memory_budget : 0));
   if(maximum_distribution_sort < joinRunSortMinimumBudget(join_codec))
   {
     throw joinError("distribution sort cap is below the join-run minimum");
@@ -5668,7 +5377,6 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
   // sort order ends in that ordinal, so the runs do not depend on which reader
   // delivered a record first. Readers and the sorters' merges run concurrently,
   // so their descriptors come from the concurrent open-file budget.
-  const size_type thread_limit = static_cast<size_type>(std::max(1, omp_get_max_threads()));
   const size_type descriptor_budget = std::max(parameters.getMaxOpenFiles(),
     parameters.getConcurrentOpenFiles()) - 2;
   const size_type total_distribution = checkedJoinAdd(maximum_distribution_sort,
@@ -5698,7 +5406,7 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
       if(reader_bytes >= total_distribution) { continue; }
       const size_type budget = (total_distribution - reader_bytes) / (2 * group);
       TempFileCodecParameters candidate = boundedJoinRunCodec(requested_range_codec,
-        budget, (parameters.getProcessWorkers() > 1 ? memory_budget : 0));
+        budget, (thread_limit > 1 ? memory_budget : 0));
       if(budget < joinRunSortMinimumBudget(candidate)) { continue; }
       // Finishing merges each sorter's runs within that sorter's own budget,
       // so it may use more threads than there are readers.
@@ -6013,7 +5721,9 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
     jobs.push_back(job);
     }
 
-    if(parameters.getProcessWorkers() > 1)
+    try
+    {
+    if(thread_limit > 1)
     {
       // Plan the ranges at once. A planner holds two run readers, four sidecar
       // readers and up to four plan representations; that footprint, not the
@@ -6063,7 +5773,6 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
       {
         if(error)
         {
-          for(RangeJoin& job : jobs) { removeJoinRun(job.left); removeJoinRun(job.right); }
           std::rethrow_exception(error);
         }
       }
@@ -6095,7 +5804,7 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
         }
         if(!productive.empty()) { jobs.swap(productive); }
       }
-      runJoinWorkerPartitions(jobs, logical, size_limit,
+      runJoinThreadPartitions(jobs, logical, size_limit,
         parameters, label_fan_in, next, next_physical, committed_bytes, stats,
         workspace, checkpoint_task);
     }
@@ -6147,13 +5856,19 @@ externalPathGraphExtend(PathGraph& graph, size_type size_limit,
         // sort and join budgets as independent maxima.
       }
     }
+    }
+    catch(...)
+    {
+      for(RangeJoin& job : jobs) { removeJoinRun(job.left); removeJoinRun(job.right); }
+      throw;
+    }
     for(RangeJoin& job : jobs) { removeJoinRun(job.left); removeJoinRun(job.right); }
   }
 
-  MemoryBudget compaction_memory(memory_budget, memory_budget / 16);
+  MemoryBudget compaction_memory(memory_budget);
   compactLogicalJoinShards(next, size_limit, parameters, label_fan_in,
     compaction_memory, committed_bytes, stats);
-  // Every sink, worker and restored partition charged this generation its
+  // Every sink, join task and restored partition charged this generation its
   // installed st_size, and compaction subtracted only what it actually
   // unlinked. That total, not the logical payload, is what the next
   // generation's disk budget must be reduced by. A failed unlink leaves the

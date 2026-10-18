@@ -38,7 +38,8 @@ class ExternalInputPreprocessor
 {
 public:
   ExternalInputPreprocessor(const InputGraph& graph,
-    const ConstructionParameters& parameters, BuildWorkspace* workspace = nullptr);
+    const ConstructionParameters& parameters, BuildWorkspace* workspace = nullptr,
+    MemoryBudget* memory = nullptr);
   ~ExternalInputPreprocessor();
 
   // Build all compact supports from the label-sorted unique key stream. This
@@ -62,6 +63,14 @@ public:
 
   size_type keyCount() const;
   size_type startNodeCount() const;
+  // Peak incremental support storage for the pinned SDSL constructors. These
+  // exclude the already-admitted input facts and path stores. Callers reserve
+  // the peak before construction and shrink to the retained serialized size.
+  size_type lcpMemoryBytes();
+  size_type mapperMemoryBytes();
+  size_type lastCharacterMemoryBytes();
+  size_type startNodeMemoryBytes();
+  void spillFacts() { this->materializeFacts(); }
   const ExternalInputPreprocessingStats& stats() const { return this->stats_; }
 
   ExternalInputPreprocessor(const ExternalInputPreprocessor&) = delete;
@@ -75,8 +84,17 @@ private:
   size_type key_count_, start_count_;
   bool prepared_;
   ExternalInputPreprocessingStats stats_;
+  MemoryBudget* memory_;
+  std::vector<key_type> keys_;
+  std::vector<node_type> starts_;
+  MemoryBudget::Reservation facts_memory_;
+  bool resident_;
+  size_type predecessor_edges_;
 
   void prepare();
+  bool tryPrepareResident();
+  bool tryBuildResidentInitial(PathGraph& result);
+  void materializeFacts();
   size_type sortBudget() const;
   size_type ioBufferBytes() const;
 };

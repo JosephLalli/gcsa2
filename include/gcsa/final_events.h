@@ -23,6 +23,10 @@
 namespace gcsa
 {
 
+template<class Element> class AdaptiveRecordStore;
+
+typedef AdaptiveRecordStore<std::uint8_t> FinalEventStore;
+
 /*
   A mapped start-node set used by the final merged-graph scan.
 
@@ -89,14 +93,29 @@ struct FinalEventFiles
   std::vector<std::string> edge_destinations;
   std::string sample_positions, sample_ids, sample_ends;
   std::string occurrences, redundant;
+  // Present only for the RAM-first construction route. Event records retain
+  // their historical little-endian byte representation in these stores, so
+  // materializing a store produces the exact raw file older readers expect.
+  std::shared_ptr<FinalEventStore> metadata_store, bwt_masks_store;
+  std::vector<std::shared_ptr<FinalEventStore>> edge_destination_stores;
+  std::shared_ptr<FinalEventStore> sample_positions_store, sample_ids_store;
+  std::shared_ptr<FinalEventStore> sample_ends_store, occurrences_store;
+  std::shared_ptr<FinalEventStore> redundant_store;
   bool delete_files;
 
-  explicit FinalEventFiles(size_type sigma = 0);
+  explicit FinalEventFiles(size_type sigma = 0, MemoryBudget* memory = nullptr);
   FinalEventFiles(FinalEventFiles&& source);
   FinalEventFiles& operator=(FinalEventFiles&& source);
   ~FinalEventFiles();
 
   void clear();
+  bool adaptive() const { return this->bwt_masks_store != nullptr; }
+  // Explicit durability boundary. Ordinary resident construction does not
+  // call this merely to create a development checkpoint.
+  void materializeAll() const;
+  // A restored workspace already supplies immutable files. Drop any empty
+  // resident stores before installing those files.
+  void useFileBacked();
 
   FinalEventFiles(const FinalEventFiles&) = delete;
   FinalEventFiles& operator=(const FinalEventFiles&) = delete;
@@ -288,11 +307,16 @@ struct FinalComponentStats
   RedundancyCountStats redundancy;
 };
 
+// Minimum shared-pool workspace for one component encoder.
+size_type finalComponentMinimumMemory(const FinalEventFiles& files,
+  const FinalEventMetadata& metadata, const ConstructionParameters& parameters);
+
 void storeFinalComponents(const GCSAHeader& header,
   const Alphabet& source_alphabet, const FinalEventFiles& files,
   const FinalEventMetadata& metadata,
   const ConstructionParameters& parameters, const std::string& filename,
-  FinalComponentStats* stats = nullptr);
+  FinalComponentStats* stats = nullptr,
+  MemoryBudget* construction_memory = nullptr);
 
 } // namespace gcsa
 

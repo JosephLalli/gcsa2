@@ -12,7 +12,7 @@ namespace gcsa
 // copy. Physical storage never changes semantic logical-file identity.
 bool pathGraphCheckpointExists(const BuildWorkspace& workspace,
   const std::string& task, const std::string& phase);
-void checkpointPathGraph(BuildWorkspace& workspace, const PathGraph& graph,
+void checkpointPathGraph(BuildWorkspace& workspace, PathGraph& graph,
   const std::string& task, const std::string& phase, size_type buffer_bytes);
 void restorePathGraph(const BuildWorkspace& workspace, PathGraph& graph,
   const std::string& task, const std::string& phase, size_type buffer_bytes);

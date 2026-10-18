@@ -64,14 +64,22 @@ GCSA2_HELPER_CXX_FLAGS := $(filter-out -I% -L%,$(MY_CXX_FLAGS))
 CXX_FLAGS=$(GCSA2_HELPER_CXX_FLAGS) $(VERIFY_FLAGS) $(PARALLEL_FLAGS) $(MY_CXX_OPT_FLAGS)
 
 HEADERS=$(wildcard include/gcsa/*.h)
-LIBOBJS=$(addprefix $(BUILD_OBJ)/,algorithms.o checkpoint.o compressed_block.o dbg.o disk_array.o external_join.o external_preprocessing.o external_sort.o files.o final_events.o gcsa.o internal.o lcp.o path_graph.o path_sort_run.o support.o utils.o resources.o workspace.o)
+LIBOBJS=$(addprefix $(BUILD_OBJ)/,adaptive_record_store.o algorithms.o checkpoint.o compressed_block.o dbg.o disk_array.o external_join.o external_preprocessing.o external_sort.o files.o final_events.o gcsa.o internal.o lcp.o path_graph.o path_sort_run.o support.o utils.o resources.o workspace.o)
 LIBRARY=$(BUILD_LIB)/libgcsa2.a
 
 PROGRAMS=$(addprefix $(BUILD_BIN)/,build_gcsa convert_graph gcsa_format try_extend)
 OBSOLETE=build_gcsa convert_graph gcsa_format try_extend
 
 .PHONY: all clean directories test compressed-block-test workspace-test external-path-sort-test path-sort-run-test external-join-test external-sort-test external-preprocessing-test external-verification-test final-events-test lcp-streaming-test disk-array-test internal-buffer-test parameter-test construction-resume-test path-graph-prune-test checkpoint-checksums-test final-scan-test
+.PHONY: adaptive-record-store-test
 all: directories $(LIBRARY) $(PROGRAMS)
+
+$(BUILD_OBJ)/test_adaptive_record_store.o:tests/test_adaptive_record_store.cpp include/gcsa/adaptive_record_store.h
+	$(MY_CXX) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -c -o $@ $<
+
+adaptive-record-store-test: directories $(BUILD_OBJ)/test_adaptive_record_store.o $(LIBRARY)
+	$(MY_CXX) $(LDFLAGS) $(CPPFLAGS) $(CXXFLAGS) $(CXX_FLAGS) -o $(BUILD_BIN)/test_adaptive_record_store $(BUILD_OBJ)/test_adaptive_record_store.o $(LIBRARY) $(LIBS)
+	$(BUILD_BIN)/test_adaptive_record_store
 
 directories: $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)
 

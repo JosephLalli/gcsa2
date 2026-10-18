@@ -2,15 +2,18 @@
 #include <gcsa/workspace.h>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <iterator>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <thread>
+#include <vector>
 #include <unistd.h>
 using namespace gcsa;
 static void require(bool v) { if(!v) { std::fprintf(stderr,"workspace test failure\n"); std::abort(); } }
@@ -224,7 +227,62 @@ static void test_retirement_families()
   }
 }
 
+static void test_nonblocking_memory_budget()
+{
+  MemoryBudget budget(100);
+  require(!budget.tryReserve(101, "oversized"));
+  MemoryBudget::Reservation full = budget.tryReserve(100, "full");
+  require(static_cast<bool>(full));
+  require(!budget.tryReserve(1, "unavailable"));
+  require(budget.stats().current == 100);
+  full.shrinkTo(64);
+  require(budget.stats().current == 64 && full.bytes() == 64);
+  auto spare = budget.tryReserve(32, "spare");
+  require(static_cast<bool>(spare));
+  full.shrinkTo(0);
+  require(budget.stats().current == 32);
+  bool growth_rejected = false;
+  try { spare.shrinkTo(33); }
+  catch(const std::invalid_argument&) { growth_rejected = true; }
+  require(growth_rejected && spare.bytes() == 32);
+  spare = MemoryBudget::Reservation();
+  full = MemoryBudget::Reservation();
+
+  std::mutex mutex;
+  std::condition_variable changed;
+  size_t ready = 0, admitted = 0;
+  bool release = false;
+  std::vector<std::thread> workers;
+  for(size_t i = 0; i < 8; i++)
+  {
+    workers.emplace_back([&]()
+    {
+      MemoryBudget::Reservation slot = budget.tryReserve(32, "worker");
+      std::unique_lock<std::mutex> lock(mutex);
+      ready++;
+      if(slot) { admitted++; }
+      changed.notify_all();
+      changed.wait(lock, [&]() { return release; });
+    });
+  }
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    // A failed growth request must return without waiting for another worker
+    // to release its live data. Blocking here would deadlock spill admission.
+    require(changed.wait_for(lock, std::chrono::seconds(2),
+      [&]() { return ready == workers.size(); }));
+    require(admitted == 3);
+    require(budget.stats().current == 32 * admitted);
+    release = true;
+    changed.notify_all();
+  }
+  for(std::thread& worker : workers) { worker.join(); }
+  require(budget.stats().current == 0);
+  require(budget.stats().maximum == 100);
+}
+
 int main() {
+  test_nonblocking_memory_budget();
   test_retirement_families();
   MemoryBudget b(100,10); MemoryBudget::Reservation first=b.reserve(90,"first"); std::atomic<bool> started(false),got(false);
   std::thread waiter([&]{started=true;MemoryBudget::Reservation second=b.reserve(1,"second");got=true;}); while(!started) std::this_thread::yield(); std::this_thread::sleep_for(std::chrono::milliseconds(25)); require(!got); first=MemoryBudget::Reservation(); waiter.join(); require(got && b.stats().current==0 && b.stats().maximum==90); bool over=false; try { b.reserve(91,"too-large"); } catch(const std::runtime_error&) { over=true; } require(over);

@@ -45,7 +45,8 @@ public:
   // validated before use.
   DiskBackedArray64(const std::string& filename, size_type elements,
     size_type cache_bytes, MemoryBudget& budget, bool create_file = true,
-    size_type requested_block_bytes = DEFAULT_BLOCK_BYTES);
+    size_type requested_block_bytes = DEFAULT_BLOCK_BYTES,
+    bool try_resident = false);
   ~DiskBackedArray64();
 
   size_type size() const { return this->elements_; }
@@ -64,9 +65,9 @@ private:
   std::string filename_;
   int descriptor_;
   size_type elements_, array_bytes_, block_bytes_, block_elements_, slots_;
+  MemoryBudget::Reservation reservation_;
   std::vector<std::uint64_t> payload_, tags_;
   std::vector<std::uint8_t> dirty_;
-  MemoryBudget::Reservation reservation_;
   Stats stats_;
 
   size_type slotFor(size_type block) const { return block % this->slots_; }

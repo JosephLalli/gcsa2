@@ -72,7 +72,7 @@ DiskBackedArray64::minimumCacheBytes()
 
 DiskBackedArray64::DiskBackedArray64(const std::string& filename,
   size_type elements, size_type cache_bytes, MemoryBudget& budget,
-  bool create_file, size_type requested_block_bytes) :
+  bool create_file, size_type requested_block_bytes, bool try_resident) :
   filename_(filename), descriptor_(-1), elements_(elements), array_bytes_(0),
   block_bytes_(0), block_elements_(0), slots_(0)
 {
@@ -81,6 +81,15 @@ DiskBackedArray64::DiskBackedArray64(const std::string& filename,
     throw diskArrayError("logical length overflows bytes", filename);
   }
   this->array_bytes_ = elements * sizeof(std::uint64_t);
+  if(create_file && try_resident)
+  {
+    this->reservation_ = budget.tryReserve(this->array_bytes_, "resident construction array");
+    if(this->reservation_)
+    {
+      this->payload_.resize(elements, 0);
+      return;
+    }
+  }
   if(this->array_bytes_ > static_cast<size_type>(std::numeric_limits<off_t>::max()))
   {
     throw diskArrayError("logical length exceeds filesystem offsets", filename);
@@ -207,6 +216,7 @@ std::uint64_t
 DiskBackedArray64::get(size_type index)
 {
   if(index >= this->elements_) { throw std::out_of_range("DiskBackedArray64::get"); }
+  if(this->descriptor_ < 0) { return this->payload_[index]; }
   size_type byte_offset = index * sizeof(std::uint64_t);
   size_type block = byte_offset / this->block_bytes_;
   size_type within = (byte_offset % this->block_bytes_) / sizeof(std::uint64_t);
@@ -217,6 +227,7 @@ void
 DiskBackedArray64::set(size_type index, std::uint64_t value)
 {
   if(index >= this->elements_) { throw std::out_of_range("DiskBackedArray64::set"); }
+  if(this->descriptor_ < 0) { this->payload_[index] = value; return; }
   size_type byte_offset = index * sizeof(std::uint64_t);
   size_type block = byte_offset / this->block_bytes_;
   size_type within = (byte_offset % this->block_bytes_) / sizeof(std::uint64_t);
@@ -227,6 +238,7 @@ DiskBackedArray64::set(size_type index, std::uint64_t value)
 void
 DiskBackedArray64::flush(bool sync_file)
 {
+  if(this->descriptor_ < 0) { return; }
   for(size_type slot = 0; slot < this->slots_; slot++) { this->writeSlot(slot); }
   if(sync_file && ::fdatasync(this->descriptor_) != 0)
   {

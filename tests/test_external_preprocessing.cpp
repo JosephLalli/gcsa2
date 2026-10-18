@@ -194,6 +194,44 @@ int main()
   }
   require(workspace.task_completed("preprocess", "key-start-streams"));
 
+  // The RAM-first and real-overflow routes produce exactly the same ordered
+  // path/rank payloads and logical-shard identities as the pinned file route.
+  for(size_type budget_bytes : { static_cast<size_type>(8 * MEGABYTE),
+      build_parameters.getSortRunSize() })
+  {
+    MemoryBudget memory(budget_bytes);
+    {
+      ExternalInputPreprocessor reference(graph, build_parameters, &workspace);
+      ExternalInputPreprocessor adaptive(graph, build_parameters, nullptr, &memory);
+      PathGraph expected(0, graph.k(), 0), observed(0, graph.k(), 0);
+      reference.buildInitialPathGraph(expected);
+      adaptive.buildInitialPathGraph(observed);
+      require(expected.files() == observed.files());
+      require(expected.size() == observed.size() && expected.ranks() == observed.ranks());
+      for(size_type file = 0; file < observed.files(); file++)
+      {
+        require(expected.logicalFile(file) == observed.logicalFile(file));
+        require(expected.physicalShard(file) == observed.physicalShard(file));
+        std::vector<PathNode> expected_paths, observed_paths;
+        std::vector<PathNode::rank_type> expected_ranks, observed_ranks;
+        expected.read(expected_paths, expected_ranks, file);
+        observed.read(observed_paths, observed_ranks, file);
+        require(expected_paths.size() == observed_paths.size());
+        require(expected_ranks == observed_ranks);
+        require(std::memcmp(expected_paths.data(), observed_paths.data(),
+          expected_paths.size() * sizeof(PathNode)) == 0);
+        if(budget_bytes == 8 * MEGABYTE)
+        {
+          require(observed.path_stores[file] && observed.path_stores[file]->resident());
+          require(observed.rank_stores[file] && observed.rank_stores[file]->resident());
+          require(observed.path_names[file].empty() && observed.rank_names[file].empty());
+        }
+      }
+      require(memory.stats().maximum <= budget_bytes);
+    }
+    require(memory.stats().current == 0);
+  }
+
   // Both artifacts pass full validation (header, checksum over the payload,
   // footer, and the task marker's record), and their payloads are exactly the
   // reduced streams: one merged key per label in label order, and the sorted
